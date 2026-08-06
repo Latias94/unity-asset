@@ -6,14 +6,16 @@ wrapping the removed APIs.
 
 This is the only non-historical document that names removed public symbols and commands.
 
-`ExtractionRequest` is now version 2 and `ExtractionPlan` is now version 4. Requests persist the
+`ExtractionRequest` is now version 4 and `ExtractionPlan` is now version 6. Requests persist the
 bundle-container query or reference-traversal intent rather than a caller-expanded object list.
-Plans bind that intent to a deterministic selection witness and persist the exact sidecar source
-and byte range selected for streamed media. Version 1 requests and version 3 plans are rejected;
-re-plan them against the intended workspace revision. `ExtractionManifest` and `ExtractionReport`
-are now version 3 and bind the current request, plan, diagnostics, source proof, and publication
-semantics. Historical version 2 manifests and reports are rejected. Create fresh resume evidence
-from a current request and plan; current evidence still requires an exact plan digest.
+The request filter now owns a canonical `object_kinds` set so YAML-only plans cannot be changed into
+mixed YAML/binary extraction after planning. Plans bind that intent to a deterministic selection
+witness and persist the exact sidecar source and byte range selected for streamed media. Earlier
+request and plan versions are rejected; re-plan them against the intended workspace revision.
+`ExtractionManifest` and `ExtractionReport` are now version 5 and bind the current request, plan,
+diagnostics, source proof, and recoverable publication semantics. Earlier manifests and reports are
+rejected. Create fresh resume evidence from a current request and plan; current evidence still
+requires an exact plan digest.
 
 `ExtractionExecutionLimits::new` now accepts a cumulative `max_evidence_verification_bytes` limit
 between `max_output_bytes` and `max_report_bytes`, and rejects `max_open_files` values below
@@ -420,7 +422,7 @@ accept a serialized prepared session.
 ### Extraction
 
 Legacy export request JSON and manifests are not accepted. Build a current
-`ExtractionRequest` version 2, use `--dry-run` to obtain its canonical `ExtractionPlan` version 4,
+`ExtractionRequest` version 4, use `--dry-run` to obtain its canonical `ExtractionPlan` version 6,
 then execute that plan. The planner derives any required reference graph from its workspace view;
 the caller supplies only the persisted selection intent and limits:
 
@@ -438,9 +440,14 @@ unity-asset export \
   --manifest manifest.json
 ```
 
-`ExtractionRequest` version 1, `ExtractionPlan` version 3, and `ExtractionManifest` /
-`ExtractionReport` version 2 are rejected rather than upgraded. Re-run the dry run and extraction
-to create current plan and resume evidence.
+Earlier `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport`
+versions are rejected rather than upgraded. Re-run the dry run and extraction to create current
+plan and resume evidence.
+
+The former library-level YAML split planner/executor/report contract has been removed. Keep using
+the `split-yaml` CLI when convenient, but consume its standard `ExtractionReport` v5 and persisted
+`extraction-manifest.json`; programmatic callers should use `ExtractionRequest::yaml_documents`,
+`ExtractionPlanner`, and `ExtractionExecutor` directly.
 
 The current manifest records normalized intent, workspace revision, source and plan identities,
 relative artifact paths, statuses, diagnostics, and content digests. It does not use the legacy

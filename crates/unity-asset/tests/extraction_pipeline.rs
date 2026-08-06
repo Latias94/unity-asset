@@ -4,12 +4,12 @@ use std::mem::size_of;
 #[cfg(not(feature = "decode"))]
 use unity_asset::extraction::ExtractionFilter;
 use unity_asset::extraction::{
-    BundleContainerQuery, BundleContainerResolution, ExistingOutputPolicy,
-    ExtractionArtifactStatus, ExtractionDiagnosticCode, ExtractionExecutionError,
-    ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
-    ExtractionFailurePolicy, ExtractionManifest, ExtractionPath, ExtractionPlan,
-    ExtractionPlanError, ExtractionPlanMismatchKind, ExtractionPlanner, ExtractionReport,
-    ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
+    BundleContainerQuery, BundleContainerResolution, EXTRACTION_PLAN_VERSION, ExistingOutputPolicy,
+    ExtractionArtifactKind, ExtractionArtifactStatus, ExtractionDiagnosticCode,
+    ExtractionExecutionError, ExtractionExecutionLimits, ExtractionExecutionOptions,
+    ExtractionExecutor, ExtractionFailurePolicy, ExtractionManifest, ExtractionPath,
+    ExtractionPlan, ExtractionPlanError, ExtractionPlanMismatchKind, ExtractionPlanner,
+    ExtractionReport, ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::reference::{RawReferenceTarget, ReferenceGraphBuildOptions};
 use unity_asset::schema::SchemaRecipePlanner;
@@ -19,7 +19,7 @@ use unity_asset::workspace::{
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, DigestV1, FieldPath,
-    ObjectAddress, SourceLocator,
+    ObjectAddress, ObjectKind, SourceLocator,
 };
 use unity_asset_binary::asset::{SerializedFileParser, class_ids};
 use unity_asset_binary::bundle::BundleParser;
@@ -185,6 +185,86 @@ fn assert_no_staging_files(root: &std::path::Path) {
             );
         }
     }
+}
+
+#[test]
+fn yaml_document_request_filters_mixed_workspaces_and_publishes_a_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let yaml_path = directory.path().join("objects.prefab");
+    let output = directory.path().join("output");
+    fs::write(&yaml_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&yaml_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    workspace
+        .load_path(sample("banner_1"), &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let request =
+        ExtractionRequest::yaml_documents().with_prefix(ExtractionPath::new("documents").unwrap());
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(request, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    assert_eq!(plan.artifacts().len(), 2);
+    assert!(plan.artifacts().iter().all(|artifact| {
+        artifact.address().kind() == ObjectKind::Yaml
+            && artifact.preferred_kind() == ExtractionArtifactKind::Yaml
+            && artifact.preferred_path().as_str().contains("/file-id-")
+            && !artifact.preferred_path().as_str().contains("/alpha--")
+            && !artifact.preferred_path().as_str().contains("/beta--")
+    }));
+
+    let manifest_path = ExtractionPath::new("extraction-manifest.json").unwrap();
+    let report = ExtractionExecutor::new()
+        .execute(
+            &snapshot,
+            &plan,
+            &output,
+            ExtractionRunOptions::new(options(1, ExistingOutputPolicy::Error))
+                .with_manifest_path(&manifest_path),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    assert_eq!(report.counts().written(), 2);
+    assert!(output.join(manifest_path.as_str()).is_file());
+    assert!(
+        report
+            .manifest()
+            .artifacts()
+            .iter()
+            .all(|artifact| artifact.kind() == ExtractionArtifactKind::Yaml)
+    );
+    assert_no_staging_files(&output);
+}
+
+#[test]
+fn persisted_yaml_plan_rejects_an_object_kind_filter_downgrade() {
+    let directory = tempfile::tempdir().unwrap();
+    let yaml_path = directory.path().join("objects.prefab");
+    fs::write(&yaml_path, FIRST_SOURCE).unwrap();
+
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_path(&yaml_path, &mut AssetLoadBudget::default())
+        .unwrap();
+    let snapshot = workspace.snapshot();
+    let plan = ExtractionPlanner::new(&snapshot)
+        .plan(
+            ExtractionRequest::yaml_documents(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut wire = serde_json::to_value(&plan).unwrap();
+    wire["request"]["filter"]["object_kinds"] = serde_json::json!(["binary"]);
+    let request: ExtractionRequest = serde_json::from_value(wire["request"].clone()).unwrap();
+    wire["request_digest"] = serde_json::to_value(request.digest().unwrap()).unwrap();
+
+    let error = serde_json::from_value::<ExtractionPlan>(wire).unwrap_err();
+    assert!(error.to_string().contains("request filter excludes"));
 }
 
 #[cfg(not(feature = "decode"))]
@@ -821,16 +901,19 @@ fn persisted_plan_cannot_understate_its_authoritative_working_set() {
         )
         .unwrap_err();
 
-    assert!(matches!(
-        error,
-        ExtractionExecutionError::PlanVerification(source)
-            if matches!(
-                source.as_ref(),
-                ExtractionPlanError::PlanDerivationMismatch {
-                    kind: ExtractionPlanMismatchKind::Representations,
-                }
-            )
-    ));
+    assert!(
+        matches!(
+            &error,
+            ExtractionExecutionError::PlanVerification(source)
+                if matches!(
+                    source.as_ref(),
+                    ExtractionPlanError::PlanDerivationMismatch {
+                        kind: ExtractionPlanMismatchKind::Representations,
+                    }
+                )
+        ),
+        "unexpected error: {error:?}"
+    );
     assert!(!output.exists());
 }
 
@@ -905,11 +988,14 @@ fn persisted_plan_request_must_rederive_the_exact_artifact_set() {
     assert!(!output.exists());
 
     let mut legacy = wire.clone();
-    legacy["version"] = serde_json::Value::from(3);
+    legacy["version"] = serde_json::Value::from(EXTRACTION_PLAN_VERSION - 1);
     let legacy = serde_json::to_vec(&legacy).unwrap();
     let error =
         ExtractionPlan::read_json(legacy.as_slice(), &mut AssetLoadBudget::default()).unwrap_err();
-    assert!(error.to_string().contains("version 3 is unsupported"));
+    assert!(error.to_string().contains(&format!(
+        "version {} is unsupported",
+        EXTRACTION_PLAN_VERSION - 1
+    )));
 
     wire["request"]["filter"]["limit"] = serde_json::Value::from(1);
     let request: ExtractionRequest = serde_json::from_value(wire["request"].clone()).unwrap();

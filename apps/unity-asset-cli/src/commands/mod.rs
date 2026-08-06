@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use std::io::Write;
 
 mod export;
+mod extraction_workspace;
 mod list_bundle;
 mod references;
 mod split_yaml;

@@ -135,9 +135,10 @@ or open additional files while answering a query.
 
 ## Extraction
 
-An `ExtractionRequest` v2 persists selection intent, filters, limits, and representation policy. A
+An `ExtractionRequest` v4 persists selection intent, object-kind/class/name filters, limits, and
+representation policy. A
 dry run resolves that intent against one immutable workspace revision and emits the canonical
-`ExtractionPlan` v4 without writing artifacts. Execution re-derives the selection before reading or
+`ExtractionPlan` v6 without writing artifacts. Execution re-derives the selection before reading or
 writing artifacts. The planner owns any `ReferenceGraph` needed for bundle-container or reference
 traversal selection; callers do not construct or pass one:
 
@@ -153,8 +154,15 @@ cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject 
 cargo run -p unity-asset-cli --bin unity-asset -- export --input D:\GameProject --output D:\Exports --plan extraction-plan.json --resume D:\Exports\reports\manifest.json
 ```
 
-Readers reject `ExtractionRequest` v1, `ExtractionPlan` v3, and `ExtractionManifest` /
-`ExtractionReport` v2. Generate v3 resume evidence from a current v2 request and v4 plan.
+Readers reject earlier extraction wire revisions. Generate v5 manifest/report evidence from a
+current v4 request and v6 plan.
+
+For YAML-only export, `split-yaml` creates the same canonical plan/report internally, persists
+`extraction-manifest.json`, and uses a request filter containing `object_kinds: ["yaml"]`:
+
+```powershell
+cargo run -p unity-asset-cli --bin unity-asset -- split-yaml --input D:\GameProject\Assets\Scene.unity --output D:\Exports\Scene
+```
 
 Output collision policy is `error`, `skip`, or `replace`. Failure policy is `collect-all` or
 `stop-in-plan-order`. Worker, in-flight byte, open-file, output-byte, evidence-verification-byte,

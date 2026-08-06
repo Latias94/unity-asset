@@ -329,14 +329,14 @@ fn export_plan_is_replayable_without_replanning_and_can_resume() {
 }
 
 #[test]
-fn export_rejects_version_one_plans_before_creating_output() {
+fn export_rejects_the_previous_plan_version_before_creating_output() {
     let temp = tempfile::tempdir().unwrap();
     let output_root = temp.path().join("artifacts");
-    let plan_path = temp.path().join("plan-v1.json");
+    let plan_path = temp.path().join("plan-v5.json");
     let input = sample("banner_1");
     let request = write_request(temp.path());
     let mut plan = dry_run_plan(&input, &output_root, &request);
-    plan["version"] = serde_json::Value::from(1);
+    plan["version"] = serde_json::Value::from(EXTRACTION_PLAN_VERSION - 1);
     fs::write(&plan_path, serde_json::to_vec(&plan).unwrap()).unwrap();
 
     let rejected = export_with_plan(&input, &output_root, &plan_path, None);
@@ -346,17 +346,17 @@ fn export_rejects_version_one_plans_before_creating_output() {
 }
 
 #[test]
-fn export_rejects_version_one_resume_manifests_before_creating_output() {
+fn export_rejects_the_previous_manifest_version_before_creating_output() {
     let temp = tempfile::tempdir().unwrap();
     let output_root = temp.path().join("artifacts");
     let replay_output = temp.path().join("replay-artifacts");
-    let manifest_path = temp.path().join("manifest-v1.json");
+    let manifest_path = temp.path().join("manifest-v4.json");
     let input = sample("banner_1");
     let request = write_request(temp.path());
     let executed = export_artifacts(&input, &output_root, &request, false);
     assert_success(&executed);
     let mut manifest = extraction_report(&executed)["manifest"].clone();
-    manifest["version"] = serde_json::Value::from(1);
+    manifest["version"] = serde_json::Value::from(EXTRACTION_MANIFEST_VERSION - 1);
     fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
     let rejected = export_with_resume(&input, &replay_output, &request, &manifest_path);
@@ -366,7 +366,7 @@ fn export_rejects_version_one_resume_manifests_before_creating_output() {
 }
 
 #[test]
-fn extraction_report_reader_rejects_version_one() {
+fn extraction_report_reader_rejects_the_previous_version() {
     let temp = tempfile::tempdir().unwrap();
     let output_root = temp.path().join("artifacts");
     let input = sample("banner_1");
@@ -374,20 +374,19 @@ fn extraction_report_reader_rejects_version_one() {
     let executed = export_artifacts(&input, &output_root, &request, false);
     assert_success(&executed);
     let mut report = extraction_report(&executed);
-    report["version"] = serde_json::Value::from(1);
+    report["version"] = serde_json::Value::from(EXTRACTION_REPORT_VERSION - 1);
     let encoded = serde_json::to_vec(&report).unwrap();
 
     let error = unity_asset::extraction::ExtractionReport::read_json(
         encoded.as_slice(),
         &mut unity_asset::AssetLoadBudget::default(),
     )
-    .expect_err("version one reports must not enter the current contract");
+    .expect_err("the previous report version must not enter the current contract");
 
-    assert!(
-        error
-            .to_string()
-            .contains("report version 1 is unsupported")
-    );
+    assert!(error.to_string().contains(&format!(
+        "report version {} is unsupported",
+        EXTRACTION_REPORT_VERSION - 1
+    )));
 }
 
 #[test]
@@ -511,7 +510,7 @@ fn removed_extract_alias_is_a_structured_argument_error() {
 }
 
 #[test]
-fn split_yaml_cli_publishes_a_separate_json_report_and_replaces_documents() {
+fn split_yaml_cli_is_a_thin_recoverable_extraction_adapter() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("scene.prefab");
     let output = temp.path().join("documents");
@@ -519,33 +518,54 @@ fn split_yaml_cli_publishes_a_separate_json_report_and_replaces_documents() {
 
     let first = split_yaml(&input, &output, None);
     assert_success(&first);
-    let report: serde_json::Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(report["contract"], "unity_asset.yaml_split_report");
-    assert_eq!(report["version"], 1);
-    assert_eq!(report["written"], 2);
-    assert_eq!(report["skipped_existing"], 0);
-
-    let document = output.join("documents/scene.prefab/file-id-1001.yaml");
-    assert!(document.is_file());
-    assert!(
-        output
-            .join("documents/scene.prefab/file-id-1002.yaml")
-            .is_file()
+    let report = extraction_report(&first);
+    assert_eq!(report["counts"]["written"], 2);
+    assert_eq!(report["counts"]["skipped_existing"], 0);
+    assert_eq!(
+        report["manifest"]["request"]["filter"]["object_kinds"],
+        serde_json::json!(["yaml"])
     );
-    assert!(!output.join("extraction-manifest.json").exists());
+    let artifacts = report["manifest"]["artifacts"].as_array().unwrap();
+    assert_eq!(artifacts.len(), 2);
+    assert!(artifacts.iter().all(|artifact| artifact["kind"] == "yaml"));
+    assert!(artifacts.iter().all(|artifact| {
+        artifact["path"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("documents/") && path.contains("/file-id-"))
+    }));
+    let document = output.join(artifacts[0]["path"].as_str().unwrap());
+    assert!(document.is_file());
+    let persisted_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(output.join("extraction-manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(persisted_manifest, report["manifest"]);
 
     fs::write(&document, b"stale output").unwrap();
     let replaced = split_yaml(&input, &output, Some("replace"));
     assert_success(&replaced);
-    let report: serde_json::Value = serde_json::from_slice(&replaced.stdout).unwrap();
-    assert_eq!(report["written"], 2);
-    assert_eq!(report["skipped_existing"], 0);
+    let report = extraction_report(&replaced);
+    assert_eq!(report["counts"]["written"], 2);
+    assert_eq!(report["counts"]["skipped_existing"], 0);
     assert!(
         String::from_utf8(fs::read(&document).unwrap())
             .unwrap()
             .contains("Alpha")
     );
     assert_no_staging_files(&output);
+}
+
+#[test]
+fn split_yaml_reports_workspace_load_failures_structurally() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("missing.unity");
+    let output = temp.path().join("documents");
+
+    let result = split_yaml(&input, &output, None);
+
+    let error = assert_cli_error(&result, "CLI_EXPORT_SOURCE_CHANGED");
+    assert_eq!(error["details"]["kind"], "workspace_load_failed");
+    assert_eq!(error["details"]["input"]["encoding"], "utf8");
+    assert!(!output.exists());
 }
 
 fn write_request(directory: &Path) -> PathBuf {

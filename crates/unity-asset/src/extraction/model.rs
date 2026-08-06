@@ -28,8 +28,8 @@ use super::representation::{
 };
 use crate::reference::{ReferenceDirection, ReferenceTraversalLimits};
 
-pub const EXTRACTION_REQUEST_VERSION: u8 = 3;
-pub const EXTRACTION_PLAN_VERSION: u8 = 5;
+pub const EXTRACTION_REQUEST_VERSION: u8 = 4;
+pub const EXTRACTION_PLAN_VERSION: u8 = 6;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -275,6 +275,7 @@ impl<'de> Deserialize<'de> for ExtractionSelection {
 /// Optional filters applied after a selection adapter resolves candidate objects.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractionFilter {
+    object_kinds: Box<[ObjectKind]>,
     class_ids: Box<[i32]>,
     class_name_contains: Option<String>,
     object_name_contains: Option<String>,
@@ -292,6 +293,7 @@ impl ExtractionFilter {
             .map(|value| NonZeroU64::new(value).ok_or(ExtractionModelError::ZeroExtractionLimit))
             .transpose()?;
         Ok(Self {
+            object_kinds: Box::new([]),
             class_ids: normalize_values(class_ids.into_iter().collect()).into_boxed_slice(),
             class_name_contains: normalize_filter_text("class_name_contains", class_name_contains)?,
             object_name_contains: normalize_filter_text(
@@ -300,6 +302,18 @@ impl ExtractionFilter {
             )?,
             limit,
         })
+    }
+
+    /// Restricts the request to format-local object identity families.
+    #[must_use]
+    pub fn with_object_kinds(mut self, object_kinds: impl IntoIterator<Item = ObjectKind>) -> Self {
+        self.object_kinds = normalize_values(object_kinds.into_iter().collect()).into_boxed_slice();
+        self
+    }
+
+    #[must_use]
+    pub fn object_kinds(&self) -> &[ObjectKind] {
+        &self.object_kinds
     }
 
     #[must_use]
@@ -323,6 +337,11 @@ impl ExtractionFilter {
     }
 
     #[must_use]
+    pub fn matches_object_kind(&self, object_kind: ObjectKind) -> bool {
+        self.object_kinds.is_empty() || self.object_kinds.contains(&object_kind)
+    }
+
+    #[must_use]
     pub fn matches_class(&self, class_id: i32, class_name: &str) -> bool {
         (self.class_ids.is_empty() || self.class_ids.binary_search(&class_id).is_ok())
             && self
@@ -342,6 +361,7 @@ impl ExtractionFilter {
 impl Default for ExtractionFilter {
     fn default() -> Self {
         Self {
+            object_kinds: Box::new([]),
             class_ids: Box::new([]),
             class_name_contains: None,
             object_name_contains: None,
@@ -352,6 +372,7 @@ impl Default for ExtractionFilter {
 
 #[derive(Serialize)]
 struct ExtractionFilterRef<'value> {
+    object_kinds: &'value [ObjectKind],
     class_ids: &'value [i32],
     class_name_contains: Option<&'value str>,
     object_name_contains: Option<&'value str>,
@@ -361,10 +382,26 @@ struct ExtractionFilterRef<'value> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExtractionFilterWire {
+    object_kinds: Option<Vec<ObjectKind>>,
     class_ids: Vec<i32>,
     class_name_contains: Option<String>,
     object_name_contains: Option<String>,
     limit: Option<u64>,
+}
+
+impl ExtractionFilterWire {
+    fn into_filter(self) -> Result<ExtractionFilter, ExtractionModelError> {
+        let object_kinds = self
+            .object_kinds
+            .ok_or(ExtractionModelError::MissingObjectKindFilter)?;
+        ExtractionFilter::new(
+            self.class_ids,
+            self.class_name_contains,
+            self.object_name_contains,
+            self.limit,
+        )
+        .map(|filter| filter.with_object_kinds(object_kinds))
+    }
 }
 
 impl Serialize for ExtractionFilter {
@@ -373,6 +410,7 @@ impl Serialize for ExtractionFilter {
         S: Serializer,
     {
         ExtractionFilterRef {
+            object_kinds: &self.object_kinds,
             class_ids: &self.class_ids,
             class_name_contains: self.class_name_contains(),
             object_name_contains: self.object_name_contains(),
@@ -388,13 +426,7 @@ impl<'de> Deserialize<'de> for ExtractionFilter {
         D: Deserializer<'de>,
     {
         let wire = ExtractionFilterWire::deserialize(deserializer)?;
-        Self::new(
-            wire.class_ids,
-            wire.class_name_contains,
-            wire.object_name_contains,
-            wire.limit,
-        )
-        .map_err(serde::de::Error::custom)
+        wire.into_filter().map_err(serde::de::Error::custom)
     }
 }
 
@@ -477,6 +509,13 @@ impl ExtractionRequest {
             ExtractionFilter::default(),
             None,
         )
+    }
+
+    /// Selects every YAML document for deterministic raw YAML extraction.
+    #[must_use]
+    pub fn yaml_documents() -> Self {
+        Self::all(ExtractionRepresentationPolicy::RawOnly)
+            .with_filter(ExtractionFilter::default().with_object_kinds([ObjectKind::Yaml]))
     }
 
     #[must_use]
@@ -562,7 +601,7 @@ struct ExtractionRequestWire {
     version: u8,
     selection: ExtractionSelection,
     representation: ExtractionRepresentationPolicy,
-    filter: ExtractionFilter,
+    filter: ExtractionFilterWire,
     prefix: Option<ExtractionPath>,
 }
 
@@ -602,13 +641,12 @@ impl<'de> Deserialize<'de> for ExtractionRequest {
                 ExtractionModelError::UnsupportedRequestVersion(wire.version),
             ));
         }
-        Self::with_selection(
-            wire.selection,
-            wire.representation,
-            wire.filter,
-            wire.prefix,
-        )
-        .map_err(serde::de::Error::custom)
+        let filter = wire
+            .filter
+            .into_filter()
+            .map_err(serde::de::Error::custom)?;
+        Self::with_selection(wire.selection, wire.representation, filter, wire.prefix)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1189,6 +1227,15 @@ fn validate_planned_artifacts_with_budget(
                 actual: artifact.ordinal,
             });
         }
+        if !request
+            .filter()
+            .matches_object_kind(artifact.address.kind())
+        {
+            return Err(ExtractionModelError::ArtifactOutsideObjectKindFilter {
+                ordinal: artifact.ordinal,
+                object_kind: artifact.address.kind(),
+            });
+        }
         validate_source_for_address(sources, &artifact.address)?;
         artifact.representation.validate_sources(sources)?;
         artifact.representation.validate_request(
@@ -1443,6 +1490,15 @@ pub enum ExtractionModelError {
     InvalidFilterText { field: &'static str, value: String },
     #[error("extraction filter limit must be nonzero")]
     ZeroExtractionLimit,
+    #[error("extraction filter is missing the required object_kinds field")]
+    MissingObjectKindFilter,
+    #[error(
+        "planned artifact {ordinal} has object kind {object_kind:?}, which the request filter excludes"
+    )]
+    ArtifactOutsideObjectKindFilter {
+        ordinal: u32,
+        object_kind: ObjectKind,
+    },
     #[error("media descriptor family is {actual:?}; representation requires {expected:?}")]
     MediaDescriptorFamilyMismatch {
         expected: MediaFamily,
@@ -1657,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn request_v3_persists_reference_intent_without_query_only_limits() {
+    fn request_v4_persists_reference_intent_without_query_only_limits() {
         let root = ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
             .unwrap();
         let limits = ExtractionReferenceTraversalLimits::unbounded()
@@ -1701,7 +1757,27 @@ mod tests {
     }
 
     #[test]
-    fn plan_v5_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
+    fn yaml_documents_request_persists_the_object_kind_filter() {
+        let request = ExtractionRequest::yaml_documents();
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            request.representation(),
+            ExtractionRepresentationPolicy::RawOnly
+        );
+        assert_eq!(request.filter().object_kinds(), &[ObjectKind::Yaml]);
+        assert_eq!(
+            encoded["filter"]["object_kinds"],
+            serde_json::json!(["yaml"])
+        );
+        assert_eq!(
+            serde_json::from_value::<ExtractionRequest>(encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn plan_v6_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
         let artifact = planned_text_artifact();
         let encoded = serde_json::to_value(&artifact).unwrap();
 
@@ -1789,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v5_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+    fn plan_v6_artifact_rejects_tampered_preferred_and_fallback_kinds() {
         let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
 
         let mut preferred = encoded.clone();

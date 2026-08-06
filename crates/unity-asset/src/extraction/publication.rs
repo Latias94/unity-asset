@@ -586,7 +586,7 @@ impl<'layout, 'plan> ExtractionPublication<'layout, 'plan> {
                 })?;
                 Ok(ArtifactPublication::NotPublished)
             }
-            Err(StagedPublishError::Uncertain(_)) => {
+            Err(StagedPublishError::Uncertain) => {
                 Err(ExtractionExecutionError::PublicationRecoveryRequired {
                     stage: "artifact_publication",
                 })
@@ -1041,7 +1041,7 @@ impl<'layout> FinalPublication<'layout> {
                     stage: "manifest_not_published",
                 })
             }
-            Err(StagedPublishError::Uncertain(_)) => {
+            Err(StagedPublishError::Uncertain) => {
                 Err(ExtractionExecutionError::PublicationRecoveryRequired {
                     stage: "manifest_publication",
                 })
@@ -1540,7 +1540,7 @@ fn write_atomic_json<T: Serialize>(
     match staged.publish(true) {
         Ok(()) => Ok(()),
         Err(StagedPublishError::NotPublished(error)) => Err(JournalWriteError::NotPublished(error)),
-        Err(StagedPublishError::Uncertain(_)) => Err(JournalWriteError::Uncertain),
+        Err(StagedPublishError::Uncertain) => Err(JournalWriteError::Uncertain),
     }
 }
 

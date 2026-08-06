@@ -15,4 +15,6 @@ pub(super) use prepared::{
     PreparedRepresentation, RepresentationPreparationError, RepresentationWriteError,
 };
 pub(super) use reservation::ExtractionReservationError;
+#[cfg(not(feature = "decode"))]
+pub(super) use reservation::{raw_binary_working_set, yaml_working_set};
 pub(super) use runtime::{RepresentationRuntime, RepresentationRuntimeContext};

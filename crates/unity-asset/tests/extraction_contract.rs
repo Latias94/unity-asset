@@ -2,8 +2,12 @@ use unity_asset::extraction::{
     EXTRACTION_REQUEST_VERSION, ExtractionPath, ExtractionRepresentationPolicy, ExtractionRequest,
 };
 use unity_asset::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, ObjectAddress, SourceLocator,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, DigestV1, ObjectAddress,
+    SourceLocator,
 };
+
+const FROZEN_REQUEST_V3: &[u8] = include_bytes!("contract-fixtures/extraction/request-v3.json");
+const CURRENT_REQUEST_V4: &str = include_str!("contract-fixtures/extraction/request-v4.json");
 
 fn request() -> ExtractionRequest {
     let source = SourceLocator::path("game.assets").unwrap();
@@ -44,6 +48,15 @@ fn request_normalization_makes_input_order_irrelevant() {
         forward.canonical_json().unwrap(),
         reverse.canonical_json().unwrap()
     );
+}
+
+#[test]
+fn request_v4_canonical_bytes_and_digest_match_the_golden_fixture() {
+    let request = ExtractionRequest::all(ExtractionRepresentationPolicy::RawOnly);
+    let expected = CURRENT_REQUEST_V4.trim_end().as_bytes();
+
+    assert_eq!(request.canonical_json().unwrap(), expected);
+    assert_eq!(request.digest().unwrap(), DigestV1::hash_bytes(expected));
 }
 
 #[test]
@@ -120,6 +133,34 @@ fn request_json_rejects_unknown_versions_and_fields() {
     assert!(
         ExtractionRequest::read_json(wrong_contract.as_bytes(), &mut AssetLoadBudget::default(),)
             .is_err()
+    );
+}
+
+#[test]
+fn frozen_request_v3_reaches_the_explicit_version_rejection() {
+    let error = ExtractionRequest::read_json(FROZEN_REQUEST_V3, &mut AssetLoadBudget::default())
+        .unwrap_err();
+    let message = error.to_string();
+
+    assert!(message.contains("version 3 is unsupported"), "{message}");
+    assert!(!message.contains("missing field"), "{message}");
+}
+
+#[test]
+fn current_request_requires_the_object_kind_filter_field() {
+    let mut wire = serde_json::to_value(request()).unwrap();
+    wire["filter"]
+        .as_object_mut()
+        .unwrap()
+        .remove("object_kinds");
+    let encoded = serde_json::to_vec(&wire).unwrap();
+    let error = ExtractionRequest::read_json(encoded.as_slice(), &mut AssetLoadBudget::default())
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("missing the required object_kinds field")
     );
 }
 

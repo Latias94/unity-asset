@@ -226,6 +226,7 @@ impl OutputLayout {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn prepare<'path>(
         root: &Path,
         relative_paths: impl IntoIterator<Item = &'path str>,
@@ -578,7 +579,7 @@ pub(super) struct StagedOutput {
 #[derive(Debug)]
 pub(super) enum StagedPublishError {
     NotPublished(OutputArtifactError),
-    Uncertain(OutputArtifactError),
+    Uncertain,
 }
 
 impl StagedOutput {
@@ -609,17 +610,14 @@ impl StagedOutput {
                 let uncertain = error.moved_or_unknown_state();
                 if uncertain {
                     self.released = true;
+                    return Err(StagedPublishError::Uncertain);
                 }
                 let error = OutputArtifactError::Io {
                     kind: ExtractionOutputErrorKind::Publish,
                     path: self.final_path.clone(),
                     source: error.into_error(),
                 };
-                if uncertain {
-                    Err(StagedPublishError::Uncertain(error))
-                } else {
-                    Err(StagedPublishError::NotPublished(error))
-                }
+                Err(StagedPublishError::NotPublished(error))
             }
         }
     }

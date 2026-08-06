@@ -284,8 +284,6 @@ pub enum ExtractionPlanError {
     },
     #[error("stream source is missing: {0:?}")]
     StreamSourceMissing(SourceLocator),
-    #[error("object identity cannot be represented as an ObjectAddress")]
-    InvalidObjectIdentity,
     #[error("invalid streamed resource path: {0:?}")]
     InvalidStreamPath(String),
     #[error("invalid streamed resource range: offset={offset}, size={size}")]

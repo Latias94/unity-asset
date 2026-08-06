@@ -35,7 +35,7 @@ pub(crate) enum Commands {
     /// Export one deterministic, revision-bound artifact set.
     Export(Box<ExportCommand>),
 
-    /// Split Unity YAML documents through the safe artifact publisher.
+    /// Extract Unity YAML documents through the canonical extraction planner and publisher.
     #[command(name = "split-yaml")]
     SplitYaml {
         #[arg(short, long)]

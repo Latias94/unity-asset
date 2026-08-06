@@ -136,10 +136,11 @@ pub(crate) fn load_full_workspace(
 pub(crate) fn load_full_workspace_excluding_output(
     input: &Path,
     output: &Path,
+    workspace_id: Option<WorkspaceId>,
     ctx: &AppContext,
     budget: &mut AssetLoadBudget,
 ) -> Result<AssetWorkspace> {
-    load_full_workspace_with_id(input, Some(output), None, ctx, budget)
+    load_full_workspace_with_id(input, Some(output), workspace_id, ctx, budget)
 }
 
 /// Loads all supported sources into a caller-selected logical workspace namespace.
@@ -153,16 +154,6 @@ pub(crate) fn load_full_workspace_with_workspace_id(
     budget: &mut AssetLoadBudget,
 ) -> Result<AssetWorkspace> {
     load_full_workspace_with_id(input, None, Some(workspace_id), ctx, budget)
-}
-
-pub(crate) fn load_full_workspace_with_workspace_id_excluding_output(
-    input: &Path,
-    output: &Path,
-    workspace_id: WorkspaceId,
-    ctx: &AppContext,
-    budget: &mut AssetLoadBudget,
-) -> Result<AssetWorkspace> {
-    load_full_workspace_with_id(input, Some(output), Some(workspace_id), ctx, budget)
 }
 
 fn load_full_workspace_with_id(

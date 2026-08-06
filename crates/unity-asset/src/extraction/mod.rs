@@ -17,7 +17,6 @@ mod representation;
 mod selection;
 #[cfg(all(test, feature = "decode"))]
 mod test_probe;
-mod yaml_split;
 
 struct CheckedByteCounter {
     bytes: u64,
@@ -98,7 +97,3 @@ pub use planning_contract::{ExtractionPlanError, ExtractionPlanMismatchKind};
 pub use selection::ExtractionPlanner;
 #[cfg(feature = "decode")]
 pub use unity_asset_decode::media::MediaInspectionError;
-pub use yaml_split::{
-    YAML_SPLIT_REPORT_CONTRACT, YAML_SPLIT_REPORT_VERSION, YamlSplitArtifact, YamlSplitError,
-    YamlSplitExecutor, YamlSplitPlan, YamlSplitPlanner, YamlSplitReport,
-};

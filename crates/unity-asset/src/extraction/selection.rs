@@ -5,9 +5,13 @@ use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 #[cfg(any(test, not(feature = "decode")))]
 use unity_asset_binary::asset::class_ids;
+#[cfg(not(feature = "decode"))]
+use unity_asset_core::ObjectKind;
+#[cfg(test)]
+use unity_asset_core::YamlFileId;
 use unity_asset_core::{
-    AssetLoadBudget, ObjectAddress, ObjectKind, RevisionedObjectHandle, SourceLocator, UnityValue,
-    YamlFileId,
+    AssetLoadBudget, ObjectAddress, RevisionedObjectHandle, SourceLocator, UnityValue,
+    YamlDocumentSelector,
 };
 
 use super::container::{
@@ -26,12 +30,16 @@ use super::planning_contract::{
     ExtractionPlanError, ExtractionPlanMismatchKind, budgeted_vec, clone_string,
     resolve_required_handle, source_for_id, usize_to_u64,
 };
-#[cfg(not(feature = "decode"))]
-use super::representation::PlannedContent;
 use super::representation::RepresentationPlanner;
+#[cfg(not(feature = "decode"))]
+use super::representation::{
+    ExtractionReservationError, PlannedContent, raw_binary_working_set, yaml_working_set,
+};
 use crate::reference::{ReferenceGraph, ReferenceGraphBuildOptions};
 #[cfg(test)]
 use crate::workspace::StreamedResourceResolver;
+#[cfg(not(feature = "decode"))]
+use crate::workspace::WorkspaceObjectValue;
 use crate::workspace::{WorkspaceObject, WorkspaceSource, WorkspaceView};
 
 /// Plans deterministic extraction artifacts against one immutable workspace view.
@@ -121,6 +129,9 @@ impl<'view> ExtractionPlanner<'view> {
     ) -> Result<(), ExtractionPlanError> {
         let mut artifact_index = 0_usize;
         for (address, handle) in candidates {
+            if !plan.request().filter().matches_object_kind(address.kind()) {
+                continue;
+            }
             let object = self.view.read_object(&handle, budget)?;
             if !plan
                 .request()
@@ -154,6 +165,16 @@ impl<'view> ExtractionPlanner<'view> {
             {
                 return Err(ExtractionPlanError::PlanDerivationMismatch {
                     kind: ExtractionPlanMismatchKind::Artifacts,
+                });
+            }
+            let minimum_working_set = match object.value() {
+                WorkspaceObjectValue::Binary(_) => raw_binary_working_set(&object),
+                WorkspaceObjectValue::Yaml(_) => yaml_working_set(&object, budget),
+            }
+            .map_err(map_no_decode_reservation_error)?;
+            if artifact.working_set_bytes() < minimum_working_set {
+                return Err(ExtractionPlanError::PlanDerivationMismatch {
+                    kind: ExtractionPlanMismatchKind::Representations,
                 });
             }
             let owner = source_for_id(handle.object().source(), sources)?;
@@ -210,7 +231,7 @@ impl<'view> ExtractionPlanner<'view> {
         let SelectionDerivation {
             sources,
             references,
-            candidates,
+            mut candidates,
             witness: selection_witness,
         } = self.derive_selection(request, budget)?;
 
@@ -219,6 +240,7 @@ impl<'view> ExtractionPlanner<'view> {
 
         let mut source_expectations =
             budgeted_vec(sources.len(), "extraction source expectations", budget)?;
+        candidates.retain(|(address, _)| request.filter().matches_object_kind(address.kind()));
         let mut artifacts = budgeted_vec(candidates.len(), "extraction planned artifacts", budget)?;
         for (address, handle) in candidates {
             let object = self.view.read_object(&handle, budget)?;
@@ -479,6 +501,26 @@ fn verify_no_decode_representations(plan: &ExtractionPlan) -> Result<(), Extract
 }
 
 #[cfg(not(feature = "decode"))]
+fn map_no_decode_reservation_error(error: ExtractionReservationError) -> ExtractionPlanError {
+    match error {
+        ExtractionReservationError::Workspace(error) => error.into(),
+        ExtractionReservationError::Budget(error) => error.into(),
+        ExtractionReservationError::ObjectUnavailable(address) => {
+            ExtractionPlanError::ObjectMissing(address)
+        }
+        ExtractionReservationError::ArithmeticOverflow { resource } => {
+            ExtractionPlanError::ArithmeticOverflow { resource }
+        }
+        ExtractionReservationError::YamlSizing(message) => ExtractionPlanError::YamlSizing(message),
+        ExtractionReservationError::ContentMismatch(_) => {
+            ExtractionPlanError::PlanDerivationMismatch {
+                kind: ExtractionPlanMismatchKind::Representations,
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "decode"))]
 const fn is_media_class(class_id: i32) -> bool {
     matches!(
         class_id,
@@ -701,15 +743,14 @@ fn allocate_path(
     let digest = canonical_digest(address)
         .map_err(|error| ExtractionPlanError::CanonicalAddress(error.to_string()))?;
     let source_name = source.root_alias().as_str();
-    let artifact_name = if let Some(name) = object_name {
-        ArtifactStem::Text(name)
-    } else if let Some(file_id) = address.yaml_file_id() {
-        ArtifactStem::YamlFileId(file_id)
-    } else if address.kind() == ObjectKind::Binary {
-        ArtifactStem::Text("object")
-    } else {
-        ArtifactStem::Text("document")
-    };
+    let artifact_name = address
+        .yaml_selector()
+        .map(ArtifactStem::Yaml)
+        .unwrap_or_else(|| {
+            object_name
+                .map(ArtifactStem::Text)
+                .unwrap_or(ArtifactStem::Text("object"))
+        });
     let fallback = if raw_fallback { ".raw" } else { "" };
     let requested = [
         prefix.map_or(0, |prefix| prefix.as_str().len() + 1),
@@ -768,14 +809,17 @@ fn allocate_path(
 #[derive(Clone, Copy)]
 enum ArtifactStem<'name> {
     Text(&'name str),
-    YamlFileId(YamlFileId),
+    Yaml(&'name YamlDocumentSelector),
 }
 
 impl ArtifactStem<'_> {
     fn capacity_bound(self, maximum: usize) -> usize {
         match self {
             Self::Text(value) => slug_capacity_bound(value, maximum),
-            Self::YamlFileId(file_id) => "file-id-".len() + decimal_i64_len(file_id.get()),
+            Self::Yaml(YamlDocumentSelector::FileId { file_id }) => {
+                "file-id-".len() + decimal_i64_len(file_id.get())
+            }
+            Self::Yaml(YamlDocumentSelector::Unanchored { .. }) => "ordinal-".len() + 10,
         }
     }
 
@@ -785,9 +829,14 @@ impl ArtifactStem<'_> {
                 push_slug(output, value, maximum);
                 Ok(())
             }
-            Self::YamlFileId(file_id) => {
+            Self::Yaml(YamlDocumentSelector::FileId { file_id }) => {
                 output.push_str("file-id-");
                 write!(output, "{file_id}").map_err(|_| ExtractionPlanError::PathFormatting)
+            }
+            Self::Yaml(YamlDocumentSelector::Unanchored { document_index }) => {
+                output.push_str("ordinal-");
+                write!(output, "{document_index:010}")
+                    .map_err(|_| ExtractionPlanError::PathFormatting)
             }
         }
     }
@@ -904,6 +953,159 @@ mod tests {
         )
         .unwrap();
         assert_eq!(texture_path, repeated);
+    }
+
+    #[test]
+    fn yaml_paths_prefer_file_identity_over_mutable_object_names() {
+        let source = SourceLocator::path("scene.prefab").unwrap();
+        let file_id = YamlFileId::new(1001).unwrap();
+        let address = ObjectAddress::yaml(source.clone(), file_id).unwrap();
+
+        let path = allocate_path(
+            Some(&ExtractionPath::new("documents").unwrap()),
+            &address,
+            &source,
+            1,
+            "GameObject",
+            Some("Renamable Object"),
+            "yaml",
+            false,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        assert!(path.as_str().contains("/file-id-1001--"));
+        assert!(!path.as_str().contains("renamable_object"));
+    }
+
+    #[test]
+    fn unanchored_yaml_paths_use_the_document_ordinal() {
+        let source = SourceLocator::path("scene.prefab").unwrap();
+        let address = ObjectAddress::yaml_document(source.clone(), 7).unwrap();
+
+        let path = allocate_path(
+            None,
+            &address,
+            &source,
+            1,
+            "GameObject",
+            Some("Ignored Name"),
+            "yaml",
+            false,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        assert!(path.as_str().contains("/ordinal-0000000007--"));
+        assert!(!path.as_str().contains("ignored_name"));
+    }
+
+    #[test]
+    fn yaml_identity_path_bounds_cover_extreme_wire_values() {
+        let source = SourceLocator::path("scene.prefab").unwrap();
+        let minimum_file_id =
+            ObjectAddress::yaml(source.clone(), YamlFileId::new(i64::MIN).unwrap()).unwrap();
+        let maximum_ordinal = ObjectAddress::yaml_document(source.clone(), u32::MAX).unwrap();
+
+        let file_id_path = allocate_path(
+            None,
+            &minimum_file_id,
+            &source,
+            i32::MIN,
+            "GameObject",
+            None,
+            "yaml",
+            false,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let ordinal_path = allocate_path(
+            None,
+            &maximum_ordinal,
+            &source,
+            i32::MAX,
+            "GameObject",
+            None,
+            "yaml",
+            false,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        assert!(
+            file_id_path
+                .as_str()
+                .contains("/file-id--9223372036854775808--")
+        );
+        assert!(ordinal_path.as_str().contains("/ordinal-4294967295--"));
+    }
+
+    #[test]
+    fn yaml_identity_paths_obey_exact_and_one_short_budgets() {
+        let source = SourceLocator::path("scene.prefab").unwrap();
+        let address = ObjectAddress::yaml(source.clone(), YamlFileId::new(1001).unwrap()).unwrap();
+        let prefix = ExtractionPath::new("documents").unwrap();
+        let mut measured = AssetLoadBudget::default();
+        let expected = allocate_path(
+            Some(&prefix),
+            &address,
+            &source,
+            1,
+            "GameObject",
+            None,
+            "yaml",
+            false,
+            &mut measured,
+        )
+        .unwrap();
+        let required = measured.usage().bytes;
+
+        let mut exact = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_bytes: required,
+            ..unity_asset_core::AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert_eq!(
+            allocate_path(
+                Some(&prefix),
+                &address,
+                &source,
+                1,
+                "GameObject",
+                None,
+                "yaml",
+                false,
+                &mut exact,
+            )
+            .unwrap(),
+            expected
+        );
+
+        let mut one_short = AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
+            max_bytes: required - 1,
+            ..unity_asset_core::AssetLoadLimits::default()
+        })
+        .unwrap();
+        let error = allocate_path(
+            Some(&prefix),
+            &address,
+            &source,
+            1,
+            "GameObject",
+            None,
+            "yaml",
+            false,
+            &mut one_short,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionPlanError::Budget(unity_asset_core::BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == required - 1 && requested == required
+        ));
     }
 
     #[test]

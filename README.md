@@ -311,12 +311,16 @@ unity-asset export \
   --manifest manifest.json
 ```
 
-Two explicit low-level adapter commands remain available:
+The low-level bundle adapter and a YAML-only extraction convenience command remain available:
 
 ```bash
 unity-asset list-bundle --input game.bundle --filter CAB-
 unity-asset split-yaml --input scene.unity --output split
 ```
+
+`split-yaml` is a thin profile over the canonical extraction contracts. It emits the standard
+`unity_asset.extraction_report`, writes `extraction-manifest.json`, and uses the same recoverable
+publication journal as `export`; it does not maintain a second YAML-specific report contract.
 
 Use global parsing policy before the subcommand:
 

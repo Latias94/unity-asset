@@ -9,13 +9,12 @@ use super::write_stdout;
 use crate::cli::ExportCommand;
 use crate::cli_error::{
     ExportManifestPathErrorKind, mark_export_execution_error, mark_export_manifest_path_error,
-    mark_export_plan_error, mark_export_shared_stdin_error, mark_export_workspace_load_error,
+    mark_export_plan_error, mark_export_shared_stdin_error,
 };
 use crate::json_io::with_contract_reader;
 use crate::shared::AppContext;
-use crate::workspace_loader::{
-    load_full_workspace_excluding_output, load_full_workspace_with_workspace_id_excluding_output,
-};
+
+use super::extraction_workspace;
 
 pub(crate) fn run(command: ExportCommand, ctx: &AppContext) -> Result<()> {
     let mut budget = AssetLoadBudget::default();
@@ -44,25 +43,13 @@ pub(crate) fn run(command: ExportCommand, ctx: &AppContext) -> Result<()> {
         .as_ref()
         .map(ExtractionPlan::workspace_id)
         .or_else(|| resume.as_ref().map(ExtractionManifest::workspace_id));
-    let workspace_id = match persisted_workspace_id {
-        Some(workspace_id) => Some(workspace_id),
-        None => ExtractionExecutor::publication_workspace_id(&command.output, &mut budget)
-            .map_err(mark_export_execution_error)
-            .context("Failed to inspect extraction publication recovery")?,
-    };
-    let workspace = match workspace_id {
-        Some(workspace_id) => load_full_workspace_with_workspace_id_excluding_output(
-            &command.input,
-            &command.output,
-            workspace_id,
-            ctx,
-            &mut budget,
-        ),
-        None => {
-            load_full_workspace_excluding_output(&command.input, &command.output, ctx, &mut budget)
-        }
-    }
-    .map_err(|error| mark_export_workspace_load_error(error, &command.input))?;
+    let workspace = extraction_workspace::load(
+        &command.input,
+        &command.output,
+        persisted_workspace_id,
+        ctx,
+        &mut budget,
+    )?;
     let snapshot = workspace.snapshot();
     let plan = match saved_plan {
         Some(plan) => plan,

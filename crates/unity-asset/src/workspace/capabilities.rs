@@ -6,7 +6,6 @@ use unity_asset_core::{CHANGE_SET_VERSION, SourceKind};
 use crate::extraction::{
     BUNDLE_CONTAINER_QUERY_VERSION, BUNDLE_CONTAINER_RESULT_VERSION, EXTRACTION_MANIFEST_VERSION,
     EXTRACTION_PLAN_VERSION, EXTRACTION_REPORT_VERSION, EXTRACTION_REQUEST_VERSION,
-    YAML_SPLIT_REPORT_VERSION,
 };
 use crate::reference::REFERENCE_GRAPH_PROJECTION_VERSION;
 
@@ -24,7 +23,7 @@ use super::preflight::PREPARE_REPORT_VERSION;
 /// Stable name of the serialized workspace capability catalog.
 pub const WORKSPACE_CAPABILITY_CATALOG_CONTRACT: &str = "unity_asset.workspace_capabilities";
 /// Current wire version of the workspace capability catalog.
-pub const WORKSPACE_CAPABILITY_CATALOG_VERSION: u16 = 2;
+pub const WORKSPACE_CAPABILITY_CATALOG_VERSION: u16 = 3;
 
 const CAPABILITIES: &[WorkspaceCapability] = &[
     WorkspaceCapability::SourceInspection,
@@ -133,7 +132,6 @@ pub struct WorkspaceContractVersions {
     extraction_plan: u8,
     extraction_manifest: u8,
     extraction_report: u8,
-    yaml_split_report: u8,
 }
 
 impl WorkspaceContractVersions {
@@ -156,7 +154,6 @@ impl WorkspaceContractVersions {
         extraction_plan: EXTRACTION_PLAN_VERSION,
         extraction_manifest: EXTRACTION_MANIFEST_VERSION,
         extraction_report: EXTRACTION_REPORT_VERSION,
-        yaml_split_report: YAML_SPLIT_REPORT_VERSION,
     };
 
     #[must_use]
@@ -247,11 +244,6 @@ impl WorkspaceContractVersions {
     #[must_use]
     pub const fn extraction_report(self) -> u8 {
         self.extraction_report
-    }
-
-    #[must_use]
-    pub const fn yaml_split_report(self) -> u8 {
-        self.yaml_split_report
     }
 }
 
@@ -592,7 +584,7 @@ mod tests {
     fn json_field_order_and_contract_versions_are_stable() {
         let json = serde_json::to_string(&workspace_capabilities()).unwrap();
         let expected = concat!(
-            r#"{"contract":"unity_asset.workspace_capabilities","contract_version":2,"#,
+            r#"{"contract":"unity_asset.workspace_capabilities","contract_version":3,"#,
             r#""capabilities":["source_inspection","object_inspection","plan","prepare","#,
             r#""preview","commit","recover","reference","extraction","search_handoff"],"#,
             r#""contracts":{"mutation_plan":3,"change_set":2,"source_inspection":1,"#,
@@ -600,9 +592,9 @@ mod tests {
             r#""streamed_resource_query":2,"prepare_report":2,"commit_report":3,"#,
             r#""recovery_locator":1,"recovery_discovery":1,"recovery_outcome":3,"#,
             r#""rollback_receipt":3,"bundle_container_query":1,"bundle_container_result":2,"#,
-            r#""reference_graph_projection":2,"extraction_request":3,"extraction_plan":5,"#,
-            r#""extraction_manifest":4,"#,
-            r#""extraction_report":4,"yaml_split_report":1},"#,
+            r#""reference_graph_projection":2,"extraction_request":4,"extraction_plan":6,"#,
+            r#""extraction_manifest":5,"#,
+            r#""extraction_report":5},"#,
             r#""source_inspection":{"source_kinds":["yaml","serialized_file","asset_bundle","#,
             r#""web_file","archive","streamed_resource"],"views":["committed","prepared"]},"#,
             r#""object_inspection":{"source_kinds":["yaml","serialized_file"],"#,

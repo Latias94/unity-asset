@@ -21,8 +21,8 @@ use super::model::{
     normalize_source_expectations, normalize_values,
 };
 
-pub const EXTRACTION_MANIFEST_VERSION: u8 = 4;
-pub const EXTRACTION_REPORT_VERSION: u8 = 4;
+pub const EXTRACTION_MANIFEST_VERSION: u8 = 5;
+pub const EXTRACTION_REPORT_VERSION: u8 = 5;
 pub const EXTRACTION_MANIFEST_CONTRACT: &str = "unity_asset.extraction_manifest";
 pub const EXTRACTION_REPORT_CONTRACT: &str = "unity_asset.extraction_report";
 
