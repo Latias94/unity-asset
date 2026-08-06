@@ -138,6 +138,31 @@ impl<'a> StreamDataRef<'a> {
     }
 }
 
+/// Classification of an optional Unity streamed-media declaration.
+///
+/// Unity serializes an empty stream as the canonical `path = "", offset = 0,
+/// size = 0` sentinel. Keeping that state distinct from both an absent field
+/// and a malformed descriptor lets media inspectors apply fallback rules
+/// without accepting damaged metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamDataClassification<'a> {
+    Missing,
+    Inactive,
+    Active(StreamDataRef<'a>),
+    Malformed(MediaInspectionError),
+}
+
+impl<'a> StreamDataClassification<'a> {
+    #[cfg(feature = "texture")]
+    fn into_candidate(self) -> Result<Option<StreamDataRef<'a>>, MediaInspectionError> {
+        match self {
+            Self::Missing | Self::Inactive => Ok(None),
+            Self::Active(stream) => Ok(Some(stream)),
+            Self::Malformed(error) => Err(error),
+        }
+    }
+}
+
 /// The unique non-empty encoded payload selected from one Unity media object.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPayloadRef<'a> {
@@ -313,7 +338,7 @@ impl<'a> AudioClipResourceRef<'a> {
 pub fn classify_audio_clip_resource(
     properties: &IndexMap<String, UnityValue>,
 ) -> Result<Option<AudioClipResourceRef<'_>>, MediaInspectionError> {
-    if let Some(stream) = stream_data_candidate(
+    match classify_stream_data(
         properties.get("m_Resource"),
         StreamDataShape {
             field: "m_Resource",
@@ -321,13 +346,18 @@ pub fn classify_audio_clip_resource(
             offset: "m_Offset",
             size: "m_Size",
         },
-    )? {
-        return Ok(Some(AudioClipResourceRef {
-            field: AudioClipResourceField::Resource,
-            stream,
-        }));
+    ) {
+        StreamDataClassification::Active(stream) => {
+            return Ok(Some(AudioClipResourceRef {
+                field: AudioClipResourceField::Resource,
+                stream,
+            }));
+        }
+        StreamDataClassification::Malformed(error) => return Err(error),
+        StreamDataClassification::Missing | StreamDataClassification::Inactive => {}
     }
-    Ok(stream_data_candidate(
+
+    match classify_stream_data(
         properties.get("m_StreamData"),
         StreamDataShape {
             field: "m_StreamData",
@@ -335,11 +365,14 @@ pub fn classify_audio_clip_resource(
             offset: "offset",
             size: "size",
         },
-    )?
-    .map(|stream| AudioClipResourceRef {
-        field: AudioClipResourceField::StreamData,
-        stream,
-    }))
+    ) {
+        StreamDataClassification::Active(stream) => Ok(Some(AudioClipResourceRef {
+            field: AudioClipResourceField::StreamData,
+            stream,
+        })),
+        StreamDataClassification::Missing | StreamDataClassification::Inactive => Ok(None),
+        StreamDataClassification::Malformed(error) => Err(error),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -360,39 +393,54 @@ impl StreamDataShape {
     };
 }
 
+#[cfg(feature = "texture")]
 pub(crate) fn stream_data_candidate<'a>(
     value: Option<&'a UnityValue>,
     shape: StreamDataShape,
 ) -> Result<Option<StreamDataRef<'a>>, MediaInspectionError> {
+    classify_stream_data(value, shape).into_candidate()
+}
+
+fn classify_stream_data<'a>(
+    value: Option<&'a UnityValue>,
+    shape: StreamDataShape,
+) -> StreamDataClassification<'a> {
     let Some(value) = value else {
-        return Ok(None);
+        return StreamDataClassification::Missing;
     };
     let UnityValue::Object(fields) = value else {
-        return Err(MediaInspectionError::InvalidDescriptor {
+        return StreamDataClassification::Malformed(MediaInspectionError::InvalidDescriptor {
             field: shape.field,
             reason: "stream declaration must be an object",
         });
     };
-    let path = fields.get(shape.path).and_then(UnityValue::as_str).ok_or(
-        MediaInspectionError::InvalidDescriptor {
+    let Some(path) = fields.get(shape.path).and_then(UnityValue::as_str) else {
+        return StreamDataClassification::Malformed(MediaInspectionError::InvalidDescriptor {
             field: shape.path,
             reason: "field must be a string",
-        },
-    )?;
-    let offset = fields
-        .get(shape.offset)
-        .and_then(UnityValue::as_u64)
-        .ok_or(MediaInspectionError::InvalidDescriptor {
+        });
+    };
+    let Some(offset) = fields.get(shape.offset).and_then(UnityValue::as_u64) else {
+        return StreamDataClassification::Malformed(MediaInspectionError::InvalidDescriptor {
             field: shape.offset,
             reason: "field must be an unsigned integer",
-        })?;
-    let size = fields.get(shape.size).and_then(UnityValue::as_u64).ok_or(
-        MediaInspectionError::InvalidDescriptor {
+        });
+    };
+    let Some(size) = fields.get(shape.size).and_then(UnityValue::as_u64) else {
+        return StreamDataClassification::Malformed(MediaInspectionError::InvalidDescriptor {
             field: shape.size,
             reason: "field must be an unsigned integer",
-        },
-    )?;
-    StreamDataRef::new(path, offset, size).map(Some)
+        });
+    };
+
+    if path.is_empty() && offset == 0 && size == 0 {
+        return StreamDataClassification::Inactive;
+    }
+
+    match StreamDataRef::new(path, offset, size) {
+        Ok(stream) => StreamDataClassification::Active(stream),
+        Err(error) => StreamDataClassification::Malformed(error),
+    }
 }
 
 impl<'a> MediaPayloadRef<'a> {
@@ -495,6 +543,57 @@ mod tests {
                 size: 1,
             })
         );
+    }
+
+    #[test]
+    fn stream_declarations_distinguish_missing_inactive_active_and_malformed() {
+        let shape = StreamDataShape {
+            field: "m_Resource",
+            path: "m_Source",
+            offset: "m_Offset",
+            size: "m_Size",
+        };
+        let inactive = UnityValue::Object(IndexMap::from([
+            ("m_Source".to_owned(), UnityValue::String(String::new())),
+            ("m_Offset".to_owned(), UnityValue::from(0_u64)),
+            ("m_Size".to_owned(), UnityValue::from(0_u64)),
+        ]));
+        let active = UnityValue::Object(IndexMap::from([
+            (
+                "m_Source".to_owned(),
+                UnityValue::String("archive:/CAB-a/CAB-a.resS".to_owned()),
+            ),
+            ("m_Offset".to_owned(), UnityValue::from(4_u64)),
+            ("m_Size".to_owned(), UnityValue::from(8_u64)),
+        ]));
+        let malformed = UnityValue::Object(IndexMap::from([
+            ("m_Source".to_owned(), UnityValue::String(String::new())),
+            ("m_Offset".to_owned(), UnityValue::from(0_u64)),
+            ("m_Size".to_owned(), UnityValue::from(1_u64)),
+        ]));
+
+        assert_eq!(
+            classify_stream_data(None, shape),
+            StreamDataClassification::Missing
+        );
+        assert_eq!(
+            classify_stream_data(Some(&inactive), shape),
+            StreamDataClassification::Inactive
+        );
+        assert!(matches!(
+            classify_stream_data(Some(&active), shape),
+            StreamDataClassification::Active(stream)
+                if stream.path() == "archive:/CAB-a/CAB-a.resS"
+                    && stream.offset() == 4
+                    && stream.size() == 8
+        ));
+        assert!(matches!(
+            classify_stream_data(Some(&malformed), shape),
+            StreamDataClassification::Malformed(MediaInspectionError::InvalidDescriptor {
+                field: "stream.path",
+                ..
+            })
+        ));
     }
 
     #[test]

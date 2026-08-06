@@ -21,8 +21,8 @@ use super::model::{
     normalize_source_expectations, normalize_values,
 };
 
-pub const EXTRACTION_MANIFEST_VERSION: u8 = 5;
-pub const EXTRACTION_REPORT_VERSION: u8 = 5;
+pub const EXTRACTION_MANIFEST_VERSION: u8 = 6;
+pub const EXTRACTION_REPORT_VERSION: u8 = 6;
 pub const EXTRACTION_MANIFEST_CONTRACT: &str = "unity_asset.extraction_manifest";
 pub const EXTRACTION_REPORT_CONTRACT: &str = "unity_asset.extraction_report";
 
@@ -195,6 +195,7 @@ impl ExtractionManifest {
         plan: &ExtractionPlan,
         mut artifacts: Vec<ExtractionManifestArtifact>,
     ) -> Result<Self, ExtractionManifestError> {
+        plan.validate_current_representation_semantics()?;
         if artifacts.len() != plan.artifacts().len() {
             return Err(ExtractionManifestError::ArtifactCountMismatch {
                 expected: plan.artifacts().len(),
@@ -371,6 +372,36 @@ struct ExtractionManifestWire {
     artifacts: Vec<ExtractionManifestArtifactWire>,
 }
 
+impl ExtractionManifestWire {
+    fn into_manifest(self) -> Result<ExtractionManifest, ExtractionManifestError> {
+        if self.contract != EXTRACTION_MANIFEST_CONTRACT {
+            return Err(ExtractionManifestError::UnexpectedContract {
+                expected: EXTRACTION_MANIFEST_CONTRACT,
+                actual: self.contract,
+            });
+        }
+        if self.version != EXTRACTION_MANIFEST_VERSION {
+            return Err(ExtractionManifestError::UnsupportedManifestVersion(
+                self.version,
+            ));
+        }
+        let artifacts = self
+            .artifacts
+            .into_iter()
+            .map(ExtractionManifestArtifactWire::into_artifact)
+            .collect::<Result<Vec<_>, _>>()?;
+        ExtractionManifest::from_parts(
+            self.workspace_id,
+            self.revision,
+            self.request,
+            self.request_digest,
+            self.plan_digest,
+            self.sources,
+            artifacts,
+        )
+    }
+}
+
 impl Serialize for ExtractionManifest {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -396,36 +427,9 @@ impl<'de> Deserialize<'de> for ExtractionManifest {
     where
         D: Deserializer<'de>,
     {
-        let wire = ExtractionManifestWire::deserialize(deserializer)?;
-        if wire.contract != EXTRACTION_MANIFEST_CONTRACT {
-            return Err(serde::de::Error::custom(
-                ExtractionManifestError::UnexpectedContract {
-                    expected: EXTRACTION_MANIFEST_CONTRACT,
-                    actual: wire.contract,
-                },
-            ));
-        }
-        if wire.version != EXTRACTION_MANIFEST_VERSION {
-            return Err(serde::de::Error::custom(
-                ExtractionManifestError::UnsupportedManifestVersion(wire.version),
-            ));
-        }
-        let artifacts = wire
-            .artifacts
-            .into_iter()
-            .map(ExtractionManifestArtifactWire::into_artifact)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(serde::de::Error::custom)?;
-        Self::from_parts(
-            wire.workspace_id,
-            wire.revision,
-            wire.request,
-            wire.request_digest,
-            wire.plan_digest,
-            wire.sources,
-            artifacts,
-        )
-        .map_err(serde::de::Error::custom)
+        ExtractionManifestWire::deserialize(deserializer)?
+            .into_manifest()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -532,7 +536,7 @@ struct ExtractionReportRef<'value> {
 struct ExtractionReportWire {
     contract: String,
     version: u8,
-    manifest: ExtractionManifest,
+    manifest: ExtractionManifestWire,
     counts: ExtractionReportCounts,
 }
 
@@ -783,7 +787,11 @@ impl<'de> Deserialize<'de> for ExtractionReport {
                 ExtractionManifestError::UnsupportedReportVersion(wire.version),
             ));
         }
-        let report = Self::new(wire.manifest).map_err(serde::de::Error::custom)?;
+        let manifest = wire
+            .manifest
+            .into_manifest()
+            .map_err(serde::de::Error::custom)?;
+        let report = Self::new(manifest).map_err(serde::de::Error::custom)?;
         if report.counts != wire.counts {
             return Err(serde::de::Error::custom(
                 ExtractionManifestError::ReportCountMismatch,

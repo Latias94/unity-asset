@@ -213,7 +213,7 @@ impl<'de> Deserialize<'de> for MediaOutputEstimate {
     }
 }
 
-/// Validated source form for a playable audio artifact.
+/// Validated source form for a standard-container audio artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreparedAudioSourceKind {

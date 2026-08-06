@@ -19,6 +19,7 @@ use self::compressed::CompressedDecoder;
 use self::crunch::CrunchDecoder;
 use self::mobile::MobileDecoder;
 use super::formats::TextureFormat;
+use super::helpers::TextureSwizzler;
 use super::types::Texture2D;
 use unity_asset_binary::{BinaryError, Result};
 
@@ -31,10 +32,13 @@ impl TextureDecoder {
         Self
     }
 
-    /// Decodes a texture using fallible allocations.
+    /// Decodes a Unity texture into canonical top-left RGBA pixels.
     pub fn decode(&self, texture: &Texture2D) -> Result<RgbaImage> {
-        self.decode_with_budget(texture, None)
-            .map_err(TextureDecodeFailure::into_binary)
+        let mut image = self
+            .decode_with_budget(texture, None)
+            .map_err(TextureDecodeFailure::into_binary)?;
+        TextureSwizzler::normalize_top_left(&mut image);
+        Ok(image)
     }
 
     pub(crate) fn decode_prepared(

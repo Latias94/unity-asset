@@ -32,9 +32,9 @@ pub(super) const RECEIPT_SEGMENT_DIRECTORY: &str =
     ".unity-asset-extraction-publication.v1.receipts";
 
 const PUBLICATION_JOURNAL_CONTRACT: &str = "unity_asset.extraction_publication";
-const PUBLICATION_JOURNAL_VERSION: u8 = 2;
+const PUBLICATION_JOURNAL_VERSION: u8 = 3;
 const RECEIPT_SEGMENT_CONTRACT: &str = "unity_asset.extraction_publication_receipt_segment";
-const RECEIPT_SEGMENT_VERSION: u8 = 2;
+const RECEIPT_SEGMENT_VERSION: u8 = 3;
 const RECEIPTS_PER_SEGMENT_U32: u32 = 64;
 const RECEIPTS_PER_SEGMENT: usize = RECEIPTS_PER_SEGMENT_U32 as usize;
 const PUBLICATION_JOURNAL_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
@@ -1172,6 +1172,8 @@ fn publication_identity(
     plan: &ExtractionPlan,
     parameters: PublicationParameters<'_>,
 ) -> Result<PublicationIdentity, ExtractionExecutionError> {
+    plan.validate_current_representation_semantics()
+        .map_err(super::manifest::ExtractionManifestError::from)?;
     Ok(PublicationIdentity {
         workspace_id: plan.workspace_id(),
         revision: plan.revision(),
@@ -1619,6 +1621,32 @@ mod tests {
 
     use super::*;
     use crate::extraction::ExtractionArtifactKind;
+
+    #[test]
+    fn legacy_v2_journal_is_rejected_before_recovery() {
+        let wire = PublicationJournalWire {
+            contract: PUBLICATION_JOURNAL_CONTRACT.to_owned(),
+            version: 2,
+            workspace_id: WorkspaceId::from_u128(1).unwrap(),
+            revision: WorkspaceRevision::new(DigestV1::hash_bytes(b"revision")),
+            request_digest: DigestV1::hash_bytes(b"request"),
+            plan_digest: DigestV1::hash_bytes(b"legacy-plan"),
+            execution_digest: DigestV1::hash_bytes(b"execution"),
+            generation: PublicationGeneration(DigestV1::hash_bytes(b"generation")),
+            sealed_segments: 0,
+            segment_chain: None,
+            tail_receipts: Vec::new(),
+            stage: JournalStage::Publishing,
+        };
+
+        let error = validate_envelope(&wire).expect_err("v2 journals must not enter recovery");
+        assert!(matches!(
+            error,
+            ExtractionExecutionError::PublicationJournalConflict {
+                reason: "publication journal has an unsupported version",
+            }
+        ));
+    }
 
     #[test]
     fn segment_path_inventory_has_exact_boundary_and_budget_accounting() {

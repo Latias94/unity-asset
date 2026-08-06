@@ -47,7 +47,7 @@ fn main() -> Result<()> {
         }
         seen += 1;
         let obj = handle.read(&mut budget)?;
-        let tex = converter.from_unity_object(&obj)?;
+        let tex = converter.from_unity_object(&obj, handle.file().object_context())?;
         let image = converter.decode_to_image(&tex)?;
 
         let stem = obj
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
         Ok(())
     };
 
-    match file {
+    match &file {
         UnityFile::SerializedFile(sf) => {
             for h in sf.object_handles() {
                 process(h)?;

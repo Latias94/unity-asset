@@ -6,16 +6,16 @@ wrapping the removed APIs.
 
 This is the only non-historical document that names removed public symbols and commands.
 
-`ExtractionRequest` is now version 4 and `ExtractionPlan` is now version 6. Requests persist the
+`ExtractionRequest` is now version 4 and `ExtractionPlan` is now version 7. Requests persist the
 bundle-container query or reference-traversal intent rather than a caller-expanded object list.
 The request filter now owns a canonical `object_kinds` set so YAML-only plans cannot be changed into
 mixed YAML/binary extraction after planning. Plans bind that intent to a deterministic selection
-witness and persist the exact sidecar source and byte range selected for streamed media. Earlier
-request and plan versions are rejected; re-plan them against the intended workspace revision.
-`ExtractionManifest` and `ExtractionReport` are now version 5 and bind the current request, plan,
-diagnostics, source proof, and recoverable publication semantics. Earlier manifests and reports are
-rejected. Create fresh resume evidence from a current request and plan; current evidence still
-requires an exact plan digest.
+witness, the representation implementation semantics, and the exact sidecar source and byte range
+selected for streamed media. Earlier request and plan versions are rejected; re-plan them against
+the intended workspace revision. `ExtractionManifest` and `ExtractionReport` are now version 6 and
+bind the current request, plan, diagnostics, source proof, and recoverable publication semantics.
+Earlier manifests and reports are rejected. Create fresh resume evidence from a current request and
+plan; current evidence still requires an exact plan digest.
 
 `ExtractionExecutionLimits::new` now accepts a cumulative `max_evidence_verification_bytes` limit
 between `max_output_bytes` and `max_report_bytes`, and rejects `max_open_files` values below
@@ -60,7 +60,7 @@ not require another source-breaking release.
 | `TextureExporter::create_filename` / `AudioExporter::create_filename` | Output naming belongs to the application, or to `ExtractionPlanner` when using the extraction pipeline |
 | `TextureExporter::validate_for_export` / `AudioExporter::validate_for_export` | Call the selected `write_*` method; each writer validates the exact dimensions, frame shape, container, and codec constraints it requires before publishing bytes |
 | `texture::export_image` / `audio::export_audio` | Call the corresponding explicit `TextureExporter::write_*` or `AudioExporter::write_*` encoder |
-| `TextureProcessor::process_and_export` / `AudioProcessor::process_and_export` | `process_and_write_png` / `process_and_write_wav` with a caller-owned writer |
+| `TextureProcessor::process_and_export` / `AudioProcessor::process_and_export` | `process_and_write_png` with a `MediaInspectionContext` derived from the owning `SerializedFile` and a caller-owned writer / `process_and_write_wav` with a caller-owned writer |
 | `SpriteProcessor::extract_sprite_image` and `process_sprite_with_texture` | `render_sprite` for an `RgbaImage`, or `write_sprite_png` for a caller-owned writer |
 | `SpriteResult`, `SpriteParser`, and `SpriteProcessor::parse_sprite` | Use strict `SpriteLayout::inspect` for extraction metadata; the unversioned raw fallback parser was removed |
 | `SpriteManager`, `SpriteConfig`, `SpriteAtlas`/`SpriteInfo`, `SpriteStats`, `create_*_manager`, `ProcessingOptions`, and Sprite feature/validation/statistics helpers | Use `SpriteLayout` for inspection or `SpriteProcessor` for rendering caller-owned `Sprite` data; the library no longer advertises unimplemented atlas, transform, mesh, physics, caching, or parallel-processing capabilities |
@@ -422,7 +422,7 @@ accept a serialized prepared session.
 ### Extraction
 
 Legacy export request JSON and manifests are not accepted. Build a current
-`ExtractionRequest` version 4, use `--dry-run` to obtain its canonical `ExtractionPlan` version 6,
+`ExtractionRequest` version 4, use `--dry-run` to obtain its canonical `ExtractionPlan` version 7,
 then execute that plan. The planner derives any required reference graph from its workspace view;
 the caller supplies only the persisted selection intent and limits:
 
@@ -445,7 +445,7 @@ versions are rejected rather than upgraded. Re-run the dry run and extraction to
 plan and resume evidence.
 
 The former library-level YAML split planner/executor/report contract has been removed. Keep using
-the `split-yaml` CLI when convenient, but consume its standard `ExtractionReport` v5 and persisted
+the `split-yaml` CLI when convenient, but consume its standard `ExtractionReport` v6 and persisted
 `extraction-manifest.json`; programmatic callers should use `ExtractionRequest::yaml_documents`,
 `ExtractionPlanner`, and `ExtractionExecutor` directly.
 

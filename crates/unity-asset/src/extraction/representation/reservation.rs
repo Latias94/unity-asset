@@ -20,6 +20,8 @@ use super::super::{CheckedByteCounter, source_budget_error};
 use super::contract::PlannedStreamSource;
 use super::contract::{PlannedContent, RepresentationContract};
 #[cfg(feature = "decode")]
+use super::texture_inspection_context;
+#[cfg(feature = "decode")]
 use crate::reference::{ReferenceGraphError, binary_external_source_resolves_to};
 #[cfg(feature = "decode")]
 use crate::workspace::{StreamedResourceResolution, StreamedResourceResolver};
@@ -53,6 +55,11 @@ pub(in crate::extraction) fn trusted_working_set(
     #[cfg(feature = "decode")] stream_resolver: Option<&StreamedResourceResolver<'_, '_>>,
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, ExtractionReservationError> {
+    contract.validate_current_semantics().map_err(|_| {
+        ExtractionReservationError::ContentMismatch(
+            "planned representation semantics do not match the current implementation",
+        )
+    })?;
     let object = read_object(view, address, budget)?;
     let preferred = content_working_set(
         view,
@@ -225,7 +232,8 @@ pub(in crate::extraction) fn texture_working_set(
     budget: &mut AssetLoadBudget,
 ) -> Result<u64, ExtractionReservationError> {
     let binary = binary_with_class(object, class_ids::TEXTURE_2D, "Texture2D")?;
-    let layout = Texture2DLayout::inspect(binary).map_err(|_| {
+    let context = texture_inspection_context(view, object)?;
+    let layout = Texture2DLayout::inspect(binary, context).map_err(|_| {
         ExtractionReservationError::ContentMismatch("Texture2D layout can no longer be inspected")
     })?;
     validate_texture_descriptor(layout, descriptor, MediaFamily::Texture)?;
@@ -351,7 +359,8 @@ pub(in crate::extraction) fn sprite_working_set_with_texture(
         ExtractionReservationError::ContentMismatch("Sprite layout can no longer be inspected")
     })?;
     let texture = binary_with_class(texture_object, class_ids::TEXTURE_2D, "Sprite Texture2D")?;
-    let layout = Texture2DLayout::inspect(texture).map_err(|_| {
+    let context = texture_inspection_context(view, texture_object)?;
+    let layout = Texture2DLayout::inspect(texture, context).map_err(|_| {
         ExtractionReservationError::ContentMismatch(
             "Sprite Texture2D layout can no longer be inspected",
         )
@@ -415,6 +424,7 @@ fn image_working_set(
         [
             image_bytes,
             png_output_bound(image_bytes)?,
+            layout.platform_copy_bytes(),
             usize_to_u64(binary_bytes, "texture binary working set")?,
             stream.map_or(0, |source| source.request().size()),
             embedded_bytes,

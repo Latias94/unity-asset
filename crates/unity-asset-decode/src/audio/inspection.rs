@@ -164,6 +164,14 @@ mod tests {
         ]))
     }
 
+    fn compatibility_stream(path: &str, offset: u64, size: u64) -> UnityValue {
+        UnityValue::Object(IndexMap::from([
+            ("path".to_owned(), UnityValue::String(path.to_owned())),
+            ("offset".to_owned(), UnityValue::from(offset)),
+            ("size".to_owned(), UnityValue::from(size)),
+        ]))
+    }
+
     #[test]
     fn typetree_requires_one_valid_payload() {
         let mut properties = base();
@@ -208,6 +216,56 @@ mod tests {
             .unwrap();
 
         assert_eq!((selected.offset(), selected.size()), (4, 8));
+    }
+
+    #[test]
+    fn inactive_stream_sentinels_allow_embedded_data_and_compatibility_fallback() {
+        let mut embedded_properties = base();
+        embedded_properties.insert("m_AudioData".to_owned(), UnityValue::Bytes(vec![1, 2]));
+        embedded_properties.insert("m_Resource".to_owned(), stream("", 0, 0));
+        embedded_properties.insert("m_StreamData".to_owned(), compatibility_stream("", 0, 0));
+
+        assert_eq!(
+            AudioClipLayout::inspect(&object(embedded_properties))
+                .unwrap()
+                .payload()
+                .embedded_byte_len(),
+            Some(2)
+        );
+
+        let mut fallback_properties = base();
+        fallback_properties.insert("m_Resource".to_owned(), stream("", 0, 0));
+        fallback_properties.insert(
+            "m_StreamData".to_owned(),
+            compatibility_stream("archive:/CAB-a/CAB-a.resS", 4, 8),
+        );
+
+        let fallback_object = object(fallback_properties);
+        let selected = AudioClipLayout::inspect(&fallback_object)
+            .unwrap()
+            .payload()
+            .stream()
+            .unwrap();
+        assert_eq!((selected.offset(), selected.size()), (4, 8));
+    }
+
+    #[test]
+    fn malformed_primary_stream_never_falls_back() {
+        let mut properties = base();
+        properties.insert("m_AudioData".to_owned(), UnityValue::Bytes(vec![1, 2]));
+        properties.insert("m_Resource".to_owned(), stream("", 0, 1));
+        properties.insert(
+            "m_StreamData".to_owned(),
+            compatibility_stream("archive:/CAB-a/CAB-a.resS", 4, 8),
+        );
+
+        assert!(matches!(
+            AudioClipLayout::inspect(&object(properties)),
+            Err(MediaInspectionError::InvalidDescriptor {
+                field: "stream.path",
+                ..
+            })
+        ));
     }
 
     #[test]

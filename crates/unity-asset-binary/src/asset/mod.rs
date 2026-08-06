@@ -30,6 +30,7 @@
 //! ```
 
 mod assetbundle_container;
+mod context;
 pub mod format;
 pub mod header;
 mod object_type_resolver;
@@ -39,6 +40,7 @@ pub mod types;
 mod validation;
 
 // Re-export main types for easy access
+pub use context::{BuildTarget, SerializedObjectContext, TargetPlatformEvidence};
 pub use format::{
     ExternalEncoding, HeaderLayout, MetadataField, MetadataPlacement, ObjectOffsetEncoding,
     ObjectTailEncoding, ObjectTypeEncoding, PathIdEncoding, SerializedFileFormat,

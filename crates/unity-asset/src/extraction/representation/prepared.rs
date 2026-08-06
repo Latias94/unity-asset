@@ -22,6 +22,8 @@ use super::contract::PlannedStreamSource;
 use super::contract::{PlannedContent, RepresentationContract};
 #[cfg(feature = "decode")]
 use super::payload::{WorkspacePayloadError, copy_workspace_range};
+#[cfg(feature = "decode")]
+use super::texture_inspection_context;
 use crate::workspace::{
     WorkspaceError, WorkspaceLookup, WorkspaceObject, WorkspaceObjectValue, WorkspaceView,
 };
@@ -66,6 +68,9 @@ impl PreparedRepresentation {
         contract: &RepresentationContract,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, RepresentationPreparationError> {
+        contract
+            .validate_current_semantics()
+            .map_err(|_| RepresentationPreparationError::InvalidContent)?;
         let object = read_object(view, address, budget)?;
         let raw_fallback = contract.fallback().is_some();
         match contract.preferred_content() {
@@ -102,7 +107,8 @@ impl PreparedRepresentation {
                 let WorkspaceObjectValue::Binary(binary) = object.value() else {
                     return Err(RepresentationPreparationError::InvalidContent);
                 };
-                let layout = Texture2DLayout::inspect(binary)
+                let context = texture_inspection_context(view, &object)?;
+                let layout = Texture2DLayout::inspect(binary, context)
                     .map_err(|_| RepresentationPreparationError::InvalidContent)?;
                 let source = media_source_bytes(view, layout.payload(), stream.as_ref(), budget)?;
                 let media = PreparedTexturePng::prepare(layout, source, budget)
@@ -125,11 +131,12 @@ impl PreparedRepresentation {
                 };
                 let sprite_layout = SpriteLayout::inspect(sprite)
                     .map_err(|_| RepresentationPreparationError::InvalidContent)?;
-                let texture = read_object(view, texture, budget)?;
-                let WorkspaceObjectValue::Binary(texture) = texture.value() else {
+                let texture_object = read_object(view, texture, budget)?;
+                let WorkspaceObjectValue::Binary(texture) = texture_object.value() else {
                     return Err(RepresentationPreparationError::InvalidContent);
                 };
-                let texture_layout = Texture2DLayout::inspect(texture)
+                let texture_context = texture_inspection_context(view, &texture_object)?;
+                let texture_layout = Texture2DLayout::inspect(texture, texture_context)
                     .map_err(|_| RepresentationPreparationError::InvalidContent)?;
                 let source = media_source_bytes(
                     view,

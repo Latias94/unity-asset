@@ -35,6 +35,8 @@ use super::payload::{WorkspacePayloadError, copy_workspace_range};
 use super::reservation::{ExtractionReservationError, raw_binary_working_set, yaml_working_set};
 #[cfg(feature = "decode")]
 use super::reservation::{audio_working_set, sprite_working_set_with_texture, texture_working_set};
+#[cfg(feature = "decode")]
+use super::texture_inspection_context;
 use crate::reference::ReferenceGraph;
 #[cfg(feature = "decode")]
 use crate::reference::ReferenceGraphBuildOptions;
@@ -258,13 +260,17 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
         let WorkspaceObjectValue::Binary(binary) = object.value() else {
             unreachable!("texture planning is only dispatched for binary objects");
         };
-        let layout =
-            match classify_media_inspection(address, Texture2DLayout::inspect(binary), budget)? {
-                MediaInspectionOutcome::Prepared(layout) => layout,
-                MediaInspectionOutcome::Unavailable(reason) => {
-                    return unavailable_choice_with(address, self.policy, raw, reason, budget);
-                }
-            };
+        let context = texture_inspection_context(self.view, object)?;
+        let layout = match classify_media_inspection(
+            address,
+            Texture2DLayout::inspect(binary, context),
+            budget,
+        )? {
+            MediaInspectionOutcome::Prepared(layout) => layout,
+            MediaInspectionOutcome::Unavailable(reason) => {
+                return unavailable_choice_with(address, self.policy, raw, reason, budget);
+            }
+        };
         let (stream, bytes) = if let Some(stream) = layout.payload().stream() {
             match self.resolve_stream(owner, stream.path(), stream.offset(), stream.size(), budget)
             {
@@ -427,9 +433,10 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                 return unavailable_choice_with(address, self.policy, raw, code, budget);
             }
         };
+        let texture_context = texture_inspection_context(self.view, &texture_object)?;
         let texture_layout = match classify_media_inspection(
             address,
-            Texture2DLayout::inspect(texture_binary),
+            Texture2DLayout::inspect(texture_binary, texture_context),
             budget,
         )? {
             MediaInspectionOutcome::Prepared(layout) => layout,

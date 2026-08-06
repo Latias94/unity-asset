@@ -1,14 +1,15 @@
 //! Compatibility adapter from strict Texture2D TypeTree inspection to the legacy owned model.
 
 use image::RgbaImage;
+use unity_asset_binary::asset::SerializedObjectContext;
+use unity_asset_binary::object::UnityObject;
+use unity_asset_binary::{BinaryError, Result};
 use unity_asset_core::UnityValue;
 
 use super::decoders::TextureDecoder;
 use super::inspection::Texture2DLayout;
 use super::types::{StreamingInfo, Texture2D};
 use crate::media::MediaPayloadRef;
-use unity_asset_binary::object::UnityObject;
-use unity_asset_binary::{BinaryError, Result};
 
 /// Legacy owned Texture2D adapter.
 ///
@@ -26,9 +27,26 @@ impl Texture2DConverter {
     }
 
     /// Converts a strictly inspected TypeTree-backed object into the legacy owned model.
-    pub fn from_unity_object(&self, object: &UnityObject) -> Result<Texture2D> {
-        let layout = Texture2DLayout::inspect(object)
+    pub fn from_unity_object(
+        &self,
+        object: &UnityObject,
+        context: SerializedObjectContext,
+    ) -> Result<Texture2D> {
+        let layout = Texture2DLayout::inspect(object, context)
             .map_err(|error| BinaryError::invalid_data(error.to_string()))?;
+        self.convert_inspected_layout(object, layout)
+    }
+
+    fn convert_inspected_layout(
+        &self,
+        object: &UnityObject,
+        layout: Texture2DLayout<'_>,
+    ) -> Result<Texture2D> {
+        if layout.context().requires_source_transform() {
+            return Err(BinaryError::unsupported(
+                "legacy Texture2D conversion cannot retain platform storage transforms; use PreparedTexturePng",
+            ));
+        }
         let properties = object.as_unity_class().properties();
         let mut texture = Texture2D {
             name: properties
@@ -77,6 +95,17 @@ impl Texture2DConverter {
         Ok(texture)
     }
 
+    #[cfg(test)]
+    fn convert_unity_object_for_test(
+        &self,
+        object: &UnityObject,
+        target_platform: i32,
+    ) -> Result<Texture2D> {
+        let layout = Texture2DLayout::inspect_for_test(object, Some(target_platform))
+            .map_err(|error| BinaryError::invalid_data(error.to_string()))?;
+        self.convert_inspected_layout(object, layout)
+    }
+
     pub fn decode_to_image(&self, texture: &Texture2D) -> Result<RgbaImage> {
         self.decoder.decode(texture)
     }
@@ -116,4 +145,87 @@ fn optional_i32(value: Option<&UnityValue>, default: i32) -> i32 {
 
 fn optional_bool(value: Option<&UnityValue>, default: bool) -> bool {
     value.and_then(UnityValue::as_bool).unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+    use unity_asset_binary::asset::{ObjectInfo, class_ids};
+    use unity_asset_core::UnityClass;
+
+    use super::*;
+
+    fn object(properties: IndexMap<String, UnityValue>) -> UnityObject {
+        let class = UnityClass::with_properties(
+            class_ids::TEXTURE_2D,
+            "Texture2D".to_owned(),
+            "1".to_owned(),
+            properties,
+        );
+        let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::TEXTURE_2D)
+            .expect("valid standalone texture object");
+        UnityObject::from_info_and_class(info, class)
+    }
+
+    #[test]
+    fn converter_retains_strict_stream_reference() {
+        let stream = UnityValue::Object(IndexMap::from([
+            (
+                "path".to_owned(),
+                UnityValue::String("archive:/CAB-abc/CAB-abc.resS".to_owned()),
+            ),
+            ("offset".to_owned(), UnityValue::from(u64::MAX - 16)),
+            ("size".to_owned(), UnityValue::Integer(16)),
+        ]));
+        let texture = object(IndexMap::from([
+            ("m_Name".to_owned(), UnityValue::String("Tex".to_owned())),
+            ("m_Width".to_owned(), UnityValue::Integer(2)),
+            ("m_Height".to_owned(), UnityValue::Integer(2)),
+            ("m_TextureFormat".to_owned(), UnityValue::Integer(4)),
+            ("m_MipCount".to_owned(), UnityValue::Integer(1)),
+            ("m_ImageCount".to_owned(), UnityValue::Integer(1)),
+            ("m_TextureDimension".to_owned(), UnityValue::Integer(2)),
+            ("m_CompleteImageSize".to_owned(), UnityValue::Integer(16)),
+            ("m_IsReadable".to_owned(), UnityValue::Bool(true)),
+            ("m_StreamData".to_owned(), stream),
+        ]));
+
+        let converted = Texture2DConverter::new()
+            .convert_unity_object_for_test(&texture, 5)
+            .unwrap();
+        assert_eq!(converted.name, "Tex");
+        assert_eq!(converted.width, 2);
+        assert_eq!(converted.height, 2);
+        assert!(converted.image_data.is_empty());
+        assert_eq!(converted.stream_info.offset, u64::MAX - 16);
+        assert_eq!(converted.stream_info.size, 16);
+        assert!(converted.stream_info.path.contains("CAB-abc"));
+    }
+
+    #[test]
+    fn converter_rejects_platform_transformed_texture_bytes() {
+        let texture = object(IndexMap::from([
+            (
+                "m_Name".to_owned(),
+                UnityValue::String("XboxTex".to_owned()),
+            ),
+            ("m_Width".to_owned(), UnityValue::Integer(1)),
+            ("m_Height".to_owned(), UnityValue::Integer(1)),
+            ("m_TextureFormat".to_owned(), UnityValue::Integer(7)),
+            ("m_MipCount".to_owned(), UnityValue::Integer(1)),
+            ("m_ImageCount".to_owned(), UnityValue::Integer(1)),
+            ("m_TextureDimension".to_owned(), UnityValue::Integer(2)),
+            ("m_CompleteImageSize".to_owned(), UnityValue::Integer(2)),
+            ("image_data".to_owned(), UnityValue::Bytes(vec![0xf8, 0x00])),
+        ]));
+
+        let error = Texture2DConverter::new()
+            .convert_unity_object_for_test(&texture, 11)
+            .expect_err("legacy conversion must not silently decode Xbox byte order");
+        assert!(matches!(
+            error,
+            BinaryError::Unsupported(message)
+                if message.contains("platform storage transforms")
+        ));
+    }
 }

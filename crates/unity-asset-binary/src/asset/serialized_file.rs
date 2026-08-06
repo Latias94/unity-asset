@@ -1,5 +1,6 @@
 //! Validated SerializedFile model and object-table access.
 
+use super::context::SerializedObjectContext;
 use super::format::{SerializedFileFormat, SerializedFileRegions};
 use super::header::SerializedFileHeader;
 use super::types::{
@@ -54,6 +55,8 @@ pub struct SerializedFile {
     pub unity_version: String,
     /// Target platform.
     pub target_platform: i32,
+    /// Immutable platform and wire evidence captured while parsing this file.
+    object_context: SerializedObjectContext,
     /// Whether type tree is enabled.
     enable_type_tree: bool,
     /// Optional external TypeTree registry for stripped files (best-effort).
@@ -125,6 +128,11 @@ impl SerializedFile {
             .ok_or_else(|| BinaryError::invalid_data("SerializedFile end offset overflow"))?;
         let data =
             DataView::from_shared_range(view.backing_shared(), absolute_start..absolute_end)?;
+        let object_context = SerializedObjectContext::from_wire(
+            parts.format,
+            parts.header.byte_order(),
+            parts.target_platform,
+        );
 
         Ok(Self {
             format: parts.format,
@@ -132,6 +140,7 @@ impl SerializedFile {
             header: parts.header,
             unity_version: parts.unity_version,
             target_platform: parts.target_platform,
+            object_context,
             enable_type_tree: parts.enable_type_tree,
             type_tree_registry: None,
             types: parts.types,
@@ -199,6 +208,12 @@ impl SerializedFile {
     /// Returns the validated format capability profile.
     pub const fn format(&self) -> SerializedFileFormat {
         self.format
+    }
+
+    /// Returns file-owned evidence for interpreting serialized object payloads.
+    #[must_use]
+    pub const fn object_context(&self) -> SerializedObjectContext {
+        self.object_context
     }
 
     /// Returns the checked physical regions of this file image.
@@ -508,6 +523,20 @@ mod tests {
     const V22_FIXTURE: &[u8] = include_bytes!(
         "../../../unity-asset-write/tests/fixtures/serialized_file_wire/v22.assets.bin"
     );
+
+    #[test]
+    fn mutable_wire_metadata_cannot_rewrite_the_parsed_object_context() {
+        let backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
+        let shared = SharedBytes::from_arc(backing);
+        let mut parsed = SerializedFileParser::from_shared_range(shared, 0..V22_FIXTURE.len())
+            .expect("fixture parses");
+        let context = parsed.object_context();
+
+        parsed.target_platform = 3_716;
+
+        assert_eq!(parsed.target_platform, 3_716);
+        assert_eq!(parsed.object_context(), context);
+    }
 
     #[test]
     fn verified_rebind_rejects_an_equal_but_unproven_parsed_backing() {

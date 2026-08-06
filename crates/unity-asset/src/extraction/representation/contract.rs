@@ -121,6 +121,7 @@ impl<'de> Deserialize<'de> for PlannedStreamSource {
 pub(in crate::extraction) struct PlannedFallback {
     path: ExtractionPath,
     content: PlannedContent,
+    representation_semantics: RepresentationSemantics,
 }
 
 impl PlannedFallback {
@@ -132,16 +133,29 @@ impl PlannedFallback {
             return Err(RepresentationContractError::InvalidFallbackContent);
         }
         content.validate_destination(&path)?;
-        Ok(Self { path, content })
+        Ok(Self {
+            path,
+            representation_semantics: content.current_semantics(),
+            content,
+        })
     }
 
     pub(in crate::extraction) fn from_declared_parts(
         kind: ExtractionArtifactKind,
         path: ExtractionPath,
         content: PlannedContent,
+        representation_semantics: Option<RepresentationSemantics>,
     ) -> Result<Self, RepresentationContractError> {
         content.validate_declared_kind(kind)?;
-        Self::new(path, content)
+        let representation_semantics = representation_semantics.ok_or(
+            RepresentationContractError::MissingRepresentationSemantics {
+                artifact_kind: content.artifact_kind(),
+            },
+        )?;
+        content.validate_semantics(representation_semantics)?;
+        let mut fallback = Self::new(path, content)?;
+        fallback.representation_semantics = representation_semantics;
+        Ok(fallback)
     }
 
     pub(in crate::extraction) const fn kind(&self) -> ExtractionArtifactKind {
@@ -154,6 +168,130 @@ impl PlannedFallback {
 
     pub(in crate::extraction) const fn content(&self) -> &PlannedContent {
         &self.content
+    }
+
+    pub(in crate::extraction) const fn representation_semantics(&self) -> RepresentationSemantics {
+        self.representation_semantics
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum RawBinaryBytesSemantics {
+    WorkspaceObjectRawBytesV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum YamlSerializerSemantics {
+    UnityYamlSerializerCanonicalV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum TextAssetBytesSemantics {
+    TypeTreeScriptBytesV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum AudioPreparationSemantics {
+    PreparedStandardAudioSourceV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum PngPixelSemantics {
+    TopLeftRgba8V1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum PlatformTransformSemantics {
+    SerializedFileBuildTargetClosedV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum PngEncoderSemantics {
+    FilterNoneStoredDeflateBlockPerIdatRgba8V1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(in crate::extraction) enum SpriteCropSemantics {
+    TopLeftTextureSpaceV1,
+}
+
+/// Closed identity of the implementation semantics required to reproduce one representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(in crate::extraction) enum RepresentationSemantics {
+    RawBinary {
+        bytes: RawBinaryBytesSemantics,
+    },
+    Yaml {
+        serializer: YamlSerializerSemantics,
+    },
+    TextAsset {
+        bytes: TextAssetBytesSemantics,
+    },
+    Audio {
+        preparation: AudioPreparationSemantics,
+    },
+    TexturePng {
+        pixels: PngPixelSemantics,
+        platform_transform: PlatformTransformSemantics,
+        encoder: PngEncoderSemantics,
+    },
+    SpritePng {
+        pixels: PngPixelSemantics,
+        platform_transform: PlatformTransformSemantics,
+        crop: SpriteCropSemantics,
+        encoder: PngEncoderSemantics,
+    },
+}
+
+impl RepresentationSemantics {
+    const fn raw_binary() -> Self {
+        Self::RawBinary {
+            bytes: RawBinaryBytesSemantics::WorkspaceObjectRawBytesV1,
+        }
+    }
+
+    const fn yaml() -> Self {
+        Self::Yaml {
+            serializer: YamlSerializerSemantics::UnityYamlSerializerCanonicalV1,
+        }
+    }
+
+    const fn text_asset() -> Self {
+        Self::TextAsset {
+            bytes: TextAssetBytesSemantics::TypeTreeScriptBytesV1,
+        }
+    }
+
+    const fn audio() -> Self {
+        Self::Audio {
+            preparation: AudioPreparationSemantics::PreparedStandardAudioSourceV1,
+        }
+    }
+
+    const fn texture_png() -> Self {
+        Self::TexturePng {
+            pixels: PngPixelSemantics::TopLeftRgba8V1,
+            platform_transform: PlatformTransformSemantics::SerializedFileBuildTargetClosedV1,
+            encoder: PngEncoderSemantics::FilterNoneStoredDeflateBlockPerIdatRgba8V1,
+        }
+    }
+
+    const fn sprite_png() -> Self {
+        Self::SpritePng {
+            pixels: PngPixelSemantics::TopLeftRgba8V1,
+            platform_transform: PlatformTransformSemantics::SerializedFileBuildTargetClosedV1,
+            crop: SpriteCropSemantics::TopLeftTextureSpaceV1,
+            encoder: PngEncoderSemantics::FilterNoneStoredDeflateBlockPerIdatRgba8V1,
+        }
     }
 }
 
@@ -180,6 +318,30 @@ pub(in crate::extraction) enum PlannedContent {
 }
 
 impl PlannedContent {
+    pub(in crate::extraction) const fn current_semantics(&self) -> RepresentationSemantics {
+        match self {
+            Self::RawBinary => RepresentationSemantics::raw_binary(),
+            Self::Yaml => RepresentationSemantics::yaml(),
+            Self::TextAsset => RepresentationSemantics::text_asset(),
+            Self::Audio { .. } => RepresentationSemantics::audio(),
+            Self::TexturePng { .. } => RepresentationSemantics::texture_png(),
+            Self::SpritePng { .. } => RepresentationSemantics::sprite_png(),
+        }
+    }
+
+    fn validate_semantics(
+        &self,
+        declared: RepresentationSemantics,
+    ) -> Result<(), RepresentationContractError> {
+        let expected = self.current_semantics();
+        if declared != expected {
+            return Err(
+                RepresentationContractError::RepresentationSemanticsMismatch { declared, expected },
+            );
+        }
+        Ok(())
+    }
+
     pub(in crate::extraction) const fn artifact_kind(&self) -> ExtractionArtifactKind {
         match self {
             Self::RawBinary => ExtractionArtifactKind::BinaryRaw,
@@ -346,6 +508,7 @@ pub(in crate::extraction) struct RepresentationContractParts {
 pub(in crate::extraction) struct RepresentationContract {
     preferred_path: ExtractionPath,
     preferred_content: PlannedContent,
+    representation_semantics: RepresentationSemantics,
     fallback: Option<PlannedFallback>,
     working_set_bytes: u64,
     diagnostics: Box<[ExtractionDiagnostic]>,
@@ -357,6 +520,16 @@ impl RepresentationContract {
         address: &ObjectAddress,
         parts: RepresentationContractParts,
     ) -> Result<Self, RepresentationContractError> {
+        let representation_semantics = parts.preferred_content.current_semantics();
+        Self::from_declared_parts(ordinal, address, representation_semantics, parts)
+    }
+
+    pub(in crate::extraction) fn from_declared_parts(
+        ordinal: u32,
+        address: &ObjectAddress,
+        representation_semantics: RepresentationSemantics,
+        parts: RepresentationContractParts,
+    ) -> Result<Self, RepresentationContractError> {
         let RepresentationContractParts {
             preferred_path,
             preferred_content,
@@ -365,6 +538,7 @@ impl RepresentationContract {
             mut diagnostics,
         } = parts;
         preferred_content.validate()?;
+        preferred_content.validate_semantics(representation_semantics)?;
         preferred_content.validate_destination(&preferred_path)?;
         if let Some(fallback) = fallback.as_ref() {
             if matches!(
@@ -393,6 +567,7 @@ impl RepresentationContract {
         Ok(Self {
             preferred_path,
             preferred_content,
+            representation_semantics,
             fallback,
             working_set_bytes,
             diagnostics: diagnostics.into_boxed_slice(),
@@ -409,6 +584,23 @@ impl RepresentationContract {
 
     pub(in crate::extraction) const fn preferred_content(&self) -> &PlannedContent {
         &self.preferred_content
+    }
+
+    pub(in crate::extraction) const fn representation_semantics(&self) -> RepresentationSemantics {
+        self.representation_semantics
+    }
+
+    pub(in crate::extraction) fn validate_current_semantics(
+        &self,
+    ) -> Result<(), RepresentationContractError> {
+        self.preferred_content
+            .validate_semantics(self.representation_semantics)?;
+        if let Some(fallback) = self.fallback.as_ref() {
+            fallback
+                .content()
+                .validate_semantics(fallback.representation_semantics())?;
+        }
+        Ok(())
     }
 
     pub(in crate::extraction) const fn preferred_requires_write_budget(&self) -> bool {
@@ -596,6 +788,17 @@ fn expectation_for<'source>(
 
 #[derive(Debug, Error)]
 pub(in crate::extraction) enum RepresentationContractError {
+    #[error("{artifact_kind:?} representation is missing its implementation semantics")]
+    MissingRepresentationSemantics {
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error(
+        "representation semantics {declared:?} do not match the current implementation {expected:?}"
+    )]
+    RepresentationSemanticsMismatch {
+        declared: RepresentationSemantics,
+        expected: RepresentationSemantics,
+    },
     #[error("media descriptor family is {actual:?}; representation requires {expected:?}")]
     MediaDescriptorFamilyMismatch {
         expected: MediaFamily,
@@ -696,6 +899,52 @@ mod tests {
         assert!(matches!(
             error,
             RepresentationContractError::InvalidFallbackContent
+        ));
+    }
+
+    #[test]
+    fn representation_semantics_have_stable_canonical_ids() {
+        assert_eq!(
+            serde_json::to_string(&RepresentationSemantics::raw_binary()).unwrap(),
+            r#"{"kind":"raw_binary","bytes":"workspace_object_raw_bytes_v1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RepresentationSemantics::text_asset()).unwrap(),
+            r#"{"kind":"text_asset","bytes":"type_tree_script_bytes_v1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RepresentationSemantics::audio()).unwrap(),
+            r#"{"kind":"audio","preparation":"prepared_standard_audio_source_v1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RepresentationSemantics::texture_png()).unwrap(),
+            r#"{"kind":"texture_png","pixels":"top_left_rgba8_v1","platform_transform":"serialized_file_build_target_closed_v1","encoder":"filter_none_stored_deflate_block_per_idat_rgba8_v1"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&RepresentationSemantics::sprite_png()).unwrap(),
+            r#"{"kind":"sprite_png","pixels":"top_left_rgba8_v1","platform_transform":"serialized_file_build_target_closed_v1","crop":"top_left_texture_space_v1","encoder":"filter_none_stored_deflate_block_per_idat_rgba8_v1"}"#
+        );
+    }
+
+    #[test]
+    fn declared_semantics_must_match_the_selected_content() {
+        let error = RepresentationContract::from_declared_parts(
+            0,
+            &address(),
+            RepresentationSemantics::raw_binary(),
+            RepresentationContractParts {
+                preferred_path: path("object.txt"),
+                preferred_content: PlannedContent::TextAsset,
+                fallback: None,
+                working_set_bytes: 1,
+                diagnostics: Vec::new(),
+            },
+        )
+        .expect_err("raw-byte semantics cannot authorize TextAsset output");
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::RepresentationSemanticsMismatch { .. }
         ));
     }
 }

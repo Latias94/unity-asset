@@ -24,6 +24,32 @@ fn prepare_standard_source(
     AudioExporter::prepare_standard_source(clip, source, &mut budget)
 }
 
+fn adts_frame(payload: &[u8], sampling_frequency_index: u8) -> Vec<u8> {
+    assert!(sampling_frequency_index <= 0x0f);
+    let frame_length = 7_usize.checked_add(payload.len()).unwrap();
+    assert!(frame_length <= 0x1fff);
+    let channel_configuration = 2_u8;
+    let mut bytes = Vec::with_capacity(frame_length);
+    bytes.extend_from_slice(&[
+        0xFF,
+        0xF1,
+        0x40 | (sampling_frequency_index << 2) | (channel_configuration >> 2),
+        ((channel_configuration & 0x03) << 6) | u8::try_from((frame_length >> 11) & 0x03).unwrap(),
+        u8::try_from((frame_length >> 3) & 0xFF).unwrap(),
+        u8::try_from((frame_length & 0x07) << 5).unwrap() | 0x1F,
+        0xFC,
+    ]);
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
+fn minimal_m4a() -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&24_u32.to_be_bytes());
+    bytes.extend_from_slice(b"ftypM4A \0\0\0\0M4A isom");
+    bytes
+}
+
 #[test]
 fn audio_writers_encode_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
     let audio = DecodedAudio::new(vec![-1.0, -0.25, 0.0, 0.5, 1.0, 0.125], 48_000, 2);
@@ -103,22 +129,76 @@ fn standard_audio_source_rejects_header_only_containers() {
 #[test]
 fn standard_audio_source_rejects_reserved_adts_sample_rates() {
     for sampling_frequency_index in [13_u8, 14] {
-        let bytes = [
-            0xFF,
-            0xF1,
-            0x40 | (sampling_frequency_index << 2),
-            0x80,
-            0x01,
-            0x1F,
-            0xFC,
-            0x00,
-        ];
+        let bytes = adts_frame(
+            &[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C],
+            sampling_frequency_index,
+        );
         let clip = AudioClip::new("reserved-adts-rate".into(), AudioCompressionFormat::AAC);
 
-        let result = prepare_standard_source(&clip, bytes.to_vec());
+        let result = prepare_standard_source(&clip, bytes);
 
         assert!(matches!(result, Err(AudioSourceError::InvalidData(_))));
     }
+}
+
+#[test]
+fn aac_passthrough_requires_complete_consistent_adts_framing() {
+    let clip = AudioClip::new("adts-framed".into(), AudioCompressionFormat::AAC);
+    let payload = [0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C];
+
+    let mut complete = adts_frame(&payload, 4);
+    complete.extend_from_slice(&adts_frame(&payload, 4));
+    let expected = complete.clone();
+    let prepared = prepare_standard_source(&clip, complete).unwrap();
+    let mut output = Vec::new();
+    prepared.write_to(&mut output).unwrap();
+    assert_eq!(output, expected);
+
+    let cases = [
+        adts_frame(&[0], 4),
+        {
+            let mut truncated = adts_frame(&payload, 4);
+            truncated.pop();
+            truncated
+        },
+        {
+            let mut multiple_raw_blocks = adts_frame(&payload, 4);
+            multiple_raw_blocks[6] |= 1;
+            multiple_raw_blocks
+        },
+        {
+            let mut crc_protected = adts_frame(&payload, 4);
+            crc_protected[1] &= !1;
+            crc_protected
+        },
+        {
+            let mut inconsistent = adts_frame(&payload, 4);
+            inconsistent.extend_from_slice(&adts_frame(&payload, 3));
+            inconsistent
+        },
+    ];
+
+    for bytes in cases {
+        assert!(matches!(
+            prepare_standard_source(&clip, bytes),
+            Err(AudioSourceError::InvalidData(_))
+        ));
+    }
+}
+
+#[test]
+fn m4a_aac_is_an_unsupported_container_not_corrupt_aac() {
+    let clip = AudioClip::new("m4a".into(), AudioCompressionFormat::AAC);
+
+    let result = prepare_standard_source(&clip, minimal_m4a());
+
+    assert!(matches!(
+        result,
+        Err(AudioSourceError::UnsupportedContainer {
+            format: AudioCompressionFormat::AAC,
+            container: "ISO BMFF/M4A AAC",
+        })
+    ));
 }
 
 #[test]
@@ -139,7 +219,9 @@ fn standard_audio_source_accepts_complete_minimal_containers() {
     let mut mp3 = vec![0_u8; 417];
     mp3[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
 
-    let aac = vec![0xFF, 0xF1, 0x50, 0x80, 0x01, 0x1F, 0xFC, 0x00];
+    // AAC passthrough guarantees complete, consistent ADTS framing. It does
+    // not claim to validate the opaque raw AAC syntax without a decoder.
+    let aac = adts_frame(&[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C], 4);
     let ima_adpcm = wave_fixture(0x11, 1, 8_000, 7_111, 8, 4, &[2, 0, 9, 0], &[0; 8]);
 
     for (format, bytes) in [
@@ -513,7 +595,8 @@ fn texture_writers_preserve_caller_sink_errors() {
 }
 
 #[test]
-fn sprite_png_writer_encodes_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
+fn sprite_png_writer_maps_unity_rects_to_top_left_pixels_once()
+-> Result<(), Box<dyn std::error::Error>> {
     let texture = Texture2D {
         width: 2,
         height: 2,
@@ -537,7 +620,19 @@ fn sprite_png_writer_encodes_caller_owned_bytes() -> Result<(), Box<dyn std::err
     assert_eq!(&png_bytes[..PNG_SIGNATURE.len()], PNG_SIGNATURE);
     let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)?.to_rgba8();
     assert_eq!(decoded.dimensions(), (2, 1));
-    assert_eq!(decoded.as_raw(), &[0, 0, 255, 128, 255, 255, 255, 64]);
+    assert_eq!(decoded.as_raw(), &[255, 0, 0, 255, 0, 255, 0, 192]);
+
+    let top_sprite = Sprite {
+        rect_y: 1.0,
+        rect_width: 2.0,
+        rect_height: 1.0,
+        ..Default::default()
+    };
+    let mut top_png_sink = Cursor::new(Vec::new());
+    processor.write_sprite_png(&top_sprite, &texture, &mut top_png_sink)?;
+    let top = image::load_from_memory_with_format(&top_png_sink.into_inner(), ImageFormat::Png)?
+        .to_rgba8();
+    assert_eq!(top.as_raw(), &[0, 0, 255, 128, 255, 255, 255, 64]);
     Ok(())
 }
 

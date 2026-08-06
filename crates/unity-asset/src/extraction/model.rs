@@ -24,12 +24,12 @@ use super::manifest::{
 };
 use super::representation::{
     PlannedContent, PlannedFallback, RepresentationContract, RepresentationContractError,
-    RepresentationContractParts,
+    RepresentationContractParts, RepresentationSemantics,
 };
 use crate::reference::{ReferenceDirection, ReferenceTraversalLimits};
 
 pub const EXTRACTION_REQUEST_VERSION: u8 = 4;
-pub const EXTRACTION_PLAN_VERSION: u8 = 6;
+pub const EXTRACTION_PLAN_VERSION: u8 = 7;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -769,6 +769,7 @@ struct PlannedFallbackRef<'artifact> {
     kind: ExtractionArtifactKind,
     path: &'artifact ExtractionPath,
     content: &'artifact PlannedContent,
+    representation_semantics: RepresentationSemantics,
 }
 
 impl<'artifact> From<&'artifact PlannedFallback> for PlannedFallbackRef<'artifact> {
@@ -777,6 +778,7 @@ impl<'artifact> From<&'artifact PlannedFallback> for PlannedFallbackRef<'artifac
             kind: fallback.kind(),
             path: fallback.path(),
             content: fallback.content(),
+            representation_semantics: fallback.representation_semantics(),
         }
     }
 }
@@ -791,6 +793,7 @@ struct PlannedArtifactRef<'artifact> {
     preferred_kind: ExtractionArtifactKind,
     preferred_path: &'artifact ExtractionPath,
     preferred_content: &'artifact PlannedContent,
+    representation_semantics: RepresentationSemantics,
     fallback: Option<PlannedFallbackRef<'artifact>>,
     working_set_bytes: u64,
     diagnostics: &'artifact [ExtractionDiagnostic],
@@ -810,6 +813,7 @@ impl Serialize for PlannedArtifact {
             preferred_kind: self.preferred_kind(),
             preferred_path: self.preferred_path(),
             preferred_content: self.preferred_content(),
+            representation_semantics: self.representation.representation_semantics(),
             fallback: self.representation.fallback().map(PlannedFallbackRef::from),
             working_set_bytes: self.working_set_bytes(),
             diagnostics: self.diagnostics(),
@@ -824,11 +828,18 @@ struct PlannedFallbackWire {
     kind: ExtractionArtifactKind,
     path: ExtractionPath,
     content: PlannedContent,
+    representation_semantics: Option<RepresentationSemantics>,
 }
 
 impl PlannedFallbackWire {
     fn into_fallback(self) -> Result<PlannedFallback, ExtractionModelError> {
-        PlannedFallback::from_declared_parts(self.kind, self.path, self.content).map_err(Into::into)
+        PlannedFallback::from_declared_parts(
+            self.kind,
+            self.path,
+            self.content,
+            self.representation_semantics,
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -843,6 +854,7 @@ struct PlannedArtifactWire {
     preferred_kind: ExtractionArtifactKind,
     preferred_path: ExtractionPath,
     preferred_content: PlannedContent,
+    representation_semantics: Option<RepresentationSemantics>,
     fallback: Option<PlannedFallbackWire>,
     working_set_bytes: u64,
     diagnostics: Vec<ExtractionDiagnostic>,
@@ -859,6 +871,7 @@ impl PlannedArtifactWire {
             preferred_kind,
             preferred_path,
             preferred_content,
+            representation_semantics,
             fallback,
             working_set_bytes,
             diagnostics,
@@ -867,9 +880,15 @@ impl PlannedArtifactWire {
         let fallback = fallback
             .map(PlannedFallbackWire::into_fallback)
             .transpose()?;
-        let representation = RepresentationContract::from_parts(
+        let representation_semantics = representation_semantics.ok_or(
+            RepresentationContractError::MissingRepresentationSemantics {
+                artifact_kind: preferred_content.artifact_kind(),
+            },
+        )?;
+        let representation = RepresentationContract::from_declared_parts(
             ordinal,
             &address,
+            representation_semantics,
             RepresentationContractParts {
                 preferred_path,
                 preferred_content,
@@ -1013,6 +1032,15 @@ impl ExtractionPlan {
     #[must_use]
     pub const fn artifacts(&self) -> &[PlannedArtifact] {
         &self.artifacts
+    }
+
+    pub(crate) fn validate_current_representation_semantics(
+        &self,
+    ) -> Result<(), ExtractionModelError> {
+        for artifact in &self.artifacts {
+            artifact.representation.validate_current_semantics()?;
+        }
+        Ok(())
     }
 
     pub fn canonical_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
@@ -1516,6 +1544,12 @@ pub enum ExtractionModelError {
         declared: ExtractionArtifactKind,
         actual: ExtractionArtifactKind,
     },
+    #[error("{artifact_kind:?} representation is missing its implementation semantics")]
+    MissingRepresentationSemantics {
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("representation semantics do not match the current implementation")]
+    RepresentationSemanticsMismatch,
     #[error("preferred and fallback outputs collide at {0:?}")]
     FallbackPathCollision(String),
     #[error("decoded extraction fallbacks must be raw binary outputs")]
@@ -1608,6 +1642,12 @@ pub enum ExtractionModelError {
 impl From<RepresentationContractError> for ExtractionModelError {
     fn from(error: RepresentationContractError) -> Self {
         match error {
+            RepresentationContractError::MissingRepresentationSemantics { artifact_kind } => {
+                Self::MissingRepresentationSemantics { artifact_kind }
+            }
+            RepresentationContractError::RepresentationSemanticsMismatch { .. } => {
+                Self::RepresentationSemanticsMismatch
+            }
             RepresentationContractError::MediaDescriptorFamilyMismatch { expected, actual } => {
                 Self::MediaDescriptorFamilyMismatch { expected, actual }
             }
@@ -1712,6 +1752,23 @@ mod tests {
         .unwrap()
     }
 
+    fn planned_text_plan() -> ExtractionPlan {
+        let artifact = planned_text_artifact();
+        let source = ExtractionSourceExpectation::new(
+            artifact.address().source_locator().clone(),
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, b"content"),
+        );
+        ExtractionPlan::new(
+            WorkspaceId::from_u128(1).unwrap(),
+            WorkspaceRevision::new(DigestV1::hash_bytes(b"revision")),
+            ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded),
+            ExtractionSelectionWitness::new(1, DigestV1::hash_bytes(b"selection")),
+            vec![source],
+            vec![artifact],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn request_v4_persists_reference_intent_without_query_only_limits() {
         let root = ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
@@ -1777,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v6_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
+    fn plan_v7_artifact_serializes_derived_kinds_and_semantics() {
         let artifact = planned_text_artifact();
         let encoded = serde_json::to_value(&artifact).unwrap();
 
@@ -1786,14 +1843,91 @@ mod tests {
             encoded["preferred_content"]["kind"],
             serde_json::json!("text_asset")
         );
+        assert_eq!(
+            encoded["representation_semantics"],
+            serde_json::json!({
+                "kind": "text_asset",
+                "bytes": "type_tree_script_bytes_v1",
+            })
+        );
         assert_eq!(encoded["fallback"]["kind"], serde_json::json!("binary_raw"));
         assert_eq!(
             encoded["fallback"]["content"]["kind"],
             serde_json::json!("raw_binary")
         );
+        assert_eq!(
+            encoded["fallback"]["representation_semantics"],
+            serde_json::json!({
+                "kind": "raw_binary",
+                "bytes": "workspace_object_raw_bytes_v1",
+            })
+        );
 
         let wire: PlannedArtifactWire = serde_json::from_value(encoded).unwrap();
         assert_eq!(wire.into_artifact().unwrap(), artifact);
+    }
+
+    #[test]
+    fn plan_v7_digest_covers_representation_semantics() {
+        let plan = planned_text_plan();
+        let canonical = plan.canonical_json().unwrap();
+        assert_eq!(plan.digest().unwrap(), DigestV1::hash_bytes(&canonical));
+        assert!(
+            canonical
+                .windows(b"representation_semantics".len())
+                .any(|window| { window == b"representation_semantics" })
+        );
+        assert!(
+            canonical
+                .windows(b"type_tree_script_bytes_v1".len())
+                .any(|window| { window == b"type_tree_script_bytes_v1" })
+        );
+    }
+
+    #[test]
+    fn legacy_v6_plan_is_rejected_before_missing_semantics_are_interpreted() {
+        let mut legacy = serde_json::to_value(planned_text_plan()).unwrap();
+        legacy["version"] = serde_json::json!(6);
+        legacy["artifacts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("representation_semantics");
+        legacy["artifacts"][0]["fallback"]
+            .as_object_mut()
+            .unwrap()
+            .remove("representation_semantics");
+
+        let error = serde_json::from_value::<ExtractionPlan>(legacy).unwrap_err();
+        assert!(error.to_string().contains("plan version 6 is unsupported"));
+    }
+
+    #[test]
+    fn v7_plan_rejects_missing_or_mismatched_semantics() {
+        let encoded = serde_json::to_value(planned_text_plan()).unwrap();
+
+        let mut missing = encoded.clone();
+        missing["artifacts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("representation_semantics");
+        let error = serde_json::from_value::<ExtractionPlan>(missing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing its implementation semantics")
+        );
+
+        let mut mismatched = encoded;
+        mismatched["artifacts"][0]["representation_semantics"] = serde_json::json!({
+            "kind": "raw_binary",
+            "bytes": "workspace_object_raw_bytes_v1",
+        });
+        let error = serde_json::from_value::<ExtractionPlan>(mismatched).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("do not match the current implementation")
+        );
     }
 
     #[test]
@@ -1865,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v6_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+    fn plan_v7_artifact_rejects_tampered_preferred_and_fallback_kinds() {
         let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
 
         let mut preferred = encoded.clone();

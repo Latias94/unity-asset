@@ -18,7 +18,7 @@ use thiserror::Error;
 use unity_asset_binary::{BinaryError, Result};
 use unity_asset_core::{AssetLoadBudget, BudgetError};
 
-/// A validated standard audio artifact that owns its exact output bytes.
+/// A standard audio artifact with validated container framing and exact owned output bytes.
 pub struct PreparedAudioSource {
     output: PreparedAudioOutput,
     descriptor: MediaDescriptor,
@@ -56,7 +56,7 @@ impl PreparedAudioSource {
     }
 }
 
-/// Failures while validating or writing a playable audio artifact.
+/// Failures while validating or writing a standard-container audio artifact.
 #[derive(Debug, Error)]
 pub enum AudioSourceError {
     #[error("invalid audio source data: {0}")]
@@ -138,8 +138,8 @@ impl AudioExporter {
         )
     }
 
-    /// Validate a Unity audio payload and prepare a deterministic standard
-    /// container export under the caller's load budget.
+    /// Validate supported container framing and prepare a deterministic
+    /// standard-container export under the caller's load budget.
     pub fn prepare_standard_source(
         clip: &AudioClip,
         bytes: BudgetedMediaBytes,
@@ -214,7 +214,13 @@ impl AudioExporter {
                 )
             }
             AudioCompressionFormat::MP3 if is_mp3(source) => (PreparedAudioSourceKind::Mp3, None),
-            AudioCompressionFormat::AAC if is_adts_aac(source) => {
+            AudioCompressionFormat::AAC if is_iso_base_media(source) => {
+                return Err(AudioSourceError::UnsupportedContainer {
+                    format: AudioCompressionFormat::AAC,
+                    container: "ISO BMFF/M4A AAC",
+                });
+            }
+            AudioCompressionFormat::AAC if is_adts_framed_aac(source) => {
                 (PreparedAudioSourceKind::AdtsAac, None)
             }
             format if Self::supports_standard_source(format) => {
@@ -245,7 +251,7 @@ impl AudioExporter {
         Ok(PreparedAudioSource { output, descriptor })
     }
 
-    /// Write a standard playable container from an AudioClip payload.
+    /// Write a framing-validated standard-container representation from an AudioClip payload.
     ///
     /// Vorbis clips may carry an FSB5 bank instead of an Ogg stream. In that
     /// case this method reconstructs the selected subsound as Ogg/Vorbis. It
@@ -492,18 +498,34 @@ fn is_mp3(bytes: &[u8]) -> bool {
     frames > 0 && cursor == frame_end
 }
 
-fn is_adts_aac(bytes: &[u8]) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AdtsStreamConfig {
+    mpeg_id: u8,
+    profile: u8,
+    sampling_frequency_index: u8,
+    channel_configuration: u16,
+}
+
+fn is_adts_framed_aac(bytes: &[u8]) -> bool {
     let mut cursor = 0_usize;
-    let mut frames = 0_usize;
+    let mut saw_frame = false;
+    let mut stream_config = None;
     while cursor < bytes.len() {
-        let Some(header) = bytes.get(cursor..cursor.saturating_add(7)) else {
+        let Some(header_end) = cursor.checked_add(7) else {
             return false;
         };
+        let Some(header) = bytes.get(cursor..header_end) else {
+            return false;
+        };
+        let mpeg_id = (header[1] >> 3) & 0x01;
+        let profile = header[2] >> 6;
         let sampling_frequency_index = (header[2] >> 2) & 0x0F;
         if header[0] != 0xFF
             || header[1] & 0xF0 != 0xF0
             || header[1] & 0x06 != 0
+            || header[1] & 0x01 == 0
             || sampling_frequency_index >= 13
+            || (mpeg_id == 1 && profile == 3)
         {
             return false;
         }
@@ -511,11 +533,32 @@ fn is_adts_aac(bytes: &[u8]) -> bool {
         if channel_configuration == 0 {
             return false;
         }
-        let header_length = if header[1] & 0x01 == 0 { 9 } else { 7 };
+        let config = AdtsStreamConfig {
+            mpeg_id,
+            profile,
+            sampling_frequency_index,
+            channel_configuration,
+        };
+        if stream_config.is_some_and(|expected| expected != config) {
+            return false;
+        }
+        stream_config = Some(config);
+
+        // Multiple raw data blocks require CRC placement and AAC syntax
+        // validation that this allocation-free framing check does not claim.
+        if header[6] & 0x03 != 0 {
+            return false;
+        }
+        let header_length = 7;
         let frame_length = (usize::from(header[3] & 0x03) << 11)
             | (usize::from(header[4]) << 3)
             | usize::from(header[5] >> 5);
-        if frame_length <= header_length {
+        // A one-byte placeholder can satisfy ADTS length arithmetic without
+        // providing enough payload for a useful raw data block. The exporter
+        // deliberately makes only a framing guarantee, but rejects this
+        // common truncated-fixture shape.
+        const MIN_RAW_DATA_BLOCK_BYTES: usize = 2;
+        if frame_length < header_length + MIN_RAW_DATA_BLOCK_BYTES {
             return false;
         }
         let Some(next) = cursor.checked_add(frame_length) else {
@@ -525,9 +568,39 @@ fn is_adts_aac(bytes: &[u8]) -> bool {
             return false;
         }
         cursor = next;
-        frames = frames.saturating_add(1);
+        saw_frame = true;
     }
-    frames > 0
+    saw_frame && cursor == bytes.len()
+}
+
+fn is_iso_base_media(bytes: &[u8]) -> bool {
+    let Some(header) = bytes.get(..8) else {
+        return false;
+    };
+    if &header[4..8] != b"ftyp" {
+        return false;
+    }
+
+    match u32::from_be_bytes([header[0], header[1], header[2], header[3]]) {
+        0 => bytes.len() >= 16,
+        1 => {
+            let Some(extended_size) = bytes.get(8..16) else {
+                return false;
+            };
+            let size = u64::from_be_bytes([
+                extended_size[0],
+                extended_size[1],
+                extended_size[2],
+                extended_size[3],
+                extended_size[4],
+                extended_size[5],
+                extended_size[6],
+                extended_size[7],
+            ]);
+            size >= 24 && usize::try_from(size).is_ok_and(|size| size <= bytes.len())
+        }
+        size => size >= 16 && usize::try_from(size).is_ok_and(|size| size <= bytes.len()),
+    }
 }
 
 fn valid_wave_format(

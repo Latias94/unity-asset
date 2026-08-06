@@ -260,11 +260,14 @@ mod tests {
 
     #[test]
     fn sprite_preparation_budget_has_exact_and_one_short_boundaries() {
-        let source = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0];
+        let source = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, // Unity bottom row
+            0, 0, 255, 255, 255, 255, 0, 255, // Unity top row
+        ];
         let sprite = sprite_object();
         let texture = texture_object(&source);
         let sprite_layout = SpriteLayout::inspect(&sprite).unwrap();
-        let texture_layout = Texture2DLayout::inspect(&texture).unwrap();
+        let texture_layout = Texture2DLayout::inspect_for_test(&texture, Some(5)).unwrap();
         let mut measured = AssetLoadBudget::default();
         let measured_source = budgeted_source(source.clone(), &mut measured);
         let prepared = PreparedSpritePng::prepare(
@@ -279,7 +282,7 @@ mod tests {
             Some(MediaDimensions::new(1, 1).unwrap())
         );
         let image = image::load_from_memory(&prepared.bytes).unwrap().to_rgba8();
-        assert_eq!(image.get_pixel(0, 0).0, [0, 255, 0, 255]);
+        assert_eq!(image.get_pixel(0, 0).0, [255, 255, 0, 255]);
         let usage = measured.usage();
         let limits = AssetLoadLimits {
             max_bytes: usage.bytes,

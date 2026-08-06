@@ -22,7 +22,7 @@
 //! let converter = Texture2DConverter::new();
 //!
 //! // Convert Unity object to Texture2D (assuming you have a UnityObject)
-//! // let texture = converter.from_unity_object(&unity_object)?;
+//! // let texture = converter.from_unity_object(&unity_object, serialized_file.object_context())?;
 //!
 //! // Create a decoder and decode to image
 //! let decoder = TextureDecoder::new();
@@ -46,9 +46,10 @@ pub use converter::Texture2DConverter;
 pub use decoders::TextureDecoder;
 pub use formats::{TextureFormat, TextureFormatInfo};
 pub use helpers::{TextureExporter, TextureSwizzler};
-pub use inspection::Texture2DLayout;
+pub use inspection::{MediaInspectionContext, Texture2DLayout};
 pub use prepared::{PreparedTexturePng, TexturePreparationError};
 pub use types::{GLTextureSettings, StreamingInfo, Texture2D};
+pub use unity_asset_binary::asset::SerializedObjectContext;
 
 /// Main texture processing facade
 ///
@@ -72,8 +73,9 @@ impl TextureProcessor {
     pub fn convert_object(
         &self,
         obj: &unity_asset_binary::object::UnityObject,
+        context: SerializedObjectContext,
     ) -> unity_asset_binary::Result<Texture2D> {
-        self.converter.from_unity_object(obj)
+        self.converter.from_unity_object(obj, context)
     }
 
     /// Decode texture to RGBA image
@@ -88,9 +90,10 @@ impl TextureProcessor {
     pub fn process_and_write_png<W: std::io::Write + ?Sized>(
         &self,
         obj: &unity_asset_binary::object::UnityObject,
+        context: SerializedObjectContext,
         writer: &mut W,
     ) -> unity_asset_binary::Result<()> {
-        let texture = self.convert_object(obj)?;
+        let texture = self.convert_object(obj, context)?;
         let image = self.decode_texture(&texture)?;
         TextureExporter::write_png(&image, writer)
     }
@@ -173,6 +176,27 @@ mod tests {
         let formats = get_supported_formats();
         assert!(!formats.is_empty());
         assert!(formats.contains(&TextureFormat::RGBA32));
+    }
+
+    #[test]
+    fn public_decode_normalizes_unity_rows_to_top_left_rgba() {
+        let texture = Texture2D {
+            width: 1,
+            height: 2,
+            complete_image_size: 8,
+            format: TextureFormat::RGBA32,
+            data_size: 8,
+            image_data: vec![
+                255, 0, 0, 255, // Unity bottom row.
+                0, 0, 255, 255, // Unity top row.
+            ],
+            ..Texture2D::default()
+        };
+
+        let image = TextureDecoder::new().decode(&texture).unwrap();
+
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(image.get_pixel(0, 1).0, [255, 0, 0, 255]);
     }
 
     #[test]

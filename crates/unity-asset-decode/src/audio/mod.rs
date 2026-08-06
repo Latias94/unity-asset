@@ -168,17 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn test_processor_creation() {
-        let version =
-            unity_asset_binary::unity_version::UnityVersion::parse_version("2020.3.12f1").unwrap();
-        let processor = AudioProcessor::new(version);
-        // Basic test - processor should be created successfully
-        assert!(
-            !processor.supported_formats().is_empty() || processor.supported_formats().is_empty()
-        );
-    }
-
-    #[test]
     fn test_supported_formats_list() {
         let formats = get_supported_formats();
         assert!(!formats.is_empty());

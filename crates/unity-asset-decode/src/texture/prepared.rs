@@ -9,7 +9,8 @@ use thiserror::Error;
 use unity_asset_core::{AssetLoadBudget, BudgetError};
 
 use super::decoders::{TextureDecodeFailure, TextureDecoder};
-use super::inspection::Texture2DLayout;
+use super::helpers::TextureSwizzler;
+use super::inspection::{Texture2DLayout, TextureStorageLayout};
 use crate::descriptor::{
     MediaDescriptor, MediaDescriptorError, MediaDimensions, MediaOutputEstimate,
     UnityTextureEncoding,
@@ -77,7 +78,6 @@ impl PreparedTextureImage {
         source: BudgetedMediaBytes,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, TexturePreparationError> {
-        source.validate_budget(budget)?;
         let source_length = u64::try_from(source.len())
             .map_err(|_| TexturePreparationError::LengthOverflow("texture source"))?;
         if source_length != layout.complete_image_size() {
@@ -90,21 +90,72 @@ impl PreparedTextureImage {
             .format()
             .descriptor_encoding()
             .ok_or(TexturePreparationError::UnsupportedFormat(layout.format()))?;
-        let image = TextureDecoder::new()
+        let source = prepare_platform_source(layout, source.into_vec(budget)?, budget)?;
+        let mut image = TextureDecoder::new()
             .decode_prepared(
                 layout.width(),
                 layout.height(),
                 layout.format(),
-                source.as_bytes(),
+                &source,
                 budget,
             )
             .map_err(map_decode_failure)?;
+        TextureSwizzler::normalize_top_left(&mut image);
 
         Ok(Self {
             source_length,
             encoding,
             image,
         })
+    }
+}
+
+fn prepare_platform_source(
+    layout: Texture2DLayout<'_>,
+    mut source: Vec<u8>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<u8>, TexturePreparationError> {
+    match layout.context().storage() {
+        TextureStorageLayout::Linear | TextureStorageLayout::SwitchLinear => Ok(source),
+        TextureStorageLayout::Xbox360WordSwapped => {
+            for word in source.chunks_mut(2) {
+                word.reverse();
+            }
+            Ok(source)
+        }
+        TextureStorageLayout::SwitchBlockLinear {
+            block_width,
+            block_height,
+            gobs_per_block,
+        } => {
+            let requested = source.len();
+            let requested_u64 = u64::try_from(requested)
+                .map_err(|_| TexturePreparationError::LengthOverflow("Switch texture source"))?;
+            budget.check_bytes(requested_u64)?;
+            let mut linear = Vec::new();
+            linear.try_reserve_exact(requested).map_err(|source| {
+                TexturePreparationError::Allocation {
+                    resource: "Nintendo Switch linear texture",
+                    requested,
+                    source,
+                }
+            })?;
+            let retained = u64::try_from(linear.capacity())
+                .map_err(|_| TexturePreparationError::LengthOverflow("Switch linear texture"))?;
+            budget.consume_bytes(retained)?;
+            linear.resize(requested, 0);
+            TextureSwizzler::deswizzle_switch_block_linear(
+                &source,
+                &mut linear,
+                layout.width(),
+                layout.height(),
+                block_width,
+                block_height,
+                gobs_per_block,
+            )
+            .map_err(TexturePreparationError::Decode)?;
+            Ok(linear)
+        }
     }
 }
 
@@ -511,12 +562,34 @@ mod tests {
     use unity_asset_binary::asset::{ObjectInfo, class_ids};
     use unity_asset_binary::object::UnityObject;
 
+    fn inspect_layout(object: &UnityObject) -> Texture2DLayout<'_> {
+        inspect_layout_for_platform(object, 5)
+    }
+
+    fn inspect_layout_for_platform(
+        object: &UnityObject,
+        target_platform: i32,
+    ) -> Texture2DLayout<'_> {
+        Texture2DLayout::inspect_for_test(object, Some(target_platform)).unwrap()
+    }
+
     fn texture_object(
         format: super::super::formats::TextureFormat,
         width: i64,
         height: i64,
         bytes: &[u8],
         streamed: bool,
+    ) -> UnityObject {
+        texture_object_with_platform_blob(format, width, height, bytes, streamed, None)
+    }
+
+    fn texture_object_with_platform_blob(
+        format: super::super::formats::TextureFormat,
+        width: i64,
+        height: i64,
+        bytes: &[u8],
+        streamed: bool,
+        platform_blob: Option<Vec<u8>>,
     ) -> UnityObject {
         let mut properties = IndexMap::from([
             ("m_Width".to_owned(), UnityValue::Integer(width)),
@@ -533,6 +606,12 @@ mod tests {
                 UnityValue::Integer(i64::try_from(bytes.len()).unwrap()),
             ),
         ]);
+        if let Some(platform_blob) = platform_blob {
+            properties.insert(
+                "m_PlatformBlob".to_owned(),
+                UnityValue::Bytes(platform_blob),
+            );
+        }
         if streamed {
             properties.insert(
                 "m_StreamData".to_owned(),
@@ -561,6 +640,31 @@ mod tests {
         UnityObject::from_info_and_class(info, class)
     }
 
+    fn switch_swizzle_rgba32(linear: &[u8], width: usize, height: usize, gobs: usize) -> Vec<u8> {
+        let units_x = width / 4;
+        let units_y = height;
+        let mut swizzled = vec![0_u8; linear.len()];
+        let mut destination = 0_usize;
+        for block_y in 0..(units_y / (8 * gobs)) {
+            for block_x in 0..(units_x / 4) {
+                let base_x = block_x * 4;
+                for gob_y in 0..gobs {
+                    let base_y = (block_y * gobs + gob_y) * 8;
+                    for ordinal in 0..32_usize {
+                        let local_x = ((ordinal >> 3) & 0b10) | ((ordinal >> 1) & 0b1);
+                        let local_y = ((ordinal >> 1) & 0b110) | (ordinal & 0b1);
+                        let source = ((base_y + local_y) * units_x + base_x + local_x) * 16;
+                        swizzled[destination..destination + 16]
+                            .copy_from_slice(&linear[source..source + 16]);
+                        destination += 16;
+                    }
+                }
+            }
+        }
+        assert_eq!(destination, swizzled.len());
+        swizzled
+    }
+
     fn rgba_layout() -> (UnityObject, Vec<u8>) {
         let bytes = vec![255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 0, 0];
         (
@@ -582,7 +686,7 @@ mod tests {
     #[test]
     fn prepared_texture_owns_exact_png_identity() {
         let (object, source) = rgba_layout();
-        let layout = Texture2DLayout::inspect(&object).unwrap();
+        let layout = inspect_layout(&object);
         let mut budget = AssetLoadBudget::default();
         let source = budgeted_source(source, &mut budget);
         let prepared = PreparedTexturePng::prepare(layout, source, &mut budget).unwrap();
@@ -601,6 +705,101 @@ mod tests {
             u64::try_from(output.len()).unwrap(),
             prepared.descriptor().output().upper_bound()
         );
+    }
+
+    #[test]
+    fn prepared_texture_normalizes_unity_rows_to_top_left_once() {
+        let source = vec![
+            255, 0, 0, 255, 0, 255, 0, 255, // Unity bottom row
+            0, 0, 255, 255, 255, 255, 0, 255, // Unity top row
+        ];
+        let object = texture_object(
+            super::super::formats::TextureFormat::RGBA32,
+            2,
+            2,
+            &source,
+            false,
+        );
+        let layout = inspect_layout(&object);
+        let mut budget = AssetLoadBudget::default();
+        let source = budgeted_source(source, &mut budget);
+        let prepared = PreparedTexturePng::prepare(layout, source, &mut budget).unwrap();
+        let image = image::load_from_memory(&prepared.bytes).unwrap().to_rgba8();
+
+        assert_eq!(image.get_pixel(0, 0).0, [0, 0, 255, 255]);
+        assert_eq!(image.get_pixel(1, 0).0, [255, 255, 0, 255]);
+        assert_eq!(image.get_pixel(0, 1).0, [255, 0, 0, 255]);
+        assert_eq!(image.get_pixel(1, 1).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn xbox_360_rgb565_words_are_restored_before_decode() {
+        let source = vec![0xf8, 0x00];
+        let object = texture_object(
+            super::super::formats::TextureFormat::RGB565,
+            1,
+            1,
+            &source,
+            false,
+        );
+        let layout = inspect_layout_for_platform(&object, 11);
+        let mut budget = AssetLoadBudget::default();
+        let source = budgeted_source(source, &mut budget);
+        let prepared = PreparedTexturePng::prepare(layout, source, &mut budget).unwrap();
+        let image = image::load_from_memory(&prepared.bytes).unwrap().to_rgba8();
+
+        assert_eq!(image.get_pixel(0, 0).0, [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn xbox_360_argb4444_words_are_restored_before_decode() {
+        let source = vec![0xfa, 0xbc];
+        let object = texture_object(
+            super::super::formats::TextureFormat::ARGB4444,
+            1,
+            1,
+            &source,
+            false,
+        );
+        let layout = inspect_layout_for_platform(&object, 11);
+        let mut budget = AssetLoadBudget::default();
+        let source = budgeted_source(source, &mut budget);
+        let prepared = PreparedTexturePng::prepare(layout, source, &mut budget).unwrap();
+        let image = image::load_from_memory(&prepared.bytes).unwrap().to_rgba8();
+
+        assert_eq!(image.get_pixel(0, 0).0, [0xaa, 0xbb, 0xcc, 0xff]);
+    }
+
+    #[test]
+    fn switch_block_linear_rgba_is_deswizzled_before_origin_normalization() {
+        let width = 16_usize;
+        let height = 16_usize;
+        let mut linear = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                linear.extend_from_slice(&[x as u8, y as u8, (x ^ y) as u8, 255]);
+            }
+        }
+        let swizzled = switch_swizzle_rgba32(&linear, width, height, 2);
+        let mut platform_blob = vec![0_u8; 12];
+        platform_blob[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        let object = texture_object_with_platform_blob(
+            super::super::formats::TextureFormat::RGBA32,
+            width as i64,
+            height as i64,
+            &swizzled,
+            false,
+            Some(platform_blob),
+        );
+        let layout = inspect_layout_for_platform(&object, 38);
+        let mut budget = AssetLoadBudget::default();
+        let source = budgeted_source(swizzled, &mut budget);
+        let prepared = PreparedTexturePng::prepare(layout, source, &mut budget).unwrap();
+        let image = image::load_from_memory(&prepared.bytes).unwrap().to_rgba8();
+
+        assert_eq!(image.get_pixel(0, 0).0, [0, 15, 15, 255]);
+        assert_eq!(image.get_pixel(13, 0).0, [13, 15, 2, 255]);
+        assert_eq!(image.get_pixel(0, 15).0, [0, 0, 0, 255]);
     }
 
     #[test]
@@ -651,7 +850,7 @@ mod tests {
     #[test]
     fn texture_preparation_budget_has_exact_and_one_short_boundaries() {
         let (object, source) = rgba_layout();
-        let layout = Texture2DLayout::inspect(&object).unwrap();
+        let layout = inspect_layout(&object);
         let mut measured = AssetLoadBudget::default();
         let measured_source = budgeted_source(source.clone(), &mut measured);
         PreparedTexturePng::prepare(layout, measured_source, &mut measured).unwrap();
@@ -700,7 +899,7 @@ mod tests {
         let mut inline_budget = AssetLoadBudget::default();
         let inline_source = budgeted_source(bytes.clone(), &mut inline_budget);
         let inline = PreparedTexturePng::prepare(
-            Texture2DLayout::inspect(&inline_object).unwrap(),
+            inspect_layout(&inline_object),
             inline_source,
             &mut inline_budget,
         )
@@ -708,7 +907,7 @@ mod tests {
         let mut streamed_budget = AssetLoadBudget::default();
         let streamed_source = budgeted_source(bytes, &mut streamed_budget);
         let streamed = PreparedTexturePng::prepare(
-            Texture2DLayout::inspect(&streamed_object).unwrap(),
+            inspect_layout(&streamed_object),
             streamed_source,
             &mut streamed_budget,
         )
@@ -725,7 +924,7 @@ mod tests {
     #[test]
     fn preparation_rejects_source_truncation_after_inspection() {
         let (object, mut source) = rgba_layout();
-        let layout = Texture2DLayout::inspect(&object).unwrap();
+        let layout = inspect_layout(&object);
         source.pop();
         let mut budget = AssetLoadBudget::default();
         let source = budgeted_source(source, &mut budget);
@@ -754,12 +953,9 @@ mod tests {
             let object = texture_object(format, 4, 4, &source, false);
             let mut budget = AssetLoadBudget::default();
             let source = budgeted_source(source, &mut budget);
-            let prepared = PreparedTexturePng::prepare(
-                Texture2DLayout::inspect(&object).unwrap(),
-                source,
-                &mut budget,
-            )
-            .unwrap_or_else(|error| panic!("{format:?} preparation failed: {error}"));
+            let prepared =
+                PreparedTexturePng::prepare(inspect_layout(&object), source, &mut budget)
+                    .unwrap_or_else(|error| panic!("{format:?} preparation failed: {error}"));
             assert_eq!(prepared.descriptor().texture_encoding(), Some(encoding));
             let mut png = Vec::new();
             prepared.write_to(&mut png).unwrap();

@@ -8,6 +8,8 @@ use serde::de::{Error as _, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+#[cfg(feature = "decode")]
+use unity_asset_binary::asset::SerializedObjectContext;
 use unity_asset_binary::asset::{SerializedFile, SerializedFileInspection};
 use unity_asset_binary::bundle::{AssetBundle, BundleInspection, BundleLayoutKind};
 use unity_asset_binary::compression::CompressionType;
@@ -162,6 +164,9 @@ pub struct SerializedFileSummary {
     declared_file_size: u64,
     unity_version: String,
     target_platform: i32,
+    #[cfg(feature = "decode")]
+    #[serde(skip)]
+    object_context: Option<SerializedObjectContext>,
     type_tree_enabled: bool,
     legacy_big_id: Option<i32>,
     object_count: u64,
@@ -190,6 +195,8 @@ impl SerializedFileSummary {
                 "serialized_file_unity_version",
             )?,
             target_platform: file.target_platform,
+            #[cfg(feature = "decode")]
+            object_context: Some(file.object_context()),
             type_tree_enabled: file.type_tree_enabled(),
             legacy_big_id: file.legacy_big_id(),
             object_count: usize_to_u64(file.objects().len(), "serialized_object_count")?,
@@ -224,6 +231,8 @@ impl SerializedFileSummary {
                 "serialized_file_unity_version",
             )?,
             target_platform: proof.target_platform(),
+            #[cfg(feature = "decode")]
+            object_context: Some(proof.object_context()),
             type_tree_enabled: proof.type_tree_enabled(),
             legacy_big_id: proof.legacy_big_id(),
             object_count: usize_to_u64(proof.objects().len(), "serialized_object_count")?,
@@ -268,6 +277,11 @@ impl SerializedFileSummary {
     #[must_use]
     pub const fn target_platform(&self) -> i32 {
         self.target_platform
+    }
+
+    #[cfg(feature = "decode")]
+    pub(crate) const fn object_context(&self) -> Option<SerializedObjectContext> {
+        self.object_context
     }
 
     #[must_use]
@@ -564,6 +578,8 @@ impl WorkspaceSourceFormatInspection {
                 declared_file_size: 0,
                 unity_version: String::new(),
                 target_platform: 0,
+                #[cfg(feature = "decode")]
+                object_context: None,
                 type_tree_enabled: false,
                 legacy_big_id: None,
                 object_count: 0,
@@ -1348,6 +1364,14 @@ impl<'view> WorkspaceInspector<'view> {
         }
     }
 
+    #[cfg(feature = "decode")]
+    pub(crate) fn serialized_object_context(
+        &self,
+        source: SourceId,
+    ) -> Result<SerializedObjectContext, WorkspaceError> {
+        serialized_object_context(reference_view_parts(self.view), source)
+    }
+
     pub fn object(
         &self,
         address: &ObjectAddress,
@@ -1549,6 +1573,66 @@ fn format_inspection(
             }
         }
     }
+}
+
+#[cfg(feature = "decode")]
+fn serialized_object_context(
+    parts: ReferenceViewParts<'_>,
+    source: SourceId,
+) -> Result<SerializedObjectContext, WorkspaceError> {
+    match parts.state {
+        ReferenceViewState::Committed(state) => state
+            .store()
+            .get(source)
+            .ok_or(WorkspaceError::MissingSource(source))
+            .and_then(|entry| stored_object_context(entry.format())),
+        ReferenceViewState::Prepared(state) => {
+            let Some(binding) = state.source_binding(source) else {
+                return state
+                    .base()
+                    .state()
+                    .store()
+                    .get(source)
+                    .ok_or(WorkspaceError::MissingSource(source))
+                    .and_then(|entry| stored_object_context(entry.format()));
+            };
+            let artifact = state
+                .artifacts()
+                .artifact(binding.artifact())
+                .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
+            match artifact.format() {
+                PreparedArtifactFormat::SerializedFile(proof) => Ok(proof.object_context()),
+                PreparedArtifactFormat::VerbatimSource(_) => state
+                    .base()
+                    .state()
+                    .store()
+                    .get(source)
+                    .ok_or(WorkspaceError::MissingSource(source))
+                    .and_then(|entry| stored_object_context(entry.format())),
+                _ => Err(invalid_texture_owner()),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "decode")]
+fn stored_object_context(
+    format: &WorkspaceSourceFormatInspection,
+) -> Result<SerializedObjectContext, WorkspaceError> {
+    match format {
+        WorkspaceSourceFormatInspection::SerializedFile(summary) => {
+            summary.object_context().ok_or_else(invalid_texture_owner)
+        }
+        _ => Err(invalid_texture_owner()),
+    }
+}
+
+#[cfg(feature = "decode")]
+fn invalid_texture_owner() -> WorkspaceError {
+    WorkspaceError::operation(
+        "Texture2D media context",
+        io::Error::other("binary object owner is not a SerializedFile"),
+    )
 }
 
 fn catalog<'parts>(

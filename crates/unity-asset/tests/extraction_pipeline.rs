@@ -531,6 +531,18 @@ fn planning_is_write_free_and_worker_count_does_not_change_manifest() {
             if source.to_string().contains("report version 2 is unsupported")
     ));
 
+    legacy_report["manifest"]["version"] = serde_json::Value::from(2);
+    let error = ExtractionReport::read_json(
+        serde_json::to_vec(&legacy_report).unwrap().as_slice(),
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        BudgetedJsonError::Json(source)
+            if source.to_string().contains("report version 2 is unsupported")
+    ));
+
     let canonical_report: serde_json::Value = serde_json::from_slice(&report_encoded).unwrap();
     for field in ["written", "resumed", "skipped_existing", "failed"] {
         let mut tampered = canonical_report.clone();
@@ -1456,6 +1468,10 @@ fn execution_rejects_a_serialized_raw_downgrade_of_decodable_media() {
     wire["artifacts"][0]["preferred_path"] = serde_json::json!(raw_path);
     wire["artifacts"][0]["preferred_content"] = serde_json::json!({
         "kind": "raw_binary",
+    });
+    wire["artifacts"][0]["representation_semantics"] = serde_json::json!({
+        "kind": "raw_binary",
+        "bytes": "workspace_object_raw_bytes_v1",
     });
     wire["artifacts"][0]["fallback"] = serde_json::Value::Null;
     wire["artifacts"][0]["diagnostics"] = serde_json::json!([{

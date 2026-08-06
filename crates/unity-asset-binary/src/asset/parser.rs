@@ -1,5 +1,6 @@
 //! SerializedFile parsing entry points and wire decoder.
 
+use super::context::SerializedObjectContext;
 use super::format::{
     MetadataField, ObjectOffsetEncoding, ObjectTailEncoding, ObjectTypeEncoding, PathIdEncoding,
     SerializedFileFormat,
@@ -38,6 +39,7 @@ pub struct SerializedFileInspection {
     declared_file_size: u64,
     unity_version: String,
     target_platform: i32,
+    object_context: SerializedObjectContext,
     type_tree_enabled: bool,
     type_count: u64,
     legacy_big_id: Option<i32>,
@@ -74,6 +76,12 @@ impl SerializedFileInspection {
 
     pub const fn target_platform(&self) -> i32 {
         self.target_platform
+    }
+
+    /// Returns independently parsed file evidence for interpreting serialized object payloads.
+    #[must_use]
+    pub const fn object_context(&self) -> SerializedObjectContext {
+        self.object_context
     }
 
     pub const fn type_tree_enabled(&self) -> bool {
@@ -268,6 +276,7 @@ impl SerializedFileParser {
             )));
         }
         let ParsedParts {
+            format,
             header,
             unity_version,
             target_platform,
@@ -294,6 +303,11 @@ impl SerializedFileParser {
             declared_file_size: header.file_size,
             unity_version,
             target_platform,
+            object_context: SerializedObjectContext::from_wire(
+                format,
+                header.byte_order(),
+                target_platform,
+            ),
             type_tree_enabled: enable_type_tree,
             type_count,
             legacy_big_id,
