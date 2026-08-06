@@ -32,9 +32,9 @@ pub(super) const RECEIPT_SEGMENT_DIRECTORY: &str =
     ".unity-asset-extraction-publication.v1.receipts";
 
 const PUBLICATION_JOURNAL_CONTRACT: &str = "unity_asset.extraction_publication";
-const PUBLICATION_JOURNAL_VERSION: u8 = 1;
+const PUBLICATION_JOURNAL_VERSION: u8 = 2;
 const RECEIPT_SEGMENT_CONTRACT: &str = "unity_asset.extraction_publication_receipt_segment";
-const RECEIPT_SEGMENT_VERSION: u8 = 1;
+const RECEIPT_SEGMENT_VERSION: u8 = 2;
 const RECEIPTS_PER_SEGMENT_U32: u32 = 64;
 const RECEIPTS_PER_SEGMENT: usize = RECEIPTS_PER_SEGMENT_U32 as usize;
 const PUBLICATION_JOURNAL_JSON_LIMITS: unity_asset_core::ContractJsonLimits =

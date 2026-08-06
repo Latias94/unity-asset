@@ -4,11 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
+use unity_asset::reference::{
+    REFERENCE_GRAPH_PROJECTION_SCHEMA, REFERENCE_GRAPH_PROJECTION_VERSION,
+};
 use unity_asset::schema::SchemaRecipePlanner;
 use unity_asset::workspace::{
-    AssetWorkspace, COMMIT_REPORT_VERSION, MutationPlanBuilder, MutationValue,
-    PREPARE_REPORT_VERSION, RECOVERY_DISCOVERY_VERSION, RECOVERY_OUTCOME_VERSION,
-    SourceOpenRequest, WorkspaceOptions, workspace_capabilities,
+    AssetWorkspace, COMMIT_REPORT_VERSION, MUTATION_PLAN_VERSION, MutationPlanBuilder,
+    MutationValue, PREPARE_REPORT_VERSION, RECOVERY_DISCOVERY_VERSION, RECOVERY_OUTCOME_VERSION,
+    SourceOpenRequest, WORKSPACE_CAPABILITY_CATALOG_VERSION, WORKSPACE_OBJECT_INSPECTION_VERSION,
+    WorkspaceOptions, workspace_capabilities,
 };
 use unity_asset::{
     AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceKind, SourceLocator, WorkspaceId,
@@ -95,8 +99,11 @@ fn write_mutation_contracts(root: &Path, input: &Path) -> (PathBuf, PathBuf) {
         )
         .expect("load source");
     let snapshot = workspace.snapshot();
-    let address =
-        ObjectAddress::yaml(SourceLocator::path("scene.prefab").unwrap(), "1001").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "1001".parse().unwrap(),
+    )
+    .unwrap();
     let planner = SchemaRecipePlanner::new(&snapshot);
     let observed = planner
         .inspect(&address, &mut AssetLoadBudget::default())
@@ -166,9 +173,15 @@ fn workspace_capabilities_emit_the_stable_library_contract() {
     let catalog: Value =
         serde_json::from_slice(&first.stdout).expect("capability output must be JSON");
     assert_eq!(catalog["contract"], "unity_asset.workspace_capabilities");
-    assert_eq!(catalog["contract_version"], 1);
-    assert_eq!(catalog["contracts"]["mutation_plan"], 2);
-    assert_eq!(catalog["contracts"]["reference_graph_projection"], 1);
+    assert_eq!(
+        catalog["contract_version"],
+        WORKSPACE_CAPABILITY_CATALOG_VERSION
+    );
+    assert_eq!(catalog["contracts"]["mutation_plan"], MUTATION_PLAN_VERSION);
+    assert_eq!(
+        catalog["contracts"]["reference_graph_projection"],
+        REFERENCE_GRAPH_PROJECTION_VERSION
+    );
     assert_eq!(catalog["automation"]["structured_input"], true);
     assert_eq!(catalog["automation"]["display_text_input"], false);
     assert_eq!(catalog["automation"]["generic_command_bus"], false);
@@ -218,7 +231,7 @@ fn workspace_inspection_emits_versioned_sources_and_sorted_objects() {
     assert_eq!(objects.len(), 2);
 
     for object in objects {
-        assert_eq!(object["version"], 1);
+        assert_eq!(object["version"], WORKSPACE_OBJECT_INSPECTION_VERSION);
         assert_eq!(object["format"]["kind"], "yaml");
         assert_eq!(object["workspace_id"], objects[0]["workspace_id"]);
         assert_eq!(object["revision"], objects[0]["revision"]);
@@ -280,8 +293,11 @@ fn workspace_inspection_loads_streamed_resource_companions_for_directory_and_fil
 fn missing_workspace_object_has_a_stable_structured_error() {
     let temp = tempfile::tempdir().expect("temporary workspace must be available");
     let input = write_workspace(temp.path());
-    let address =
-        ObjectAddress::yaml(SourceLocator::path("scene.prefab").unwrap(), "9999").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "9999".parse().unwrap(),
+    )
+    .unwrap();
     let address_path = temp.path().join("missing-object-address.json");
     fs::write(&address_path, serde_json::to_vec(&address).unwrap()).unwrap();
 
@@ -301,8 +317,11 @@ fn missing_workspace_object_has_a_stable_structured_error() {
 #[test]
 fn load_warning_is_embedded_in_the_single_structured_failure() {
     let temp = tempfile::tempdir().expect("temporary workspace must be available");
-    let address =
-        ObjectAddress::yaml(SourceLocator::path("scene.prefab").unwrap(), "1001").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "1001".parse().unwrap(),
+    )
+    .unwrap();
     let address_path = temp.path().join("missing-source-address.json");
     fs::write(&address_path, serde_json::to_vec(&address).unwrap()).unwrap();
 
@@ -370,7 +389,7 @@ fn references_graph_emits_the_versioned_resolved_projection() {
 
     let graph: Value =
         serde_json::from_slice(&output.stdout).expect("reference graph must be JSON");
-    assert_eq!(graph["schema"], "unity-asset.reference-graph.v1");
+    assert_eq!(graph["schema"], REFERENCE_GRAPH_PROJECTION_SCHEMA);
     assert_eq!(graph["complete"], true);
     assert_eq!(graph["coverage"]["total_sources"], 1);
     assert_eq!(graph["coverage"]["scanned_sources"], 1);
@@ -424,7 +443,7 @@ fn typed_workspace_transaction_survives_independent_cli_processes() {
     ]);
     assert_success(&preview);
     let preview: Value = serde_json::from_slice(&preview.stdout).expect("preview must be JSON");
-    assert_eq!(preview["version"], 1);
+    assert_eq!(preview["version"], WORKSPACE_OBJECT_INSPECTION_VERSION);
     assert_eq!(preview["class"]["properties"]["m_Name"], "Committed");
     assert!(
         fs::read_to_string(&input)

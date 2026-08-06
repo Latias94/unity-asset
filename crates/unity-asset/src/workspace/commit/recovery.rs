@@ -66,7 +66,7 @@ use super::publication_protocol::{
 use super::{AssetWorkspace, CommitReport, PublicationTarget, RecoveryLocator, VerificationCharge};
 
 /// Version of the rollback-receipt response contract.
-pub const ROLLBACK_RECEIPT_VERSION: u8 = 2;
+pub const ROLLBACK_RECEIPT_VERSION: u8 = 3;
 
 /// Stable receipt for a transaction whose pre-publication state was restored.
 ///
@@ -160,7 +160,7 @@ impl RollbackReceipt {
 }
 
 /// Version of the terminal recovery-outcome response contract.
-pub const RECOVERY_OUTCOME_VERSION: u8 = 2;
+pub const RECOVERY_OUTCOME_VERSION: u8 = 3;
 
 /// Terminal result of recovering one transaction.
 ///
@@ -4974,7 +4974,7 @@ mod tests {
     fn address() -> ObjectAddress {
         ObjectAddress::yaml(
             SourceLocator::path(SOURCE_ALIAS).expect("source locator"),
-            "1",
+            "1".parse().unwrap(),
         )
         .expect("object address")
     }
@@ -5017,7 +5017,7 @@ mod tests {
     fn resource_address() -> ObjectAddress {
         ObjectAddress::yaml(
             SourceLocator::path(RESOURCE_ALIAS).expect("resource locator"),
-            "1",
+            "1".parse().unwrap(),
         )
         .expect("resource address")
     }
@@ -8048,7 +8048,7 @@ mod tests {
         let encoded_text = serde_json::to_string(&live).expect("serialize live recovery outcome");
         assert!(
             encoded_text
-                .starts_with("{\"version\":2,\"outcome\":{\"status\":\"finalized\",\"report\":")
+                .starts_with("{\"version\":3,\"outcome\":{\"status\":\"finalized\",\"report\":")
         );
         let encoded =
             serde_json::from_str::<serde_json::Value>(&encoded_text).expect("outcome JSON");

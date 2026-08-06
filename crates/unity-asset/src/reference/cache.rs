@@ -14,7 +14,7 @@ use super::index::ReferenceIndex;
 use super::input::{ReferenceSourceOwner, WeakReferenceSourceOwner};
 use super::{ReferenceGraphBuildOptions, ReferenceGraphError};
 
-const REFERENCE_SCANNER_VERSION: u8 = 1;
+const REFERENCE_SCANNER_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum LocalObjectId {

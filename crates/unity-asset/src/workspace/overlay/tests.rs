@@ -269,11 +269,11 @@ fn prepared_view_projects_one_candidate_revision_across_all_queries() {
     );
     let first = objects
         .iter()
-        .find(|handle| handle.object().yaml_anchor() == Some("1"))
+        .find(|handle| handle.object().yaml_file_id() == Some("1".parse().unwrap()))
         .unwrap();
     let second = objects
         .iter()
-        .find(|handle| handle.object().yaml_anchor() == Some("2"))
+        .find(|handle| handle.object().yaml_file_id() == Some("2".parse().unwrap()))
         .unwrap();
     let object = WorkspaceView::read_object(&view, first, &mut AssetLoadBudget::default()).unwrap();
     assert_eq!(
@@ -317,7 +317,7 @@ fn prepared_view_projects_one_candidate_revision_across_all_queries() {
     let base_fact = base_graph
         .facts()
         .iter()
-        .find(|fact| fact.source().object().yaml_anchor() == Some("1"))
+        .find(|fact| fact.source().object().yaml_file_id() == Some("1".parse().unwrap()))
         .unwrap();
     assert!(matches!(
         base_fact.raw_target(),
@@ -329,7 +329,7 @@ fn prepared_view_projects_one_candidate_revision_across_all_queries() {
     let prepared_fact = prepared_graph
         .facts()
         .iter()
-        .find(|fact| fact.source().object().yaml_anchor() == Some("1"))
+        .find(|fact| fact.source().object().yaml_file_id() == Some("1".parse().unwrap()))
         .unwrap();
     assert!(matches!(
         prepared_fact.raw_target(),

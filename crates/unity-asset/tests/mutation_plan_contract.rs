@@ -117,7 +117,7 @@ fn raw_binary_address() -> ObjectAddress {
 }
 
 fn yaml_address() -> ObjectAddress {
-    ObjectAddress::yaml(yaml_locator(), "100100000").unwrap()
+    ObjectAddress::yaml(yaml_locator(), "100100000".parse().unwrap()).unwrap()
 }
 
 fn expectations() -> Vec<SourceExpectation> {
@@ -250,22 +250,12 @@ fn sample_plan() -> MutationPlan {
 fn all_mutation_primitives_have_stable_canonical_json() {
     let plan = sample_plan();
     let bytes = plan.canonical_json().unwrap();
-    // Retain v1 as a rejection fixture while reusing its unchanged operation tail as the v2 golden.
-    let legacy =
-        include_str!("mutation_plan_v1_all_operations.json").trim_end_matches(['\r', '\n']);
-    let legacy_tail = legacy
-        .strip_prefix(r#"{"version":1,"base_revision":""#)
-        .unwrap();
-    let golden = format!(
-        r#"{{"version":2,"workspace_id":"{}","base_revision":"{}"#,
-        workspace_id(),
-        legacy_tail
-    );
+    let golden = include_bytes!("mutation_plan_v3_all_operations.json");
 
-    if bytes != golden.as_bytes() {
+    if bytes != golden {
         let mismatch = bytes
             .iter()
-            .zip(golden.as_bytes())
+            .zip(golden)
             .position(|(actual, expected)| actual != expected)
             .unwrap_or_else(|| bytes.len().min(golden.len()));
         let start = mismatch.saturating_sub(80);
@@ -277,10 +267,10 @@ fn all_mutation_primitives_have_stable_canonical_json() {
             bytes.len(),
             golden.len(),
             String::from_utf8_lossy(&bytes[start..actual_end]),
-            String::from_utf8_lossy(&golden.as_bytes()[start..expected_end]),
+            String::from_utf8_lossy(&golden[start..expected_end]),
         );
     }
-    assert_eq!(plan.version(), 2);
+    assert_eq!(plan.version(), 3);
     assert_eq!(plan.workspace_id(), workspace_id());
     assert_eq!(serde_json::to_vec(&plan).unwrap(), bytes);
     assert_eq!(read_json_plan(&bytes).unwrap(), plan);
@@ -735,28 +725,24 @@ fn field_operations_reject_the_whole_object_root() {
 fn wire_contract_rejects_unknown_tags_and_corrupt_payloads() {
     let plan = sample_plan();
 
-    assert!(matches!(
-        read_json_plan(include_bytes!("mutation_plan_v1_all_operations.json")),
-        Err(MutationPlanReadError::Contract(
-            MutationPlanError::UnsupportedVersion(1)
-        ))
-    ));
+    let legacy = read_json_plan(include_bytes!("mutation_plan_v1_all_operations.json"));
+    assert!(legacy.is_err(), "v1 mutation plans must be rejected");
 
     let mut previous_version = serde_json::to_value(&plan).unwrap();
-    previous_version["version"] = serde_json::json!(1);
+    previous_version["version"] = serde_json::json!(2);
     assert!(matches!(
         read_json_value(previous_version),
         Err(MutationPlanReadError::Contract(
-            MutationPlanError::UnsupportedVersion(1)
+            MutationPlanError::UnsupportedVersion(2)
         ))
     ));
 
     let mut unknown_version = serde_json::to_value(&plan).unwrap();
-    unknown_version["version"] = serde_json::json!(3);
+    unknown_version["version"] = serde_json::json!(4);
     assert!(matches!(
         read_json_value(unknown_version),
         Err(MutationPlanReadError::Contract(
-            MutationPlanError::UnsupportedVersion(3)
+            MutationPlanError::UnsupportedVersion(4)
         ))
     ));
 

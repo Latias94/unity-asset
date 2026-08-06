@@ -31,9 +31,9 @@ use super::{
 /// Current wire version for workspace source inspection projections.
 pub const WORKSPACE_SOURCE_INSPECTION_VERSION: u8 = 1;
 /// Current wire version for workspace object inspection projections.
-pub const WORKSPACE_OBJECT_INSPECTION_VERSION: u8 = 1;
+pub const WORKSPACE_OBJECT_INSPECTION_VERSION: u8 = 2;
 /// Current wire version for streamed-resource requests and query results.
-pub const STREAMED_RESOURCE_QUERY_VERSION: u8 = 1;
+pub const STREAMED_RESOURCE_QUERY_VERSION: u8 = 2;
 
 const MAX_STREAM_PATH_BYTES: usize = 4096;
 const STREAMED_RESOURCE_REQUEST_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(

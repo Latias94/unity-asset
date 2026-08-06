@@ -1560,8 +1560,8 @@ impl SourceCatalog {
                 })?,
             ),
             ObjectKind::Yaml => {
-                if let Some(anchor) = object.yaml_anchor() {
-                    ObjectAddress::yaml(source_locator, anchor)
+                if let Some(file_id) = object.yaml_file_id() {
+                    ObjectAddress::yaml(source_locator, file_id)
                 } else if let Some(index) = object.yaml_document_ordinal() {
                     ObjectAddress::yaml_document(source_locator, index)
                 } else {

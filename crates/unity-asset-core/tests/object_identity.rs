@@ -4,11 +4,15 @@ use std::str::FromStr;
 use unity_asset_core::{
     BundleMemberId, ContainmentKind, ContainmentStep, ContractError, DigestV1, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceAlias, SourceId, SourceKind, SourceLocator,
-    SourceMemberId, WorkspaceId, WorkspaceRevision, YamlAnchor, YamlDocumentSelector,
+    SourceMemberId, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, YamlFileId,
 };
 
 fn source(workspace: WorkspaceId, kind: SourceKind, local: u64) -> SourceId {
     SourceId::new(workspace, kind, u128::from(local)).unwrap()
+}
+
+fn yaml_file_id(value: i64) -> YamlFileId {
+    YamlFileId::new(value).unwrap()
 }
 
 #[test]
@@ -46,35 +50,44 @@ fn object_ids_reject_null_binary_ids_and_wrong_source_kinds() {
         Err(ContractError::ObjectSourceKindMismatch { .. })
     ));
     assert!(matches!(
-        ObjectId::yaml(serialized, "100001"),
+        ObjectId::yaml(serialized, yaml_file_id(100001)),
         Err(ContractError::ObjectSourceKindMismatch { .. })
     ));
 }
 
 #[test]
-fn yaml_object_ids_preserve_string_anchors_and_explicit_ordinals() {
+fn yaml_object_ids_preserve_file_ids_and_explicit_ordinals() {
     let workspace = WorkspaceId::from_u128(1).unwrap();
     let yaml = source(workspace, SourceKind::Yaml, 1);
-    let anchored = ObjectId::yaml(yaml, "doc_0").unwrap();
+    let identified = ObjectId::yaml(yaml, yaml_file_id(-42)).unwrap();
     let ordinal = ObjectId::yaml_document(yaml, 3).unwrap();
 
-    assert_eq!(anchored.kind(), ObjectKind::Yaml);
-    assert_eq!(anchored.yaml_anchor(), Some("doc_0"));
-    assert_eq!(anchored.yaml_document_ordinal(), None);
-    assert_eq!(ordinal.yaml_anchor(), None);
+    assert_eq!(identified.kind(), ObjectKind::Yaml);
+    assert_eq!(identified.yaml_file_id(), Some(yaml_file_id(-42)));
+    assert_eq!(identified.yaml_document_ordinal(), None);
+    assert_eq!(ordinal.yaml_file_id(), None);
     assert_eq!(ordinal.yaml_document_ordinal(), Some(3));
 
-    let real_doc_anchor = ObjectId::yaml(yaml, "doc_0").unwrap();
-    let unanchored_document = ObjectId::yaml_document(yaml, 0).unwrap();
-    assert_ne!(real_doc_anchor, unanchored_document);
-    assert_eq!(ObjectId::yaml(yaml, "0").unwrap().yaml_anchor(), Some("0"));
+    let file_id = ObjectId::yaml(yaml, yaml_file_id(1)).unwrap();
+    let unanchored_document = ObjectId::yaml_document(yaml, 1).unwrap();
+    assert_ne!(file_id, unanchored_document);
+    assert_ne!(
+        serde_json::to_vec(&file_id).unwrap(),
+        serde_json::to_vec(&unanchored_document).unwrap()
+    );
 
-    for invalid in ["", "has space", "bad,anchor", "bad\0anchor"] {
-        assert!(
-            ObjectId::yaml(yaml, invalid).is_err(),
-            "accepted {invalid:?}"
-        );
-    }
+    let locator = SourceLocator::path("scene.unity").unwrap();
+    let file_address = ObjectAddress::yaml(locator.clone(), yaml_file_id(1)).unwrap();
+    let ordinal_address = ObjectAddress::yaml_document(locator, 1).unwrap();
+    assert_ne!(file_address, ordinal_address);
+    assert_ne!(
+        serde_json::to_vec(&file_address).unwrap(),
+        serde_json::to_vec(&ordinal_address).unwrap()
+    );
+    assert_ne!(
+        file_address.to_compact_string().unwrap(),
+        ordinal_address.to_compact_string().unwrap()
+    );
 }
 
 #[test]
@@ -159,40 +172,52 @@ fn identity_clone_sizes_include_all_owned_backing_allocations() {
     assert_eq!(locator.retained_clone_bytes(), Some(locator_bytes));
 
     let workspace = WorkspaceId::from_u128(7).unwrap();
-    let anchor = "1158508787625206";
-    let object = ObjectId::yaml(source(workspace, SourceKind::Yaml, 1), anchor).unwrap();
+    let file_id = yaml_file_id(1_158_508_787_625_206);
+    let object = ObjectId::yaml(source(workspace, SourceKind::Yaml, 1), file_id).unwrap();
     let revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"clone-size"));
     let handle = RevisionedObjectHandle::new(workspace, revision, object.clone()).unwrap();
-    let address = ObjectAddress::yaml(locator, anchor).unwrap();
+    let address = ObjectAddress::yaml(locator, file_id).unwrap();
 
-    assert_eq!(object.retained_clone_bytes(), anchor.len());
-    assert_eq!(handle.retained_clone_bytes(), anchor.len());
-    assert_eq!(
-        address.retained_clone_bytes(),
-        Some(locator_bytes + anchor.len())
-    );
+    assert_eq!(object.retained_clone_bytes(), 0);
+    assert_eq!(handle.retained_clone_bytes(), 0);
+    assert_eq!(address.retained_clone_bytes(), Some(locator_bytes));
 }
 
 #[test]
-fn yaml_anchor_borrowed_validation_rejects_unrepresentable_input() {
-    let oversized = [b'a'; 1_025];
-    let oversized = std::str::from_utf8(&oversized).unwrap();
+fn yaml_file_ids_require_canonical_nonzero_decimal_spelling() {
     assert_eq!(
-        YamlAnchor::validate(oversized),
-        Err(ContractError::InvalidYamlAnchor)
+        YamlFileId::parse_canonical("0"),
+        Err(ContractError::NullYamlFileId)
     );
-
-    for invalid in ["", "has space", "bad,anchor", "bad\0anchor", "anchoré"] {
+    for invalid in [
+        "",
+        "-0",
+        "+1",
+        "00",
+        "01",
+        "-01",
+        "has space",
+        "1_000",
+        "anchor",
+        "9223372036854775808",
+        "-9223372036854775809",
+    ] {
         assert_eq!(
-            YamlAnchor::validate(invalid),
-            Err(ContractError::InvalidYamlAnchor),
+            YamlFileId::parse_canonical(invalid),
+            Err(ContractError::InvalidYamlFileId),
             "accepted {invalid:?}"
         );
     }
 
-    for valid in ["0", "1158508787625206", "doc_0", "doc-0"] {
-        YamlAnchor::validate(valid).unwrap();
-        assert_eq!(YamlAnchor::new(valid).unwrap().as_str(), valid);
+    for valid in [
+        "1",
+        "-1",
+        "1158508787625206",
+        "9223372036854775807",
+        "-9223372036854775808",
+    ] {
+        let parsed = YamlFileId::parse_canonical(valid).unwrap();
+        assert_eq!(parsed.to_string(), valid);
     }
 }
 
@@ -232,7 +257,7 @@ fn every_object_address_variant_round_trips_canonically() {
             42,
         )
         .unwrap(),
-        ObjectAddress::yaml(archive.clone(), "100001").unwrap(),
+        ObjectAddress::yaml(archive.clone(), yaml_file_id(100001)).unwrap(),
         ObjectAddress::yaml_document(archive, 4).unwrap(),
     ];
 
@@ -351,15 +376,64 @@ fn object_address_wire_rejects_illegal_variants_versions_and_path_id_coercions()
 
 #[test]
 fn compact_addresses_reject_unbounded_input_before_decoding() {
-    let oversized = format!("oa1:{}", "00".repeat(512 * 1024));
+    let oversized = format!("oa2:{}", "00".repeat(512 * 1024));
     assert!(matches!(
         ObjectAddress::from_str(&oversized),
         Err(ContractError::CompactAddressTooLong { .. })
     ));
-    assert!(ObjectAddress::from_str("oa1:0").is_err());
-    assert!(ObjectAddress::from_str("oa1:zz").is_err());
-    assert!(ObjectAddress::from_str("oa1:ff").is_err());
+    assert!(matches!(
+        ObjectAddress::from_str("oa1:00"),
+        Err(ContractError::CompactAddress(_))
+    ));
+    assert!(ObjectAddress::from_str("oa2:0").is_err());
+    assert!(ObjectAddress::from_str("oa2:zz").is_err());
+    assert!(ObjectAddress::from_str("oa2:ff").is_err());
     assert!(ObjectAddress::from_str("bok3:legacy").is_err());
+}
+
+#[test]
+fn yaml_file_id_serde_is_numeric_and_rejects_non_identity_values() {
+    let file_id = yaml_file_id(-42);
+    assert_eq!(serde_json::to_string(&file_id).unwrap(), "-42");
+    assert_eq!(serde_json::from_str::<YamlFileId>("-42").unwrap(), file_id);
+
+    for invalid in ["0", r#""42""#, "42.0", "null"] {
+        assert!(
+            serde_json::from_str::<YamlFileId>(invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn yaml_object_wire_requires_v2_numeric_file_ids() {
+    let locator = SourceLocator::path("scene.unity").unwrap();
+    let address = ObjectAddress::yaml(locator, yaml_file_id(100001)).unwrap();
+    let encoded = serde_json::to_string(&address).unwrap();
+    assert!(encoded.contains(r#""version":2"#));
+    assert!(encoded.contains(r#""kind":"file_id","file_id":100001"#));
+    assert_eq!(
+        serde_json::from_str::<ObjectAddress>(&encoded).unwrap(),
+        address
+    );
+
+    let old_anchor = r#"{
+        "version":1,
+        "kind":"yaml",
+        "source":{"version":1,"outer_path":"scene.unity","members":[]},
+        "selector":{"kind":"anchored","anchor":"100001"}
+    }"#;
+    let zero = r#"{
+        "version":2,
+        "kind":"yaml",
+        "source":{"version":1,"outer_path":"scene.unity","members":[]},
+        "selector":{"kind":"file_id","file_id":0}
+    }"#;
+    let wrong_version = encoded.replacen(r#""version":2"#, r#""version":1"#, 1);
+
+    assert!(serde_json::from_str::<ObjectAddress>(old_anchor).is_err());
+    assert!(serde_json::from_str::<ObjectAddress>(zero).is_err());
+    assert!(serde_json::from_str::<ObjectAddress>(&wrong_version).is_err());
 }
 
 #[test]
@@ -442,29 +516,32 @@ fn revisioned_handle_cannot_bind_an_object_from_another_workspace() {
 
 #[test]
 fn yaml_selectors_have_stable_structured_serialization() {
-    let anchor = YamlDocumentSelector::anchor("1158508787625206").unwrap();
+    let file_id = YamlDocumentSelector::file_id(yaml_file_id(1_158_508_787_625_206));
     let ordinal = YamlDocumentSelector::ordinal(0);
 
-    assert_eq!(anchor.anchor_str(), Some("1158508787625206"));
+    assert_eq!(
+        file_id.file_id_value(),
+        Some(yaml_file_id(1_158_508_787_625_206))
+    );
     assert_eq!(ordinal.ordinal_index(), Some(0));
     assert_eq!(
-        serde_json::from_str::<YamlDocumentSelector>(&serde_json::to_string(&anchor).unwrap())
+        serde_json::from_str::<YamlDocumentSelector>(&serde_json::to_string(&file_id).unwrap())
             .unwrap(),
-        anchor
+        file_id
     );
 }
 
 #[test]
 fn yaml_document_hints_are_not_part_of_persisted_identity() {
     let locator = SourceLocator::path("scene.unity").unwrap();
-    let canonical = ObjectAddress::yaml(locator, "100001").unwrap();
+    let canonical = ObjectAddress::yaml(locator, yaml_file_id(100001)).unwrap();
     let json = serde_json::to_string(&canonical).unwrap();
 
     assert!(!json.contains("document_hint"));
     assert!(
         serde_json::from_str::<ObjectAddress>(&json.replace(
-            r#""anchor":"100001""#,
-            r#""anchor":"100001","document_hint":7"#
+            r#""file_id":100001"#,
+            r#""file_id":100001,"document_hint":7"#
         ))
         .is_err()
     );

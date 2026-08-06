@@ -3,10 +3,10 @@ use std::io::{Cursor, Write};
 
 use unity_asset::workspace::{
     AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationValue, PlanPayload,
-    PrepareOptions, ResolvedStreamedResource, SourceExpectation, StreamedResourceQueryResult,
-    StreamedResourceRequest, StreamedResourceResolution, WorkspaceError, WorkspaceInspector,
-    WorkspaceLookup, WorkspaceObjectFormatInspection, WorkspaceSourceFormatInspection,
-    WorkspaceView,
+    PrepareOptions, ResolvedStreamedResource, STREAMED_RESOURCE_QUERY_VERSION, SourceExpectation,
+    StreamedResourceQueryResult, StreamedResourceRequest, StreamedResourceResolution,
+    WorkspaceError, WorkspaceInspector, WorkspaceLookup, WorkspaceObjectFormatInspection,
+    WorkspaceSourceFormatInspection, WorkspaceView,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, ContainmentKind,
@@ -56,7 +56,7 @@ fn zip_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn yaml_address(alias: &str, anchor: &str) -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(alias).unwrap(), anchor).unwrap()
+    ObjectAddress::yaml(SourceLocator::path(alias).unwrap(), anchor.parse().unwrap()).unwrap()
 }
 
 fn resolved_resource(result: &StreamedResourceQueryResult) -> &ResolvedStreamedResource {
@@ -634,6 +634,34 @@ fn streamed_resource_request_json_accepts_exact_budget_and_rejects_one_short() {
         }))
     ));
     assert_eq!(one_short.usage().bytes, parser_bytes);
+}
+
+#[test]
+fn streamed_resource_request_rejects_previous_and_future_wire_versions() {
+    let request = StreamedResourceRequest::new(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "scene.resS",
+        0,
+        1,
+    )
+    .unwrap();
+    let current = serde_json::to_value(request).unwrap();
+
+    for unsupported_version in [
+        STREAMED_RESOURCE_QUERY_VERSION - 1,
+        STREAMED_RESOURCE_QUERY_VERSION + 1,
+    ] {
+        let mut unsupported = current.clone();
+        unsupported["version"] = serde_json::json!(unsupported_version);
+        let encoded = serde_json::to_vec(&unsupported).unwrap();
+        assert!(
+            StreamedResourceRequest::read_json(
+                encoded.as_slice(),
+                &mut AssetLoadBudget::default(),
+            )
+            .is_err()
+        );
+    }
 }
 
 #[test]

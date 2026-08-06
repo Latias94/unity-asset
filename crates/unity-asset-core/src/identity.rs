@@ -10,11 +10,10 @@ use crate::bounded::{BoundedString, BoundedVec};
 use crate::{SourceKind, WorkspaceRevision};
 
 const WORKSPACE_PREFIX: &str = "workspace-v1:";
-const ADDRESS_PREFIX: &str = "oa1:";
+const ADDRESS_PREFIX: &str = "oa2:";
 const WORKSPACE_ID_WIRE_BYTES: usize = WORKSPACE_PREFIX.len() + 32;
 const MAX_SOURCE_ALIAS_BYTES: usize = 64 * 1024;
 const MAX_MEMBER_PATH_BYTES: usize = 16 * 1024;
-const MAX_YAML_ANCHOR_BYTES: usize = 1_024;
 const MAX_CONTAINMENT_DEPTH: usize = 64;
 const MAX_LOCATOR_TEXT_BYTES: usize = 96 * 1024;
 const MAX_COMPACT_ADDRESS_BYTES: usize = 256 * 1024;
@@ -169,7 +168,7 @@ impl<'de> Deserialize<'de> for SourceId {
         D: Deserializer<'de>,
     {
         let wire = SourceIdInput::deserialize(deserializer)?;
-        validate_contract_version("source identity", wire.version)
+        validate_contract_version("source identity", wire.version, 1)
             .map_err(serde::de::Error::custom)?;
         let local = wire.local.into_string();
         if local.len() != 32 {
@@ -523,79 +522,76 @@ impl<'de> Deserialize<'de> for SourceLocator {
         D: Deserializer<'de>,
     {
         let wire = SourceLocatorWire::deserialize(deserializer)?;
-        validate_contract_version("source locator", wire.version)
+        validate_contract_version("source locator", wire.version, 1)
             .map_err(serde::de::Error::custom)?;
         Self::from_parts(wire.outer_path, wire.members.into_vec()).map_err(serde::de::Error::custom)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-/// Validated YAML anchor spelling. The string `"0"` is a valid anchor.
-pub struct YamlAnchor(String);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+/// Canonical nonzero Unity YAML `fileID` used as stable object identity.
+pub struct YamlFileId(NonZeroI64);
 
-impl YamlAnchor {
-    pub fn new(value: impl AsRef<str> + Into<String>) -> Result<Self, ContractError> {
-        Self::validate(value.as_ref())?;
-        Ok(Self(value.into()))
+impl YamlFileId {
+    pub fn new(value: i64) -> Result<Self, ContractError> {
+        NonZeroI64::new(value)
+            .map(Self)
+            .ok_or(ContractError::NullYamlFileId)
     }
 
-    /// Validates a borrowed anchor without allocating.
-    pub fn validate(value: &str) -> Result<(), ContractError> {
-        if value.is_empty()
-            || value.len() > MAX_YAML_ANCHOR_BYTES
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-        {
-            return Err(ContractError::InvalidYamlAnchor);
+    /// Parses a canonical Unity YAML document anchor without allocating.
+    pub fn parse_canonical(value: &str) -> Result<Self, ContractError> {
+        if value == "0" {
+            return Err(ContractError::NullYamlFileId);
         }
-        Ok(())
+        let digits = value.strip_prefix('-').unwrap_or(value);
+        if digits.is_empty()
+            || digits.starts_with('0')
+            || !digits.bytes().all(|byte| byte.is_ascii_digit())
+            || value.starts_with('+')
+        {
+            return Err(ContractError::InvalidYamlFileId);
+        }
+
+        value
+            .parse::<i64>()
+            .map_err(|_| ContractError::InvalidYamlFileId)
+            .and_then(Self::new)
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
+    pub const fn get(self) -> i64 {
+        self.0.get()
     }
 }
 
-impl fmt::Display for YamlAnchor {
+impl fmt::Display for YamlFileId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        self.0.fmt(formatter)
     }
 }
 
-impl Serialize for YamlAnchor {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&self.0)
-    }
-}
+impl FromStr for YamlFileId {
+    type Err = ContractError;
 
-impl<'de> Deserialize<'de> for YamlAnchor {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(BoundedString::<MAX_YAML_ANCHOR_BYTES>::deserialize(deserializer)?.into_string())
-            .map_err(serde::de::Error::custom)
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse_canonical(value)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-/// Stable YAML document selector that keeps real anchors distinct from unanchored ordinals.
+/// Stable YAML document selector that keeps file IDs distinct from unanchored ordinals.
 pub enum YamlDocumentSelector {
-    Anchored { anchor: YamlAnchor },
+    FileId { file_id: YamlFileId },
     Unanchored { document_index: u32 },
 }
 
 impl YamlDocumentSelector {
-    pub fn anchor(value: impl AsRef<str> + Into<String>) -> Result<Self, ContractError> {
-        Ok(Self::Anchored {
-            anchor: YamlAnchor::new(value)?,
-        })
+    #[must_use]
+    pub const fn file_id(file_id: YamlFileId) -> Self {
+        Self::FileId { file_id }
     }
 
     #[must_use]
@@ -604,22 +600,17 @@ impl YamlDocumentSelector {
     }
 
     #[must_use]
-    pub fn anchor_value(&self) -> Option<&YamlAnchor> {
+    pub const fn file_id_value(&self) -> Option<YamlFileId> {
         match self {
-            Self::Anchored { anchor, .. } => Some(anchor),
+            Self::FileId { file_id } => Some(*file_id),
             Self::Unanchored { .. } => None,
         }
     }
 
     #[must_use]
-    pub fn anchor_str(&self) -> Option<&str> {
-        self.anchor_value().map(YamlAnchor::as_str)
-    }
-
-    #[must_use]
     pub const fn ordinal_index(&self) -> Option<u32> {
         match self {
-            Self::Anchored { .. } => None,
+            Self::FileId { .. } => None,
             Self::Unanchored { document_index } => Some(*document_index),
         }
     }
@@ -636,7 +627,7 @@ pub enum ObjectKind {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum ObjectKey {
     BinaryPathId(NonZeroI64),
-    YamlAnchor(YamlAnchor),
+    YamlFileId(YamlFileId),
     YamlDocumentOrdinal(u32),
 }
 
@@ -658,14 +649,11 @@ impl ObjectId {
         })
     }
 
-    pub fn yaml(
-        source: SourceId,
-        anchor: impl AsRef<str> + Into<String>,
-    ) -> Result<Self, ContractError> {
+    pub fn yaml(source: SourceId, file_id: YamlFileId) -> Result<Self, ContractError> {
         validate_object_source_kind(source, SourceKind::Yaml)?;
         Ok(Self {
             source,
-            key: ObjectKey::YamlAnchor(YamlAnchor::new(anchor)?),
+            key: ObjectKey::YamlFileId(file_id),
         })
     }
 
@@ -682,7 +670,7 @@ impl ObjectId {
         selector: &YamlDocumentSelector,
     ) -> Result<Self, ContractError> {
         match selector {
-            YamlDocumentSelector::Anchored { anchor, .. } => Self::yaml(source, anchor.as_str()),
+            YamlDocumentSelector::FileId { file_id } => Self::yaml(source, *file_id),
             YamlDocumentSelector::Unanchored { document_index } => {
                 Self::yaml_document(source, *document_index)
             }
@@ -698,7 +686,7 @@ impl ObjectId {
     pub fn kind(&self) -> ObjectKind {
         match &self.key {
             ObjectKey::BinaryPathId(_) => ObjectKind::Binary,
-            ObjectKey::YamlAnchor(_) | ObjectKey::YamlDocumentOrdinal(_) => ObjectKind::Yaml,
+            ObjectKey::YamlFileId(_) | ObjectKey::YamlDocumentOrdinal(_) => ObjectKind::Yaml,
         }
     }
 
@@ -706,14 +694,14 @@ impl ObjectId {
     pub fn binary_path_id(&self) -> Option<i64> {
         match &self.key {
             ObjectKey::BinaryPathId(value) => Some(value.get()),
-            ObjectKey::YamlAnchor(_) | ObjectKey::YamlDocumentOrdinal(_) => None,
+            ObjectKey::YamlFileId(_) | ObjectKey::YamlDocumentOrdinal(_) => None,
         }
     }
 
     #[must_use]
-    pub fn yaml_anchor(&self) -> Option<&str> {
+    pub const fn yaml_file_id(&self) -> Option<YamlFileId> {
         match &self.key {
-            ObjectKey::YamlAnchor(value) => Some(value.as_str()),
+            ObjectKey::YamlFileId(value) => Some(*value),
             ObjectKey::BinaryPathId(_) | ObjectKey::YamlDocumentOrdinal(_) => None,
         }
     }
@@ -722,13 +710,13 @@ impl ObjectId {
     pub fn yaml_document_ordinal(&self) -> Option<u32> {
         match &self.key {
             ObjectKey::YamlDocumentOrdinal(index) => Some(*index),
-            ObjectKey::BinaryPathId(_) | ObjectKey::YamlAnchor(_) => None,
+            ObjectKey::BinaryPathId(_) | ObjectKey::YamlFileId(_) => None,
         }
     }
 
     #[must_use]
-    pub fn retained_clone_bytes(&self) -> usize {
-        self.yaml_anchor().map_or(0, str::len)
+    pub const fn retained_clone_bytes(&self) -> usize {
+        0
     }
 }
 
@@ -755,13 +743,13 @@ impl From<ObjectId> for ObjectIdWire {
                 source: value.source,
                 path_id: path_id.get(),
             },
-            ObjectKey::YamlAnchor(anchor) => Self::Yaml {
-                version: 1,
+            ObjectKey::YamlFileId(file_id) => Self::Yaml {
+                version: 2,
                 source: value.source,
-                selector: YamlDocumentSelector::Anchored { anchor },
+                selector: YamlDocumentSelector::FileId { file_id },
             },
             ObjectKey::YamlDocumentOrdinal(document_index) => Self::Yaml {
-                version: 1,
+                version: 2,
                 source: value.source,
                 selector: YamlDocumentSelector::Unanchored { document_index },
             },
@@ -779,7 +767,7 @@ impl TryFrom<ObjectIdWire> for ObjectId {
                 source,
                 path_id,
             } => {
-                validate_contract_version("object identity", version)?;
+                validate_contract_version("object identity", version, 1)?;
                 Self::binary(source, path_id)
             }
             ObjectIdWire::Yaml {
@@ -787,7 +775,7 @@ impl TryFrom<ObjectIdWire> for ObjectId {
                 source,
                 selector,
             } => {
-                validate_contract_version("object identity", version)?;
+                validate_contract_version("object identity", version, 2)?;
                 Self::from_yaml_selector(source, &selector)
             }
         }
@@ -864,8 +852,8 @@ impl RevisionedObjectHandle {
     /// Rebinds this owned handle to another immutable revision of the same workspace.
     ///
     /// This is intended for derived read views whose object identity is unchanged while the
-    /// revision context advances. Consuming the handle preserves any owned YAML selector without
-    /// cloning its anchor string.
+    /// revision context advances. Consuming the handle preserves the typed YAML selector without
+    /// rebuilding or allocating identity text.
     #[must_use]
     pub fn with_revision(mut self, revision: WorkspaceRevision) -> Self {
         self.revision = revision;
@@ -937,11 +925,8 @@ impl ObjectAddress {
         Self::binary_at(locator.child(ContainmentKind::Bundle, member)?, path_id)
     }
 
-    pub fn yaml(
-        locator: SourceLocator,
-        anchor: impl AsRef<str> + Into<String>,
-    ) -> Result<Self, ContractError> {
-        Self::yaml_with_selector(locator, YamlDocumentSelector::anchor(anchor)?)
+    pub fn yaml(locator: SourceLocator, file_id: YamlFileId) -> Result<Self, ContractError> {
+        Self::yaml_with_selector(locator, YamlDocumentSelector::file_id(file_id))
     }
 
     pub fn yaml_document(
@@ -987,17 +972,16 @@ impl ObjectAddress {
 
     #[must_use]
     pub fn retained_clone_bytes(&self) -> Option<usize> {
-        self.source.retained_clone_bytes()?.checked_add(
-            self.yaml_selector()
-                .and_then(YamlDocumentSelector::anchor_str)
-                .map_or(0, str::len),
-        )
+        self.source.retained_clone_bytes()
     }
 
     #[must_use]
-    pub fn yaml_anchor(&self) -> Option<&str> {
-        self.yaml_selector()
-            .and_then(YamlDocumentSelector::anchor_str)
+    pub const fn yaml_file_id(&self) -> Option<YamlFileId> {
+        match &self.key {
+            ObjectAddressKey::Yaml(YamlDocumentSelector::FileId { file_id }) => Some(*file_id),
+            ObjectAddressKey::BinaryPathId(_)
+            | ObjectAddressKey::Yaml(YamlDocumentSelector::Unanchored { .. }) => None,
+        }
     }
 
     #[must_use]
@@ -1068,7 +1052,7 @@ impl From<ObjectAddress> for ObjectAddressWire {
                 }
             }
             ObjectAddressKey::Yaml(selector) => Self::Yaml {
-                version: 1,
+                version: 2,
                 source: value.source,
                 selector,
             },
@@ -1086,7 +1070,7 @@ impl TryFrom<ObjectAddressWire> for ObjectAddress {
                 source,
                 path_id,
             } => {
-                validate_contract_version("object address", version)?;
+                validate_contract_version("object address", version, 1)?;
                 Self::binary_direct(source, path_id)
             }
             ObjectAddressWire::BinaryBundleMember {
@@ -1094,7 +1078,7 @@ impl TryFrom<ObjectAddressWire> for ObjectAddress {
                 source,
                 path_id,
             } => {
-                validate_contract_version("object address", version)?;
+                validate_contract_version("object address", version, 1)?;
                 if source.last_containment_kind() != Some(ContainmentKind::Bundle) {
                     return Err(ContractError::BundleAddressMissingMember);
                 }
@@ -1105,7 +1089,7 @@ impl TryFrom<ObjectAddressWire> for ObjectAddress {
                 source,
                 selector,
             } => {
-                validate_contract_version("object address", version)?;
+                validate_contract_version("object address", version, 2)?;
                 Self::yaml_with_selector(source, selector)
             }
         }
@@ -1158,8 +1142,12 @@ impl FromStr for ObjectAddress {
     }
 }
 
-fn validate_contract_version(contract: &'static str, version: u8) -> Result<(), ContractError> {
-    if version == 1 {
+fn validate_contract_version(
+    contract: &'static str,
+    version: u8,
+    expected: u8,
+) -> Result<(), ContractError> {
+    if version == expected {
         Ok(())
     } else {
         Err(ContractError::UnsupportedContractVersion { contract, version })
@@ -1229,8 +1217,10 @@ pub enum ContractError {
     BundleAddressMissingMember,
     #[error("{kind} is not a valid portable path: {value:?}")]
     InvalidPortablePath { kind: &'static str, value: String },
-    #[error("invalid YAML anchor")]
-    InvalidYamlAnchor,
+    #[error("YAML fileID zero denotes null and cannot identify an object")]
+    NullYamlFileId,
+    #[error("invalid canonical YAML fileID")]
+    InvalidYamlFileId,
     #[error("source containment exceeds the maximum depth of {max_depth}")]
     ContainmentDepthExceeded { max_depth: usize },
     #[error("source locator text exceeds the maximum of {max_text_bytes} bytes")]

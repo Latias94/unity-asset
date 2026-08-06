@@ -39,7 +39,11 @@ fn workspace_fixture_with(
 }
 
 fn address() -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(SOURCE_ALIAS).unwrap(), "1").unwrap()
+    ObjectAddress::yaml(
+        SourceLocator::path(SOURCE_ALIAS).unwrap(),
+        "1".parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn name_path() -> FieldPath {
@@ -198,7 +202,11 @@ fn later_guard_failure_rolls_back_the_complete_candidate() {
 #[test]
 fn missing_object_is_reported_during_address_resolution() {
     let (_directory, _path, workspace) = workspace_fixture();
-    let missing = ObjectAddress::yaml(SourceLocator::path(SOURCE_ALIAS).unwrap(), "999").unwrap();
+    let missing = ObjectAddress::yaml(
+        SourceLocator::path(SOURCE_ALIAS).unwrap(),
+        "999".parse().unwrap(),
+    )
+    .unwrap();
     let change = plan(
         &workspace,
         vec![GenericMutation::FieldReplace {

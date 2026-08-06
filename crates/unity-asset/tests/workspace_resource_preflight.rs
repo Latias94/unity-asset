@@ -68,7 +68,11 @@ impl Fixture {
     }
 
     fn address(&self) -> ObjectAddress {
-        ObjectAddress::yaml(SourceLocator::path(ALIAS).unwrap(), "8300001").unwrap()
+        ObjectAddress::yaml(
+            SourceLocator::path(ALIAS).unwrap(),
+            "8300001".parse().unwrap(),
+        )
+        .unwrap()
     }
 }
 
@@ -300,7 +304,11 @@ fn earlier_field_guard_failure_precedes_later_missing_resource_target() {
     let field_path = FieldPath::root().push_field("m_Name").unwrap();
     let resource_path = FieldPath::root().push_field("m_StreamData").unwrap();
     let payload = PlanPayload::new(PAYLOAD.to_vec());
-    let missing = ObjectAddress::yaml(SourceLocator::path(ALIAS).unwrap(), "8300002").unwrap();
+    let missing = ObjectAddress::yaml(
+        SourceLocator::path(ALIAS).unwrap(),
+        "8300002".parse().unwrap(),
+    )
+    .unwrap();
     let plan = MutationPlan::new(
         snapshot.workspace_id(),
         snapshot.revision(),
@@ -360,7 +368,7 @@ fn source_expectations_are_global_preconditions_before_resource_guards() {
             SourceMemberId::new("missing.asset").unwrap(),
         )
         .unwrap();
-    let missing = ObjectAddress::yaml(missing_locator.clone(), "1").unwrap();
+    let missing = ObjectAddress::yaml(missing_locator.clone(), "1".parse().unwrap()).unwrap();
     let stale = FieldGuard::new(
         DigestV1::hash_bytes(b"stale-resource-schema"),
         DigestV1::hash_bytes(b"stale-resource-value"),

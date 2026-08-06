@@ -22,7 +22,7 @@ const YAML: &[u8] =
 fn object_address() -> ObjectAddress {
     ObjectAddress::yaml(
         SourceLocator::path(SOURCE_ALIAS).expect("source locator"),
-        "1",
+        "1".parse().unwrap(),
     )
     .expect("object address")
 }

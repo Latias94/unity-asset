@@ -25,7 +25,7 @@ pub(crate) const MAX_PLAN_DEPTH: u32 = 59;
 // operation shape. This remains bounded while every valid in-memory value can round-trip.
 pub(crate) const MAX_PLAN_WIRE_DEPTH: u32 = MAX_PLAN_DEPTH * 3 + 9;
 /// Current canonical MutationPlan wire version.
-pub const MUTATION_PLAN_VERSION: u8 = 2;
+pub const MUTATION_PLAN_VERSION: u8 = 3;
 
 /// Expected identity of one source modified by a plan.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

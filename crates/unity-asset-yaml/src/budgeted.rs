@@ -15,7 +15,7 @@ use same_file::Handle as FileIdentity;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, UnityClass, UnityClassHeader, UnityValue,
-    YamlAnchor, arc_slice_allocation_bytes, arc_value_allocation_bytes,
+    arc_slice_allocation_bytes, arc_value_allocation_bytes,
 };
 use yaml_rust2::ScanError;
 use yaml_rust2::parser::{Event, Parser, Tag};
@@ -24,6 +24,7 @@ use yaml_rust2::scanner::{Marker, TScalarStyle};
 use crate::YamlDocument;
 
 const MAX_YAML_DEPTH: u32 = 59;
+const MAX_UNITY_ANCHOR_BYTES: usize = 1_024;
 // These constants bound requested container capacities in the locked parser; they do not claim an
 // exact allocator RSS value or include allocator-private bookkeeping.
 // yaml-rust2 0.11.0 requests four 32-byte strings before scanning each plain scalar. A block scalar's
@@ -848,9 +849,10 @@ fn parse_header_line<'a>(
 
 fn valid_unity_anchor(value: &str) -> bool {
     let digits = value.strip_prefix('-').unwrap_or(value);
-    !digits.is_empty()
+    !value.is_empty()
+        && value.len() <= MAX_UNITY_ANCHOR_BYTES
+        && !digits.is_empty()
         && digits.bytes().all(|byte| byte.is_ascii_digit())
-        && YamlAnchor::validate(value).is_ok()
 }
 
 #[derive(Clone, Copy)]

@@ -5,7 +5,7 @@ use std::mem::size_of;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, FieldPath, FieldPathError, FieldPathSegment,
-    UnityClass, UnityDocument, UnityValue, YamlAnchor, YamlDocumentSelector,
+    UnityClass, UnityDocument, UnityValue, YamlDocumentSelector, YamlFileId,
 };
 
 use crate::YamlDocument;
@@ -49,6 +49,34 @@ pub enum YamlReferenceShape {
         raw: YamlReferenceRawTarget,
         diagnostic: YamlReferenceDiagnostic,
     },
+}
+
+/// Allocation-free ownership classification for a single YAML value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YamlReferenceClassification {
+    /// The value does not claim Unity PPtr semantics.
+    NotReference,
+    /// The value is a structurally valid Unity PPtr, including null references.
+    ValidReference,
+    /// The value contains a PPtr marker but violates the PPtr contract.
+    MalformedReference,
+}
+
+/// Classifies PPtr ownership without allocating or discarding malformed candidates.
+#[must_use]
+pub fn classify_reference_value(value: &UnityValue) -> YamlReferenceClassification {
+    let UnityValue::Object(map) = value else {
+        return YamlReferenceClassification::NotReference;
+    };
+    let Some(candidate) = inspect_candidate(map) else {
+        return YamlReferenceClassification::NotReference;
+    };
+    match candidate.outcome {
+        CandidateOutcome::Null(_) | CandidateOutcome::Valid(_) => {
+            YamlReferenceClassification::ValidReference
+        }
+        CandidateOutcome::Invalid(_) => YamlReferenceClassification::MalformedReference,
+    }
 }
 
 impl YamlReferenceShape {
@@ -187,9 +215,9 @@ pub enum YamlReferenceScanError {
     #[error("YAML class source omitted declared document index {document_index}")]
     MissingDocument { document_index: usize },
     #[error(
-        "YAML documents {first_document_index} and {second_document_index} use the same anchor"
+        "YAML documents {first_document_index} and {second_document_index} use the same fileID"
     )]
-    DuplicateDocumentAnchor {
+    DuplicateDocumentFileId {
         first_document_index: usize,
         second_document_index: usize,
     },
@@ -248,11 +276,8 @@ pub fn scan_reference_class_occurrences<'class>(
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SelectorRef<'a> {
-    Anchored {
-        anchor: &'a str,
-        document_index: usize,
-    },
+enum SelectorRef {
+    FileId(YamlFileId),
     Ordinal(u32),
 }
 
@@ -266,7 +291,7 @@ enum PathSegmentRef<'a> {
 enum TraversalEvent<'a> {
     Visit {
         value: &'a UnityValue,
-        selector: SelectorRef<'a>,
+        selector: SelectorRef,
         segment: PathSegmentRef<'a>,
         depth: u32,
     },
@@ -297,7 +322,7 @@ impl<'budget> ScanState<'budget> {
     fn visit_document<'value>(
         &mut self,
         class: &'value UnityClass,
-        selector: SelectorRef<'value>,
+        selector: SelectorRef,
         path: &mut Vec<PathSegmentRef<'value>>,
         traversal: &mut Vec<TraversalEvent<'value>>,
     ) -> Result<(), YamlReferenceScanError> {
@@ -351,7 +376,7 @@ impl<'budget> ScanState<'budget> {
     fn visit_value<'value>(
         &mut self,
         value: &'value UnityValue,
-        selector: SelectorRef<'value>,
+        selector: SelectorRef,
         path: &[PathSegmentRef<'value>],
         traversal: &mut Vec<TraversalEvent<'value>>,
         depth: u32,
@@ -482,7 +507,7 @@ impl<'budget> ScanState<'budget> {
 
     fn emit(
         &mut self,
-        selector: SelectorRef<'_>,
+        selector: SelectorRef,
         path: &[PathSegmentRef<'_>],
         candidate: Candidate<'_>,
     ) -> Result<(), YamlReferenceScanError> {
@@ -547,11 +572,11 @@ fn prepare_selectors<'class>(
     document_count: usize,
     class_at: &mut impl FnMut(usize) -> Option<&'class UnityClass>,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<SelectorRef<'class>>, YamlReferenceScanError> {
+) -> Result<Vec<SelectorRef>, YamlReferenceScanError> {
     let mut selectors = Vec::new();
     let mut selector_capacity = 0;
-    let mut anchors = Vec::new();
-    let mut anchor_capacity = 0;
+    let mut file_ids = Vec::new();
+    let mut file_id_capacity = 0;
     reserve_budgeted_vec(
         &mut selectors,
         &mut selector_capacity,
@@ -560,26 +585,27 @@ fn prepare_selectors<'class>(
         "YAML document selector table",
     )?;
     reserve_budgeted_vec(
-        &mut anchors,
-        &mut anchor_capacity,
+        &mut file_ids,
+        &mut file_id_capacity,
         document_count,
         budget,
-        "YAML document anchor validation",
+        "YAML document fileID validation",
     )?;
 
     for document_index in 0..document_count {
         let class = class_at(document_index)
             .ok_or(YamlReferenceScanError::MissingDocument { document_index })?;
         let selector = selector_ref(class, document_index)?;
-        if let SelectorRef::Anchored { anchor, .. } = selector {
-            anchors.push((anchor, document_index));
+        if let SelectorRef::FileId(file_id) = selector {
+            file_ids.push((file_id, document_index));
         }
         selectors.push(selector);
     }
 
-    anchors.sort_unstable_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(&right.1)));
-    if let Some(pair) = anchors.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(YamlReferenceScanError::DuplicateDocumentAnchor {
+    file_ids
+        .sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    if let Some(pair) = file_ids.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(YamlReferenceScanError::DuplicateDocumentFileId {
             first_document_index: pair[0].1,
             second_document_index: pair[1].1,
         });
@@ -594,23 +620,20 @@ const fn can_contain_occurrence(value: &UnityValue) -> bool {
 fn selector_ref(
     class: &UnityClass,
     document_index: usize,
-) -> Result<SelectorRef<'_>, YamlReferenceScanError> {
+) -> Result<SelectorRef, YamlReferenceScanError> {
     if is_synthetic_document_anchor(class, document_index) {
         let document_index = u32::try_from(document_index)
             .map_err(|_| YamlReferenceScanError::DocumentIndexOverflow { document_index })?;
         return Ok(SelectorRef::Ordinal(document_index));
     }
 
-    YamlAnchor::validate(class.anchor()).map_err(|source| {
+    let file_id = YamlFileId::parse_canonical(class.anchor()).map_err(|source| {
         YamlReferenceScanError::InvalidDocumentSelector {
             document_index,
             source,
         }
     })?;
-    Ok(SelectorRef::Anchored {
-        anchor: class.anchor(),
-        document_index,
-    })
+    Ok(SelectorRef::FileId(file_id))
 }
 
 fn is_synthetic_document_anchor(class: &UnityClass, document_index: usize) -> bool {
@@ -623,22 +646,11 @@ fn is_synthetic_document_anchor(class: &UnityClass, document_index: usize) -> bo
 }
 
 fn build_selector(
-    selector: SelectorRef<'_>,
-    budget: &mut AssetLoadBudget,
+    selector: SelectorRef,
+    _budget: &mut AssetLoadBudget,
 ) -> Result<YamlDocumentSelector, YamlReferenceScanError> {
     match selector {
-        SelectorRef::Anchored {
-            anchor,
-            document_index,
-        } => {
-            let anchor = clone_string_budgeted(anchor, budget, "YAML reference object anchor")?;
-            YamlDocumentSelector::anchor(anchor).map_err(|source| {
-                YamlReferenceScanError::InvalidDocumentSelector {
-                    document_index,
-                    source,
-                }
-            })
-        }
+        SelectorRef::FileId(file_id) => Ok(YamlDocumentSelector::file_id(file_id)),
         SelectorRef::Ordinal(document_index) => Ok(YamlDocumentSelector::ordinal(document_index)),
     }
 }

@@ -478,8 +478,11 @@ fn prepared_view_extraction_reads_the_uncommitted_candidate_revision() {
         .load_path(&source_path, &mut AssetLoadBudget::default())
         .unwrap();
     let base = workspace.snapshot();
-    let address =
-        ObjectAddress::yaml(SourceLocator::path("objects.prefab").unwrap(), "1001").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("objects.prefab").unwrap(),
+        "1001".parse().unwrap(),
+    )
+    .unwrap();
     let name_path = FieldPath::root().push_field("m_Name").unwrap();
 
     let recipes = SchemaRecipePlanner::new(&base);

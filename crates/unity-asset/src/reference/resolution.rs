@@ -1,10 +1,9 @@
-use std::fmt::Write as _;
 use std::mem::size_of;
 
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, FieldPath, FieldPathSegment,
     ObjectId, RevisionedObjectHandle, SourceId, SourceKind, UnityDocument, WorkspaceId,
-    WorkspaceRevision,
+    WorkspaceRevision, YamlFileId,
 };
 
 use super::ReferenceGraphError;
@@ -647,7 +646,7 @@ impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
                 )?,
             });
         }
-        let object = ObjectId::yaml(source, decimal_i64(file_id, budget)?)?;
+        let object = ObjectId::yaml(source, YamlFileId::new(file_id)?)?;
         self.resolve_object(object, budget)
     }
 
@@ -749,7 +748,7 @@ impl<'input, I: ReferenceInput + ?Sized> ResolutionCatalog<'input, I> {
         for source in candidates {
             let object = match source.kind() {
                 SourceKind::SerializedFile => ObjectId::binary(source, file_id)?,
-                SourceKind::Yaml => ObjectId::yaml(source, decimal_i64(file_id, budget)?)?,
+                SourceKind::Yaml => ObjectId::yaml(source, YamlFileId::new(file_id)?)?,
                 SourceKind::AssetBundle
                 | SourceKind::WebFile
                 | SourceKind::Archive
@@ -1272,35 +1271,6 @@ pub(super) fn clone_string(
     Ok(cloned)
 }
 
-fn decimal_i64(value: i64, budget: &mut AssetLoadBudget) -> Result<String, ReferenceGraphError> {
-    let mut magnitude = value.unsigned_abs();
-    let mut length = usize::from(value < 0);
-    loop {
-        length += 1;
-        magnitude /= 10;
-        if magnitude == 0 {
-            break;
-        }
-    }
-    let resource = "YAML reference file ID";
-    budget.check_bytes(usize_to_u64(length, resource)?)?;
-    let mut rendered = String::new();
-    rendered
-        .try_reserve_exact(length)
-        .map_err(|source| ReferenceGraphError::Allocation {
-            resource,
-            requested: length,
-            unit: super::ReferenceAllocationUnit::Bytes,
-            source,
-        })?;
-    let retained = usize_to_u64(rendered.capacity(), resource)?;
-    budget.check_bytes(retained)?;
-    write!(rendered, "{value}")
-        .map_err(|_| ReferenceGraphError::Invariant("failed to format YAML reference file ID"))?;
-    budget.consume_bytes(retained)?;
-    Ok(rendered)
-}
-
 fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, BudgetError> {
     u64::try_from(value).map_err(|_| BudgetError::ArithmeticOverflow { resource })
 }
@@ -1359,13 +1329,6 @@ mod tests {
         assert_eq!(
             path_budget.usage().bytes,
             u64::try_from(normalized.capacity()).unwrap()
-        );
-
-        let mut decimal_budget = AssetLoadBudget::default();
-        let rendered = decimal_i64(i64::MIN, &mut decimal_budget).unwrap();
-        assert_eq!(
-            decimal_budget.usage().bytes,
-            u64::try_from(rendered.capacity()).unwrap()
         );
 
         let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
@@ -1621,15 +1584,6 @@ mod tests {
             Err(ReferenceGraphError::Budget(_))
         ));
         assert_eq!(one_short.usage().members, 0);
-    }
-
-    #[test]
-    fn decimal_rendering_allocates_through_the_budget() {
-        let mut budget = AssetLoadBudget::default();
-        assert_eq!(
-            decimal_i64(i64::MIN, &mut budget).unwrap(),
-            i64::MIN.to_string()
-        );
     }
 
     #[test]

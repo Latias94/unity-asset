@@ -4437,8 +4437,10 @@ mod tests {
         let snapshot = workspace.snapshot();
         let first_locator = SourceLocator::path("first.asset").unwrap();
         let second_locator = SourceLocator::path("second.asset").unwrap();
-        let first_address = ObjectAddress::yaml(first_locator.clone(), "1").unwrap();
-        let second_address = ObjectAddress::yaml(second_locator.clone(), "1").unwrap();
+        let first_address =
+            ObjectAddress::yaml(first_locator.clone(), "1".parse().unwrap()).unwrap();
+        let second_address =
+            ObjectAddress::yaml(second_locator.clone(), "1".parse().unwrap()).unwrap();
         let field = FieldPath::root().push_field("m_StreamData").unwrap();
         let digest = DigestV1::hash_bytes(b"resource-index");
         let guard = FieldGuard::new(digest, digest);

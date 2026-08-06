@@ -1,7 +1,7 @@
 //! Stable capability discovery for the public workspace workflow.
 
 use serde::Serialize;
-use unity_asset_core::SourceKind;
+use unity_asset_core::{CHANGE_SET_VERSION, SourceKind};
 
 use crate::extraction::{
     BUNDLE_CONTAINER_QUERY_VERSION, BUNDLE_CONTAINER_RESULT_VERSION, EXTRACTION_MANIFEST_VERSION,
@@ -24,7 +24,7 @@ use super::preflight::PREPARE_REPORT_VERSION;
 /// Stable name of the serialized workspace capability catalog.
 pub const WORKSPACE_CAPABILITY_CATALOG_CONTRACT: &str = "unity_asset.workspace_capabilities";
 /// Current wire version of the workspace capability catalog.
-pub const WORKSPACE_CAPABILITY_CATALOG_VERSION: u16 = 1;
+pub const WORKSPACE_CAPABILITY_CATALOG_VERSION: u16 = 2;
 
 const CAPABILITIES: &[WorkspaceCapability] = &[
     WorkspaceCapability::SourceInspection,
@@ -116,6 +116,7 @@ pub enum WorkspaceSearchHandoffArtifact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct WorkspaceContractVersions {
     mutation_plan: u8,
+    change_set: u8,
     source_inspection: u8,
     object_inspection: u8,
     streamed_resource_query: u8,
@@ -138,6 +139,7 @@ pub struct WorkspaceContractVersions {
 impl WorkspaceContractVersions {
     const CURRENT: Self = Self {
         mutation_plan: MUTATION_PLAN_VERSION,
+        change_set: CHANGE_SET_VERSION,
         source_inspection: WORKSPACE_SOURCE_INSPECTION_VERSION,
         object_inspection: WORKSPACE_OBJECT_INSPECTION_VERSION,
         streamed_resource_query: STREAMED_RESOURCE_QUERY_VERSION,
@@ -160,6 +162,11 @@ impl WorkspaceContractVersions {
     #[must_use]
     pub const fn mutation_plan(self) -> u8 {
         self.mutation_plan
+    }
+
+    #[must_use]
+    pub const fn change_set(self) -> u8 {
+        self.change_set
     }
 
     #[must_use]
@@ -556,6 +563,7 @@ mod tests {
             WORKSPACE_CAPABILITY_CATALOG_VERSION
         );
         assert_eq!(catalog.contracts().mutation_plan(), MUTATION_PLAN_VERSION);
+        assert_eq!(catalog.contracts().change_set(), CHANGE_SET_VERSION);
         assert_eq!(
             catalog.contracts().reference_graph_projection(),
             REFERENCE_GRAPH_PROJECTION_VERSION
@@ -584,16 +592,17 @@ mod tests {
     fn json_field_order_and_contract_versions_are_stable() {
         let json = serde_json::to_string(&workspace_capabilities()).unwrap();
         let expected = concat!(
-            r#"{"contract":"unity_asset.workspace_capabilities","contract_version":1,"#,
+            r#"{"contract":"unity_asset.workspace_capabilities","contract_version":2,"#,
             r#""capabilities":["source_inspection","object_inspection","plan","prepare","#,
             r#""preview","commit","recover","reference","extraction","search_handoff"],"#,
-            r#""contracts":{"mutation_plan":2,"source_inspection":1,"object_inspection":1,"#,
-            r#""streamed_resource_query":1,"prepare_report":1,"commit_report":2,"#,
-            r#""recovery_locator":1,"recovery_discovery":1,"recovery_outcome":2,"#,
-            r#""rollback_receipt":2,"bundle_container_query":1,"bundle_container_result":1,"#,
-            r#""reference_graph_projection":1,"extraction_request":2,"extraction_plan":4,"#,
-            r#""extraction_manifest":3,"#,
-            r#""extraction_report":3,"yaml_split_report":1},"#,
+            r#""contracts":{"mutation_plan":3,"change_set":2,"source_inspection":1,"#,
+            r#""object_inspection":2,"#,
+            r#""streamed_resource_query":2,"prepare_report":2,"commit_report":3,"#,
+            r#""recovery_locator":1,"recovery_discovery":1,"recovery_outcome":3,"#,
+            r#""rollback_receipt":3,"bundle_container_query":1,"bundle_container_result":2,"#,
+            r#""reference_graph_projection":2,"extraction_request":3,"extraction_plan":5,"#,
+            r#""extraction_manifest":4,"#,
+            r#""extraction_report":4,"yaml_split_report":1},"#,
             r#""source_inspection":{"source_kinds":["yaml","serialized_file","asset_bundle","#,
             r#""web_file","archive","streamed_resource"],"views":["committed","prepared"]},"#,
             r#""object_inspection":{"source_kinds":["yaml","serialized_file"],"#,

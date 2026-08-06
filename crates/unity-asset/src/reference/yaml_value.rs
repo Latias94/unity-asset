@@ -1,4 +1,5 @@
 use unity_asset_core::UnityValue;
+use unity_asset_yaml::{YamlReferenceClassification, classify_reference_value};
 
 pub(crate) const YAML_FILE_ID: &str = "fileID";
 pub(crate) const YAML_GUID: &str = "guid";
@@ -11,6 +12,13 @@ pub(crate) const YAML_MEMBER_TYPE: &str = "m_Type";
 pub(crate) struct InvalidYamlReferenceValue;
 
 #[derive(Debug, Clone, Copy)]
+pub(crate) enum ClassifiedYamlReferenceValue<'value> {
+    NotReference,
+    Valid(YamlReferenceValue<'value>),
+    Malformed,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct YamlReferenceValue<'value> {
     file_field: &'value str,
     guid_field: Option<&'value str>,
@@ -21,7 +29,28 @@ pub(crate) struct YamlReferenceValue<'value> {
 }
 
 impl<'value> YamlReferenceValue<'value> {
+    pub(crate) fn classify(value: &'value UnityValue) -> ClassifiedYamlReferenceValue<'value> {
+        match classify_reference_value(value) {
+            YamlReferenceClassification::NotReference => ClassifiedYamlReferenceValue::NotReference,
+            YamlReferenceClassification::MalformedReference => {
+                ClassifiedYamlReferenceValue::Malformed
+            }
+            YamlReferenceClassification::ValidReference => match Self::read_exact(value) {
+                Ok(reference) => ClassifiedYamlReferenceValue::Valid(reference),
+                Err(_) => ClassifiedYamlReferenceValue::Malformed,
+            },
+        }
+    }
+
     pub(crate) fn read(value: &'value UnityValue) -> Result<Self, InvalidYamlReferenceValue> {
+        match Self::classify(value) {
+            ClassifiedYamlReferenceValue::Valid(reference) => Ok(reference),
+            ClassifiedYamlReferenceValue::NotReference
+            | ClassifiedYamlReferenceValue::Malformed => Err(InvalidYamlReferenceValue),
+        }
+    }
+
+    fn read_exact(value: &'value UnityValue) -> Result<Self, InvalidYamlReferenceValue> {
         let UnityValue::Object(fields) = value else {
             return Err(InvalidYamlReferenceValue);
         };
@@ -172,6 +201,25 @@ mod tests {
                 Err(InvalidYamlReferenceValue)
             ));
         }
+    }
+
+    #[test]
+    fn classification_distinguishes_plain_values_from_malformed_references() {
+        assert!(matches!(
+            YamlReferenceValue::classify(&UnityValue::Integer(1)),
+            ClassifiedYamlReferenceValue::NotReference
+        ));
+        assert!(matches!(
+            YamlReferenceValue::classify(&object(&[(
+                YAML_FILE_ID,
+                UnityValue::String("not-an-integer".to_owned()),
+            )])),
+            ClassifiedYamlReferenceValue::Malformed
+        ));
+        assert!(matches!(
+            YamlReferenceValue::classify(&object(&[(YAML_FILE_ID, UnityValue::Integer(1))])),
+            ClassifiedYamlReferenceValue::Valid(_)
+        ));
     }
 
     #[test]

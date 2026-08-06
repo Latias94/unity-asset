@@ -156,7 +156,11 @@ fn name_path() -> FieldPath {
 }
 
 fn address() -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(TARGET_ALIAS).unwrap(), "1").unwrap()
+    ObjectAddress::yaml(
+        SourceLocator::path(TARGET_ALIAS).unwrap(),
+        "1".parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn guard_for(value: &str) -> FieldGuard {
@@ -197,7 +201,7 @@ fn resource_path() -> FieldPath {
 }
 
 fn resource_address(locator: SourceLocator) -> ObjectAddress {
-    ObjectAddress::yaml(locator, "1").unwrap()
+    ObjectAddress::yaml(locator, "1".parse().unwrap()).unwrap()
 }
 
 fn observed_field_guard(
@@ -875,8 +879,9 @@ fn source_insertion_permutations_preserve_prepare_artifacts_graph_and_reports() 
         let bytes = if index == 3 {
             TARGET_YAML.to_owned()
         } else {
+            let file_id = index + 1;
             format!(
-                "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &{index}\nGameObject:\n  m_Name: Unrelated{index}\n"
+                "%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &{file_id}\nGameObject:\n  m_Name: Unrelated{index}\n"
             )
         };
         fs::write(&path, bytes).unwrap();

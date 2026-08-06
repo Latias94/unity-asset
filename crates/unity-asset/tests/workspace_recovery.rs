@@ -42,7 +42,11 @@ fn mutation_plan_with_values(
         )],
         Vec::new(),
         vec![GenericMutation::FieldReplace {
-            target: ObjectAddress::yaml(SourceLocator::path(SOURCE_ALIAS).unwrap(), "1").unwrap(),
+            target: ObjectAddress::yaml(
+                SourceLocator::path(SOURCE_ALIAS).unwrap(),
+                "1".parse().unwrap(),
+            )
+            .unwrap(),
             path,
             guard,
             replacement: MutationValue::string(replacement_name).unwrap(),

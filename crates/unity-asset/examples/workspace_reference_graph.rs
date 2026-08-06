@@ -121,7 +121,7 @@ fn arguments() -> io::Result<(PathBuf, ReferenceProjectionFormat)> {
         .as_deref()
         .map(parse_projection_format)
         .transpose()?
-        .unwrap_or(ReferenceProjectionFormat::JsonLinesV1);
+        .unwrap_or(ReferenceProjectionFormat::JsonLinesV2);
     if arguments.next().is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -133,9 +133,9 @@ fn arguments() -> io::Result<(PathBuf, ReferenceProjectionFormat)> {
 
 fn parse_projection_format(value: &OsStr) -> io::Result<ReferenceProjectionFormat> {
     match value.to_str() {
-        Some("json") => Ok(ReferenceProjectionFormat::JsonV1),
-        Some("jsonl") => Ok(ReferenceProjectionFormat::JsonLinesV1),
-        Some("dot") => Ok(ReferenceProjectionFormat::DotV1),
+        Some("json") => Ok(ReferenceProjectionFormat::JsonV2),
+        Some("jsonl") => Ok(ReferenceProjectionFormat::JsonLinesV2),
+        Some("dot") => Ok(ReferenceProjectionFormat::DotV2),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "projection format must be json, jsonl, or dot",

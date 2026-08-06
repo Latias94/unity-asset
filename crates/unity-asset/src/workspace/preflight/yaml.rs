@@ -6,7 +6,7 @@ use thiserror::Error;
 use unity_asset_core::{
     AllocationSizeError, AssetLoadBudget, BudgetError, DigestBuildError, DigestV1, FieldPath,
     ObjectId, ObjectKind, SemanticDigestError, SourceId, UnityClass, UnityValue,
-    UnityValueCloneError, UnityValueKind, ValuePathError, arc_value_allocation_bytes,
+    UnityValueCloneError, UnityValueKind, ValuePathError, YamlFileId, arc_value_allocation_bytes,
     semantic_value_digest, yaml_field_schema_digest, yaml_schema_digest,
 };
 
@@ -443,8 +443,8 @@ impl YamlObjectCandidate {
 }
 
 fn yaml_identity_matches(object: &ObjectId, document_index: usize, class: &UnityClass) -> bool {
-    match (object.yaml_anchor(), object.yaml_document_ordinal()) {
-        (Some(anchor), None) => anchor == class.anchor(),
+    match (object.yaml_file_id(), object.yaml_document_ordinal()) {
+        (Some(file_id), None) => YamlFileId::parse_canonical(class.anchor()).ok() == Some(file_id),
         (None, Some(ordinal)) => usize::try_from(ordinal) == Ok(document_index),
         (Some(_), Some(_)) | (None, None) => false,
     }
@@ -998,7 +998,7 @@ mod tests {
     fn test_object() -> ObjectId {
         let workspace = WorkspaceId::from_u128(1).unwrap();
         let source = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
-        ObjectId::yaml(source, "7").unwrap()
+        ObjectId::yaml(source, YamlFileId::new(7).unwrap()).unwrap()
     }
 
     fn candidate_from(class: &UnityClass) -> YamlObjectCandidate {
@@ -1049,7 +1049,10 @@ mod tests {
             YamlObjectCandidate::from_workspace_object(base, &mut AssetLoadBudget::default())
                 .unwrap();
 
-        assert_eq!(candidate.object().yaml_anchor(), Some("7"));
+        assert_eq!(
+            candidate.object().yaml_file_id(),
+            Some(YamlFileId::new(7).unwrap())
+        );
         assert_eq!(candidate.document_index(), 0);
         assert_eq!(
             candidate.class().get("name").unwrap().as_str(),

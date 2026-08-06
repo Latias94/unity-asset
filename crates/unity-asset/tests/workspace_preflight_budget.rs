@@ -39,7 +39,7 @@ fn yaml_locator() -> SourceLocator {
 }
 
 fn address() -> ObjectAddress {
-    ObjectAddress::yaml(yaml_locator(), "1").unwrap()
+    ObjectAddress::yaml(yaml_locator(), "1".parse().unwrap()).unwrap()
 }
 
 fn guard_for(value: &str) -> FieldGuard {

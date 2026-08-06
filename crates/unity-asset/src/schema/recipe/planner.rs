@@ -1,7 +1,7 @@
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectAddress,
-    ObjectKind, SourceId, UnityClass, UnityValue, ValuePathError, WorkspaceRevision, class_ids,
-    class_names, field_schema_digest, observe_semantic_value, semantic_value_digest,
+    ObjectKind, SourceId, UnityClass, UnityValue, ValuePathError, WorkspaceRevision, YamlFileId,
+    class_ids, class_names, field_schema_digest, observe_semantic_value, semantic_value_digest,
     yaml_field_schema_digest,
 };
 
@@ -10,7 +10,7 @@ use super::contract::{
     RecipeValueKind, SchemaOrigin, SchemaProvenance, SchemaVariantId,
 };
 use super::output::RecipeOutputBuilder;
-use crate::reference::yaml_value::YamlReferenceValue;
+use crate::reference::yaml_value::{ClassifiedYamlReferenceValue, YamlReferenceValue};
 use crate::schema::resource::classify_audio_clip_resource;
 use crate::workspace::{
     FieldGuard, GenericMutation, MutationPlanError, MutationPlanFragment, MutationValue,
@@ -388,7 +388,7 @@ fn validate_inspection(
     let key_matches = match address.kind() {
         ObjectKind::Binary => identity.binary_path_id() == address.binary_path_id(),
         ObjectKind::Yaml => {
-            identity.yaml_anchor() == address.yaml_anchor()
+            identity.yaml_file_id() == address.yaml_file_id()
                 && identity.yaml_document_ordinal() == address.yaml_document_ordinal()
         }
     };
@@ -471,7 +471,10 @@ fn is_reference_value(value: &UnityValue, kind: ObjectKind) -> bool {
         return false;
     };
     match kind {
-        ObjectKind::Yaml => YamlReferenceValue::read(value).is_ok(),
+        ObjectKind::Yaml => !matches!(
+            YamlReferenceValue::classify(value),
+            ClassifiedYamlReferenceValue::NotReference
+        ),
         ObjectKind::Binary => {
             aliased_reference_integer(fields, "m_FileID", "fileID").is_some()
                 && aliased_reference_integer(fields, "m_PathID", "pathID").is_some()
@@ -524,7 +527,10 @@ pub(crate) fn validate_reference_shape<'value>(
         });
     };
     let valid = match object.address.kind() {
-        ObjectKind::Yaml => YamlReferenceValue::read(value).is_ok(),
+        ObjectKind::Yaml => matches!(
+            YamlReferenceValue::classify(value),
+            ClassifiedYamlReferenceValue::Valid(_)
+        ),
         ObjectKind::Binary => {
             let file = aliased_reference_integer(fields, "m_FileID", "fileID");
             let path_id = aliased_reference_integer(fields, "m_PathID", "pathID");
@@ -565,11 +571,16 @@ pub(crate) fn decode_local_reference(
                     path: output.path(path)?,
                 });
             }
-            let mut buffer = [0_u8; 20];
-            let anchor = decimal_i64(file_id, &mut buffer);
-            let anchor = output.string(anchor, "hierarchy YAML anchor")?;
+            let file_id = match YamlFileId::new(file_id) {
+                Ok(file_id) => file_id,
+                Err(_) => {
+                    return Err(RecipeError::InvalidReference {
+                        path: output.path(path)?,
+                    });
+                }
+            };
             let locator = output.locator(object.address().source_locator())?;
-            match ObjectAddress::yaml(locator, anchor) {
+            match ObjectAddress::yaml(locator, file_id) {
                 Ok(address) => Ok(Some(address)),
                 Err(_) => Err(RecipeError::InvalidReference {
                     path: output.path(path)?,
@@ -604,24 +615,6 @@ pub(crate) fn decode_local_reference(
             }
         }
     }
-}
-
-fn decimal_i64(value: i64, buffer: &mut [u8; 20]) -> &str {
-    let mut cursor = buffer.len();
-    let mut magnitude = value.unsigned_abs();
-    loop {
-        cursor -= 1;
-        buffer[cursor] = b'0' + u8::try_from(magnitude % 10).expect("one decimal digit");
-        magnitude /= 10;
-        if magnitude == 0 {
-            break;
-        }
-    }
-    if value.is_negative() {
-        cursor -= 1;
-        buffer[cursor] = b'-';
-    }
-    std::str::from_utf8(&buffer[cursor..]).expect("decimal digits are valid UTF-8")
 }
 
 fn aliased_reference_integer(
@@ -841,6 +834,7 @@ pub(crate) fn ensure_finite(values: &[f64]) -> Result<(), RecipeError> {
 
 #[cfg(test)]
 mod tests {
+    use indexmap::IndexMap;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -854,17 +848,47 @@ mod tests {
     use super::*;
 
     #[test]
-    fn local_yaml_reference_formatting_preserves_the_full_signed_range() {
-        for (value, expected) in [
-            (0_i64, "0"),
-            (1_i64, "1"),
-            (-1_i64, "-1"),
-            (i64::MAX, "9223372036854775807"),
-            (i64::MIN, "-9223372036854775808"),
-        ] {
-            let mut buffer = [0_u8; 20];
-            assert_eq!(decimal_i64(value, &mut buffer), expected);
-        }
+    fn malformed_yaml_reference_fields_remain_semantically_protected() {
+        let malformed = UnityValue::Object(IndexMap::from([
+            (
+                "fileID".to_owned(),
+                UnityValue::String("not-an-integer".to_owned()),
+            ),
+            ("unexpected".to_owned(), UnityValue::Integer(1)),
+        ]));
+        let root = IndexMap::from([("m_Target".to_owned(), malformed)]);
+        let target = FieldPath::root().push_field("m_Target").unwrap();
+        let nested = target.clone().push_field("fileID").unwrap();
+
+        assert_eq!(
+            protected_plain_field_owner(1, ObjectKind::Yaml, &root, &target),
+            Some("unity-reference")
+        );
+        assert_eq!(
+            protected_plain_field_owner(1, ObjectKind::Yaml, &root, &nested),
+            Some("unity-reference")
+        );
+    }
+
+    #[test]
+    fn plain_yaml_objects_are_not_claimed_by_the_reference_subsystem() {
+        let root = IndexMap::from([(
+            "m_Data".to_owned(),
+            UnityValue::Object(IndexMap::from([(
+                "value".to_owned(),
+                UnityValue::Integer(1),
+            )])),
+        )]);
+        let path = FieldPath::root()
+            .push_field("m_Data")
+            .unwrap()
+            .push_field("value")
+            .unwrap();
+
+        assert_eq!(
+            protected_plain_field_owner(1, ObjectKind::Yaml, &root, &path),
+            None
+        );
     }
 
     #[test]

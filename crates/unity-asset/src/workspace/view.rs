@@ -842,8 +842,8 @@ pub enum WorkspaceSourceIdentityError {
     ZeroBinaryPathId,
     #[error("SerializedFile contains duplicate path IDs")]
     DuplicateBinaryPathId,
-    #[error("YAML source contains duplicate object anchors")]
-    DuplicateYamlAnchor,
+    #[error("YAML source contains duplicate object file IDs")]
+    DuplicateYamlFileId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

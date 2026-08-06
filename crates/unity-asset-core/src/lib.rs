@@ -32,12 +32,12 @@ pub use budget::{
     AssetLoadBudget, AssetLoadBudgetDomainToken, AssetLoadDepthScope, AssetLoadLimits,
     AssetLoadUsage, BudgetError, BudgetedJsonError, DecompressionBudget, DecompressionUsage,
 };
-pub use change::{ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
+pub use change::{CHANGE_SET_VERSION, ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
 pub use constants::*;
 pub use contract_json::{
     ContractJsonLimits, ContractJsonResourceModel, read_contract_json, read_contract_json_slice,
 };
-pub use diagnostic::{Diagnostic, DiagnosticError, DiagnosticSeverity};
+pub use diagnostic::{DIAGNOSTIC_VERSION, Diagnostic, DiagnosticError, DiagnosticSeverity};
 pub use digest::{DigestBuildError, DigestParseError, DigestV1, DigestV1Builder};
 pub use document::{DocumentFormat, UnityDocument};
 pub use error::{Result, UnityAssetError};
@@ -45,7 +45,7 @@ pub use field_path::{FieldPath, FieldPathError, FieldPathSegment};
 pub use identity::{
     BundleMemberId, ContainmentKind, ContainmentStep, ContractError, ObjectAddress, ObjectId,
     ObjectKind, RevisionedObjectHandle, SourceAlias, SourceId, SourceLocator, SourceMemberId,
-    WorkspaceId, YamlAnchor, YamlDocumentSelector,
+    WorkspaceId, YamlDocumentSelector, YamlFileId,
 };
 pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
 pub use semantic_digest::{

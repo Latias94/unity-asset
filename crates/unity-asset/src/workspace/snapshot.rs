@@ -8,7 +8,8 @@ use unity_asset_binary::asset::SerializedFile;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticSeverity, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, vec_allocation_bytes,
+    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, YamlFileId,
+    vec_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
 
@@ -259,7 +260,6 @@ impl WorkspaceView for WorkspaceSnapshot {
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<RevisionedObjectHandle>, WorkspaceError> {
         let mut count = 0_usize;
-        let mut yaml_anchor_bytes = 0_usize;
         for (source, entry) in self.state.store().iter() {
             match source.kind() {
                 SourceKind::SerializedFile => {
@@ -276,15 +276,6 @@ impl WorkspaceView for WorkspaceSnapshot {
                             resource: "workspace_object_results",
                         },
                     )?;
-                    for (index, class) in document.entries().iter().enumerate() {
-                        if !is_plain_yaml_document(index, class) {
-                            yaml_anchor_bytes = yaml_anchor_bytes
-                                .checked_add(class.anchor().len())
-                                .ok_or(BudgetError::ArithmeticOverflow {
-                                    resource: "workspace_object_results",
-                                })?;
-                        }
-                    }
                 }
                 SourceKind::AssetBundle
                 | SourceKind::WebFile
@@ -293,16 +284,6 @@ impl WorkspaceView for WorkspaceSnapshot {
             }
         }
         let mut objects = budgeted_result_vec::<RevisionedObjectHandle>(count, budget)?;
-        budget.check_bytes(u64::try_from(yaml_anchor_bytes).map_err(|_| {
-            BudgetError::ArithmeticOverflow {
-                resource: "workspace_object_results",
-            }
-        })?)?;
-        budget.consume_bytes(u64::try_from(yaml_anchor_bytes).map_err(|_| {
-            BudgetError::ArithmeticOverflow {
-                resource: "workspace_object_results",
-            }
-        })?)?;
 
         for (source, entry) in self.state.store().iter() {
             match source.kind() {
@@ -405,12 +386,7 @@ impl WorkspaceView for WorkspaceSnapshot {
         match matches {
             0 => Ok(WorkspaceLookup::Missing),
             1 => {
-                let retained_bytes = address.yaml_anchor().map_or(0, str::len);
-                consume_single_result(
-                    retained_bytes,
-                    "workspace_object_handle_projection",
-                    budget,
-                )?;
+                consume_single_result(0, "workspace_object_handle_projection", budget)?;
                 let object = match address.kind() {
                     ObjectKind::Binary => ObjectId::binary(
                         source,
@@ -753,7 +729,10 @@ pub(super) fn yaml_object_id(
         })?;
         Ok(ObjectId::yaml_document(source, index)?)
     } else {
-        Ok(ObjectId::yaml(source, class.anchor())?)
+        Ok(ObjectId::yaml(
+            source,
+            YamlFileId::parse_canonical(class.anchor())?,
+        )?)
     }
 }
 
@@ -773,8 +752,9 @@ fn yaml_selector_matches(
     class: &UnityClass,
 ) -> bool {
     match selector {
-        YamlDocumentSelector::Anchored { anchor } => {
-            !is_plain_yaml_document(index, class) && class.anchor() == anchor.as_str()
+        YamlDocumentSelector::FileId { file_id } => {
+            !is_plain_yaml_document(index, class)
+                && YamlFileId::parse_canonical(class.anchor()).ok() == Some(*file_id)
         }
         YamlDocumentSelector::Unanchored { document_index } => {
             usize::try_from(*document_index) == Ok(index) && is_plain_yaml_document(index, class)
@@ -783,8 +763,9 @@ fn yaml_selector_matches(
 }
 
 fn yaml_object_matches(object: &ObjectId, index: usize, class: &UnityClass) -> bool {
-    if let Some(anchor) = object.yaml_anchor() {
-        !is_plain_yaml_document(index, class) && class.anchor() == anchor
+    if let Some(file_id) = object.yaml_file_id() {
+        !is_plain_yaml_document(index, class)
+            && YamlFileId::parse_canonical(class.anchor()).ok() == Some(file_id)
     } else {
         object
             .yaml_document_ordinal()

@@ -25,7 +25,7 @@ mod yaml;
 mod scenario_tests;
 
 /// Wire schema shared by success and rejection reports.
-pub const PREPARE_REPORT_VERSION: u8 = 1;
+pub const PREPARE_REPORT_VERSION: u8 = 2;
 
 /// Caller-selected proof-image ceilings for one zero-write prepare operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

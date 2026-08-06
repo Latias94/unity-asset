@@ -48,7 +48,8 @@ pub(crate) use preparation::{
     JournalPreparation, JournalPreparationOutput, OpenedJournalPreparation,
 };
 
-pub(crate) const JOURNAL_VERSION: u8 = 4;
+pub(crate) const JOURNAL_VERSION: u8 = 5;
+pub(crate) const JOURNAL_TRANSACTION_SEED_VERSION: u8 = 2;
 const LEGACY_EVENT_VERSION: u8 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1321,7 +1322,7 @@ impl JournalManifest {
         }
         let actual = transaction_id_from_seed(
             &JournalTransactionSeed {
-                version: 1,
+                version: JOURNAL_TRANSACTION_SEED_VERSION,
                 workspace: self.workspace_id,
                 base_revision: self.base_revision,
                 committed_revision: self.committed_revision,
@@ -3479,7 +3480,7 @@ mod tests {
         let baseline = baseline(workspace, source, report_artifact.digest());
         let transaction = transaction_id_from_seed(
             &JournalTransactionSeed {
-                version: 1,
+                version: JOURNAL_TRANSACTION_SEED_VERSION,
                 workspace,
                 base_revision: from,
                 committed_revision: to,
@@ -3555,6 +3556,63 @@ mod tests {
         .unwrap();
         install_fixture_preparation(&layout, &report, &manifest);
         (report, manifest, layout)
+    }
+
+    #[test]
+    fn transaction_identity_isolated_by_literal_seed_version() {
+        assert_eq!(JOURNAL_TRANSACTION_SEED_VERSION, 2);
+        let directory = tempdir().unwrap();
+        let (_report, manifest, layout) = journal_fixture(directory.path(), true);
+        let outputs = manifest
+            .artifacts
+            .iter()
+            .enumerate()
+            .map(|(ordinal, artifact)| JournalTransactionOutputSeed {
+                ordinal: u32::try_from(ordinal).unwrap(),
+                logical_name: artifact.logical_name(),
+                source: artifact.source(),
+                relative_target: artifact.target().as_str(),
+                expected: if artifact.old_identity().is_some() {
+                    JournalExpectedDestination::Existing
+                } else {
+                    JournalExpectedDestination::Absent
+                },
+                expected_digest: artifact.old_digest(),
+                expected_identity: artifact.old_identity(),
+                destination_parent_identity: artifact.destination_parent_identity(),
+                digest: artifact.new_digest(),
+                bytes: artifact.bytes(),
+            })
+            .collect::<Vec<_>>();
+        let containment_root = layout.parent().to_str().unwrap();
+        let transaction_for = |version| {
+            transaction_id_from_seed(
+                &JournalTransactionSeed {
+                    version,
+                    workspace: manifest.workspace_id,
+                    base_revision: manifest.base_revision,
+                    committed_revision: manifest.committed_revision,
+                    base_installation: manifest.base_installation,
+                    committed_installation: manifest.committed_installation,
+                    plan_digest: manifest.plan_digest,
+                    atomicity: manifest.atomicity,
+                    containment_root,
+                    containment_root_identity: layout.root_identity(),
+                    outputs: &outputs,
+                    changed_sources: manifest.result.changes.changed_sources(),
+                    changed_objects: manifest.result.changes.changed_objects(),
+                    identity_remaps: manifest.result.changes.identity_remaps(),
+                    baseline: &manifest.baseline,
+                },
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+        };
+
+        let legacy = transaction_for(1);
+        let current = transaction_for(2);
+        assert_ne!(legacy, current);
+        assert_eq!(current, manifest.transaction());
     }
 
     fn install_fixture_preparation(

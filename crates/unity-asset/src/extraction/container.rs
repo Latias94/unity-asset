@@ -19,7 +19,7 @@ use crate::workspace::{WorkspaceObject, WorkspaceObjectValue, WorkspaceView};
 pub const BUNDLE_CONTAINER_QUERY_CONTRACT: &str = "unity_asset.bundle_container_query";
 pub const BUNDLE_CONTAINER_QUERY_VERSION: u8 = 1;
 pub const BUNDLE_CONTAINER_RESULT_CONTRACT: &str = "unity_asset.bundle_container_result";
-pub const BUNDLE_CONTAINER_RESULT_VERSION: u8 = 1;
+pub const BUNDLE_CONTAINER_RESULT_VERSION: u8 = 2;
 
 const BUNDLE_CONTAINER_QUERY_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
     small_contract_limits(BUNDLE_CONTAINER_QUERY_CONTRACT);
@@ -1040,5 +1040,22 @@ mod tests {
 
         assert_eq!(result.occurrences().len(), 2);
         assert_eq!(result.occurrences()[0], result.occurrences()[1]);
+
+        let current = serde_json::to_value(&result).unwrap();
+        for unsupported_version in [
+            BUNDLE_CONTAINER_RESULT_VERSION - 1,
+            BUNDLE_CONTAINER_RESULT_VERSION + 1,
+        ] {
+            let mut unsupported = current.clone();
+            unsupported["version"] = serde_json::json!(unsupported_version);
+            let encoded = serde_json::to_vec(&unsupported).unwrap();
+            assert!(
+                BundleContainerResult::read_json(
+                    encoded.as_slice(),
+                    &mut AssetLoadBudget::default(),
+                )
+                .is_err()
+            );
+        }
     }
 }

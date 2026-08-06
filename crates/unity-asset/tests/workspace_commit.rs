@@ -35,7 +35,11 @@ fn fixture() -> (TempDir, std::path::PathBuf, AssetWorkspace) {
 }
 
 fn address() -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(SOURCE_ALIAS).unwrap(), "1").unwrap()
+    ObjectAddress::yaml(
+        SourceLocator::path(SOURCE_ALIAS).unwrap(),
+        "1".parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn name_path() -> FieldPath {

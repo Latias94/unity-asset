@@ -91,13 +91,14 @@ fn zip_with_entries(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 fn handle(workspace: &AssetWorkspace, source: SourceId, anchor: &str) -> RevisionedObjectHandle {
+    let file_id = anchor.parse().unwrap();
     workspace
         .snapshot()
         .objects(&mut AssetLoadBudget::default())
         .unwrap()
         .into_iter()
         .find(|handle| {
-            handle.object().source() == source && handle.object().yaml_anchor() == Some(anchor)
+            handle.object().source() == source && handle.object().yaml_file_id() == Some(file_id)
         })
         .unwrap()
 }
@@ -143,7 +144,7 @@ struct CanonicalObjectIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum CanonicalLocalObjectIdentity {
     BinaryPathId(i64),
-    YamlAnchor(String),
+    YamlFileId(i64),
     YamlDocumentOrdinal(u32),
 }
 
@@ -193,8 +194,8 @@ fn canonical_reference_graph(
             .clone();
         let local = if let Some(path_id) = object.binary_path_id() {
             CanonicalLocalObjectIdentity::BinaryPathId(path_id)
-        } else if let Some(anchor) = object.yaml_anchor() {
-            CanonicalLocalObjectIdentity::YamlAnchor(anchor.to_owned())
+        } else if let Some(file_id) = object.yaml_file_id() {
+            CanonicalLocalObjectIdentity::YamlFileId(file_id.get())
         } else {
             CanonicalLocalObjectIdentity::YamlDocumentOrdinal(
                 object
@@ -662,21 +663,24 @@ fn one_index_preserves_occurrences_and_serves_all_graph_queries() {
     let report = graph
         .write_projection(
             &mut json,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
     assert!(report.is_complete());
     assert_eq!(report.facts_written(), 6);
     let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
-    assert_eq!(value["schema"], "unity-asset.reference-graph.v1");
+    assert_eq!(
+        value["schema"],
+        unity_asset::reference::REFERENCE_GRAPH_PROJECTION_SCHEMA
+    );
     assert_eq!(value["facts"].as_array().unwrap().len(), 6);
 
     let mut second = Vec::new();
     graph
         .write_projection(
             &mut second,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -686,7 +690,7 @@ fn one_index_preserves_occurrences_and_serves_all_graph_queries() {
     graph
         .write_projection(
             &mut dot,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::DotV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::DotV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -704,7 +708,7 @@ fn one_index_preserves_occurrences_and_serves_all_graph_queries() {
     let error = graph
         .write_projection(
             &mut Vec::new(),
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut one_short,
         )
         .unwrap_err();
@@ -828,14 +832,14 @@ fn projections_separate_revision_context_from_portable_object_addresses() {
     first_graph
         .write_projection(
             &mut first_json,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
     second_graph
         .write_projection(
             &mut second_json,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -883,7 +887,7 @@ fn canonical_projection_is_independent_of_graph_and_fact_cache_warmth() {
     let mut cold_json = Vec::new();
     cold.write_projection(
         &mut cold_json,
-        ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+        ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
         &mut AssetLoadBudget::default(),
     )
     .unwrap();
@@ -900,7 +904,7 @@ fn canonical_projection_is_independent_of_graph_and_fact_cache_warmth() {
     graph_cached
         .write_projection(
             &mut graph_cached_json,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
@@ -919,7 +923,7 @@ fn canonical_projection_is_independent_of_graph_and_fact_cache_warmth() {
     let mut warm_json = Vec::new();
     warm.write_projection(
         &mut warm_json,
-        ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+        ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
         &mut AssetLoadBudget::default(),
     )
     .unwrap();
@@ -1037,7 +1041,7 @@ fn duplicate_archive_members_pair_meta_guids_and_project_exact_occurrences() {
     graph
         .write_projection(
             &mut dot,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::DotV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::DotV2),
             &mut AssetLoadBudget::default(),
         )
         .unwrap();

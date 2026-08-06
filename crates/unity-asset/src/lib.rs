@@ -43,14 +43,15 @@
 // Re-export from core crate
 pub use unity_asset_core::{
     AssetLoadBudget, AssetLoadBudgetDomainToken, AssetLoadDepthScope, AssetLoadLimits,
-    AssetLoadUsage, BudgetError, BudgetedJsonError, BudgetedSourceBytes, BundleMemberId, ChangeSet,
-    ChangeSetError, ContainmentKind, ContractError, ContractJsonLimits, ContractJsonResourceModel,
-    DecompressionBudget, DecompressionUsage, Diagnostic, DiagnosticError, DiagnosticSeverity,
-    DigestBuildError, DigestParseError, DigestV1, DigestV1Builder, DocumentFormat, FieldPath,
-    FieldPathError, FieldPathSegment, IdentityRemap, ObjectAddress, ObjectId, ObjectKind, Result,
+    AssetLoadUsage, BudgetError, BudgetedJsonError, BudgetedSourceBytes, BundleMemberId,
+    CHANGE_SET_VERSION, ChangeSet, ChangeSetError, ContainmentKind, ContractError,
+    ContractJsonLimits, ContractJsonResourceModel, DIAGNOSTIC_VERSION, DecompressionBudget,
+    DecompressionUsage, Diagnostic, DiagnosticError, DiagnosticSeverity, DigestBuildError,
+    DigestParseError, DigestV1, DigestV1Builder, DocumentFormat, FieldPath, FieldPathError,
+    FieldPathSegment, IdentityRemap, ObjectAddress, ObjectId, ObjectKind, Result,
     RevisionedObjectHandle, SourceAlias, SourceFingerprint, SourceId, SourceKind, SourceLocator,
     SourceMemberId, TransactionId, UnityAssetError, UnityClass, UnityClassHeader, UnityDocument,
-    UnityValue, WorkspaceId, WorkspaceRevision, YamlAnchor, YamlDocumentSelector, constants::*,
+    UnityValue, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, YamlFileId, constants::*,
     read_contract_json, read_contract_json_slice,
 };
 

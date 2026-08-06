@@ -17,8 +17,8 @@ use crate::BinaryError;
 use crate::schema::{BinarySchemaVersion, DeclaredUnityVersion, SchemaOrigin, SchemaProvenance};
 
 use super::{
-    WorkspaceSnapshot, consume_object_table_scan, consume_single_result, is_plain_yaml_document,
-    source_object_index_error, yaml_object_id,
+    WorkspaceSnapshot, consume_object_table_scan, consume_single_result, source_object_index_error,
+    yaml_object_id,
 };
 use crate::workspace::view::{
     SourceObjectDescriptor, WorkspaceError, WorkspaceObject, WorkspaceObjectValue,
@@ -94,12 +94,7 @@ impl WorkspaceSnapshot {
                     .entries()
                     .get(index)
                     .ok_or_else(source_object_index_error)?;
-                let retained_bytes = if is_plain_yaml_document(index, class) {
-                    0
-                } else {
-                    class.anchor().len()
-                };
-                consume_single_result(retained_bytes, "workspace_object_projection", budget)?;
+                consume_single_result(0, "workspace_object_projection", budget)?;
                 let handle = self.handle_for_object(yaml_object_id(source, index, class)?)?;
                 Ok(SourceObjectDescriptor::new(handle, class.class_id(), index))
             }

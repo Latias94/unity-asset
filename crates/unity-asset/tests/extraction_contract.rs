@@ -1,4 +1,6 @@
-use unity_asset::extraction::{ExtractionPath, ExtractionRepresentationPolicy, ExtractionRequest};
+use unity_asset::extraction::{
+    EXTRACTION_REQUEST_VERSION, ExtractionPath, ExtractionRepresentationPolicy, ExtractionRequest,
+};
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedJsonError, ObjectAddress, SourceLocator,
 };
@@ -94,7 +96,11 @@ fn request_json_rejects_structure_beyond_its_contract_profile() {
 #[test]
 fn request_json_rejects_unknown_versions_and_fields() {
     let encoded = String::from_utf8(request().canonical_json().unwrap()).unwrap();
-    let unknown_version = encoded.replacen("\"version\":2", "\"version\":3", 1);
+    let unknown_version = encoded.replacen(
+        &format!("\"version\":{EXTRACTION_REQUEST_VERSION}"),
+        &format!("\"version\":{}", EXTRACTION_REQUEST_VERSION + 1),
+        1,
+    );
     assert!(
         ExtractionRequest::read_json(unknown_version.as_bytes(), &mut AssetLoadBudget::default(),)
             .is_err()

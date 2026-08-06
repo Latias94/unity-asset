@@ -265,10 +265,7 @@ fn yaml_output_path(
     budget: &mut AssetLoadBudget,
 ) -> Result<ExtractionPath, YamlSplitError> {
     let alias = source.locator().root_alias().as_str();
-    let selector_bytes = handle
-        .object()
-        .yaml_anchor()
-        .map_or(32, |anchor| anchor.len().saturating_add("anchor-".len()));
+    let selector_bytes = "file-id-".len() + 20;
     let maximum_bytes = "documents//.yaml"
         .len()
         .checked_add(alias.len())
@@ -282,10 +279,10 @@ fn yaml_output_path(
         }
     })?)?;
     let selector = match (
-        handle.object().yaml_anchor(),
+        handle.object().yaml_file_id(),
         handle.object().yaml_document_ordinal(),
     ) {
-        (Some(anchor), None) => format!("anchor-{anchor}"),
+        (Some(file_id), None) => format!("file-id-{file_id}"),
         (None, Some(index)) => format!("ordinal-{index:010}"),
         _ => return Err(YamlSplitError::InvalidYamlIdentity),
     };
@@ -394,12 +391,12 @@ mod tests {
         assert_eq!(report.skipped_existing(), 0);
         assert!(
             output
-                .join("documents/scene.prefab/anchor-1.yaml")
+                .join("documents/scene.prefab/file-id-1.yaml")
                 .is_file()
         );
         assert!(
             output
-                .join("documents/scene.prefab/anchor-2.yaml")
+                .join("documents/scene.prefab/file-id-2.yaml")
                 .is_file()
         );
         assert!(!output.join("extraction-manifest.json").exists());

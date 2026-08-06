@@ -33,7 +33,7 @@ fn graph(input: PathBuf, unity_project: bool, max_facts: u64, context: &AppConte
     let graph = snapshot
         .reference_graph(ReferenceGraphBuildOptions::unbounded(), &mut budget)
         .context("Failed to build the revision-bound reference graph")?;
-    let options = ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1)
+    let options = ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2)
         .with_max_facts(max_facts);
     let stdout = std::io::stdout();
     let mut output = stdout.lock();

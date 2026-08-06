@@ -15,7 +15,7 @@ fn locator() -> SourceLocator {
 }
 
 fn address(anchor: &str) -> ObjectAddress {
-    ObjectAddress::yaml(locator(), anchor).unwrap()
+    ObjectAddress::yaml(locator(), anchor.parse().unwrap()).unwrap()
 }
 
 fn source(bytes: &[u8]) -> SourceExpectation {
@@ -380,7 +380,7 @@ fn builder_uses_incremental_indexes_for_many_distinct_fragments() {
     for index in 0..FRAGMENT_COUNT {
         let payload = PlanPayload::new(index.to_le_bytes().to_vec());
         let digest = payload.digest();
-        let target = address(&index.to_string());
+        let target = address(&(index + 1).to_string());
         builder
             .append(fragment(
                 expected_source.clone(),

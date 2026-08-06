@@ -167,7 +167,7 @@ pub(crate) fn build_graph_from_input<I: ReferenceInput + ?Sized>(
             }
         }
         for occurrence in result.occurrences.occurrences.iter() {
-            let object = local_object_id(source_id, &occurrence.source, budget)?;
+            let object = local_object_id(source_id, &occurrence.source)?;
             let Ok(node_ordinal) =
                 nodes.binary_search_by(|candidate| candidate.object().cmp(&object))
             else {
@@ -351,14 +351,12 @@ pub(crate) fn build_graph_from_input<I: ReferenceInput + ?Sized>(
 fn local_object_id(
     source: SourceId,
     local: &LocalObjectId,
-    budget: &mut AssetLoadBudget,
 ) -> Result<ObjectId, ReferenceGraphError> {
     match local {
         LocalObjectId::Binary(path_id) => Ok(ObjectId::binary(source, *path_id)?),
-        LocalObjectId::Yaml(YamlDocumentSelector::Anchored { anchor }) => Ok(ObjectId::yaml(
-            source,
-            clone_string(anchor.as_str(), "YAML reference owner anchor", budget)?,
-        )?),
+        LocalObjectId::Yaml(YamlDocumentSelector::FileId { file_id }) => {
+            Ok(ObjectId::yaml(source, *file_id)?)
+        }
         LocalObjectId::Yaml(YamlDocumentSelector::Unanchored { document_index }) => {
             Ok(ObjectId::yaml_document(source, *document_index)?)
         }
@@ -376,7 +374,7 @@ fn bind_local_diagnostic<I: ReferenceInput + ?Sized>(
     let owned_object = local
         .source
         .as_ref()
-        .map(|local| local_object_id(source, local, budget))
+        .map(|local| local_object_id(source, local))
         .transpose()?;
     let object = owned_object.as_ref().or(default_object);
     let field_path = local.field_path.as_ref().or(default_path);

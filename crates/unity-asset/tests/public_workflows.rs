@@ -130,8 +130,11 @@ fn yaml_public_workflow_previews_commits_reopens_and_verifies() {
     fs::write(&path, YAML_SOURCE).expect("write YAML fixture");
 
     let mut workspace = load_workspace(&path, YAML_ALIAS, SourceKind::Yaml);
-    let address = ObjectAddress::yaml(SourceLocator::path(YAML_ALIAS).expect("locator"), "1")
-        .expect("YAML address");
+    let address = ObjectAddress::yaml(
+        SourceLocator::path(YAML_ALIAS).expect("locator"),
+        "1".parse().unwrap(),
+    )
+    .expect("YAML address");
     let field = FieldPath::root().push_field("m_Name").expect("name field");
     let base = workspace.snapshot();
     assert_inspection(&base, &address);
@@ -237,9 +240,11 @@ fn mixed_format_public_workflow_commits_one_transaction_and_reopens_both_sources
         SourceKind::SerializedFile,
     );
 
-    let yaml_address =
-        ObjectAddress::yaml(SourceLocator::path(YAML_ALIAS).expect("YAML locator"), "1")
-            .expect("YAML address");
+    let yaml_address = ObjectAddress::yaml(
+        SourceLocator::path(YAML_ALIAS).expect("YAML locator"),
+        "1".parse().unwrap(),
+    )
+    .expect("YAML address");
     let binary_address = ObjectAddress::binary_direct(
         SourceLocator::path(BINARY_ALIAS).expect("binary locator"),
         42,

@@ -617,7 +617,7 @@ fn validate_parts(
     }
     let actual = transaction_id_from_seed(
         &JournalTransactionSeed {
-            version: 1,
+            version: super::JOURNAL_TRANSACTION_SEED_VERSION,
             workspace: workspace_id,
             base_revision,
             committed_revision,

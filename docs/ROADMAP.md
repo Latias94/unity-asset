@@ -11,7 +11,7 @@ The following architecture is implemented:
 - one authoritative `AssetWorkspace` with immutable committed and prepared views;
 - stable source locators, object addresses, workspace revisions, and content digests;
 - `WorkspaceInspector` source/object contracts and exact streamed-resource resolution;
-- deterministic `MutationPlan` v2, zero-write prepare, prepared preview, recoverable commit, and
+- deterministic `MutationPlan` v3, zero-write prepare, prepared preview, recoverable commit, and
   typed recovery outcomes;
 - one revision-bound `ReferenceGraph` for YAML and binary references;
 - typed extraction request, plan, manifest, and report contracts;

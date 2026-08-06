@@ -5,7 +5,8 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 use unity_asset::workspace::{
-    GenericMutation, MutationPlan, MutationValue, ObjectGuard, SourceExpectation,
+    GenericMutation, MUTATION_PLAN_VERSION, MutationPlan, MutationValue, ObjectGuard,
+    SourceExpectation,
 };
 use unity_asset::{
     DigestV1, ObjectAddress, SourceFingerprint, SourceKind, SourceLocator, WorkspaceId,
@@ -78,7 +79,7 @@ fn canonical_plan() -> Vec<u8> {
         locator.clone(),
         SourceFingerprint::from_bytes(SourceKind::Yaml, b"workspace-json-test"),
     );
-    let target = ObjectAddress::yaml(locator, "1001").unwrap();
+    let target = ObjectAddress::yaml(locator, "1001".parse().unwrap()).unwrap();
     let plan = MutationPlan::new(
         WorkspaceId::from_u128(1).unwrap(),
         WorkspaceRevision::new(DigestV1::hash_bytes(b"base-revision")),
@@ -119,7 +120,7 @@ fn plan_validate_is_a_canonical_round_trip() {
 
     let plan: Value =
         serde_json::from_slice(&second.stdout).expect("validated plan must remain JSON");
-    assert_eq!(plan["version"], 2);
+    assert_eq!(plan["version"], MUTATION_PLAN_VERSION);
     assert_eq!(plan["operations"][0]["ordinal"], 0);
     assert_eq!(plan["operations"][0]["action"]["kind"], "schema_replace");
 }
@@ -177,8 +178,11 @@ fn oversized_small_contracts_report_a_typed_budget_error() {
 fn small_contracts_reject_a_trailing_json_document() {
     let temp = tempfile::tempdir().expect("temporary contract directory must be available");
     let path = temp.path().join("object-address-with-trailing-json.json");
-    let address =
-        ObjectAddress::yaml(SourceLocator::path("scene.prefab").unwrap(), "1001").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "1001".parse().unwrap(),
+    )
+    .unwrap();
     let mut encoded = serde_json::to_vec(&address).unwrap();
     encoded.extend_from_slice(b"\nnull");
     fs::write(&path, encoded).unwrap();

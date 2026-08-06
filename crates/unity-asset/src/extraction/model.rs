@@ -28,8 +28,8 @@ use super::representation::{
 };
 use crate::reference::{ReferenceDirection, ReferenceTraversalLimits};
 
-pub const EXTRACTION_REQUEST_VERSION: u8 = 2;
-pub const EXTRACTION_PLAN_VERSION: u8 = 4;
+pub const EXTRACTION_REQUEST_VERSION: u8 = 3;
+pub const EXTRACTION_PLAN_VERSION: u8 = 5;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -1657,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn request_v2_persists_reference_intent_without_query_only_limits() {
+    fn request_v3_persists_reference_intent_without_query_only_limits() {
         let root = ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
             .unwrap();
         let limits = ExtractionReferenceTraversalLimits::unbounded()
@@ -1673,7 +1673,10 @@ mod tests {
         .unwrap();
         let encoded = serde_json::to_value(&request).unwrap();
 
-        assert_eq!(encoded["version"], serde_json::json!(2));
+        assert_eq!(
+            encoded["version"],
+            serde_json::json!(EXTRACTION_REQUEST_VERSION)
+        );
         assert_eq!(
             encoded["selection"]["direction"],
             serde_json::json!("outgoing")
@@ -1698,7 +1701,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v4_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
+    fn plan_v5_artifact_serializes_derived_kinds_in_the_existing_wire_shape() {
         let artifact = planned_text_artifact();
         let encoded = serde_json::to_value(&artifact).unwrap();
 
@@ -1786,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v4_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+    fn plan_v5_artifact_rejects_tampered_preferred_and_fallback_kinds() {
         let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
 
         let mut preferred = encoded.clone();

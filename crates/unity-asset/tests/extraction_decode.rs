@@ -5,11 +5,12 @@ use std::path::PathBuf;
 
 use image::ImageFormat;
 use unity_asset::extraction::{
-    ExistingOutputPolicy, ExtractionArtifactKind, ExtractionArtifactStatus,
-    ExtractionDiagnosticCode, ExtractionExecutionError, ExtractionExecutionLimits,
-    ExtractionExecutionOptions, ExtractionExecutor, ExtractionFailurePolicy, ExtractionFilter,
-    ExtractionPlan, ExtractionPlanError, ExtractionPlanMismatchKind, ExtractionPlanner,
-    ExtractionRepresentationPolicy, ExtractionRequest, ExtractionRunOptions,
+    EXTRACTION_PLAN_VERSION, ExistingOutputPolicy, ExtractionArtifactKind,
+    ExtractionArtifactStatus, ExtractionDiagnosticCode, ExtractionExecutionError,
+    ExtractionExecutionLimits, ExtractionExecutionOptions, ExtractionExecutor,
+    ExtractionFailurePolicy, ExtractionFilter, ExtractionPlan, ExtractionPlanError,
+    ExtractionPlanMismatchKind, ExtractionPlanner, ExtractionRepresentationPolicy,
+    ExtractionRequest, ExtractionRunOptions,
 };
 use unity_asset::workspace::{AssetWorkspace, WorkspaceError};
 use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
@@ -308,7 +309,10 @@ fn media_plan_rejects_a_destination_suffix_that_disagrees_with_its_descriptor() 
         )
         .unwrap();
     let mut encoded = serde_json::to_value(plan).unwrap();
-    assert_eq!(encoded["version"], serde_json::json!(4));
+    assert_eq!(
+        encoded["version"],
+        serde_json::json!(EXTRACTION_PLAN_VERSION)
+    );
     let path = encoded["artifacts"][0]["preferred_path"]
         .as_str()
         .unwrap()

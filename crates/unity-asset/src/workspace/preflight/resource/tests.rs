@@ -106,7 +106,8 @@ fn resource_fields<'class>(
 }
 
 fn yaml_candidate(class: &UnityClass) -> YamlObjectCandidate {
-    let object = ObjectId::yaml(source(SourceKind::Yaml, 2), class.anchor().to_owned()).unwrap();
+    let object =
+        ObjectId::yaml(source(SourceKind::Yaml, 2), class.anchor().parse().unwrap()).unwrap();
     YamlObjectCandidate::from_class(
         object,
         0,

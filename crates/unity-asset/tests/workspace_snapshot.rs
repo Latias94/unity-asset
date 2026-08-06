@@ -272,12 +272,13 @@ fn assert_single_result_is_budgeted<T>(
     mut query: impl FnMut(&mut AssetLoadBudget) -> Result<T, WorkspaceError>,
     expected_entries: u64,
     expected_entries_before_byte_limit: u64,
+    expects_retained_bytes: bool,
 ) {
     let mut successful = AssetLoadBudget::default();
     query(&mut successful).unwrap();
     let successful_usage = successful.usage();
     assert_eq!(successful_usage.entries, expected_entries);
-    assert!(successful_usage.bytes > 0);
+    assert_eq!(successful_usage.bytes > 0, expects_retained_bytes);
 
     let mut entry_limited = AssetLoadBudget::new(AssetLoadLimits {
         max_entries: successful_usage.entries,
@@ -293,6 +294,10 @@ fn assert_single_result_is_budgeted<T>(
     ));
     assert_eq!(entry_limited.usage().entries, successful_usage.entries);
     assert_eq!(entry_limited.usage().bytes, 0);
+
+    if !expects_retained_bytes {
+        return;
+    }
 
     let mut byte_limited = AssetLoadBudget::new(AssetLoadLimits {
         max_bytes: successful_usage.bytes,
@@ -769,7 +774,11 @@ fn object_addresses_resolve_without_implicit_loading() {
         .load_path(&path, &mut AssetLoadBudget::default())
         .unwrap();
     let snapshot = workspace.snapshot();
-    let address = ObjectAddress::yaml(SourceLocator::path("scene.prefab").unwrap(), "100").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "100".parse().unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         snapshot
             .resolve_object(&address, &mut AssetLoadBudget::default())
@@ -777,8 +786,11 @@ fn object_addresses_resolve_without_implicit_loading() {
         WorkspaceLookup::Resolved(_)
     ));
 
-    let missing =
-        ObjectAddress::yaml(SourceLocator::path("missing.prefab").unwrap(), "100").unwrap();
+    let missing = ObjectAddress::yaml(
+        SourceLocator::path("missing.prefab").unwrap(),
+        "100".parse().unwrap(),
+    )
+    .unwrap();
     assert!(matches!(
         snapshot
             .resolve_object(&missing, &mut AssetLoadBudget::default())
@@ -852,7 +864,11 @@ fn single_query_results_respect_entry_and_byte_budgets() {
         .load_path(&path, &mut AssetLoadBudget::default())
         .unwrap();
     let snapshot = workspace.snapshot();
-    let address = ObjectAddress::yaml(SourceLocator::path("scene.prefab").unwrap(), "100").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.prefab").unwrap(),
+        "100".parse().unwrap(),
+    )
+    .unwrap();
     let handle = match snapshot
         .resolve_object(&address, &mut AssetLoadBudget::default())
         .unwrap()
@@ -861,9 +877,14 @@ fn single_query_results_respect_entry_and_byte_budgets() {
         other => panic!("expected resolved object, got {other:?}"),
     };
 
-    assert_single_result_is_budgeted(|budget| snapshot.source(root, budget), 1, 0);
-    assert_single_result_is_budgeted(|budget| snapshot.resolve_object(&address, budget), 2, 1);
-    assert_single_result_is_budgeted(|budget| snapshot.read_object(&handle, budget), 4, 1);
+    assert_single_result_is_budgeted(|budget| snapshot.source(root, budget), 1, 0, true);
+    assert_single_result_is_budgeted(
+        |budget| snapshot.resolve_object(&address, budget),
+        2,
+        1,
+        false,
+    );
+    assert_single_result_is_budgeted(|budget| snapshot.read_object(&handle, budget), 4, 4, true);
 }
 
 #[test]
@@ -947,7 +968,7 @@ fn yaml_object_table_scans_charge_each_cached_candidate_visit() {
         .unwrap();
     let snapshot = workspace.snapshot();
     let locator = SourceLocator::path(file_name).unwrap();
-    let missing = ObjectAddress::yaml(locator.clone(), "999").unwrap();
+    let missing = ObjectAddress::yaml(locator.clone(), "999".parse().unwrap()).unwrap();
 
     let mut exact = AssetLoadBudget::new(AssetLoadLimits {
         max_entries: CANDIDATE_COUNT,
@@ -975,7 +996,7 @@ fn yaml_object_table_scans_charge_each_cached_candidate_visit() {
     ));
     assert_eq!(one_short.usage(), AssetLoadUsage::default());
 
-    let address = ObjectAddress::yaml(locator, "200").unwrap();
+    let address = ObjectAddress::yaml(locator, "200".parse().unwrap()).unwrap();
     let mut resolve_then_read = AssetLoadBudget::new(AssetLoadLimits {
         max_entries: CANDIDATE_COUNT * 2,
         ..AssetLoadLimits::default()
@@ -1011,7 +1032,12 @@ fn invalid_yaml_identities_are_rejected_without_publishing_a_revision() {
         .unwrap();
     let revision = workspace.revision();
 
-    for invalid_anchor in ["12x".to_owned(), "9".repeat(1_025)] {
+    for invalid_anchor in [
+        "01".to_owned(),
+        "-0".to_owned(),
+        "12x".to_owned(),
+        "9".repeat(1_025),
+    ] {
         fs::write(&path, yaml_with_anchor(&invalid_anchor)).unwrap();
         assert!(
             workspace
@@ -1032,7 +1058,7 @@ fn invalid_yaml_identities_are_rejected_without_publishing_a_revision() {
     assert!(matches!(
         workspace.load_path(&path, &mut AssetLoadBudget::default()),
         Err(WorkspaceError::InvalidSourceIdentity {
-            reason: unity_asset::workspace::WorkspaceSourceIdentityError::DuplicateYamlAnchor,
+            reason: unity_asset::workspace::WorkspaceSourceIdentityError::DuplicateYamlFileId,
             ..
         })
     ));

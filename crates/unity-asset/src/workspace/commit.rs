@@ -180,7 +180,7 @@ pub use recovery::{
 };
 
 /// Current canonical commit-report wire version.
-pub const COMMIT_REPORT_VERSION: u8 = 2;
+pub const COMMIT_REPORT_VERSION: u8 = 3;
 
 /// Current canonical recovery-locator wire version.
 pub const RECOVERY_LOCATOR_VERSION: u8 = 1;
@@ -881,7 +881,7 @@ fn preflight_commit(
         });
     }
     let seed = JournalTransactionSeed {
-        version: 1,
+        version: journal::JOURNAL_TRANSACTION_SEED_VERSION,
         workspace: report.workspace_id(),
         base_revision: report.base_revision(),
         committed_revision: report.prepared_revision(),

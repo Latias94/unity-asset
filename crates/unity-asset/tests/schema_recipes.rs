@@ -279,7 +279,11 @@ impl Fixture {
     }
 
     fn address(&self, anchor: &str) -> ObjectAddress {
-        ObjectAddress::yaml(SourceLocator::path(&self.alias).unwrap(), anchor).unwrap()
+        ObjectAddress::yaml(
+            SourceLocator::path(&self.alias).unwrap(),
+            anchor.parse().unwrap(),
+        )
+        .unwrap()
     }
 }
 
@@ -1749,8 +1753,11 @@ fn hierarchy_projection_rejects_cross_source_wrong_class_and_wrong_shape() {
         .unwrap();
     let snapshot = fixture.workspace.snapshot();
     let planner = SchemaRecipePlanner::new(&snapshot);
-    let other_parent =
-        ObjectAddress::yaml(SourceLocator::path("other.prefab").unwrap(), "3").unwrap();
+    let other_parent = ObjectAddress::yaml(
+        SourceLocator::path("other.prefab").unwrap(),
+        "3".parse().unwrap(),
+    )
+    .unwrap();
     let cross_source = hierarchy_intent(
         &planner,
         fixture.address("2"),

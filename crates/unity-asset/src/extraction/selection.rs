@@ -7,6 +7,7 @@ use serde::{Serialize, Serializer};
 use unity_asset_binary::asset::class_ids;
 use unity_asset_core::{
     AssetLoadBudget, ObjectAddress, ObjectKind, RevisionedObjectHandle, SourceLocator, UnityValue,
+    YamlFileId,
 };
 
 use super::container::{
@@ -560,7 +561,7 @@ fn selection_witness(
     let candidate_count = usize_to_u64(candidates.len(), "extraction selection witness")?;
     let candidate_digest = canonical_digest(&SelectionWitnessPayload {
         contract: "unity_asset.extraction_selection_witness",
-        version: 1,
+        version: 2,
         addresses: CandidateAddresses(candidates),
     })
     .map_err(ExtractionModelError::from)
@@ -700,15 +701,15 @@ fn allocate_path(
     let digest = canonical_digest(address)
         .map_err(|error| ExtractionPlanError::CanonicalAddress(error.to_string()))?;
     let source_name = source.root_alias().as_str();
-    let artifact_name = object_name.unwrap_or_else(|| {
-        address
-            .yaml_anchor()
-            .unwrap_or(if address.kind() == ObjectKind::Binary {
-                "object"
-            } else {
-                "document"
-            })
-    });
+    let artifact_name = if let Some(name) = object_name {
+        ArtifactStem::Text(name)
+    } else if let Some(file_id) = address.yaml_file_id() {
+        ArtifactStem::YamlFileId(file_id)
+    } else if address.kind() == ObjectKind::Binary {
+        ArtifactStem::Text("object")
+    } else {
+        ArtifactStem::Text("document")
+    };
     let fallback = if raw_fallback { ".raw" } else { "" };
     let requested = [
         prefix.map_or(0, |prefix| prefix.as_str().len() + 1),
@@ -719,7 +720,7 @@ fn allocate_path(
         "-".len(),
         slug_capacity_bound(class_name, CLASS_LIMIT),
         "/".len(),
-        slug_capacity_bound(artifact_name, NAME_LIMIT),
+        artifact_name.capacity_bound(NAME_LIMIT),
         "--".len(),
         DIGEST_HEX_BYTES,
         fallback.len(),
@@ -752,7 +753,7 @@ fn allocate_path(
     relative.push('-');
     push_slug(&mut relative, class_name, CLASS_LIMIT);
     relative.push('/');
-    push_slug(&mut relative, artifact_name, NAME_LIMIT);
+    artifact_name.push_slug(&mut relative, NAME_LIMIT)?;
     relative.push_str("--");
     push_digest_hex(&mut relative, digest);
     relative.push_str(fallback);
@@ -762,6 +763,39 @@ fn allocate_path(
     ExtractionPath::from_string_with_budget(relative, budget)
         .map_err(ExtractionModelError::from)
         .map_err(map_model_error)
+}
+
+#[derive(Clone, Copy)]
+enum ArtifactStem<'name> {
+    Text(&'name str),
+    YamlFileId(YamlFileId),
+}
+
+impl ArtifactStem<'_> {
+    fn capacity_bound(self, maximum: usize) -> usize {
+        match self {
+            Self::Text(value) => slug_capacity_bound(value, maximum),
+            Self::YamlFileId(file_id) => "file-id-".len() + decimal_i64_len(file_id.get()),
+        }
+    }
+
+    fn push_slug(self, output: &mut String, maximum: usize) -> Result<(), ExtractionPlanError> {
+        match self {
+            Self::Text(value) => {
+                push_slug(output, value, maximum);
+                Ok(())
+            }
+            Self::YamlFileId(file_id) => {
+                output.push_str("file-id-");
+                write!(output, "{file_id}").map_err(|_| ExtractionPlanError::PathFormatting)
+            }
+        }
+    }
+}
+
+fn decimal_i64_len(value: i64) -> usize {
+    let digits = value.unsigned_abs().ilog10() as usize + 1;
+    digits + usize::from(value.is_negative())
 }
 
 const fn slug_capacity_bound(value: &str, maximum: usize) -> usize {

@@ -12,23 +12,23 @@ use super::index::ReferenceIndex;
 use super::{ReferenceGraphError, ReferenceTruncationKind};
 
 /// Stable schema name emitted by all reference graph projections.
-pub const REFERENCE_GRAPH_PROJECTION_SCHEMA: &str = "unity-asset.reference-graph.v1";
+pub const REFERENCE_GRAPH_PROJECTION_SCHEMA: &str = "unity-asset.reference-graph.v2";
 /// Current wire version of the reference graph projection schema.
-pub const REFERENCE_GRAPH_PROJECTION_VERSION: u8 = 1;
+pub const REFERENCE_GRAPH_PROJECTION_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReferenceProjectionFormat {
-    DotV1,
-    JsonV1,
-    JsonLinesV1,
+    DotV2,
+    JsonV2,
+    JsonLinesV2,
 }
 
 impl fmt::Display for ReferenceProjectionFormat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::DotV1 => "dot_v1",
-            Self::JsonV1 => "json_v1",
-            Self::JsonLinesV1 => "json_lines_v1",
+            Self::DotV2 => "dot_v2",
+            Self::JsonV2 => "json_v2",
+            Self::JsonLinesV2 => "json_lines_v2",
         })
     }
 }
@@ -218,13 +218,13 @@ pub(crate) fn write_projection<W: Write + ?Sized>(
     let plan = ProjectionPlan::prepare(index, options, budget)?;
     let mut writer = BudgetWriter::new(output, budget);
     match options.format {
-        ReferenceProjectionFormat::JsonV1 => {
+        ReferenceProjectionFormat::JsonV2 => {
             write_json(index, &mut writer, plan)?;
         }
-        ReferenceProjectionFormat::JsonLinesV1 => {
+        ReferenceProjectionFormat::JsonLinesV2 => {
             write_json_lines(index, &mut writer, plan)?;
         }
-        ReferenceProjectionFormat::DotV1 => write_dot(index, &mut writer, plan)?,
+        ReferenceProjectionFormat::DotV2 => write_dot(index, &mut writer, plan)?,
     }
     finish_flush(&mut writer, options.format)?;
     let bytes_written = writer.bytes_written;
@@ -328,8 +328,8 @@ impl ProjectionPlan {
 
     const fn resolved_edges_written(self, format: ReferenceProjectionFormat) -> u64 {
         match format {
-            ReferenceProjectionFormat::DotV1 => self.dot_resolved_edges,
-            ReferenceProjectionFormat::JsonV1 | ReferenceProjectionFormat::JsonLinesV1 => {
+            ReferenceProjectionFormat::DotV2 => self.dot_resolved_edges,
+            ReferenceProjectionFormat::JsonV2 | ReferenceProjectionFormat::JsonLinesV2 => {
                 self.selected_resolved_edges
             }
         }
@@ -360,7 +360,7 @@ fn write_json<W: Write + ?Sized>(
         revision: index.revision(),
         complete: plan.complete,
         coverage: CoverageProjection(index),
-        projection: plan.projection_counts(ReferenceProjectionFormat::JsonV1),
+        projection: plan.projection_counts(ReferenceProjectionFormat::JsonV2),
         resolution_counts: plan.resolution_counts,
         nodes: NodesProjection {
             index,
@@ -373,7 +373,7 @@ fn write_json<W: Write + ?Sized>(
         diagnostics: &index.diagnostics()[..plan.diagnostic_count],
     };
     let result = serde_json::to_writer(&mut *writer, &document);
-    finish_json(result, writer, ReferenceProjectionFormat::JsonV1)
+    finish_json(result, writer, ReferenceProjectionFormat::JsonV2)
 }
 
 fn write_json_lines<W: Write + ?Sized>(
@@ -388,7 +388,7 @@ fn write_json_lines<W: Write + ?Sized>(
         revision: index.revision(),
         complete: plan.complete,
         coverage: CoverageProjection(index),
-        projection: plan.projection_counts(ReferenceProjectionFormat::JsonLinesV1),
+        projection: plan.projection_counts(ReferenceProjectionFormat::JsonLinesV2),
         resolution_counts: plan.resolution_counts,
     };
     write_json_line(writer, &header)?;
@@ -427,11 +427,11 @@ fn write_json_line<W: Write + ?Sized>(
     value: &impl Serialize,
 ) -> Result<(), ReferenceGraphError> {
     let result = serde_json::to_writer(&mut *writer, value);
-    finish_json(result, writer, ReferenceProjectionFormat::JsonLinesV1)?;
+    finish_json(result, writer, ReferenceProjectionFormat::JsonLinesV2)?;
     finish_io(
         writer.write_all(b"\n"),
         writer,
-        ReferenceProjectionFormat::JsonLinesV1,
+        ReferenceProjectionFormat::JsonLinesV2,
     )
 }
 
@@ -484,7 +484,7 @@ fn write_dot<W: Write + ?Sized>(
     for diagnostic in &index.diagnostics()[..plan.diagnostic_count] {
         dot_io(write!(writer, "  // diagnostic="), writer)?;
         let result = serde_json::to_writer(&mut *writer, diagnostic);
-        finish_json(result, writer, ReferenceProjectionFormat::DotV1)?;
+        finish_json(result, writer, ReferenceProjectionFormat::DotV2)?;
         dot_io(writeln!(writer), writer)?;
     }
     dot_io(writeln!(writer, "  rankdir=LR;"), writer)?;
@@ -571,9 +571,8 @@ fn write_object_label<W: Write + ?Sized>(
     dot_io(write!(writer, ":"), writer)?;
     if let Some(path_id) = address.binary_path_id() {
         dot_io(write!(writer, "path_id={path_id}"), writer)
-    } else if let Some(anchor) = address.yaml_anchor() {
-        dot_io(write!(writer, "anchor="), writer)?;
-        write_dot_escaped(writer, anchor)
+    } else if let Some(file_id) = address.yaml_file_id() {
+        dot_io(write!(writer, "file_id={file_id}"), writer)
     } else if let Some(index) = address.yaml_document_ordinal() {
         dot_io(write!(writer, "document={index}"), writer)
     } else {
@@ -1009,7 +1008,7 @@ fn dot_io<W: Write + ?Sized>(
     result: io::Result<()>,
     writer: &mut BudgetWriter<'_, W>,
 ) -> Result<(), ReferenceGraphError> {
-    finish_io(result, writer, ReferenceProjectionFormat::DotV1)
+    finish_io(result, writer, ReferenceProjectionFormat::DotV2)
 }
 
 fn finish_flush<W: Write + ?Sized>(
@@ -1123,7 +1122,7 @@ fn analyze_resolutions(
 mod tests {
     use unity_asset_core::{
         AssetLoadLimits, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath, ObjectAddress,
-        ObjectId, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator,
+        ObjectId, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, YamlFileId,
     };
 
     use super::*;
@@ -1212,6 +1211,26 @@ mod tests {
         .expect("diagnostic")
     }
 
+    #[test]
+    fn yaml_object_labels_emit_typed_file_ids() {
+        let address = ObjectAddress::yaml(
+            SourceLocator::path("projection.prefab").expect("source locator"),
+            YamlFileId::new(-42).expect("YAML file ID"),
+        )
+        .expect("YAML address");
+        let mut output = Vec::new();
+        let mut budget = AssetLoadBudget::default();
+        {
+            let mut writer = BudgetWriter::new(&mut output, &mut budget);
+            write_object_label(&mut writer, &address).expect("object label");
+        }
+
+        assert_eq!(
+            std::str::from_utf8(&output).expect("UTF-8 label"),
+            "projection.prefab:file_id=-42"
+        );
+    }
+
     fn exact_projection_budget() -> AssetLoadBudget {
         AssetLoadBudget::new(AssetLoadLimits {
             max_entries: 9,
@@ -1225,9 +1244,9 @@ mod tests {
     fn every_format_reports_the_same_deterministic_diagnostic_truncation() {
         let graph = graph();
         for format in [
-            ReferenceProjectionFormat::JsonV1,
-            ReferenceProjectionFormat::JsonLinesV1,
-            ReferenceProjectionFormat::DotV1,
+            ReferenceProjectionFormat::JsonV2,
+            ReferenceProjectionFormat::JsonLinesV2,
+            ReferenceProjectionFormat::DotV2,
         ] {
             let mut output = Vec::new();
             let mut budget = exact_projection_budget();
@@ -1260,7 +1279,7 @@ mod tests {
 
     fn assert_projection_diagnostics(format: ReferenceProjectionFormat, output: &[u8]) {
         match format {
-            ReferenceProjectionFormat::JsonV1 => {
+            ReferenceProjectionFormat::JsonV2 => {
                 let document: serde_json::Value =
                     serde_json::from_slice(output).expect("JSON projection");
                 assert_eq!(document["projection"]["diagnostics_written"], 1);
@@ -1276,7 +1295,7 @@ mod tests {
                 );
                 assert_eq!(document["diagnostics"][0]["code"], "PROJECTION_0");
             }
-            ReferenceProjectionFormat::JsonLinesV1 => {
+            ReferenceProjectionFormat::JsonLinesV2 => {
                 let lines = output
                     .split(|byte| *byte == b'\n')
                     .filter(|line| !line.is_empty())
@@ -1293,7 +1312,7 @@ mod tests {
                 assert_eq!(diagnostics.len(), 1);
                 assert_eq!(diagnostics[0]["diagnostic"]["code"], "PROJECTION_0");
             }
-            ReferenceProjectionFormat::DotV1 => {
+            ReferenceProjectionFormat::DotV2 => {
                 let dot = std::str::from_utf8(output).expect("DOT projection");
                 assert!(dot.contains(
                     "facts=6/6 resolved_edges=1 diagnostics=1/3 diagnostics_truncated=true"
@@ -1308,9 +1327,9 @@ mod tests {
     fn facts_written_is_format_invariant_while_dot_edges_are_explicitly_lossy() {
         let graph = graph();
         for (format, expected_edges) in [
-            (ReferenceProjectionFormat::JsonV1, 1),
-            (ReferenceProjectionFormat::JsonLinesV1, 1),
-            (ReferenceProjectionFormat::DotV1, 0),
+            (ReferenceProjectionFormat::JsonV2, 1),
+            (ReferenceProjectionFormat::JsonLinesV2, 1),
+            (ReferenceProjectionFormat::DotV2, 0),
         ] {
             let mut output = Vec::new();
             let report = write_projection(
@@ -1324,13 +1343,13 @@ mod tests {
             assert_eq!(report.resolved_edges_written(), expected_edges);
 
             match format {
-                ReferenceProjectionFormat::JsonV1 => {
+                ReferenceProjectionFormat::JsonV2 => {
                     let document: serde_json::Value =
                         serde_json::from_slice(&output).expect("JSON projection");
                     assert_eq!(document["projection"]["facts_written"], 6);
                     assert_eq!(document["projection"]["resolved_edges_written"], 1);
                 }
-                ReferenceProjectionFormat::JsonLinesV1 => {
+                ReferenceProjectionFormat::JsonLinesV2 => {
                     let header: serde_json::Value = serde_json::from_slice(
                         output.split(|byte| *byte == b'\n').next().expect("header"),
                     )
@@ -1338,7 +1357,7 @@ mod tests {
                     assert_eq!(header["projection"]["facts_written"], 6);
                     assert_eq!(header["projection"]["resolved_edges_written"], 1);
                 }
-                ReferenceProjectionFormat::DotV1 => {
+                ReferenceProjectionFormat::DotV2 => {
                     let dot = std::str::from_utf8(&output).expect("DOT projection");
                     assert!(dot.contains("facts=6/6 resolved_edges=0"));
                     assert!(!dot.contains(" -> "));
@@ -1350,7 +1369,7 @@ mod tests {
     #[test]
     fn hard_entry_and_member_limits_fail_before_any_output() {
         let graph = graph();
-        let options = ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1)
+        let options = ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2)
             .with_max_diagnostics(1);
 
         let mut entry_budget = AssetLoadBudget::new(AssetLoadLimits {
@@ -1413,13 +1432,13 @@ mod tests {
         let error = write_projection(
             &graph,
             &mut FailingWriter,
-            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV1),
+            ReferenceProjectionOptions::new(ReferenceProjectionFormat::JsonV2),
             &mut AssetLoadBudget::default(),
         )
         .expect_err("writer must fail");
         match error {
             ReferenceGraphError::ProjectionIo { format, source, .. } => {
-                assert_eq!(format, ReferenceProjectionFormat::JsonV1);
+                assert_eq!(format, ReferenceProjectionFormat::JsonV2);
                 assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
             }
             other => panic!("expected projection I/O error, got {other:?}"),

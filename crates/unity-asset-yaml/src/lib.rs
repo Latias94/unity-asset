@@ -36,9 +36,10 @@ pub use budgeted::{
     parse_prebudgeted_yaml_source,
 };
 pub use reference::{
-    YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceOccurrence, YamlReferenceRawTarget,
-    YamlReferenceRawTargetRef, YamlReferenceScan, YamlReferenceScanError, YamlReferenceScanStats,
-    YamlReferenceShape, YamlReferenceTarget, YamlValueKind, scan_reference_class_occurrences,
+    YamlReferenceClassification, YamlReferenceDiagnostic, YamlReferenceField,
+    YamlReferenceOccurrence, YamlReferenceRawTarget, YamlReferenceRawTargetRef, YamlReferenceScan,
+    YamlReferenceScanError, YamlReferenceScanStats, YamlReferenceShape, YamlReferenceTarget,
+    YamlValueKind, classify_reference_value, scan_reference_class_occurrences,
     scan_reference_occurrences,
 };
 pub use unity_yaml_serializer::UnityYamlSerializer;

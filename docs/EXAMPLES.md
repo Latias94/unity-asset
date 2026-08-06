@@ -82,7 +82,7 @@ cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect object --inp
 cargo run -p unity-asset-cli --bin unity-asset -- workspace inspect bundle-containers --input D:\GameProject --query-json container-query.json
 ```
 
-Validate and canonicalize a `MutationPlan` v2 before loading a workspace:
+Validate and canonicalize a `MutationPlan` v3 before loading a workspace:
 
 ```powershell
 cargo run -p unity-asset-cli --bin unity-asset -- workspace plan validate --plan mutation-plan.json

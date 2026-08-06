@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 use unity_asset::extraction::{
+    EXTRACTION_MANIFEST_VERSION, EXTRACTION_PLAN_VERSION, EXTRACTION_REPORT_VERSION,
     ExtractionFilter, ExtractionRepresentationPolicy, ExtractionRequest,
 };
 
@@ -50,7 +51,7 @@ fn export_dry_run_is_side_effect_free_and_execution_uses_manifest_paths() {
     assert_success(&dry_run);
     let plan: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
     assert_eq!(plan["contract"], "unity_asset.extraction_plan");
-    assert_eq!(plan["version"], 4);
+    assert_eq!(plan["version"], EXTRACTION_PLAN_VERSION);
     assert_eq!(plan["artifacts"].as_array().unwrap().len(), 1);
     assert!(!output_root.exists());
 
@@ -58,7 +59,7 @@ fn export_dry_run_is_side_effect_free_and_execution_uses_manifest_paths() {
     assert_success(&execution);
     let report = extraction_report(&execution);
     assert_eq!(report["contract"], "unity_asset.extraction_report");
-    assert_eq!(report["version"], 3);
+    assert_eq!(report["version"], EXTRACTION_REPORT_VERSION);
     assert_eq!(report["counts"]["written"], 1);
     let artifacts = report["manifest"]["artifacts"].as_array().unwrap();
     assert_eq!(artifacts.len(), 1);
@@ -524,11 +525,11 @@ fn split_yaml_cli_publishes_a_separate_json_report_and_replaces_documents() {
     assert_eq!(report["written"], 2);
     assert_eq!(report["skipped_existing"], 0);
 
-    let document = output.join("documents/scene.prefab/anchor-1001.yaml");
+    let document = output.join("documents/scene.prefab/file-id-1001.yaml");
     assert!(document.is_file());
     assert!(
         output
-            .join("documents/scene.prefab/anchor-1002.yaml")
+            .join("documents/scene.prefab/file-id-1002.yaml")
             .is_file()
     );
     assert!(!output.join("extraction-manifest.json").exists());
@@ -710,12 +711,12 @@ fn extraction_report(output: &Output) -> serde_json::Value {
     let report: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("extraction report must be JSON");
     assert_eq!(report["contract"], "unity_asset.extraction_report");
-    assert_eq!(report["version"], 3);
+    assert_eq!(report["version"], EXTRACTION_REPORT_VERSION);
     assert_eq!(
         report["manifest"]["contract"],
         "unity_asset.extraction_manifest"
     );
-    assert_eq!(report["manifest"]["version"], 3);
+    assert_eq!(report["manifest"]["version"], EXTRACTION_MANIFEST_VERSION);
     report
 }
 

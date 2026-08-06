@@ -2,13 +2,18 @@ use indexmap::IndexMap;
 use std::sync::Arc;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, FieldPath, UnityClass, UnityDocument,
-    UnityValue, YamlDocumentSelector,
+    UnityValue, YamlDocumentSelector, YamlFileId,
 };
 use unity_asset_yaml::{
-    YamlDocument, YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceOccurrence,
-    YamlReferenceScanError, YamlReferenceShape, YamlValueKind, parse_budgeted_yaml_source,
-    scan_reference_class_occurrences, scan_reference_occurrences,
+    YamlDocument, YamlReferenceClassification, YamlReferenceDiagnostic, YamlReferenceField,
+    YamlReferenceOccurrence, YamlReferenceScanError, YamlReferenceShape, YamlValueKind,
+    classify_reference_value, parse_budgeted_yaml_source, scan_reference_class_occurrences,
+    scan_reference_occurrences,
 };
+
+fn yaml_file_id(value: i64) -> YamlFileId {
+    YamlFileId::new(value).unwrap()
+}
 
 fn parse_document(input: &str) -> Arc<YamlDocument> {
     let mut budget = AssetLoadBudget::default();
@@ -81,7 +86,7 @@ MonoBehaviour:
     for occurrence in &scan.occurrences {
         assert_eq!(
             occurrence.object,
-            YamlDocumentSelector::anchor("-42").unwrap()
+            YamlDocumentSelector::file_id(yaml_file_id(-42))
         );
     }
 
@@ -319,7 +324,7 @@ GameObject:
 }
 
 #[test]
-fn rejects_duplicate_anchored_object_selectors_before_emitting_occurrences() {
+fn rejects_duplicate_file_ids_before_emitting_occurrences() {
     let first = with_property(
         UnityClass::new(1, "GameObject".to_string(), "100".to_string()),
         "target",
@@ -334,7 +339,7 @@ fn rejects_duplicate_anchored_object_selectors_before_emitting_occurrences() {
 
     assert!(matches!(
         scan_reference_occurrences(&document, &mut AssetLoadBudget::default()),
-        Err(YamlReferenceScanError::DuplicateDocumentAnchor {
+        Err(YamlReferenceScanError::DuplicateDocumentFileId {
             first_document_index: 0,
             second_document_index: 1,
         })
@@ -403,11 +408,11 @@ fn indexed_class_projection_scans_sparse_replacements_without_cloning_the_docume
     ));
     assert_eq!(
         scan.occurrences[0].object,
-        YamlDocumentSelector::anchor("100").unwrap()
+        YamlDocumentSelector::file_id(yaml_file_id(100))
     );
     assert_eq!(
         scan.occurrences[1].object,
-        YamlDocumentSelector::anchor("200").unwrap()
+        YamlDocumentSelector::file_id(yaml_file_id(200))
     );
 }
 
@@ -422,6 +427,32 @@ fn indexed_class_projection_rejects_a_missing_declared_document() {
         ),
         Err(YamlReferenceScanError::MissingDocument { document_index: 1 })
     ));
+}
+
+#[test]
+fn classifies_malformed_reference_markers_without_fail_open() {
+    assert_eq!(
+        classify_reference_value(&UnityValue::Integer(1)),
+        YamlReferenceClassification::NotReference
+    );
+    assert_eq!(
+        classify_reference_value(&UnityValue::Object(IndexMap::from([(
+            "value".to_string(),
+            UnityValue::Integer(1),
+        )]))),
+        YamlReferenceClassification::NotReference
+    );
+    assert_eq!(
+        classify_reference_value(&UnityValue::Object(pointer(0))),
+        YamlReferenceClassification::ValidReference
+    );
+    assert_eq!(
+        classify_reference_value(&UnityValue::Object(IndexMap::from([
+            ("fileID".to_string(), UnityValue::Integer(1)),
+            ("unexpected".to_string(), UnityValue::Integer(2)),
+        ]))),
+        YamlReferenceClassification::MalformedReference
+    );
 }
 
 fn pointer(file_id: i64) -> IndexMap<String, UnityValue> {

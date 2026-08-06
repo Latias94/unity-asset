@@ -7,6 +7,9 @@ use crate::{FieldPath, ObjectAddress};
 const MAX_DIAGNOSTIC_CODE_BYTES: usize = 128;
 const MAX_DIAGNOSTIC_MESSAGE_BYTES: usize = 64 * 1024;
 
+/// Current wire version for diagnostics that may carry a versioned object address.
+pub const DIAGNOSTIC_VERSION: u8 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSeverity {
@@ -51,7 +54,7 @@ impl Serialize for Diagnostic {
         S: Serializer,
     {
         DiagnosticRef {
-            version: 1,
+            version: DIAGNOSTIC_VERSION,
             severity: self.severity,
             code: &self.code,
             message: &self.message,
@@ -68,7 +71,7 @@ impl<'de> Deserialize<'de> for Diagnostic {
         D: Deserializer<'de>,
     {
         let wire = DiagnosticWire::deserialize(deserializer)?;
-        if wire.version != 1 {
+        if wire.version != DIAGNOSTIC_VERSION {
             return Err(serde::de::Error::custom(
                 DiagnosticError::UnsupportedVersion(wire.version),
             ));

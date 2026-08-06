@@ -522,16 +522,10 @@ fn yaml_file_id(target: &ObjectId) -> Result<i64, ReferenceEncodingError> {
     if let Some(path_id) = target.binary_path_id() {
         return Ok(path_id);
     }
-    let Some(anchor) = target.yaml_anchor() else {
+    let Some(file_id) = target.yaml_file_id() else {
         return Err(ReferenceEncodingError::YamlDocumentHasNoFileId);
     };
-    let file_id = anchor
-        .parse::<i64>()
-        .map_err(|_| ReferenceEncodingError::YamlAnchorIsNotFileId)?;
-    if file_id == 0 {
-        return Err(ReferenceEncodingError::YamlFileIdIsNull);
-    }
-    Ok(file_id)
+    Ok(file_id.get())
 }
 
 fn external_path(
@@ -633,10 +627,6 @@ pub(crate) enum ReferenceEncodingError {
     },
     #[error("YAML document ordinals cannot be encoded as PPtr file IDs")]
     YamlDocumentHasNoFileId,
-    #[error("YAML object anchor is not a signed decimal PPtr file ID")]
-    YamlAnchorIsNotFileId,
-    #[error("YAML object file ID zero would encode a null reference")]
-    YamlFileIdIsNull,
     #[error("external YAML target source {source_id:?} has no matching .meta GUID")]
     TargetMetaGuidMissing { source_id: SourceId },
     #[error("external YAML target source {source_id:?} has an all-zero .meta GUID")]
@@ -657,6 +647,7 @@ mod tests {
     use unity_asset_core::{
         AssetLoadLimits, ContainmentKind, Diagnostic, DiagnosticSeverity, DigestV1, ObjectAddress,
         SourceLocator, SourceMemberId, UnityClass, UnityValue, WorkspaceId, WorkspaceRevision,
+        YamlFileId,
     };
     use unity_asset_yaml::{YamlReferenceShape, scan_reference_class_occurrences};
     use zip::{CompressionMethod, ZipWriter, write::FileOptions};
@@ -690,7 +681,7 @@ mod tests {
         let owner = RevisionedObjectHandle::new(
             snapshot.workspace_id(),
             snapshot.revision(),
-            ObjectId::yaml(owner_source, "1").unwrap(),
+            ObjectId::yaml(owner_source, YamlFileId::new(1).unwrap()).unwrap(),
         )
         .unwrap();
         let local = target(&snapshot, owner_source, ObjectKind::Yaml, 2);
@@ -813,7 +804,11 @@ mod tests {
         ));
 
         let missing = ReferenceTarget::object(
-            ObjectAddress::yaml(locator(&snapshot, owner_source), "999").unwrap(),
+            ObjectAddress::yaml(
+                locator(&snapshot, owner_source),
+                YamlFileId::new(999).unwrap(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             encoder.encode(
@@ -826,7 +821,11 @@ mod tests {
             Err(ReferenceEncodingError::TargetMissing)
         ));
         let unloaded = ReferenceTarget::object(
-            ObjectAddress::yaml(SourceLocator::path("unloaded.prefab").unwrap(), "1").unwrap(),
+            ObjectAddress::yaml(
+                SourceLocator::path("unloaded.prefab").unwrap(),
+                YamlFileId::new(1).unwrap(),
+            )
+            .unwrap(),
         );
         assert!(matches!(
             encoder.encode(
@@ -841,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_external_rejects_missing_zero_ambiguous_and_non_numeric_identities() {
+    fn yaml_external_rejects_missing_zero_ambiguous_and_ordinal_identities() {
         let directory = tempfile::tempdir().unwrap();
         let owner_path = directory.path().join("owner.prefab");
         let missing_path = directory.path().join("missing.prefab");
@@ -891,7 +890,7 @@ mod tests {
         let owner = RevisionedObjectHandle::new(
             snapshot.workspace_id(),
             snapshot.revision(),
-            ObjectId::yaml(owner_source, "1").unwrap(),
+            ObjectId::yaml(owner_source, YamlFileId::new(1).unwrap()).unwrap(),
         )
         .unwrap();
         let mut budget = AssetLoadBudget::default();
@@ -1275,7 +1274,7 @@ mod tests {
         let owner = RevisionedObjectHandle::new(
             snapshot.workspace_id(),
             snapshot.revision(),
-            ObjectId::yaml(owner_source, "1").unwrap(),
+            ObjectId::yaml(owner_source, YamlFileId::new(1).unwrap()).unwrap(),
         )
         .unwrap();
         let mut budget = AssetLoadBudget::default();
@@ -1407,7 +1406,7 @@ mod tests {
         let locator = locator(snapshot, source);
         ReferenceTarget::object(match kind {
             ObjectKind::Binary => ObjectAddress::binary_at(locator, id).unwrap(),
-            ObjectKind::Yaml => ObjectAddress::yaml(locator, id.to_string()).unwrap(),
+            ObjectKind::Yaml => ObjectAddress::yaml(locator, YamlFileId::new(id).unwrap()).unwrap(),
         })
     }
 
@@ -1436,7 +1435,7 @@ mod tests {
                 ObjectAddress::binary_at(locator, object.binary_path_id().unwrap()).unwrap()
             }
             ObjectKind::Yaml => {
-                ObjectAddress::yaml(locator, object.yaml_anchor().unwrap()).unwrap()
+                ObjectAddress::yaml(locator, object.yaml_file_id().unwrap()).unwrap()
             }
         };
         assert!(matches!(

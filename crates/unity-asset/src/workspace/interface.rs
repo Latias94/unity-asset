@@ -15,7 +15,7 @@ use unity_asset_binary::typetree::{
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, DigestBuildError, DigestV1, DigestV1Builder,
     SourceAlias, SourceId, SourceKind, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision,
-    YamlAnchor, arc_slice_allocation_bytes, arc_value_allocation_bytes,
+    YamlFileId, arc_slice_allocation_bytes, arc_value_allocation_bytes,
 };
 use unity_asset_yaml::{BudgetedYamlError, YamlDocument, parse_prebudgeted_yaml_source};
 
@@ -1914,23 +1914,25 @@ pub(super) fn validate_yaml_identities(
         document.entries().len(),
         "yaml_identity_entries",
     )?)?;
-    let mut anchors =
-        reserve_budgeted_vec::<&str>(document.entries().len(), budget, "YAML identity validation")?;
+    let mut file_ids = reserve_budgeted_vec::<YamlFileId>(
+        document.entries().len(),
+        budget,
+        "YAML identity validation",
+    )?;
     for (index, class) in document.entries().iter().enumerate() {
         if is_plain_yaml_document(index, class) {
             u32::try_from(index).map_err(|_| BudgetError::ArithmeticOverflow {
                 resource: "yaml_document_ordinal",
             })?;
         } else {
-            YamlAnchor::validate(class.anchor())?;
-            anchors.push(class.anchor());
+            file_ids.push(YamlFileId::parse_canonical(class.anchor())?);
         }
     }
-    anchors.sort_unstable();
-    if anchors.windows(2).any(|pair| pair[0] == pair[1]) {
+    file_ids.sort_unstable();
+    if file_ids.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(WorkspaceError::InvalidSourceIdentity {
             source_kind: SourceKind::Yaml,
-            reason: WorkspaceSourceIdentityError::DuplicateYamlAnchor,
+            reason: WorkspaceSourceIdentityError::DuplicateYamlFileId,
         });
     }
     Ok(())

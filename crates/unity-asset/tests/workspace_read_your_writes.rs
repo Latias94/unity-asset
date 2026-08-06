@@ -25,7 +25,11 @@ GameObject:
 "#;
 
 fn address(anchor: &str) -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(SOURCE_ALIAS).unwrap(), anchor).unwrap()
+    ObjectAddress::yaml(
+        SourceLocator::path(SOURCE_ALIAS).unwrap(),
+        anchor.parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn target_path() -> FieldPath {
@@ -149,7 +153,8 @@ fn prepared_reference_is_one_revision_across_object_and_graph_queries() {
         .unwrap();
     assert!(matches!(
         base_graph.outgoing(&base_source).unwrap().next().unwrap().resolution(),
-        ReferenceResolution::Resolved(target) if target.object().yaml_anchor() == Some("2")
+        ReferenceResolution::Resolved(target)
+            if target.object().yaml_file_id() == Some("2".parse().unwrap())
     ));
     assert_eq!(fs::read(&source_path).unwrap(), YAML.as_bytes());
 }

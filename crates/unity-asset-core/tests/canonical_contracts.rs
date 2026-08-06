@@ -1,7 +1,7 @@
 use unity_asset_core::{
-    ChangeSet, ChangeSetError, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath, IdentityRemap,
-    ObjectAddress, ObjectId, SourceId, SourceKind, SourceLocator, TransactionId, WorkspaceId,
-    WorkspaceRevision,
+    CHANGE_SET_VERSION, ChangeSet, ChangeSetError, DIAGNOSTIC_VERSION, Diagnostic,
+    DiagnosticSeverity, DigestV1, FieldPath, IdentityRemap, ObjectAddress, ObjectId, SourceId,
+    SourceKind, SourceLocator, TransactionId, WorkspaceId, WorkspaceRevision, YamlFileId,
 };
 
 fn source(workspace: WorkspaceId, kind: SourceKind, local: u64) -> SourceId {
@@ -12,19 +12,23 @@ fn transaction(bytes: &[u8]) -> TransactionId {
     TransactionId::new(DigestV1::hash_bytes(bytes))
 }
 
+fn yaml_file_id(value: i64) -> YamlFileId {
+    YamlFileId::new(value).unwrap()
+}
+
 #[test]
 fn change_sets_have_versioned_canonical_bytes_independent_of_insertion_order() {
     let workspace = WorkspaceId::from_u128(1).unwrap();
     let first_source = source(workspace, SourceKind::SerializedFile, 1);
     let second_source = source(workspace, SourceKind::Yaml, 2);
     let first_object = ObjectId::binary(first_source, -9).unwrap();
-    let second_object = ObjectId::yaml(second_source, "17").unwrap();
+    let second_object = ObjectId::yaml(second_source, yaml_file_id(17)).unwrap();
     let from = WorkspaceRevision::new(DigestV1::hash_bytes(b"from"));
     let to = WorkspaceRevision::new(DigestV1::hash_bytes(b"to"));
     let first_address =
         ObjectAddress::binary_direct(SourceLocator::path("a.assets").unwrap(), -9).unwrap();
     let second_address =
-        ObjectAddress::yaml(SourceLocator::path("b.prefab").unwrap(), "17").unwrap();
+        ObjectAddress::yaml(SourceLocator::path("b.prefab").unwrap(), yaml_file_id(17)).unwrap();
     let remap = IdentityRemap::new(first_address, second_address).unwrap();
 
     let left = ChangeSet::new(
@@ -43,7 +47,10 @@ fn change_sets_have_versioned_canonical_bytes_independent_of_insertion_order() {
         from,
         to,
         vec![first_source, second_source],
-        vec![first_object, ObjectId::yaml(second_source, "17").unwrap()],
+        vec![
+            first_object,
+            ObjectId::yaml(second_source, yaml_file_id(17)).unwrap(),
+        ],
         vec![remap],
     )
     .unwrap();
@@ -52,12 +59,12 @@ fn change_sets_have_versioned_canonical_bytes_independent_of_insertion_order() {
     assert_eq!(left_bytes, serde_json::to_vec(&right).unwrap());
     assert_eq!(
         DigestV1::hash_bytes(&left_bytes).to_string(),
-        "blake3-v1:9e59c57899fd51c5ac055256beca5738de29b555d718c00ecf49fd9046b45217"
+        "blake3-v1:8c5ee9d8062416cc51cd11e759ca0eb9a060ed425523d3e45740d9a59d01b53f"
     );
     assert!(
         std::str::from_utf8(&left_bytes)
             .unwrap()
-            .contains("\"version\":1")
+            .contains("\"version\":2")
     );
     assert_eq!(
         serde_json::from_slice::<ChangeSet>(&left_bytes).unwrap(),
@@ -188,13 +195,30 @@ fn change_set_deserialization_revalidates_version_and_invariants() {
     let workspace = WorkspaceId::from_u128(1).unwrap();
     let revision = WorkspaceRevision::new(DigestV1::hash_bytes(b"same"));
     let invalid = format!(
-        r#"{{"version":1,"transaction":"{}","workspace":"{workspace}","from_revision":"{revision}","to_revision":"{revision}","changed_sources":[],"changed_objects":[],"identity_remaps":[]}}"#,
+        r#"{{"version":2,"transaction":"{}","workspace":"{workspace}","from_revision":"{revision}","to_revision":"{revision}","changed_sources":[],"changed_objects":[],"identity_remaps":[]}}"#,
         transaction(b"deserialize")
     );
     assert!(serde_json::from_str::<ChangeSet>(&invalid).is_err());
 
-    let unknown_version = invalid.replace("\"version\":1", "\"version\":2");
-    assert!(serde_json::from_str::<ChangeSet>(&unknown_version).is_err());
+    let valid = ChangeSet::new(
+        transaction(b"versioned"),
+        workspace,
+        WorkspaceRevision::new(DigestV1::hash_bytes(b"from")),
+        WorkspaceRevision::new(DigestV1::hash_bytes(b"to")),
+        vec![source(workspace, SourceKind::Yaml, 1)],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap();
+    let current = serde_json::to_value(valid).unwrap();
+    for unsupported_version in [CHANGE_SET_VERSION - 1, CHANGE_SET_VERSION + 1] {
+        let mut unsupported = current.clone();
+        unsupported["version"] = serde_json::json!(unsupported_version);
+        let error = serde_json::from_value::<ChangeSet>(unsupported).unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "change set version {unsupported_version} is unsupported"
+        )));
+    }
 }
 
 #[test]
@@ -204,8 +228,11 @@ fn diagnostics_sort_by_structured_fields_and_expose_typed_context() {
         .unwrap()
         .push_index(2)
         .unwrap();
-    let address =
-        ObjectAddress::yaml(SourceLocator::path("scene.unity").unwrap(), "100001").unwrap();
+    let address = ObjectAddress::yaml(
+        SourceLocator::path("scene.unity").unwrap(),
+        yaml_file_id(100001),
+    )
+    .unwrap();
     let error = Diagnostic::new(
         DiagnosticSeverity::Error,
         "INVALID_REFERENCE",
@@ -236,12 +263,17 @@ fn diagnostics_sort_by_structured_fields_and_expose_typed_context() {
     assert!(
         serde_json::to_string(&left[0])
             .unwrap()
-            .contains("\"version\":1")
+            .contains(&format!("\"version\":{}", DIAGNOSTIC_VERSION))
     );
-    let unsupported = serde_json::to_string(&left[0])
-        .unwrap()
-        .replace("\"version\":1", "\"version\":2");
-    assert!(serde_json::from_str::<Diagnostic>(&unsupported).is_err());
+    let encoded = serde_json::to_value(&left[0]).unwrap();
+    for unsupported_version in [DIAGNOSTIC_VERSION - 1, DIAGNOSTIC_VERSION + 1] {
+        let mut unsupported = encoded.clone();
+        unsupported["version"] = serde_json::json!(unsupported_version);
+        let error = serde_json::from_value::<Diagnostic>(unsupported).unwrap_err();
+        assert!(error.to_string().contains(&format!(
+            "diagnostic version {unsupported_version} is unsupported"
+        )));
+    }
 }
 
 #[test]

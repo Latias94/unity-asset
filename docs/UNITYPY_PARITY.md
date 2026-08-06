@@ -38,7 +38,7 @@ The following are intentionally not goals:
 |---|---|---|
 | Source ownership and identity | `AssetWorkspace`, `SourceLocator`, `WorkspaceSnapshot` | Nested archive, WebFile, bundle, SerializedFile, YAML, and streamed-resource sources retain exact ownership and revision identity. |
 | Inspection | `WorkspaceInspector` over committed or prepared `WorkspaceView` values | Sources and objects have versioned JSON projections; exact lookup preserves missing, ambiguous, and invalid states. |
-| Mutation | `MutationPlan` v2 and `MutationPlanFragment` | Ordered, digest-guarded operations replace implicit mutable object state. |
+| Mutation | `MutationPlan` v3 and `MutationPlanFragment` | Ordered, digest-guarded operations replace implicit mutable object state. |
 | Preflight | `AssetWorkspace::prepare` and opaque `PreparedChange` | Every candidate artifact is encoded, sealed, independently reparsed, and exposed through read-your-writes inspection before publication. |
 | Publication | `AssetWorkspace::commit`, `PublicationTarget`, and recovery contracts | Publication is per-artifact recoverable, transaction-keyed, and idempotently recoverable from durable evidence. |
 | TypeTree semantics | `TypeTreeSchema` shared by read, skip, scan, write, and rewrite | Alignment, numeric bulk paths, unsigned values, PPtr scanning, and unnamed-field byte preservation use one schema execution model. |

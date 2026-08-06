@@ -1104,10 +1104,13 @@ mod tests {
         let locator = locator(&snapshot, source);
         let owner = resolved_object(
             &snapshot,
-            &ObjectAddress::yaml(locator.clone(), "1").unwrap(),
+            &ObjectAddress::yaml(locator.clone(), "1".parse().unwrap()).unwrap(),
         );
-        let first = ReferenceTarget::object(ObjectAddress::yaml(locator.clone(), "2").unwrap());
-        let second = ReferenceTarget::object(ObjectAddress::yaml(locator, "3").unwrap());
+        let first = ReferenceTarget::object(
+            ObjectAddress::yaml(locator.clone(), "2".parse().unwrap()).unwrap(),
+        );
+        let second =
+            ReferenceTarget::object(ObjectAddress::yaml(locator, "3".parse().unwrap()).unwrap());
         let base = snapshot
             .read_object(&owner, &mut AssetLoadBudget::default())
             .unwrap();
@@ -1195,9 +1198,10 @@ mod tests {
         let locator = locator(&snapshot, source);
         let owner = resolved_object(
             &snapshot,
-            &ObjectAddress::yaml(locator.clone(), "1").unwrap(),
+            &ObjectAddress::yaml(locator.clone(), "1".parse().unwrap()).unwrap(),
         );
-        let target = ReferenceTarget::object(ObjectAddress::yaml(locator, "2").unwrap());
+        let target =
+            ReferenceTarget::object(ObjectAddress::yaml(locator, "2".parse().unwrap()).unwrap());
         let nested = MutationValue::object(vec![
             MutationField::new(
                 "outer",

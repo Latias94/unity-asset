@@ -8,6 +8,9 @@ use crate::{DigestV1, ObjectAddress, ObjectId, SourceId, WorkspaceId, WorkspaceR
 
 const MAX_CHANGE_SET_ITEMS: usize = 1_000_000;
 
+/// Current wire version of the authoritative workspace change set.
+pub const CHANGE_SET_VERSION: u8 = 2;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TransactionId(DigestV1);
@@ -127,7 +130,7 @@ impl Serialize for ChangeSet {
         S: Serializer,
     {
         ChangeSetRef {
-            version: 1,
+            version: CHANGE_SET_VERSION,
             transaction: self.transaction,
             workspace: self.workspace,
             from_revision: self.from_revision,
@@ -146,7 +149,7 @@ impl<'de> Deserialize<'de> for ChangeSet {
         D: Deserializer<'de>,
     {
         let wire = ChangeSetWire::deserialize(deserializer)?;
-        if wire.version != 1 {
+        if wire.version != CHANGE_SET_VERSION {
             return Err(serde::de::Error::custom(
                 ChangeSetError::UnsupportedVersion(wire.version),
             ));
