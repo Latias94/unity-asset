@@ -775,9 +775,7 @@ mod tests {
             ..AssetLoadLimits::default()
         };
         let mut exact = AssetLoadBudget::new(exact_limits).unwrap();
-        reader
-            .read(range, location.digest(), &mut exact)
-            .unwrap();
+        reader.read(range, location.digest(), &mut exact).unwrap();
         assert_eq!(exact.usage(), usage);
 
         let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
@@ -786,11 +784,7 @@ mod tests {
         })
         .unwrap();
         let error = reader
-            .read(
-                range,
-                location.digest(),
-                &mut one_short,
-            )
+            .read(range, location.digest(), &mut one_short)
             .unwrap_err();
         assert!(matches!(
             error,
@@ -824,11 +818,7 @@ mod tests {
             )
             .unwrap();
         let error = reader
-            .read(
-                range,
-                location.digest(),
-                &mut AssetLoadBudget::default(),
-            )
+            .read(range, location.digest(), &mut AssetLoadBudget::default())
             .unwrap_err();
         assert!(matches!(
             error,
