@@ -7,7 +7,7 @@ use unity_asset_search_protocol::{
 
 use crate::client::SessionBinding;
 
-pub const CLI_CONTRACT_VERSION: u16 = 1;
+pub const CLI_CONTRACT_VERSION: u16 = 2;
 const LOCAL_ERROR_SOURCE: &str = "unity_asset_search_cli";
 const MAX_LOCAL_MESSAGE_BYTES: usize = 4 * 1024;
 

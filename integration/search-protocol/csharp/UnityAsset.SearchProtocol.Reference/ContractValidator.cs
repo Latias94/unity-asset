@@ -323,7 +323,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 path + ".query_binding",
                 256,
                 allowEmpty: false);
-            StrictJson.FixedHex(actualQueryBinding, "reference-query-v1:", 64, path + ".query_binding", lowercaseOnly: true);
+            StrictJson.FixedHex(actualQueryBinding, "reference-query-v2:", 64, path + ".query_binding", lowercaseOnly: true);
             if (!string.Equals(actualQueryBinding, expectedQueryBinding, StringComparison.Ordinal))
             {
                 throw new ProtocolValidationException(path + ".query_binding does not match the reference request");
@@ -1454,6 +1454,8 @@ namespace UnityAsset.SearchProtocol.Reference
                 "workspace",
                 "actual_revision",
                 "desired_revision",
+                "semantics_current",
+                "configuration_current",
                 "stale");
             StrictJson.RequireRevision(StrictJson.Required(generation, "protocol_revision", path), path + ".protocol_revision");
             ValidateDigest(StrictJson.Required(generation, "generation", path), path + ".generation");
@@ -1463,10 +1465,18 @@ namespace UnityAsset.SearchProtocol.Reference
             ValidateDigest(StrictJson.Required(generation, "desired_revision", path), path + ".desired_revision");
             string actual = StrictJson.Required(generation, "actual_revision", path).GetString()!;
             string desired = StrictJson.Required(generation, "desired_revision", path).GetString()!;
+            bool semanticsCurrent = StrictJson.Boolean(
+                StrictJson.Required(generation, "semantics_current", path),
+                path + ".semantics_current");
+            bool configurationCurrent = StrictJson.Boolean(
+                StrictJson.Required(generation, "configuration_current", path),
+                path + ".configuration_current");
             bool stale = StrictJson.Boolean(StrictJson.Required(generation, "stale", path), path + ".stale");
-            if (stale != !string.Equals(actual, desired, StringComparison.Ordinal))
+            if (stale != (!string.Equals(actual, desired, StringComparison.Ordinal)
+                || !semanticsCurrent
+                || !configurationCurrent))
             {
-                throw new ProtocolValidationException(path + ".stale does not match the revision comparison");
+                throw new ProtocolValidationException(path + ".stale does not match revision and semantic freshness");
             }
         }
 
@@ -1560,9 +1570,10 @@ namespace UnityAsset.SearchProtocol.Reference
         private static void ValidateDiagnostic(JsonElement diagnostic, string path)
         {
             StrictJson.Properties(diagnostic, path, "version", "severity", "code", "message", "address", "field_path");
-            if (StrictJson.UInt32(StrictJson.Required(diagnostic, "version", path), path + ".version") != 1)
+            if (StrictJson.UInt32(StrictJson.Required(diagnostic, "version", path), path + ".version") != ProtocolConstants.CoreDiagnosticVersion)
             {
-                throw new ProtocolValidationException(path + ".version must be 1");
+                throw new ProtocolValidationException(
+                    $"{path}.version must be {ProtocolConstants.CoreDiagnosticVersion}");
             }
             StrictJson.Enum(StrictJson.Required(diagnostic, "severity", path), path + ".severity", "error", "warning", "info");
             string code = StrictJson.String(StrictJson.Required(diagnostic, "code", path), path + ".code", 128, allowEmpty: false);
@@ -1618,7 +1629,7 @@ namespace UnityAsset.SearchProtocol.Reference
             if (kind == "binary_direct" || kind == "binary_bundle_member")
             {
                 StrictJson.Properties(address, path, "kind", "version", "source", "path_id");
-                RequireCoreVersion(StrictJson.Required(address, "version", path), path + ".version");
+                RequireVersion(StrictJson.Required(address, "version", path), path + ".version", 1);
                 JsonElement source = StrictJson.Required(address, "source", path);
                 ValidateSourceLocator(source, path + ".source");
                 if (StrictJson.Int64(StrictJson.Required(address, "path_id", path), path + ".path_id") == 0)
@@ -1639,7 +1650,7 @@ namespace UnityAsset.SearchProtocol.Reference
             if (kind == "yaml")
             {
                 StrictJson.Properties(address, path, "kind", "version", "source", "selector");
-                RequireCoreVersion(StrictJson.Required(address, "version", path), path + ".version");
+                RequireVersion(StrictJson.Required(address, "version", path), path + ".version", 2);
                 ValidateSourceLocator(StrictJson.Required(address, "source", path), path + ".source");
                 ValidateYamlSelector(StrictJson.Required(address, "selector", path), path + ".selector");
                 return;
@@ -1650,7 +1661,7 @@ namespace UnityAsset.SearchProtocol.Reference
         private static void ValidateSourceLocator(JsonElement locator, string path)
         {
             StrictJson.Properties(locator, path, "version", "outer_path", "members");
-            RequireCoreVersion(StrictJson.Required(locator, "version", path), path + ".version");
+            RequireVersion(StrictJson.Required(locator, "version", path), path + ".version", 1);
             StrictJson.PortablePath(
                 StrictJson.Required(locator, "outer_path", path),
                 path + ".outer_path",
@@ -1685,17 +1696,12 @@ namespace UnityAsset.SearchProtocol.Reference
         private static void ValidateYamlSelector(JsonElement selector, string path)
         {
             string kind = StrictJson.String(StrictJson.Required(selector, "kind", path), path + ".kind", allowEmpty: false);
-            if (kind == "anchored")
+            if (kind == "file_id")
             {
-                StrictJson.Properties(selector, path, "kind", "anchor");
-                string anchor = StrictJson.String(StrictJson.Required(selector, "anchor", path), path + ".anchor", 1024, allowEmpty: false);
-                if (anchor.Any(character => !((character >= 'a' && character <= 'z')
-                    || (character >= 'A' && character <= 'Z')
-                    || (character >= '0' && character <= '9')
-                    || character == '_'
-                    || character == '-')))
+                StrictJson.Properties(selector, path, "kind", "file_id");
+                if (StrictJson.Int64(StrictJson.Required(selector, "file_id", path), path + ".file_id") == 0)
                 {
-                    throw new ProtocolValidationException(path + ".anchor has invalid characters");
+                    throw new ProtocolValidationException(path + ".file_id must not be zero");
                 }
                 return;
             }
@@ -1732,7 +1738,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "incoming",
                 "outgoing");
             JsonElement selector = StrictJson.Required(request, "selector", path);
-            byte[] domain = Encoding.UTF8.GetBytes("unity-asset:reference-query:cursor-binding:v1\0");
+            byte[] domain = Encoding.UTF8.GetBytes("unity-asset:reference-query:cursor-binding:v2\0");
             byte[] selectorJson = BootstrapCodec.Write(writer => selector.WriteTo(writer));
             var input = new byte[checked(domain.Length + 1 + selectorJson.Length)];
             Buffer.BlockCopy(domain, 0, input, 0, domain.Length);
@@ -1744,7 +1750,7 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 digest = sha256.ComputeHash(input);
             }
-            var binding = new StringBuilder("reference-query-v1:", "reference-query-v1:".Length + 64);
+            var binding = new StringBuilder("reference-query-v2:", "reference-query-v2:".Length + 64);
             foreach (byte value in digest)
             {
                 binding.Append(value.ToString("x2", System.Globalization.CultureInfo.InvariantCulture));
@@ -1758,11 +1764,11 @@ namespace UnityAsset.SearchProtocol.Reference
             StrictJson.FixedHex(value, string.Empty, 32, path, lowercaseOnly: true);
         }
 
-        private static void RequireCoreVersion(JsonElement element, string path)
+        private static void RequireVersion(JsonElement element, string path, uint expected)
         {
-            if (StrictJson.UInt32(element, path) != 1)
+            if (StrictJson.UInt32(element, path) != expected)
             {
-                throw new ProtocolValidationException(path + " must be 1");
+                throw new ProtocolValidationException($"{path} must be {expected}");
             }
         }
 

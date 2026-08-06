@@ -6,6 +6,11 @@ use std::io;
 use std::path::{Component, Path};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, BorrowedHandle};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
@@ -294,6 +299,20 @@ impl std::fmt::Debug for ReadDirectory {
             .debug_struct("ReadDirectory")
             .field("policy", &self.policy)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl AsFd for ReadDirectory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.inner.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl AsHandle for ReadDirectory {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        self.inner.as_handle()
     }
 }
 

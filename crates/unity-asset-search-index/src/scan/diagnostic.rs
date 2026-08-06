@@ -14,7 +14,6 @@ pub(crate) enum SourcePart {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PathRejection {
     InvalidPath,
-    OutsideProject,
     OutsideScanRoots,
     InsideIndexRoot,
     Excluded,

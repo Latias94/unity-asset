@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::marker::PhantomData;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::FileExt as _;
 use std::path::{Component, Path};
@@ -20,6 +20,12 @@ const REGULAR_FILE_FLAGS: OFlags =
 
 pub(super) struct ReadDirectory {
     descriptor: OwnedFd,
+}
+
+impl AsFd for ReadDirectory {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.descriptor.as_fd()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -34,7 +34,7 @@ fn assert_failure(output: &Output, category: &str, exit_code: i32) -> Value {
     assert!(output.stdout.is_empty(), "errors must not write stdout");
     let document: Value =
         serde_json::from_slice(&output.stderr).expect("stderr must contain one JSON document");
-    assert_eq!(document["cli_contract_version"], 1);
+    assert_eq!(document["cli_contract_version"], 2);
     assert_eq!(document["category"], category);
     assert_eq!(
         document["error"]["details"]["source"],
@@ -110,7 +110,7 @@ fn malformed_and_unknown_request_json_are_structured_input_errors() {
         ("malformed.json", "{"),
         (
             "unknown.json",
-            r#"{"cli_contract_version":1,"operation":{"kind":"status","request":{}},"unknown":true}"#,
+            r#"{"cli_contract_version":2,"operation":{"kind":"status","request":{}},"unknown":true}"#,
         ),
     ] {
         let path = directory.path().join(name);
@@ -139,7 +139,7 @@ fn request_json_and_subcommand_conflict_is_machine_readable() {
     let path = directory.path().join("request.json");
     fs::write(
         &path,
-        r#"{"cli_contract_version":1,"operation":{"kind":"status","request":{}}}"#,
+        r#"{"cli_contract_version":2,"operation":{"kind":"status","request":{}}}"#,
     )
     .expect("write request fixture");
     let output = run_cli(&[

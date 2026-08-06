@@ -54,7 +54,7 @@ async fn convenience_and_json_requests_share_the_verified_ipc_path() {
     let request_path = root.path().join("capabilities.json");
     fs::write(
         &request_path,
-        r#"{"cli_contract_version":1,"operation":{"kind":"capabilities","request":{}}}"#,
+        r#"{"cli_contract_version":2,"operation":{"kind":"capabilities","request":{}}}"#,
     )
     .expect("write CLI request");
     let json = run_cli(&[
@@ -83,7 +83,7 @@ fn assert_success(output: &Output, project_id: String, instance_id: String) {
     );
     assert!(output.stderr.is_empty(), "success must not write stderr");
     let document: Value = serde_json::from_slice(&output.stdout).expect("success JSON");
-    assert_eq!(document["cli_contract_version"], 1);
+    assert_eq!(document["cli_contract_version"], 2);
     assert_eq!(document["project_id"], project_id);
     assert_eq!(document["daemon_instance_id"], instance_id);
     assert_eq!(document["result"]["kind"], "operation");

@@ -4,8 +4,8 @@ use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_protocol::{
     DaemonInstanceId, FilesystemReindexIntent, GenerationIdV1, GenerationStamp, PortablePath,
     ProjectId, QueryPolicyId, ReferenceCursor, ReferenceDirection, ReferenceRequest,
-    ReferenceSelector, RequestEnvelope, RequestId, RequestOperation, SearchCapabilities,
-    ValidateContract,
+    ReferenceSelector, RequestEnvelope, RequestId, RequestOperation, SEARCH_PROTOCOL_REVISION,
+    SearchCapabilities, ValidateContract,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -85,7 +85,7 @@ fn reference_cursor_binding_is_stable_and_covers_direction_and_selector() {
     let incoming = ReferenceRequest::incoming_guid(GUID, Some(11_500_000), 25);
     assert_eq!(
         incoming.cursor_query_binding().unwrap(),
-        "reference-query-v1:4532a80c3931635cfb1715cea097d3757a404c72b7aed9246fa94c24756f00df"
+        "reference-query-v2:cf0e42a788caf646573b836b4a4cf9a96134d0064a3ad5a81e0f592d9830cfd2"
     );
 
     let outgoing = ReferenceRequest::outgoing_guid(GUID, Some(11_500_000), 25);
@@ -184,7 +184,7 @@ fn changed_path_reindex_is_portable_and_nonempty() {
     assert_eq!(
         serde_json::to_value(intent).unwrap(),
         json!({
-            "protocol_revision": 2,
+            "protocol_revision": SEARCH_PROTOCOL_REVISION,
             "scope": {
                 "kind": "changed_paths",
                 "paths": ["Assets/Player.prefab"]

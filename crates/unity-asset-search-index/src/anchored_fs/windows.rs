@@ -4,7 +4,9 @@ use std::io;
 use std::mem::{align_of, size_of};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::windows::fs::FileExt as _;
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+use std::os::windows::io::{
+    AsHandle, AsRawHandle as _, BorrowedHandle, FromRawHandle as _, RawHandle,
+};
 use std::path::{Component, Components, Path, Prefix};
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -58,6 +60,13 @@ const fn regular_share(policy: OpenPolicy) -> u32 {
 
 pub(super) struct ReadDirectory {
     handle: OwnedHandle,
+}
+
+impl AsHandle for ReadDirectory {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: the returned borrow cannot outlive this directory's owned live handle.
+        unsafe { BorrowedHandle::borrow_raw(self.handle.raw() as RawHandle) }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

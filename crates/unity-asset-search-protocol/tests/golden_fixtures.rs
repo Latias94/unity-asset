@@ -13,13 +13,15 @@ use unity_asset_search_protocol::{
 
 const FROZEN_BUSINESS_V1_INVENTORY_SHA256: &str =
     "13cf5971f83e9a608c504582a36c442e79a982c9eb9dbad8d447a41c7694022a";
+const FROZEN_BUSINESS_V2_INVENTORY_SHA256: &str =
+    "6891e3190d36396e546989a0f55ac97766902aa37289993b5f4709ffa3ccf776";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FixtureManifest {
     fixture_format: u16,
     protocol_revision: u16,
-    frozen_inventory: FrozenInventoryReference,
+    frozen_inventories: Vec<FrozenInventoryReference>,
     binding: FixtureBinding,
     valid: Vec<FixtureEntry>,
     invalid: Vec<FixtureEntry>,
@@ -76,11 +78,11 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
     let root = fixture_root();
     let manifest: FixtureManifest =
         serde_json::from_slice(&read_nonempty(&root.join("manifest.json"))).unwrap();
-    assert_eq!(manifest.fixture_format, 2);
+    assert_eq!(manifest.fixture_format, 3);
     assert_eq!(manifest.protocol_revision, BUSINESS_PROTOCOL_REVISION);
     assert!(!manifest.valid.is_empty());
     assert!(!manifest.invalid.is_empty());
-    assert_frozen_business_v1(&root, &manifest.frozen_inventory);
+    assert_frozen_business(&root, &manifest.frozen_inventories);
 
     let project = ProjectId::from_str(&manifest.binding.project_id).unwrap();
     let instance = DaemonInstanceId::from_str(&manifest.binding.daemon_instance_id).unwrap();
@@ -149,13 +151,13 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
                     .to_string(),
                 Err(error) => error.to_string(),
             },
-            "request" => {
-                let request: RequestEnvelope = serde_json::from_slice(&bytes).unwrap();
-                request
+            "request" => match serde_json::from_slice::<RequestEnvelope>(&bytes) {
+                Ok(request) => request
                     .validate_binding(project, instance, query_policy)
                     .unwrap_err()
-                    .to_string()
-            }
+                    .to_string(),
+                Err(error) => error.to_string(),
+            },
             other => panic!("unknown invalid fixture kind {other:?}"),
         };
         assert!(
@@ -168,55 +170,68 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
     }
 }
 
-fn assert_frozen_business_v1(root: &Path, reference: &FrozenInventoryReference) {
-    assert_eq!(reference.business_revision, 1);
-    assert_eq!(reference.sha256, FROZEN_BUSINESS_V1_INVENTORY_SHA256);
+fn assert_frozen_business(root: &Path, references: &[FrozenInventoryReference]) {
+    let expected = [
+        (1, FROZEN_BUSINESS_V1_INVENTORY_SHA256),
+        (2, FROZEN_BUSINESS_V2_INVENTORY_SHA256),
+    ];
+    assert_eq!(references.len(), expected.len());
 
-    let inventory_bytes = read_canonical(&root.join(&reference.path));
-    assert_eq!(
-        hex::encode(Sha256::digest(&inventory_bytes)),
-        FROZEN_BUSINESS_V1_INVENTORY_SHA256,
-        "frozen business v1 inventory changed"
-    );
-    let inventory: FrozenBusinessInventory = serde_json::from_slice(&inventory_bytes).unwrap();
-    assert_eq!(inventory.inventory_format, 1);
-    assert_eq!(inventory.business_revision, 1);
-    assert!(!inventory.files.is_empty());
+    for (reference, (business_revision, expected_digest)) in references.iter().zip(expected) {
+        assert_eq!(reference.business_revision, business_revision);
+        assert_eq!(reference.sha256, expected_digest);
 
-    let mut previous = None;
-    let mut inventoried = BTreeSet::new();
-    for fixture in &inventory.files {
-        if let Some(previous) = previous {
+        let inventory_bytes = read_canonical(&root.join(&reference.path));
+        assert_eq!(
+            hex::encode(Sha256::digest(&inventory_bytes)),
+            expected_digest,
+            "frozen business v{business_revision} inventory changed"
+        );
+        let inventory: FrozenBusinessInventory = serde_json::from_slice(&inventory_bytes).unwrap();
+        assert_eq!(inventory.inventory_format, 1);
+        assert_eq!(inventory.business_revision, business_revision);
+        assert!(!inventory.files.is_empty());
+
+        let suffix = format!("-v{business_revision}.json");
+        let mut previous = None;
+        let mut inventoried = BTreeSet::new();
+        for fixture in &inventory.files {
+            if let Some(previous) = previous {
+                assert!(
+                    previous < fixture.path.as_str(),
+                    "frozen inventory is not sorted"
+                );
+            }
+            previous = Some(fixture.path.as_str());
             assert!(
-                previous < fixture.path.as_str(),
-                "frozen inventory is not sorted"
+                fixture.path.ends_with(&suffix)
+                    && (fixture.path.starts_with("requests/")
+                        || fixture.path.starts_with("responses/")
+                        || fixture.path.starts_with("invalid/request-")),
+                "unexpected frozen business fixture path: {}",
+                fixture.path
+            );
+            assert!(inventoried.insert(fixture.path.clone()));
+
+            let payload = read_canonical(&root.join(&fixture.path));
+            assert_eq!(payload.len(), fixture.encoded_bytes, "{}", fixture.path);
+            assert_eq!(
+                hex::encode(Sha256::digest(&payload)),
+                fixture.sha256,
+                "{} changed after business v{business_revision} was frozen",
+                fixture.path
             );
         }
-        previous = Some(fixture.path.as_str());
-        assert!(
-            fixture.path.ends_with("-v1.json")
-                && (fixture.path.starts_with("requests/")
-                    || fixture.path.starts_with("responses/")
-                    || fixture.path.starts_with("invalid/request-")),
-            "unexpected frozen business fixture path: {}",
-            fixture.path
-        );
-        assert!(inventoried.insert(fixture.path.clone()));
 
-        let payload = read_canonical(&root.join(&fixture.path));
-        assert_eq!(payload.len(), fixture.encoded_bytes, "{}", fixture.path);
         assert_eq!(
-            hex::encode(Sha256::digest(&payload)),
-            fixture.sha256,
-            "{} changed after business v1 was frozen",
-            fixture.path
+            inventoried,
+            archived_business_paths(root, business_revision)
         );
     }
-
-    assert_eq!(inventoried, archived_business_v1_paths(root));
 }
 
-fn archived_business_v1_paths(root: &Path) -> BTreeSet<String> {
+fn archived_business_paths(root: &Path, business_revision: u16) -> BTreeSet<String> {
+    let suffix = format!("-v{business_revision}.json");
     ["requests", "responses", "invalid"]
         .into_iter()
         .flat_map(|directory| {
@@ -226,9 +241,9 @@ fn archived_business_v1_paths(root: &Path) -> BTreeSet<String> {
         })
         .filter_map(|(directory, entry)| {
             let name = entry.file_name().into_string().unwrap();
-            let is_business_v1 = name.ends_with("-v1.json")
-                && (directory != "invalid" || name.starts_with("request-"));
-            is_business_v1.then(|| format!("{directory}/{name}"))
+            let is_archived_business =
+                name.ends_with(&suffix) && (directory != "invalid" || name.starts_with("request-"));
+            is_archived_business.then(|| format!("{directory}/{name}"))
         })
         .collect()
 }

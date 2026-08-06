@@ -1,10 +1,12 @@
 //! Logical source-state contract for incremental search generations.
 
+use std::collections::TryReserveError;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
+use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unity_asset_core::{
     AssetLoadBudget, BudgetedJsonError, ChangeSet, Diagnostic, DigestBuildError, DigestV1,
     DigestV1Builder, ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision,
@@ -16,12 +18,24 @@ use crate::analysis::{
     ReferenceDependencyKey, ReferenceProjectionFact, ReferenceResolutionProjection,
     WorkspaceObjectFact,
 };
-use crate::generation::{ArtifactTreeEvidence, SearchGenerationManifestV1};
+use crate::generation::{
+    ArtifactTreeEvidence, LegacySearchGenerationManifest, SearchGenerationManifestV1,
+};
+use crate::legacy_wire::{
+    LegacyAssetAnalysisV1, LegacyDiagnosticV1, LegacyObjectAddressV1,
+    LegacyReferenceDependencyKeyV1, LegacyReferenceProjectionFactV1, LegacySourceStateSnapshotV1,
+    LegacyWireError, LegacyWorkspaceObjectFactV1,
+};
+use crate::semantics::AnalysisCacheIdentityV1;
+#[cfg(test)]
+use crate::semantics::SearchSemantics;
 
-const SOURCE_STATE_CONTRACT_VERSION: u16 = 1;
+pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 2;
+pub(super) const SOURCE_STATE_LOGICAL_IDENTITY_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
 const MAX_TRANSACTION_RECEIPTS: usize = 4_096;
+const TRANSACTION_RECEIPT_CONTRACT_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_RELATIVE_PATH_BYTES: usize = MAX_PORTABLE_PATH_BYTES;
 // Vec starts with at most eight slots for supported non-zero-sized element types, then grows
 // geometrically. Internally tagged Serde enums may temporarily buffer one Content sequence/map
@@ -37,7 +51,6 @@ pub(crate) struct SourceStateLimits {
     pub(crate) max_encoded_bytes: u64,
     pub(crate) max_assets: usize,
     pub(crate) max_scan_hints: usize,
-    pub(crate) max_transaction_receipts: usize,
     pub(crate) max_relative_path_bytes: usize,
 }
 
@@ -47,7 +60,6 @@ impl Default for SourceStateLimits {
             max_encoded_bytes: 512 * 1024 * 1024,
             max_assets: MAX_SOURCE_STATE_ASSETS,
             max_scan_hints: MAX_SOURCE_STATE_SCAN_HINTS,
-            max_transaction_receipts: MAX_TRANSACTION_RECEIPTS,
             max_relative_path_bytes: MAX_SOURCE_STATE_RELATIVE_PATH_BYTES,
         }
     }
@@ -71,7 +83,7 @@ impl TransactionReceipt {
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, SourceStateError> {
         Ok(Self {
-            contract_version: SOURCE_STATE_CONTRACT_VERSION,
+            contract_version: TRANSACTION_RECEIPT_CONTRACT_VERSION,
             transaction: changes.transaction(),
             workspace: changes.workspace(),
             from_revision: changes.from_revision(),
@@ -111,17 +123,16 @@ enum TransactionReceiptLookup {
 /// authoritative barrier for transactions older than the retained window. Filesystem
 /// reconciliation can advance the enclosing source-state snapshot without consuming a Change Set,
 /// so retained receipts may lag the snapshot and adjacent receipts may contain revision gaps.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TransactionReceiptWindow {
-    receipts: Vec<TransactionReceipt>,
+    receipts: Arc<Vec<TransactionReceipt>>,
 }
 
 impl TransactionReceiptWindow {
     #[must_use]
-    pub(crate) const fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         Self {
-            receipts: Vec::new(),
+            receipts: Arc::new(Vec::new()),
         }
     }
 
@@ -140,14 +151,14 @@ impl TransactionReceiptWindow {
         &self.receipts
     }
 
-    pub(crate) fn ids(&self) -> impl ExactSizeIterator<Item = TransactionId> + '_ {
-        self.receipts.iter().map(|receipt| receipt.transaction())
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn shares_backing_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.receipts, &other.receipts)
     }
 
-    pub(crate) fn canonical_ids(&self) -> Vec<TransactionId> {
-        let mut transactions = self.ids().collect::<Vec<_>>();
-        transactions.sort_unstable();
-        transactions
+    pub(crate) fn ids(&self) -> impl ExactSizeIterator<Item = TransactionId> + '_ {
+        self.receipts.iter().map(|receipt| receipt.transaction())
     }
 
     #[must_use]
@@ -168,6 +179,58 @@ impl TransactionReceiptWindow {
             TransactionReceiptLookup::Exact => TransactionReceiptMembership::Exact,
             TransactionReceiptLookup::Conflict { .. } => TransactionReceiptMembership::Conflict,
         })
+    }
+
+    pub(crate) fn after_change_set(
+        &self,
+        indexed_workspace: WorkspaceId,
+        indexed_revision: WorkspaceRevision,
+        changes: &ChangeSet,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, SourceStateError> {
+        if indexed_workspace != changes.workspace() {
+            return Err(SourceStateError::TransactionReceiptWorkspaceMismatch {
+                expected: indexed_workspace,
+                actual: changes.workspace(),
+                transaction: changes.transaction(),
+            });
+        }
+        if indexed_revision != changes.from_revision() {
+            return Err(SourceStateError::TransactionReceiptRevisionBarrier {
+                indexed: indexed_revision,
+                change_from: changes.from_revision(),
+                change_to: changes.to_revision(),
+            });
+        }
+        let mut receipts = self.clone();
+        receipts.append(changes, budget)?;
+        Ok(receipts)
+    }
+
+    pub(crate) fn after_reconciled_target(
+        &self,
+        indexed_workspace: WorkspaceId,
+        indexed_revision: WorkspaceRevision,
+        changes: &ChangeSet,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, SourceStateError> {
+        if indexed_workspace != changes.workspace() {
+            return Err(SourceStateError::TransactionReceiptWorkspaceMismatch {
+                expected: indexed_workspace,
+                actual: changes.workspace(),
+                transaction: changes.transaction(),
+            });
+        }
+        if indexed_revision != changes.to_revision() {
+            return Err(SourceStateError::TransactionReceiptRevisionBarrier {
+                indexed: indexed_revision,
+                change_from: changes.from_revision(),
+                change_to: changes.to_revision(),
+            });
+        }
+        let mut receipts = self.clone();
+        receipts.append(changes, budget)?;
+        Ok(receipts)
     }
 
     fn lookup(
@@ -223,26 +286,25 @@ impl TransactionReceiptWindow {
         budget
             .consume_bytes(receipt_bytes)
             .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
-        if self.receipts.len() == MAX_TRANSACTION_RECEIPTS {
-            self.receipts.remove(0);
-        } else {
-            self.receipts.try_reserve_exact(1).map_err(|error| {
-                SourceStateError::AllocationFailed {
-                    requested: receipt_bytes as usize,
-                    message: error.to_string(),
-                }
-            })?;
+        if let Some(receipts) = Arc::get_mut(&mut self.receipts) {
+            if receipts.len() == MAX_TRANSACTION_RECEIPTS {
+                receipts.remove(0);
+            } else {
+                receipts.try_reserve_exact(1).map_err(|source| {
+                    SourceStateError::AllocationFailed {
+                        requested: receipt_bytes as usize,
+                        source,
+                    }
+                })?;
+            }
+            receipts.push(incoming);
+            return Ok(());
         }
-        self.receipts.push(incoming);
-        Ok(())
-    }
 
-    pub(crate) fn try_clone_with_budget(
-        &self,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, SourceStateError> {
+        let first_retained = usize::from(self.receipts.len() == MAX_TRANSACTION_RECEIPTS);
+        let retained = &self.receipts[first_retained..];
         let entries =
-            u64::try_from(self.receipts.len()).map_err(|_| SourceStateError::SizeOverflow {
+            u64::try_from(retained.len()).map_err(|_| SourceStateError::SizeOverflow {
                 resource: "transaction receipt entries",
             })?;
         let bytes = entries
@@ -264,25 +326,31 @@ impl TransactionReceiptWindow {
             .map_err(|source| SourceStateError::Budget(BudgetedJsonError::Budget(source)))?;
         let mut receipts = Vec::new();
         receipts
-            .try_reserve_exact(self.receipts.len())
-            .map_err(|error| SourceStateError::AllocationFailed {
-                requested: self
-                    .receipts
+            .try_reserve_exact(retained.len().saturating_add(1))
+            .map_err(|source| SourceStateError::AllocationFailed {
+                requested: retained
                     .len()
+                    .saturating_add(1)
                     .saturating_mul(std::mem::size_of::<TransactionReceipt>()),
-                message: error.to_string(),
+                source,
             })?;
-        receipts.extend_from_slice(&self.receipts);
-        Ok(Self { receipts })
+        receipts.extend_from_slice(retained);
+        receipts.push(incoming);
+        self.receipts = Arc::new(receipts);
+        Ok(())
     }
 
-    fn validate(&self, workspace: WorkspaceId, maximum: usize) -> Result<(), SourceStateError> {
+    pub(crate) fn validate_for_workspace(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<(), SourceStateError> {
+        let maximum = MAX_TRANSACTION_RECEIPTS;
         validate_source_state_count("transaction receipts", self.receipts.len(), maximum)?;
         for (index, receipt) in self.receipts.iter().enumerate() {
-            if receipt.contract_version != SOURCE_STATE_CONTRACT_VERSION {
+            if receipt.contract_version != TRANSACTION_RECEIPT_CONTRACT_VERSION {
                 return Err(SourceStateError::UnsupportedTransactionReceiptVersion {
                     actual: receipt.contract_version,
-                    expected: SOURCE_STATE_CONTRACT_VERSION,
+                    expected: TRANSACTION_RECEIPT_CONTRACT_VERSION,
                 });
             }
             if receipt.workspace != workspace {
@@ -312,6 +380,26 @@ impl TransactionReceiptWindow {
         // generation's source state, while transaction_receipts_after enforces that every newly
         // consumed Change Set starts at that source state's current snapshot revision.
         Ok(())
+    }
+}
+
+impl Serialize for TransactionReceiptWindow {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.receipts.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for TransactionReceiptWindow {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Vec::<TransactionReceipt>::deserialize(deserializer).map(|receipts| Self {
+            receipts: Arc::new(receipts),
+        })
     }
 }
 
@@ -357,7 +445,7 @@ pub(crate) struct SourceStateSnapshot {
     contract_version: u16,
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
-    transaction_receipts: TransactionReceiptWindow,
+    analysis_cache_identity: AnalysisCacheIdentityV1,
     scan_hints: Vec<SourceScanHint>,
     assets: Vec<AssetAnalysis>,
     logical_digest: DigestV1,
@@ -367,31 +455,43 @@ impl SourceStateSnapshot {
     pub(crate) fn from_batch(
         batch: AssetAnalysisBatch,
         scan_hints: Vec<SourceScanHint>,
-        transaction_receipts: TransactionReceiptWindow,
+        analysis_cache_identity: AnalysisCacheIdentityV1,
     ) -> Result<Self, SourceStateError> {
-        if !transaction_receipts.matches_canonical_ids(&batch.transactions) {
-            return Err(SourceStateError::BatchTransactionsMismatch {
-                batch: batch.transactions,
-                receipts: transaction_receipts.canonical_ids(),
-            });
-        }
-        Self::new(
+        Self::new_with_analysis_cache_identity(
             batch.workspace,
             batch.revision,
-            transaction_receipts,
+            analysis_cache_identity,
             scan_hints,
             batch.assets,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn new(
         workspace: WorkspaceId,
         revision: WorkspaceRevision,
-        transaction_receipts: TransactionReceiptWindow,
+        scan_hints: Vec<SourceScanHint>,
+        assets: Vec<AssetAnalysis>,
+    ) -> Result<Self, SourceStateError> {
+        let analysis_cache_identity = SearchSemantics::current()
+            .analysis_cache_identity(DigestV1::hash_bytes(b"options"))
+            .map_err(SourceStateError::Digest)?;
+        Self::new_with_analysis_cache_identity(
+            workspace,
+            revision,
+            analysis_cache_identity,
+            scan_hints,
+            assets,
+        )
+    }
+
+    fn new_with_analysis_cache_identity(
+        workspace: WorkspaceId,
+        revision: WorkspaceRevision,
+        analysis_cache_identity: AnalysisCacheIdentityV1,
         mut scan_hints: Vec<SourceScanHint>,
         mut assets: Vec<AssetAnalysis>,
     ) -> Result<Self, SourceStateError> {
-        transaction_receipts.validate(workspace, MAX_TRANSACTION_RECEIPTS)?;
         validate_source_state_count("scan hints", scan_hints.len(), MAX_SOURCE_STATE_SCAN_HINTS)?;
         validate_source_state_count("assets", assets.len(), MAX_SOURCE_STATE_ASSETS)?;
 
@@ -426,12 +526,12 @@ impl SourceStateSnapshot {
         }
 
         let logical_digest =
-            source_state_logical_digest(workspace, revision, &transaction_receipts, &assets)?;
+            source_state_logical_digest(workspace, revision, analysis_cache_identity, &assets)?;
         Ok(Self {
             contract_version: SOURCE_STATE_CONTRACT_VERSION,
             workspace,
             revision,
-            transaction_receipts,
+            analysis_cache_identity,
             scan_hints,
             assets,
             logical_digest,
@@ -449,74 +549,8 @@ impl SourceStateSnapshot {
     }
 
     #[must_use]
-    pub(crate) const fn transaction_receipts(&self) -> &TransactionReceiptWindow {
-        &self.transaction_receipts
-    }
-
-    pub(crate) fn transaction_membership(
-        &self,
-        changes: &ChangeSet,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<TransactionReceiptMembership, SourceStateError> {
-        self.transaction_receipts.membership(changes, budget)
-    }
-
-    /// Extends the receipt window only from this snapshot's revision.
-    ///
-    /// Receipt history may lag this snapshot after filesystem reconciliation. The revision check
-    /// belongs here instead of in `TransactionReceiptWindow`, where digest values cannot express
-    /// a chronology.
-    pub(crate) fn transaction_receipts_after(
-        &self,
-        changes: &ChangeSet,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<TransactionReceiptWindow, SourceStateError> {
-        if self.workspace != changes.workspace() {
-            return Err(SourceStateError::TransactionReceiptWorkspaceMismatch {
-                expected: self.workspace,
-                actual: changes.workspace(),
-                transaction: changes.transaction(),
-            });
-        }
-        if self.revision != changes.from_revision() {
-            return Err(SourceStateError::TransactionReceiptRevisionBarrier {
-                indexed: self.revision,
-                change_from: changes.from_revision(),
-                change_to: changes.to_revision(),
-            });
-        }
-        let mut receipts = self.transaction_receipts.try_clone_with_budget(budget)?;
-        receipts.append(changes, budget)?;
-        Ok(receipts)
-    }
-
-    /// Extends the receipt window when filesystem reconciliation already observed the target.
-    ///
-    /// This is the only legal receipt-only transition: the source state must already represent
-    /// the Change Set's target revision, while the caller separately proves the matching
-    /// `WorkspaceView` revision before publication.
-    pub(crate) fn transaction_receipts_after_reconciled_target(
-        &self,
-        changes: &ChangeSet,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<TransactionReceiptWindow, SourceStateError> {
-        if self.workspace != changes.workspace() {
-            return Err(SourceStateError::TransactionReceiptWorkspaceMismatch {
-                expected: self.workspace,
-                actual: changes.workspace(),
-                transaction: changes.transaction(),
-            });
-        }
-        if self.revision != changes.to_revision() {
-            return Err(SourceStateError::TransactionReceiptRevisionBarrier {
-                indexed: self.revision,
-                change_from: changes.from_revision(),
-                change_to: changes.to_revision(),
-            });
-        }
-        let mut receipts = self.transaction_receipts.try_clone_with_budget(budget)?;
-        receipts.append(changes, budget)?;
-        Ok(receipts)
+    pub(crate) const fn analysis_cache_identity(&self) -> AnalysisCacheIdentityV1 {
+        self.analysis_cache_identity
     }
 
     #[must_use]
@@ -552,12 +586,24 @@ impl SourceStateSnapshot {
         self.logical_digest
     }
 
+    #[cfg(test)]
+    pub(crate) fn rebind_analysis_cache_identity(
+        self,
+        analysis_cache_identity: AnalysisCacheIdentityV1,
+    ) -> Result<Self, SourceStateError> {
+        Self::new_with_analysis_cache_identity(
+            self.workspace,
+            self.revision,
+            analysis_cache_identity,
+            self.scan_hints,
+            self.assets,
+        )
+    }
+
     pub(super) fn validate_limits(
         &self,
         limits: SourceStateLimits,
     ) -> Result<(), SourceStateError> {
-        self.transaction_receipts
-            .validate(self.workspace, limits.max_transaction_receipts)?;
         validate_source_state_count("scan hints", self.scan_hints.len(), limits.max_scan_hints)?;
         validate_source_state_count("assets", self.assets.len(), limits.max_assets)?;
         for hint in &self.scan_hints {
@@ -582,7 +628,7 @@ struct SourceStateSnapshotWire {
     contract_version: u16,
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
-    transaction_receipts: TransactionReceiptWindow,
+    analysis_cache_identity: AnalysisCacheIdentityV1,
     scan_hints: Vec<SourceScanHint>,
     assets: Vec<AssetAnalysis>,
     logical_digest: DigestV1,
@@ -605,10 +651,10 @@ impl<'de> Deserialize<'de> for SourceStateSnapshot {
         ensure_source_state_canonical_order(&wire.scan_hints, &wire.assets)
             .map_err(serde::de::Error::custom)?;
         ensure_source_state_assets_canonical(&wire.assets).map_err(serde::de::Error::custom)?;
-        let snapshot = Self::new(
+        let snapshot = Self::new_with_analysis_cache_identity(
             wire.workspace,
             wire.revision,
-            wire.transaction_receipts,
+            wire.analysis_cache_identity,
             wire.scan_hints,
             wire.assets,
         )
@@ -625,26 +671,85 @@ impl<'de> Deserialize<'de> for SourceStateSnapshot {
     }
 }
 
+/// Read-only view over the exact storage-v1 source-state wire.
+///
+/// The legacy contract keeps transaction receipts inside the source-state digest and has no
+/// analysis-semantics identity. It is never serialized back through the current writer and its
+/// analysis payload is not eligible for incremental reuse.
+pub(crate) type LegacySourceStateSnapshot = LegacySourceStateSnapshotV1;
+
+impl LegacySourceStateSnapshotV1 {
+    pub(super) fn validate_limits(
+        &self,
+        limits: SourceStateLimits,
+    ) -> Result<(), SourceStateError> {
+        self.transaction_receipts()
+            .validate_for_workspace(self.workspace())?;
+        validate_source_state_count("scan hints", self.scan_hints().len(), limits.max_scan_hints)?;
+        validate_source_state_count("assets", self.assets().len(), limits.max_assets)?;
+        for hint in self.scan_hints() {
+            validate_source_state_relative_path(
+                &hint.relative_path,
+                limits.max_relative_path_bytes,
+            )?;
+        }
+        for analysis in self.assets() {
+            validate_source_state_relative_path(
+                analysis.relative_path(),
+                limits.max_relative_path_bytes,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_manifest(
+        &self,
+        manifest: &LegacySearchGenerationManifest,
+    ) -> Result<(), SourceStateError> {
+        if self.workspace() != manifest.workspace() || self.revision() != manifest.revision() {
+            return Err(SourceStateError::GenerationContextMismatch {
+                expected_workspace: manifest.workspace(),
+                actual_workspace: self.workspace(),
+                expected_revision: manifest.revision(),
+                actual_revision: self.revision(),
+            });
+        }
+        if self.logical_digest() != manifest.source_state_digest() {
+            return Err(SourceStateError::ManifestDigestMismatch {
+                expected: manifest.source_state_digest(),
+                actual: self.logical_digest(),
+            });
+        }
+        if !self
+            .transaction_receipts()
+            .matches_canonical_ids(manifest.applied_transactions())
+        {
+            return Err(SourceStateError::ManifestTransactionsMismatch);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Serialize)]
 struct SourceStateLogicalRef<'state> {
-    contract_version: u16,
+    identity_version: u16,
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
-    transaction_receipts: &'state TransactionReceiptWindow,
+    analysis_cache_identity: AnalysisCacheIdentityV1,
     assets: &'state [AssetAnalysis],
 }
 
 fn source_state_logical_digest(
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
-    transaction_receipts: &TransactionReceiptWindow,
+    analysis_cache_identity: AnalysisCacheIdentityV1,
     assets: &[AssetAnalysis],
 ) -> Result<DigestV1, SourceStateError> {
     let logical = SourceStateLogicalRef {
-        contract_version: SOURCE_STATE_CONTRACT_VERSION,
+        identity_version: SOURCE_STATE_LOGICAL_IDENTITY_VERSION,
         workspace,
         revision,
-        transaction_receipts,
+        analysis_cache_identity,
         assets,
     };
     canonical_digest(&logical)
@@ -954,11 +1059,15 @@ pub(super) fn validate_source_state_manifest(
             actual: snapshot.logical_digest,
         });
     }
-    if !snapshot
-        .transaction_receipts
-        .matches_canonical_ids(manifest.applied_transactions())
-    {
-        return Err(SourceStateError::ManifestTransactionsMismatch);
+    let expected_analysis_cache_identity = manifest
+        .semantics()
+        .analysis_cache_identity(manifest.options_digest())
+        .map_err(SourceStateError::Digest)?;
+    if snapshot.analysis_cache_identity != expected_analysis_cache_identity {
+        return Err(SourceStateError::ManifestAnalysisCacheIdentityMismatch {
+            expected: expected_analysis_cache_identity,
+            actual: snapshot.analysis_cache_identity,
+        });
     }
     Ok(())
 }
@@ -966,16 +1075,29 @@ pub(super) fn validate_source_state_manifest(
 pub(super) fn source_state_entry_count(
     snapshot: &SourceStateSnapshot,
 ) -> Result<u64, SourceStateError> {
-    let mut entries = snapshot
-        .transaction_receipts
-        .receipts
-        .len()
-        .checked_add(snapshot.scan_hints.len())
-        .and_then(|count| count.checked_add(snapshot.assets.len()))
+    source_state_entry_count_parts(snapshot.scan_hints.len(), &snapshot.assets, 0)
+}
+
+pub(super) fn legacy_source_state_entry_count(
+    snapshot: &LegacySourceStateSnapshot,
+) -> Result<u64, SourceStateError> {
+    snapshot
+        .nested_collection_count()
+        .map_err(|error| SourceStateError::LegacyWire(Box::new(error)))
+}
+
+fn source_state_entry_count_parts(
+    scan_hints: usize,
+    assets: &[AssetAnalysis],
+    additional_entries: usize,
+) -> Result<u64, SourceStateError> {
+    let mut entries = scan_hints
+        .checked_add(assets.len())
+        .and_then(|count| count.checked_add(additional_entries))
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state entries",
         })?;
-    for analysis in &snapshot.assets {
+    for analysis in assets {
         for count in [
             analysis.search.hierarchy_paths.len(),
             analysis.search.script_symbols.len(),
@@ -1208,6 +1330,12 @@ pub(super) fn source_state_owned_allocation_bound(
         std::mem::size_of::<AnalysisTruncation>(),
         std::mem::size_of::<ReferenceDependencyKey>(),
         std::mem::size_of::<ObjectAddress>(),
+        std::mem::size_of::<LegacyAssetAnalysisV1>(),
+        std::mem::size_of::<LegacyWorkspaceObjectFactV1>(),
+        std::mem::size_of::<LegacyReferenceProjectionFactV1>(),
+        std::mem::size_of::<LegacyDiagnosticV1>(),
+        std::mem::size_of::<LegacyReferenceDependencyKeyV1>(),
+        std::mem::size_of::<LegacyObjectAddressV1>(),
         std::mem::size_of::<String>(),
     ]
     .into_iter()
@@ -1256,6 +1384,7 @@ pub(crate) enum SourceStateError {
     Budget(BudgetedJsonError),
     Json(serde_json::Error),
     Digest(DigestBuildError),
+    LegacyWire(Box<LegacyWireError>),
     UnsupportedVersion {
         actual: u16,
         expected: u16,
@@ -1264,10 +1393,6 @@ pub(crate) enum SourceStateError {
         collection: &'static str,
         actual: usize,
         maximum: usize,
-    },
-    BatchTransactionsMismatch {
-        batch: Vec<TransactionId>,
-        receipts: Vec<TransactionId>,
     },
     UnsupportedTransactionReceiptVersion {
         actual: u16,
@@ -1316,6 +1441,10 @@ pub(crate) enum SourceStateError {
         expected: DigestV1,
         actual: DigestV1,
     },
+    ManifestAnalysisCacheIdentityMismatch {
+        expected: AnalysisCacheIdentityV1,
+        actual: AnalysisCacheIdentityV1,
+    },
     ManifestTransactionsMismatch,
     PhysicalEvidenceMismatch {
         expected: ArtifactTreeEvidence,
@@ -1337,7 +1466,7 @@ pub(crate) enum SourceStateError {
     },
     AllocationFailed {
         requested: usize,
-        message: String,
+        source: TryReserveError,
     },
     StructuralEntryUnderestimate {
         structural: u64,
@@ -1358,6 +1487,7 @@ impl fmt::Display for SourceStateError {
             Self::Budget(error) => fmt::Display::fmt(error, formatter),
             Self::Json(error) => write!(formatter, "invalid source state JSON: {error}"),
             Self::Digest(error) => write!(formatter, "failed to digest source state: {error}"),
+            Self::LegacyWire(error) => write!(formatter, "invalid legacy source state: {error}"),
             Self::UnsupportedVersion { actual, expected } => write!(
                 formatter,
                 "source state version {actual} is unsupported; expected {expected}"
@@ -1369,10 +1499,6 @@ impl fmt::Display for SourceStateError {
             } => write!(
                 formatter,
                 "source state {collection} contains {actual} items; maximum is {maximum}"
-            ),
-            Self::BatchTransactionsMismatch { batch, receipts } => write!(
-                formatter,
-                "analysis batch transactions {batch:?} do not match receipt transactions {receipts:?}"
             ),
             Self::UnsupportedTransactionReceiptVersion { actual, expected } => write!(
                 formatter,
@@ -1441,8 +1567,13 @@ impl fmt::Display for SourceStateError {
                 formatter,
                 "source state does not match generation manifest: expected {expected}, got {actual}"
             ),
-            Self::ManifestTransactionsMismatch => formatter
-                .write_str("source state transactions do not match the generation manifest"),
+            Self::ManifestAnalysisCacheIdentityMismatch { expected, actual } => write!(
+                formatter,
+                "source state analysis cache identity does not match generation manifest: expected {expected:?}, got {actual:?}"
+            ),
+            Self::ManifestTransactionsMismatch => formatter.write_str(
+                "source state transaction receipts do not match the generation manifest",
+            ),
             Self::PhysicalEvidenceMismatch { expected, actual } => write!(
                 formatter,
                 "source state physical evidence mismatch: expected {expected:?}, got {actual:?}"
@@ -1464,9 +1595,9 @@ impl fmt::Display for SourceStateError {
                 formatter,
                 "encoded source state length changed while reading: expected {expected} bytes, got {actual}"
             ),
-            Self::AllocationFailed { requested, message } => write!(
+            Self::AllocationFailed { requested, source } => write!(
                 formatter,
-                "failed to reserve {requested} bytes for source state: {message}"
+                "failed to reserve {requested} bytes for source state: {source}"
             ),
             Self::StructuralEntryUnderestimate {
                 structural,
@@ -1490,6 +1621,8 @@ impl Error for SourceStateError {
             Self::Budget(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Digest(error) => Some(error),
+            Self::LegacyWire(error) => Some(error.as_ref()),
+            Self::AllocationFailed { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -1509,7 +1642,11 @@ mod source_state_tests {
         AnalysisTruncation, AnalysisTruncationKind, AnalyzedSource, AssetAnalysis, SearchFacts,
         WorkspaceObjectFact,
     };
-    use crate::generation::{GenerationProjectionDigests, SearchGenerationIdentityV1};
+    use crate::generation::{
+        ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
+        SearchGenerationIdentityV1, SearchGenerationManifestV1,
+    };
+    use crate::semantics::SearchSemantics;
 
     fn digest(label: &str) -> DigestV1 {
         DigestV1::hash_bytes(label.as_bytes())
@@ -1554,23 +1691,10 @@ mod source_state_tests {
         .unwrap()
     }
 
-    fn receipt_window(changes: &ChangeSet) -> TransactionReceiptWindow {
-        let mut budget = AssetLoadBudget::new(AssetLoadLimits::default()).unwrap();
-        TransactionReceiptWindow::from_change_set(changes, &mut budget).unwrap()
-    }
-
     fn source_state(workspace: WorkspaceId, revision: WorkspaceRevision) -> SourceStateSnapshot {
-        let changes = change_set(
-            workspace,
-            "transaction",
-            WorkspaceRevision::new(digest("previous revision")),
-            revision,
-            1,
-        );
         SourceStateSnapshot::new(
             workspace,
             revision,
-            receipt_window(&changes),
             vec![
                 SourceScanHint::new("Assets/B.asset".to_owned(), 20, None, Some(10), None).unwrap(),
                 SourceScanHint::new("Assets/A.asset".to_owned(), 10, Some(100), None, None)
@@ -1591,15 +1715,10 @@ mod source_state_tests {
         assert_eq!(snapshot.assets()[0].source.relative_path, "Assets/A.asset");
         assert!(snapshot.scan_hint("Assets/B.asset").is_some());
         assert!(snapshot.analysis("Assets/B.asset").is_some());
-        assert_eq!(
-            snapshot.transaction_receipts().canonical_ids(),
-            vec![TransactionId::new(digest("transaction"))]
-        );
 
         let changed_hints = SourceStateSnapshot::new(
             workspace,
             revision,
-            snapshot.transaction_receipts().clone(),
             vec![
                 SourceScanHint::new("Assets/A.asset".to_owned(), 10, Some(999), None, None)
                     .unwrap(),
@@ -1623,9 +1742,72 @@ mod source_state_tests {
         unknown["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<SourceStateSnapshot>(unknown).is_err());
 
-        let mut unsupported = serde_json::to_value(&snapshot).unwrap();
-        unsupported["contract_version"] = serde_json::json!(2);
-        assert!(serde_json::from_value::<SourceStateSnapshot>(unsupported).is_err());
+        for unsupported_version in [
+            SOURCE_STATE_CONTRACT_VERSION - 1,
+            SOURCE_STATE_CONTRACT_VERSION + 1,
+        ] {
+            let mut unsupported = serde_json::to_value(&snapshot).unwrap();
+            unsupported["contract_version"] = serde_json::json!(unsupported_version);
+            assert!(serde_json::from_value::<SourceStateSnapshot>(unsupported).is_err());
+        }
+    }
+
+    #[test]
+    fn source_state_logical_digest_and_manifest_bind_analysis_cache_identity() {
+        let workspace = WorkspaceId::from_u128(0x54).unwrap();
+        let revision = WorkspaceRevision::new(digest("revision"));
+        let configuration_digest = digest("options");
+        let current_semantics = SearchSemantics::current();
+        let current_identity = current_semantics
+            .analysis_cache_identity(configuration_digest)
+            .unwrap();
+        let current = SourceStateSnapshot::new_with_analysis_cache_identity(
+            workspace,
+            revision,
+            current_identity,
+            Vec::new(),
+            vec![analysis("Assets/A.asset")],
+        )
+        .unwrap();
+        let stale_semantics = SearchSemantics::current()
+            .with_reference_projection_digest(digest("stale reference projection semantics"));
+        let stale_identity = stale_semantics
+            .analysis_cache_identity(configuration_digest)
+            .unwrap();
+        let stale = SourceStateSnapshot::new_with_analysis_cache_identity(
+            workspace,
+            revision,
+            stale_identity,
+            Vec::new(),
+            vec![analysis("Assets/A.asset")],
+        )
+        .unwrap();
+        assert_ne!(current.logical_digest(), stale.logical_digest());
+
+        let manifest = SearchGenerationManifestV1::new(
+            SearchGenerationIdentityV1::new_with_semantics(
+                workspace,
+                revision,
+                GenerationProjectionDigests::new(digest("search"), digest("references")),
+                Default::default(),
+                current_semantics,
+                configuration_digest,
+                stale.logical_digest(),
+            )
+            .unwrap(),
+            GenerationArtifactEvidence::new(
+                ArtifactTreeEvidence::new(digest("search artifacts"), 1, 1),
+                ArtifactTreeEvidence::new(digest("reference artifacts"), 1, 1),
+                ArtifactTreeEvidence::new(digest("source-state artifacts"), 1, 1),
+            ),
+        );
+        assert!(matches!(
+            validate_source_state_manifest(&stale, &manifest),
+            Err(SourceStateError::ManifestAnalysisCacheIdentityMismatch {
+                expected,
+                actual
+            }) if expected == current_identity && actual == stale_identity
+        ));
     }
 
     #[test]
@@ -1716,7 +1898,7 @@ mod source_state_tests {
     }
 
     #[test]
-    fn source_state_accepts_lagging_receipts_and_appends_from_snapshot_revision() {
+    fn transaction_window_accepts_lagging_receipts_and_appends_from_indexed_revision() {
         let workspace = WorkspaceId::from_u128(0x55).unwrap();
         let revision_0 = WorkspaceRevision::new(digest("revision 0"));
         let revision_1 = WorkspaceRevision::new(digest("revision 1"));
@@ -1726,27 +1908,43 @@ mod source_state_tests {
         let second = change_set(workspace, "transaction 2", revision_2, revision_3, 2);
         let mut budget = AssetLoadBudget::new(AssetLoadLimits::default()).unwrap();
         let receipts = TransactionReceiptWindow::from_change_set(&first, &mut budget).unwrap();
-        let snapshot =
-            SourceStateSnapshot::new(workspace, revision_2, receipts, Vec::new(), Vec::new())
-                .unwrap();
 
         assert!(matches!(
-            snapshot
-                .transaction_membership(&first, &mut budget)
-                .unwrap(),
+            receipts.membership(&first, &mut budget).unwrap(),
             TransactionReceiptMembership::Exact
         ));
-        let receipts = snapshot
-            .transaction_receipts_after(&second, &mut budget)
+        let receipts = receipts
+            .after_change_set(workspace, revision_2, &second, &mut budget)
             .unwrap();
         assert_eq!(receipts.as_slice().len(), 2);
         assert_eq!(receipts.as_slice()[0].to_revision, revision_1);
         assert_eq!(receipts.as_slice()[1].from_revision, revision_2);
-        SourceStateSnapshot::new(workspace, revision_3, receipts, Vec::new(), Vec::new()).unwrap();
+        receipts.validate_for_workspace(workspace).unwrap();
+        assert_eq!(receipts.as_slice()[1].to_revision, revision_3);
     }
 
     #[test]
-    fn source_state_records_reconciled_target_receipts_only_at_the_target_revision() {
+    fn transaction_receipt_clone_shares_backing_until_append() {
+        let workspace = WorkspaceId::from_u128(0x5a).unwrap();
+        let revision_0 = WorkspaceRevision::new(digest("shared revision 0"));
+        let revision_1 = WorkspaceRevision::new(digest("shared revision 1"));
+        let revision_2 = WorkspaceRevision::new(digest("shared revision 2"));
+        let first = change_set(workspace, "shared transaction 1", revision_0, revision_1, 1);
+        let second = change_set(workspace, "shared transaction 2", revision_1, revision_2, 2);
+        let mut budget = AssetLoadBudget::default();
+        let original = TransactionReceiptWindow::from_change_set(&first, &mut budget).unwrap();
+        let mut appended = original.clone();
+
+        assert!(original.shares_backing_with(&appended));
+        appended.append(&second, &mut budget).unwrap();
+
+        assert!(!original.shares_backing_with(&appended));
+        assert_eq!(original.as_slice().len(), 1);
+        assert_eq!(appended.as_slice().len(), 2);
+    }
+
+    #[test]
+    fn transaction_window_records_reconciled_receipts_only_at_the_target_revision() {
         let workspace = WorkspaceId::from_u128(0x551).unwrap();
         let revision_0 = WorkspaceRevision::new(digest("reconciled revision 0"));
         let revision_1 = WorkspaceRevision::new(digest("reconciled revision 1"));
@@ -1759,31 +1957,19 @@ mod source_state_tests {
             1,
         );
         let mut budget = AssetLoadBudget::new(AssetLoadLimits::default()).unwrap();
-        let reconciled = SourceStateSnapshot::new(
-            workspace,
-            revision_1,
-            TransactionReceiptWindow::empty(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
-
-        let receipts = reconciled
-            .transaction_receipts_after_reconciled_target(&changes, &mut budget)
+        let receipts = TransactionReceiptWindow::empty()
+            .after_reconciled_target(workspace, revision_1, &changes, &mut budget)
             .unwrap();
         assert_eq!(receipts.as_slice().len(), 1);
         assert_eq!(receipts.as_slice()[0].transaction(), changes.transaction());
 
-        let mismatched = SourceStateSnapshot::new(
-            workspace,
-            revision_2,
-            TransactionReceiptWindow::empty(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
         assert!(matches!(
-            mismatched.transaction_receipts_after_reconciled_target(&changes, &mut budget),
+            TransactionReceiptWindow::empty().after_reconciled_target(
+                workspace,
+                revision_2,
+                &changes,
+                &mut budget
+            ),
             Err(SourceStateError::TransactionReceiptRevisionBarrier { .. })
         ));
     }
@@ -1819,16 +2005,13 @@ mod source_state_tests {
             TransactionReceiptMembership::Absent
         ));
 
-        let snapshot = SourceStateSnapshot::new(
-            workspace,
-            revisions[MAX_TRANSACTION_RECEIPTS + 1],
-            receipts,
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
         assert!(matches!(
-            snapshot.transaction_receipts_after(&first, &mut budget),
+            receipts.after_change_set(
+                workspace,
+                revisions[MAX_TRANSACTION_RECEIPTS + 1],
+                &first,
+                &mut budget
+            ),
             Err(SourceStateError::TransactionReceiptRevisionBarrier { .. })
         ));
     }
@@ -1867,14 +2050,8 @@ mod source_state_tests {
             AnalysisTruncation::new(AnalysisTruncationKind::ContentTerms, Some(10), 11),
         ];
 
-        let snapshot = SourceStateSnapshot::new(
-            workspace,
-            revision,
-            TransactionReceiptWindow::empty(),
-            Vec::new(),
-            vec![asset],
-        )
-        .unwrap();
+        let snapshot =
+            SourceStateSnapshot::new(workspace, revision, Vec::new(), vec![asset]).unwrap();
         let asset = &snapshot.assets()[0];
 
         assert_eq!(asset.graph_inputs.objects.len(), 2);
@@ -2015,8 +2192,6 @@ mod source_state_tests {
             revision,
             GenerationProjectionDigests::new(digest("search"), digest("references")),
             Default::default(),
-            None,
-            snapshot.transaction_receipts().canonical_ids(),
             digest("options"),
             snapshot.logical_digest(),
         )
@@ -2036,7 +2211,7 @@ mod source_state_tests {
             .unwrap()
             .load_source_state(&mut budget)
             .unwrap();
-        assert_eq!(reopened, snapshot);
+        assert_eq!(reopened, GenerationSourceState::CurrentV2(snapshot));
 
         let low_limits = AssetLoadLimits {
             max_bytes: 1,

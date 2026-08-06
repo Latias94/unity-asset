@@ -1,5 +1,9 @@
 use std::ffi::OsStr;
 use std::io;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::os::fd::BorrowedFd;
+#[cfg(windows)]
+use std::os::windows::io::BorrowedHandle;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest as _, Sha256};
@@ -21,13 +25,8 @@ impl ProjectLocatorV1 {
         let root = absolute_path(root.as_ref())?;
         let authority =
             platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
-        let platform_identity = authority
-            .identity()
-            .map_err(|source| map_root_error(&root, source))?;
+        let (identity, platform_identity) = derive_read_directory_identity(&root, &authority)?;
         validate_markers(&authority, &root)?;
-        let identity = ProjectIdentityV1 {
-            project_id: derive_project_id(platform_identity)?,
-        };
         Ok(Self {
             root,
             identity,
@@ -91,6 +90,32 @@ pub struct ProjectIdentityV1 {
 }
 
 impl ProjectIdentityV1 {
+    /// Derives a stable identity from an already-open local directory descriptor.
+    ///
+    /// `path_for_diagnostics` is used only to contextualize errors. It is not opened, resolved, or
+    /// included in the derived identity.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub fn for_open_directory(
+        path_for_diagnostics: &Path,
+        authority: BorrowedFd<'_>,
+    ) -> Result<Self, ProjectLocatorError> {
+        derive_open_directory_identity(path_for_diagnostics, authority)
+            .map(|(identity, _)| identity)
+    }
+
+    /// Derives a stable identity from an already-open local directory handle.
+    ///
+    /// `path_for_diagnostics` is used only to contextualize errors. It is not opened, resolved, or
+    /// included in the derived identity.
+    #[cfg(windows)]
+    pub fn for_open_directory(
+        path_for_diagnostics: &Path,
+        authority: BorrowedHandle<'_>,
+    ) -> Result<Self, ProjectLocatorError> {
+        derive_open_directory_identity(path_for_diagnostics, authority)
+            .map(|(identity, _)| identity)
+    }
+
     /// Derives a stable identity for an existing local directory without asserting that it is a
     /// Unity project. This is intended for path-scoped local state; callers that need Unity
     /// project validation must use [`ProjectLocatorV1::open`].
@@ -98,26 +123,70 @@ impl ProjectIdentityV1 {
         let root = absolute_path(root.as_ref())?;
         let authority =
             platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
-        let platform_identity = authority
-            .identity()
-            .map_err(|source| map_root_error(&root, source))?;
+        let (identity, platform_identity) = derive_read_directory_identity(&root, &authority)?;
         let reopened =
             platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
-        let rebound = reopened
-            .identity()
-            .map_err(|source| map_root_error(&root, source))?;
+        let (_, rebound) = derive_read_directory_identity(&root, &reopened)?;
         if rebound != platform_identity {
             return Err(ProjectLocatorError::IdentityChanged { path: root });
         }
-        Ok(Self {
-            project_id: derive_project_id(platform_identity)?,
-        })
+        Ok(identity)
     }
 
     #[must_use]
     pub const fn project_id(self) -> ProjectId {
         self.project_id
     }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn derive_open_directory_identity(
+    path_for_diagnostics: &Path,
+    authority: BorrowedFd<'_>,
+) -> Result<(ProjectIdentityV1, platform::DirectoryIdentity), ProjectLocatorError> {
+    finish_open_directory_identity(
+        path_for_diagnostics,
+        platform::validated_directory_identity(authority),
+    )
+}
+
+#[cfg(windows)]
+fn derive_open_directory_identity(
+    path_for_diagnostics: &Path,
+    authority: BorrowedHandle<'_>,
+) -> Result<(ProjectIdentityV1, platform::DirectoryIdentity), ProjectLocatorError> {
+    finish_open_directory_identity(
+        path_for_diagnostics,
+        platform::validated_directory_identity(authority),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
+fn derive_read_directory_identity(
+    path_for_diagnostics: &Path,
+    authority: &platform::ReadDirectory,
+) -> Result<(ProjectIdentityV1, platform::DirectoryIdentity), ProjectLocatorError> {
+    derive_open_directory_identity(path_for_diagnostics, authority.borrowed_authority())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn derive_read_directory_identity(
+    path_for_diagnostics: &Path,
+    authority: &platform::ReadDirectory,
+) -> Result<(ProjectIdentityV1, platform::DirectoryIdentity), ProjectLocatorError> {
+    finish_open_directory_identity(path_for_diagnostics, authority.identity())
+}
+
+fn finish_open_directory_identity(
+    path_for_diagnostics: &Path,
+    platform_identity: io::Result<platform::DirectoryIdentity>,
+) -> Result<(ProjectIdentityV1, platform::DirectoryIdentity), ProjectLocatorError> {
+    let platform_identity =
+        platform_identity.map_err(|source| map_root_error(path_for_diagnostics, source))?;
+    let identity = ProjectIdentityV1 {
+        project_id: derive_project_id(platform_identity)?,
+    };
+    Ok((identity, platform_identity))
 }
 
 fn validate_markers(
@@ -265,9 +334,81 @@ pub enum ProjectLocatorError {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
 mod tests {
-    use std::fs;
+    use std::fs::{self, File};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::os::fd::AsFd as _;
+    #[cfg(windows)]
+    use std::os::windows::io::AsHandle as _;
+    use std::path::Path;
 
-    use super::ProjectIdentityV1;
+    use super::{ProjectIdentityV1, ProjectLocatorError, platform};
+
+    fn identity_from_authority(
+        path_for_diagnostics: &Path,
+        authority: &platform::ReadDirectory,
+    ) -> Result<ProjectIdentityV1, ProjectLocatorError> {
+        ProjectIdentityV1::for_open_directory(path_for_diagnostics, authority.borrowed_authority())
+    }
+
+    fn identity_from_file(
+        path_for_diagnostics: &Path,
+        file: &File,
+    ) -> Result<ProjectIdentityV1, ProjectLocatorError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let authority = file.as_fd();
+        #[cfg(windows)]
+        let authority = file.as_handle();
+        ProjectIdentityV1::for_open_directory(path_for_diagnostics, authority)
+    }
+
+    #[test]
+    fn path_and_open_directory_identity_match() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let authority = platform::ReadDirectory::open(&root).unwrap();
+
+        let from_path = ProjectIdentityV1::for_existing_root(&root).unwrap();
+        let from_authority = identity_from_authority(&root, &authority).unwrap();
+
+        assert_eq!(from_path, from_authority);
+    }
+
+    #[test]
+    fn borrowed_open_directory_identity_survives_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let original = temporary.path().join("original");
+        let renamed = temporary.path().join("renamed");
+        fs::create_dir(&original).unwrap();
+        let authority = platform::ReadDirectory::open(&original).unwrap();
+
+        let before = identity_from_authority(&original, &authority).unwrap();
+        fs::rename(&original, &renamed).unwrap();
+        fs::create_dir(&original).unwrap();
+        let after = identity_from_authority(&original, &authority).unwrap();
+        let replacement = ProjectIdentityV1::for_existing_root(&original).unwrap();
+
+        assert_eq!(before, after);
+        assert_ne!(after, replacement);
+    }
+
+    #[test]
+    fn open_regular_file_is_rejected_as_project_authority() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("asset.txt");
+        fs::write(&path, b"content").unwrap();
+        let file = File::open(&path).unwrap();
+
+        let error = identity_from_file(&path, &file).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProjectLocatorError::InvalidRoot {
+                path: error_path,
+                ..
+            } if error_path == path
+        ));
+    }
 
     #[test]
     fn existing_root_identity_survives_rename_but_not_copy() {
@@ -294,7 +435,7 @@ mod tests {
 mod platform {
     use std::ffi::OsStr;
     use std::io;
-    use std::os::fd::{AsFd as _, OwnedFd};
+    use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Component, Path};
 
@@ -333,13 +474,16 @@ mod platform {
                     }
                 }
             }
-            validate_directory(&descriptor)?;
-            validate_local_filesystem(&descriptor)?;
+            validated_directory_identity(descriptor.as_fd())?;
             Ok(Self { descriptor })
         }
 
         pub(super) fn open_directory(&self, name: &OsStr) -> io::Result<Self> {
             open_directory_at(&self.descriptor, name).map(|descriptor| Self { descriptor })
+        }
+
+        pub(super) fn borrowed_authority(&self) -> BorrowedFd<'_> {
+            self.descriptor.as_fd()
         }
 
         pub(super) fn identity(&self) -> io::Result<DirectoryIdentity> {
@@ -365,6 +509,15 @@ mod platform {
         }
     }
 
+    pub(super) fn validated_directory_identity(
+        descriptor: BorrowedFd<'_>,
+    ) -> io::Result<DirectoryIdentity> {
+        let stat = fstat(descriptor).map_err(io::Error::from)?;
+        let identity = directory_identity(&stat)?;
+        crate::local_filesystem::validate_local_directory(descriptor)?;
+        Ok(identity)
+    }
+
     fn open_directory_at(parent: &OwnedFd, name: &OsStr) -> io::Result<OwnedFd> {
         validate_leaf(name)?;
         let descriptor =
@@ -382,11 +535,6 @@ mod platform {
         Ok(descriptor)
     }
 
-    fn validate_directory(descriptor: &OwnedFd) -> io::Result<()> {
-        let stat = fstat(descriptor).map_err(io::Error::from)?;
-        directory_identity(&stat).map(|_| ())
-    }
-
     fn directory_identity(stat: &rustix::fs::Stat) -> io::Result<DirectoryIdentity> {
         if !FileType::from_raw_mode(stat.st_mode).is_dir() {
             return Err(io::Error::other("path is not a directory"));
@@ -400,10 +548,6 @@ mod platform {
             ));
         }
         Ok(DirectoryIdentity { device, inode })
-    }
-
-    fn validate_local_filesystem(descriptor: &OwnedFd) -> io::Result<()> {
-        crate::local_filesystem::validate_local_directory(descriptor)
     }
 
     fn validate_leaf(name: &OsStr) -> io::Result<()> {
@@ -433,6 +577,7 @@ mod platform {
     use std::io;
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
+    use std::os::windows::io::{AsRawHandle as _, BorrowedHandle, RawHandle};
     use std::path::{Component, Components, Path, Prefix};
 
     use sha2::{Digest as _, Sha256};
@@ -484,6 +629,10 @@ mod platform {
             open_directory_handle_at(self.handle.raw(), name).map(|handle| Self { handle })
         }
 
+        pub(super) fn borrowed_authority(&self) -> BorrowedHandle<'_> {
+            self.handle.borrowed()
+        }
+
         pub(super) fn identity(&self) -> io::Result<DirectoryIdentity> {
             directory_identity(self.handle.raw())
         }
@@ -503,6 +652,15 @@ mod platform {
         }
     }
 
+    pub(super) fn validated_directory_identity(
+        authority: BorrowedHandle<'_>,
+    ) -> io::Result<DirectoryIdentity> {
+        let handle = authority.as_raw_handle() as HANDLE;
+        let identity = validate_directory_handle(handle)?;
+        crate::windows_volume::validate_local_volume(handle)?;
+        Ok(identity)
+    }
+
     struct OwnedHandle(HANDLE);
 
     unsafe impl Send for OwnedHandle {}
@@ -511,6 +669,11 @@ mod platform {
     impl OwnedHandle {
         const fn raw(&self) -> HANDLE {
             self.0
+        }
+
+        fn borrowed(&self) -> BorrowedHandle<'_> {
+            // SAFETY: this wrapper owns a live handle for at least the returned borrow's lifetime.
+            unsafe { BorrowedHandle::borrow_raw(self.0 as RawHandle) }
         }
     }
 
@@ -553,8 +716,7 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
         let handle = OwnedHandle(handle);
-        validate_directory_handle(handle.raw())?;
-        crate::windows_volume::validate_local_volume(handle.raw())?;
+        validated_directory_identity(handle.borrowed())?;
         Ok(handle)
     }
 
@@ -632,7 +794,7 @@ mod platform {
         Ok(OwnedHandle(handle))
     }
 
-    fn validate_directory_handle(handle: HANDLE) -> io::Result<()> {
+    fn validate_directory_handle(handle: HANDLE) -> io::Result<DirectoryIdentity> {
         let mut attributes = FILE_ATTRIBUTE_TAG_INFO::default();
         // SAFETY: `attributes` is writable for the exact structure size.
         if unsafe {
@@ -653,7 +815,7 @@ mod platform {
         if !standard.Directory {
             return Err(io::Error::other("path is not a directory"));
         }
-        directory_identity(handle).map(|_| ())
+        directory_identity(handle)
     }
 
     fn directory_identity(handle: HANDLE) -> io::Result<DirectoryIdentity> {

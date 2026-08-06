@@ -1,14 +1,22 @@
-use std::collections::BTreeSet;
 use std::fmt;
-use std::path::PathBuf;
+use std::mem::size_of;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use unity_asset_core::{DigestV1, TransactionId, WorkspaceId, WorkspaceRevision};
+use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 
-pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 1;
-const GENERATION_DIRECTORY_PREFIX: &str = "generation-v1-";
-const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v1\0";
-const MAX_APPLIED_TRANSACTIONS: usize = 4_096;
+use crate::ProjectPathSet;
+use crate::semantics::SearchSemantics;
+
+mod legacy;
+
+pub(crate) use legacy::{
+    LEGACY_SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, LegacySearchGenerationManifest,
+    legacy_generation_directory_name, parse_legacy_generation_directory_name,
+};
+
+pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 2;
+const GENERATION_DIRECTORY_PREFIX: &str = "generation-v2-";
+const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v2\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -57,12 +65,110 @@ impl fmt::Display for SearchGenerationId {
     }
 }
 
+/// Exact on-disk generation contract selected by an activation record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) enum GenerationStorageContract {
+    LegacyV1,
+    CurrentV2,
+}
+
+impl GenerationStorageContract {
+    #[must_use]
+    pub(crate) const fn wire_version(self) -> u16 {
+        match self {
+            Self::LegacyV1 => LEGACY_SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            Self::CurrentV2 => SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+        }
+    }
+}
+
+impl Serialize for GenerationStorageContract {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_u16(self.wire_version())
+    }
+}
+
+impl<'de> Deserialize<'de> for GenerationStorageContract {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u16::deserialize(deserializer)? {
+            LEGACY_SEARCH_GENERATION_STORAGE_CONTRACT_VERSION => Ok(Self::LegacyV1),
+            SEARCH_GENERATION_STORAGE_CONTRACT_VERSION => Ok(Self::CurrentV2),
+            actual => Err(serde::de::Error::custom(format_args!(
+                "search generation storage version {actual} is unsupported"
+            ))),
+        }
+    }
+}
+
+/// Versioned reference to one immutable generation directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct StoredGenerationRef {
+    storage: GenerationStorageContract,
+    generation: SearchGenerationId,
+}
+
+impl StoredGenerationRef {
+    #[must_use]
+    pub(crate) const fn new(
+        storage: GenerationStorageContract,
+        generation: SearchGenerationId,
+    ) -> Self {
+        Self {
+            storage,
+            generation,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn current(generation: SearchGenerationId) -> Self {
+        Self::new(GenerationStorageContract::CurrentV2, generation)
+    }
+
+    #[must_use]
+    pub(crate) const fn storage(self) -> GenerationStorageContract {
+        self.storage
+    }
+
+    #[must_use]
+    pub(crate) const fn generation(self) -> SearchGenerationId {
+        self.generation
+    }
+
+    #[must_use]
+    pub(crate) fn directory_name(self) -> String {
+        match self.storage {
+            GenerationStorageContract::LegacyV1 => {
+                legacy_generation_directory_name(self.generation)
+            }
+            GenerationStorageContract::CurrentV2 => self.generation.directory_name(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn from_directory_name(value: &str) -> Option<Self> {
+        SearchGenerationId::from_directory_name(value)
+            .map(Self::current)
+            .or_else(|| {
+                parse_legacy_generation_directory_name(value)
+                    .map(|generation| Self::new(GenerationStorageContract::LegacyV1, generation))
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GenerationStamp {
     pub(crate) generation: SearchGenerationId,
     pub(crate) workspace: WorkspaceId,
     pub(crate) actual_revision: WorkspaceRevision,
     pub(crate) desired_revision: WorkspaceRevision,
+    pub(crate) semantics_current: bool,
+    pub(crate) configuration_current: bool,
     pub(crate) stale: bool,
 }
 
@@ -78,6 +184,8 @@ impl GenerationStamp {
             workspace,
             actual_revision: revision,
             desired_revision: revision,
+            semantics_current: true,
+            configuration_current: true,
             stale: false,
         }
     }
@@ -85,8 +193,28 @@ impl GenerationStamp {
     #[must_use]
     pub fn with_desired_revision(mut self, desired_revision: WorkspaceRevision) -> Self {
         self.desired_revision = desired_revision;
-        self.stale = self.actual_revision != desired_revision;
+        self.refresh_stale();
         self
+    }
+
+    #[must_use]
+    pub fn with_semantics_current(mut self, semantics_current: bool) -> Self {
+        self.semantics_current = semantics_current;
+        self.refresh_stale();
+        self
+    }
+
+    #[must_use]
+    pub fn with_configuration_current(mut self, configuration_current: bool) -> Self {
+        self.configuration_current = configuration_current;
+        self.refresh_stale();
+        self
+    }
+
+    fn refresh_stale(&mut self) {
+        self.stale = self.actual_revision != self.desired_revision
+            || !self.semantics_current
+            || !self.configuration_current;
     }
 }
 
@@ -98,7 +226,7 @@ impl GenerationStamp {
 pub enum FilesystemReindexScope {
     Full,
     Reconcile,
-    ChangedPaths { paths: Vec<PathBuf> },
+    ChangedPaths { paths: ProjectPathSet },
 }
 
 /// In-process request for one filesystem-backed search generation build.
@@ -123,7 +251,7 @@ impl FilesystemReindexIntent {
     }
 
     #[must_use]
-    pub fn changed_paths(paths: Vec<PathBuf>) -> Self {
+    pub fn changed_paths(paths: ProjectPathSet) -> Self {
         Self {
             scope: FilesystemReindexScope::ChangedPaths { paths },
         }
@@ -381,38 +509,47 @@ pub(crate) struct SearchGenerationIdentityV1 {
     revision: WorkspaceRevision,
     projections: GenerationProjectionDigests,
     projection_summary: GenerationProjectionSummary,
-    parent_generation: Option<SearchGenerationId>,
-    applied_transactions: Vec<TransactionId>,
+    semantics: SearchSemantics,
     options_digest: DigestV1,
     source_state_digest: DigestV1,
 }
 
 impl SearchGenerationIdentityV1 {
+    #[cfg(test)]
     pub fn new(
         workspace: WorkspaceId,
         revision: WorkspaceRevision,
         projections: GenerationProjectionDigests,
         projection_summary: GenerationProjectionSummary,
-        parent_generation: Option<SearchGenerationId>,
-        mut applied_transactions: Vec<TransactionId>,
         options_digest: DigestV1,
         source_state_digest: DigestV1,
     ) -> Result<Self, GenerationManifestError> {
-        if applied_transactions.len() > MAX_APPLIED_TRANSACTIONS {
-            return Err(GenerationManifestError::TooManyAppliedTransactions {
-                actual: applied_transactions.len(),
-                maximum: MAX_APPLIED_TRANSACTIONS,
-            });
-        }
-        applied_transactions.sort_unstable();
-        applied_transactions.dedup();
+        Self::new_with_semantics(
+            workspace,
+            revision,
+            projections,
+            projection_summary,
+            SearchSemantics::current(),
+            options_digest,
+            source_state_digest,
+        )
+    }
+
+    pub fn new_with_semantics(
+        workspace: WorkspaceId,
+        revision: WorkspaceRevision,
+        projections: GenerationProjectionDigests,
+        projection_summary: GenerationProjectionSummary,
+        semantics: SearchSemantics,
+        options_digest: DigestV1,
+        source_state_digest: DigestV1,
+    ) -> Result<Self, GenerationManifestError> {
         Ok(Self {
             workspace,
             revision,
             projections,
             projection_summary,
-            parent_generation,
-            applied_transactions,
+            semantics,
             options_digest,
             source_state_digest,
         })
@@ -432,9 +569,7 @@ pub(crate) struct SearchGenerationManifestV1 {
     search_projection_digest: DigestV1,
     reference_projection_digest: DigestV1,
     projection_summary: GenerationProjectionSummary,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    parent_generation: Option<SearchGenerationId>,
-    applied_transactions: Vec<TransactionId>,
+    semantics: SearchSemantics,
     options_digest: DigestV1,
     source_state_digest: DigestV1,
     artifacts: GenerationArtifactEvidence,
@@ -453,8 +588,7 @@ impl SearchGenerationManifestV1 {
             search_projection_digest: identity.projections.search,
             reference_projection_digest: identity.projections.references,
             projection_summary: identity.projection_summary,
-            parent_generation: identity.parent_generation,
-            applied_transactions: identity.applied_transactions,
+            semantics: identity.semantics,
             options_digest: identity.options_digest,
             source_state_digest: identity.source_state_digest,
             artifacts,
@@ -477,13 +611,8 @@ impl SearchGenerationManifestV1 {
     }
 
     #[must_use]
-    pub const fn parent_generation(&self) -> Option<SearchGenerationId> {
-        self.parent_generation
-    }
-
-    #[must_use]
-    pub fn applied_transactions(&self) -> &[TransactionId] {
-        &self.applied_transactions
+    pub(crate) const fn semantics(&self) -> SearchSemantics {
+        self.semantics
     }
 
     #[must_use]
@@ -504,34 +633,29 @@ impl SearchGenerationManifestV1 {
     /// Computes the content address of the logical generation identity.
     #[must_use]
     pub fn generation_id(&self) -> SearchGenerationId {
-        let transaction_bytes = self.applied_transactions.len() * DigestV1::BYTE_LEN;
         let mut canonical = Vec::with_capacity(
-            GENERATION_ID_DOMAIN.len() + 16 + DigestV1::BYTE_LEN * 6 + 1 + 8 + transaction_bytes,
+            GENERATION_ID_DOMAIN.len()
+                + 16
+                + DigestV1::BYTE_LEN * 8
+                + 3 * size_of::<u16>()
+                + 5 * size_of::<u64>(),
         );
         canonical.extend_from_slice(GENERATION_ID_DOMAIN);
         canonical.extend_from_slice(&self.workspace.get().to_le_bytes());
         canonical.extend_from_slice(self.revision.digest().as_bytes());
         canonical.extend_from_slice(self.search_projection_digest.as_bytes());
         canonical.extend_from_slice(self.reference_projection_digest.as_bytes());
+        canonical.extend_from_slice(&self.semantics.analysis_version().to_le_bytes());
+        canonical.extend_from_slice(self.semantics.analysis_digest().as_bytes());
+        canonical.extend_from_slice(&self.semantics.search_projection_version().to_le_bytes());
+        canonical.extend_from_slice(self.semantics.search_projection_digest().as_bytes());
+        canonical.extend_from_slice(&self.semantics.reference_projection_version().to_le_bytes());
+        canonical.extend_from_slice(self.semantics.reference_projection_digest().as_bytes());
         canonical.extend_from_slice(&self.projection_summary.assets.to_le_bytes());
         canonical.extend_from_slice(&self.projection_summary.search_documents.to_le_bytes());
         canonical.extend_from_slice(&self.projection_summary.reference_documents.to_le_bytes());
         canonical.extend_from_slice(&self.projection_summary.projection_truncations.to_le_bytes());
         canonical.extend_from_slice(&self.projection_summary.incomplete_assets.to_le_bytes());
-        match self.parent_generation {
-            Some(parent) => {
-                canonical.push(1);
-                canonical.extend_from_slice(parent.digest().as_bytes());
-            }
-            None => {
-                canonical.push(0);
-                canonical.extend_from_slice(&[0_u8; DigestV1::BYTE_LEN]);
-            }
-        }
-        canonical.extend_from_slice(&(self.applied_transactions.len() as u64).to_le_bytes());
-        for transaction in &self.applied_transactions {
-            canonical.extend_from_slice(transaction.digest().as_bytes());
-        }
         canonical.extend_from_slice(self.options_digest.as_bytes());
         canonical.extend_from_slice(self.source_state_digest.as_bytes());
         SearchGenerationId::new(DigestV1::hash_bytes(&canonical))
@@ -547,8 +671,7 @@ struct SearchGenerationManifestWire {
     search_projection_digest: DigestV1,
     reference_projection_digest: DigestV1,
     projection_summary: GenerationProjectionSummary,
-    parent_generation: Option<SearchGenerationId>,
-    applied_transactions: Vec<TransactionId>,
+    semantics: SearchSemantics,
     options_digest: DigestV1,
     source_state_digest: DigestV1,
     artifacts: GenerationArtifactEvidence,
@@ -564,8 +687,7 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
             "search generation manifest",
             wire.contract_version,
         )?;
-        ensure_canonical_transactions::<D::Error>(&wire.applied_transactions)?;
-        let identity = SearchGenerationIdentityV1::new(
+        let identity = SearchGenerationIdentityV1::new_with_semantics(
             wire.workspace,
             wire.revision,
             GenerationProjectionDigests::new(
@@ -573,8 +695,7 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
                 wire.reference_projection_digest,
             ),
             wire.projection_summary,
-            wire.parent_generation,
-            wire.applied_transactions,
+            wire.semantics,
             wire.options_digest,
             wire.source_state_digest,
         )
@@ -583,26 +704,64 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
     }
 }
 
-fn ensure_canonical_transactions<E>(transactions: &[TransactionId]) -> Result<(), E>
-where
-    E: serde::de::Error,
-{
-    if transactions.len() > MAX_APPLIED_TRANSACTIONS {
-        return Err(E::custom(
-            GenerationManifestError::TooManyAppliedTransactions {
-                actual: transactions.len(),
-                maximum: MAX_APPLIED_TRANSACTIONS,
-            },
-        ));
+/// Read-only runtime view over every supported persisted generation manifest.
+///
+/// This wrapper deliberately does not implement `Serialize`. Current publication APIs accept only
+/// [`SearchGenerationManifestV1`], so a legacy manifest cannot be rewritten as a current one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StoredGenerationManifest {
+    LegacyV1(LegacySearchGenerationManifest),
+    CurrentV2(SearchGenerationManifestV1),
+}
+
+impl StoredGenerationManifest {
+    #[must_use]
+    pub(crate) const fn workspace(&self) -> WorkspaceId {
+        match self {
+            Self::LegacyV1(manifest) => manifest.workspace(),
+            Self::CurrentV2(manifest) => manifest.workspace(),
+        }
     }
-    let unique = transactions.iter().copied().collect::<BTreeSet<_>>();
-    let canonical = unique.into_iter().collect::<Vec<_>>();
-    if canonical != transactions {
-        return Err(E::custom(
-            GenerationManifestError::NonCanonicalAppliedTransactions,
-        ));
+
+    #[must_use]
+    pub(crate) const fn revision(&self) -> WorkspaceRevision {
+        match self {
+            Self::LegacyV1(manifest) => manifest.revision(),
+            Self::CurrentV2(manifest) => manifest.revision(),
+        }
     }
-    Ok(())
+
+    #[must_use]
+    pub(crate) const fn projection_summary(&self) -> GenerationProjectionSummary {
+        match self {
+            Self::LegacyV1(manifest) => manifest.projection_summary(),
+            Self::CurrentV2(manifest) => manifest.projection_summary(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn semantics(&self) -> Option<SearchSemantics> {
+        match self {
+            Self::LegacyV1(_) => None,
+            Self::CurrentV2(manifest) => Some(manifest.semantics()),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn options_digest(&self) -> DigestV1 {
+        match self {
+            Self::LegacyV1(manifest) => manifest.options_digest(),
+            Self::CurrentV2(manifest) => manifest.options_digest(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn artifacts(&self) -> GenerationArtifactEvidence {
+        match self {
+            Self::LegacyV1(manifest) => manifest.artifacts(),
+            Self::CurrentV2(manifest) => manifest.artifacts(),
+        }
+    }
 }
 
 fn validate_storage_contract_version<E>(contract: &'static str, actual: u16) -> Result<(), E>
@@ -626,15 +785,15 @@ pub(crate) enum GenerationManifestError {
         actual: u16,
         expected: u16,
     },
+    InvalidProjectionSummary {
+        assets: u64,
+        incomplete_assets: u64,
+    },
     TooManyAppliedTransactions {
         actual: usize,
         maximum: usize,
     },
     NonCanonicalAppliedTransactions,
-    InvalidProjectionSummary {
-        assets: u64,
-        incomplete_assets: u64,
-    },
 }
 
 impl fmt::Display for GenerationManifestError {
@@ -648,13 +807,6 @@ impl fmt::Display for GenerationManifestError {
                 formatter,
                 "{contract} version {actual} is unsupported; expected {expected}"
             ),
-            Self::TooManyAppliedTransactions { actual, maximum } => write!(
-                formatter,
-                "generation records {actual} applied transactions; maximum is {maximum}"
-            ),
-            Self::NonCanonicalAppliedTransactions => {
-                formatter.write_str("applied transactions must be sorted and unique")
-            }
             Self::InvalidProjectionSummary {
                 assets,
                 incomplete_assets,
@@ -662,6 +814,13 @@ impl fmt::Display for GenerationManifestError {
                 formatter,
                 "projection summary contains {incomplete_assets} incomplete assets but only {assets} assets"
             ),
+            Self::TooManyAppliedTransactions { actual, maximum } => write!(
+                formatter,
+                "generation records {actual} applied transactions; maximum is {maximum}"
+            ),
+            Self::NonCanonicalAppliedTransactions => {
+                formatter.write_str("applied transactions must be sorted and unique")
+            }
         }
     }
 }

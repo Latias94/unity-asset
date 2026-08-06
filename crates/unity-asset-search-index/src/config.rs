@@ -3,12 +3,16 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
 use unity_asset_core::DigestV1;
-use unity_asset_search_local::{PrivateIndexRootV1, ProjectIdentityV1};
-use unity_asset_search_protocol::{MAX_STATUS_SCAN_ROOTS, PortablePath, StatusResponse};
+use unity_asset_search_local::PrivateIndexRootV1;
+use unity_asset_search_protocol::{MAX_STATUS_SCAN_ROOTS, PortablePath, ProjectId, StatusResponse};
 
 use crate::anchored_fs::{OpenPolicy, ReadDirectory};
-use crate::path_semantics::strip_prefix as strip_platform_prefix;
-use crate::scan::{ScanReadLimits, is_portable_component};
+use crate::path_semantics::{
+    ProjectPathSpace, compare_portable_paths, is_portable_component,
+    strip_prefix as strip_platform_prefix,
+};
+use crate::project_root::ProjectRootAuthority;
+use crate::scan::ScanReadLimits;
 
 const SCAN_ENTRIES_HARD_MAX: u64 = 16_000_000;
 const SCAN_PATH_BYTES_HARD_MAX: u64 = 16 * 1024 * 1024 * 1024;
@@ -23,6 +27,7 @@ const SEARCH_IGNORE_RULES_HARD_MAX: usize = 1_024;
 const SEARCH_IGNORE_PARSER_WORK_HARD_MAX: u64 = 2 * SEARCH_IGNORE_FILE_BYTES_HARD_MAX;
 const SEARCH_IGNORE_AUTOMATON_BYTES_HARD_MAX: u64 = 128 * 1024 * 1024;
 const SEARCH_IGNORE_COMPILATION_BYTES_HARD_MAX: u64 = 256 * 1024 * 1024;
+const LOGICAL_INDEX_CONFIGURATION_VERSION: u16 = 1;
 
 fn ensure_positive_at_most(name: &str, value: u64, hard_max: u64) -> Result<()> {
     ensure!(
@@ -32,12 +37,13 @@ fn ensure_positive_at_most(name: &str, value: u64, hard_max: u64) -> Result<()> 
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct IndexPaths {
-    project_root: PathBuf,
+    project: ProjectRootAuthority,
     index_root: PrivateIndexRootV1,
     index_namespace_exclusion: Option<PathBuf>,
     scan_roots: Vec<PathBuf>,
+    logical_scan_roots: Vec<String>,
 }
 
 impl IndexPaths {
@@ -46,42 +52,30 @@ impl IndexPaths {
         index_root: Option<PathBuf>,
         scan_roots: Option<Vec<PathBuf>>,
     ) -> Result<Self> {
-        let project_root = std::path::absolute(&project_root)
-            .with_context(|| format!("resolve project root: {}", project_root.display()))?;
-        let project_identity = ProjectIdentityV1::for_existing_root(&project_root)
-            .context("derive a stable identity for the project root")?;
-        let project_authority = ReadDirectory::open(&project_root, OpenPolicy::ProjectSource)
-            .with_context(|| {
-                format!(
-                    "open project root without following links: {}",
-                    project_root.display()
-                )
-            })?;
-        let canonical_project_root = canonical_directory_binding(
-            &project_root,
-            &project_authority,
-            OpenPolicy::ProjectSource,
-            "project root",
-        )?;
+        let project = ProjectRootAuthority::open(project_root)?;
+        let canonical_project_root = project.root();
+        let project_identity = project.identity();
 
         let scan_roots = match scan_roots {
             Some(roots) if !roots.is_empty() => roots,
-            _ => default_scan_roots(&project_root),
+            _ => default_scan_roots(canonical_project_root),
         };
-        let canonical_scan_roots = normalize_scan_roots(
-            &project_root,
-            &canonical_project_root,
-            &project_authority,
+        let normalized_scan_roots = normalize_scan_roots(
+            canonical_project_root,
+            canonical_project_root,
+            project.directory(),
             scan_roots,
         )?;
+        let (canonical_scan_roots, logical_scan_roots): (Vec<PathBuf>, Vec<String>) =
+            normalized_scan_roots.into_iter().unzip();
 
         let index_root = match index_root {
             Some(index_root) => {
-                let index_root = if index_root.is_absolute() {
-                    index_root
-                } else {
-                    project_root.join(index_root)
-                };
+                ensure!(
+                    index_root.is_absolute(),
+                    "explicit private index root must be absolute: {}",
+                    index_root.display()
+                );
                 PrivateIndexRootV1::open_or_create_for_project_override(
                     project_identity,
                     index_root,
@@ -103,17 +97,17 @@ impl IndexPaths {
             .revalidate()
             .context("revalidate the private index authority after topology validation")?;
         ensure!(
-            !platform_paths_equal(&canonical_project_root, &canonical_index_root),
+            !platform_paths_equal(canonical_project_root, &canonical_index_root),
             "project-bound private index root cannot equal the project root: {}",
-            project_root.display()
+            canonical_project_root.display()
         );
 
         let index_namespace_exclusion =
-            match strip_platform_prefix(&canonical_project_root, &canonical_index_namespace) {
+            match strip_platform_prefix(canonical_project_root, &canonical_index_namespace) {
                 Ok(relative) if relative.as_os_str().is_empty() => {
                     return Err(anyhow!(
                         "private index namespace cannot equal the project root: {}",
-                        project_root.display()
+                        canonical_project_root.display()
                     ));
                 }
                 Ok(relative) => Some(canonical_project_root.join(relative)),
@@ -121,7 +115,7 @@ impl IndexPaths {
             };
         if let Some(namespace) = index_namespace_exclusion.as_deref() {
             let canonical_namespace_relative =
-                strip_platform_prefix(&canonical_project_root, namespace)
+                strip_platform_prefix(canonical_project_root, namespace)
                     .expect("canonical namespace exclusion is project relative");
             let canonical_namespace = canonical_project_root.join(canonical_namespace_relative);
             for scan_root in &canonical_scan_roots {
@@ -142,22 +136,44 @@ impl IndexPaths {
             }
         }
         validate_status_path_contract(
-            &canonical_project_root,
+            canonical_project_root,
             &index_root_path,
             &canonical_scan_roots,
         )?;
+        project
+            .revalidate()
+            .context("revalidate project authority after index topology validation")?;
 
         Ok(Self {
-            project_root: canonical_project_root,
+            project,
             index_root,
             index_namespace_exclusion,
             scan_roots: canonical_scan_roots,
+            logical_scan_roots,
         })
     }
 
     #[must_use]
     pub fn project_root(&self) -> &Path {
-        &self.project_root
+        self.project.root()
+    }
+
+    #[must_use]
+    pub fn project_path_space(&self) -> &ProjectPathSpace {
+        self.project.path_space()
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> ProjectId {
+        self.project.project_id()
+    }
+
+    /// Proves that the configured project path still names the retained project authority.
+    ///
+    /// This never rebinds the authority. Scans continue to read through the original directory
+    /// handle even when this check rejects a replaced lexical path.
+    pub fn revalidate_project_root(&self) -> Result<()> {
+        self.project.revalidate()
     }
 
     #[must_use]
@@ -187,9 +203,20 @@ impl IndexPaths {
         &self.index_root
     }
 
+    pub(crate) fn project_authority(&self) -> &ProjectRootAuthority {
+        &self.project
+    }
+
     #[must_use]
     pub fn scan_roots(&self) -> &[PathBuf] {
         &self.scan_roots
+    }
+
+    pub(crate) fn logical_configuration_digest(
+        &self,
+        options: SearchIndexOptions,
+    ) -> Result<DigestV1> {
+        options.logical_digest(&self.logical_scan_roots)
     }
 }
 
@@ -407,10 +434,15 @@ impl SearchIndexOptions {
         Ok(self)
     }
 
-    pub(crate) fn logical_digest(self) -> Result<DigestV1> {
-        serde_json::to_vec(&self)
+    fn logical_digest(self, scan_roots: &[String]) -> Result<DigestV1> {
+        let logical = LogicalIndexConfigurationV1 {
+            identity_version: LOGICAL_INDEX_CONFIGURATION_VERSION,
+            scan_roots,
+            options: LogicalSearchIndexOptions::from(self),
+        };
+        serde_json::to_vec(&logical)
             .map(|bytes| DigestV1::hash_bytes(&bytes))
-            .map_err(|error| anyhow!("serialize search options: {error}"))
+            .map_err(|error| anyhow!("serialize logical search configuration: {error}"))
     }
 
     pub(crate) const fn scan_limits(self) -> ScanReadLimits {
@@ -418,6 +450,41 @@ impl SearchIndexOptions {
             max_asset_bytes: self.max_source_bytes,
             max_retained_asset_bytes: self.max_retained_source_bytes,
             max_meta_bytes: self.max_metadata_bytes,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct LogicalIndexConfigurationV1<'paths> {
+    identity_version: u16,
+    scan_roots: &'paths [String],
+    options: LogicalSearchIndexOptions,
+}
+
+#[derive(Serialize)]
+struct LogicalSearchIndexOptions {
+    index_bundle_container_entries: bool,
+    max_bundle_container_entries_per_bundle: usize,
+    max_references_per_asset: usize,
+    scan_limits: ScanTraversalLimits,
+    ignore_limits: SearchIgnoreV1Limits,
+    max_source_bytes: u64,
+    max_retained_source_bytes: u64,
+    max_metadata_bytes: u64,
+}
+
+impl From<SearchIndexOptions> for LogicalSearchIndexOptions {
+    fn from(options: SearchIndexOptions) -> Self {
+        Self {
+            index_bundle_container_entries: options.index_bundle_container_entries,
+            max_bundle_container_entries_per_bundle: options
+                .max_bundle_container_entries_per_bundle,
+            max_references_per_asset: options.max_references_per_asset,
+            scan_limits: options.scan_limits,
+            ignore_limits: options.ignore_limits,
+            max_source_bytes: options.max_source_bytes,
+            max_retained_source_bytes: options.max_retained_source_bytes,
+            max_metadata_bytes: options.max_metadata_bytes,
         }
     }
 }
@@ -465,7 +532,7 @@ fn normalize_scan_roots(
     canonical_project_root: &Path,
     project_authority: &ReadDirectory,
     roots: Vec<PathBuf>,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<(PathBuf, String)>> {
     ensure!(
         roots.len() <= MAX_STATUS_SCAN_ROOTS,
         "scan root count {} exceeds the protocol maximum of {MAX_STATUS_SCAN_ROOTS}",
@@ -556,10 +623,54 @@ fn normalize_scan_roots(
             true
         }
     });
-    Ok(normalized
+    let mut candidates = normalized
         .into_iter()
-        .map(|(_, canonical, _)| canonical)
-        .collect())
+        .map(|(_, canonical, _)| {
+            let logical = logical_scan_root(canonical_project_root, &canonical)?;
+            Ok((canonical, logical))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    candidates.sort_unstable_by(|left, right| compare_portable_paths(&left.1, &right.1));
+
+    let mut effective: Vec<(PathBuf, String)> = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        if effective.iter().any(|(ancestor, _)| {
+            strip_platform_prefix(ancestor.as_path(), candidate.0.as_path()).is_ok()
+        }) {
+            continue;
+        }
+        effective.push(candidate);
+    }
+    Ok(effective)
+}
+
+fn logical_scan_root(project_root: &Path, scan_root: &Path) -> Result<String> {
+    let relative = strip_platform_prefix(project_root, scan_root).map_err(|_| {
+        anyhow!(
+            "normalized scan root escaped the project: {}",
+            scan_root.display()
+        )
+    })?;
+    let mut logical = String::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(anyhow!(
+                "normalized scan root contains a non-relative component: {}",
+                scan_root.display()
+            ));
+        };
+        let name = name.to_str().ok_or_else(|| {
+            anyhow!(
+                "normalized scan root must be valid UTF-8: {}",
+                scan_root.display()
+            )
+        })?;
+        if !logical.is_empty() {
+            logical.push('/');
+        }
+        logical.push_str(name);
+    }
+    Ok(logical)
 }
 
 fn canonical_directory_binding(
@@ -653,6 +764,21 @@ mod tests {
         assert_eq!(paths_a.index_root().parent(), Some(index_base.as_path()));
         assert_eq!(paths_b.index_root().parent(), Some(index_base.as_path()));
         assert_ne!(paths_a.index_root(), paths_b.index_root());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn explicit_index_base_must_be_absolute() {
+        let project = tempfile::tempdir().unwrap();
+
+        let error = IndexPaths::for_project(
+            project.path().to_path_buf(),
+            Some(PathBuf::from("relative-index")),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be absolute"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -908,6 +1034,77 @@ mod tests {
         let error =
             IndexPaths::for_project(project.path().to_path_buf(), None, Some(roots)).unwrap_err();
         assert!(error.to_string().contains("scan root count"));
+    }
+
+    #[test]
+    fn logical_configuration_binds_effective_scan_roots_but_not_retention() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(project.join("Assets")).unwrap();
+        std::fs::create_dir_all(project.join("Packages")).unwrap();
+        let index = temporary.path().join("index");
+        let assets = IndexPaths::for_project(
+            project.clone(),
+            Some(index.clone()),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let assets_and_packages = IndexPaths::for_project(
+            project,
+            Some(index),
+            Some(vec![PathBuf::from("Packages"), PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let options = SearchIndexOptions::default();
+        let mut different_retention = options;
+        different_retention.retain_previous_generations = 0;
+
+        assert_eq!(
+            assets.logical_configuration_digest(options).unwrap(),
+            assets
+                .logical_configuration_digest(different_retention)
+                .unwrap()
+        );
+        assert_ne!(
+            assets.logical_configuration_digest(options).unwrap(),
+            assets_and_packages
+                .logical_configuration_digest(options)
+                .unwrap()
+        );
+        assert_eq!(
+            assets_and_packages
+                .logical_scan_roots
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["Assets", "Packages"]
+        );
+    }
+
+    #[test]
+    fn ancestor_scan_root_collapses_descendants_in_runtime_and_identity() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        std::fs::create_dir_all(project.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project.clone(),
+            Some(temporary.path().join("index")),
+            Some(vec![project.clone(), project.join("Assets")]),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths.scan_roots(),
+            &[std::fs::canonicalize(project).unwrap()]
+        );
+        assert_eq!(
+            paths
+                .logical_scan_roots
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            [""]
+        );
     }
 
     #[test]

@@ -13,6 +13,8 @@ internal static class ConformanceProgram
 {
     private const string FrozenBusinessV1InventorySha256 =
         "13cf5971f83e9a608c504582a36c442e79a982c9eb9dbad8d447a41c7694022a";
+    private const string FrozenBusinessV2InventorySha256 =
+        "6891e3190d36396e546989a0f55ac97766902aa37289993b5f4709ffa3ccf776";
 
     private static readonly string[] OperationNames =
     {
@@ -46,7 +48,7 @@ internal static class ConformanceProgram
             await AssertPublicProtocolSessionSerializesExchangesAsync(fixtureRoot).ConfigureAwait(false);
             await AssertPublicProtocolSessionDisposeAsync(fixtureRoot).ConfigureAwait(false);
             await AssertFramedStreamPoisoningAsync().ConfigureAwait(false);
-            Console.WriteLine($"PASS: search protocol v2 fixtures conform; business v1 remains frozen ({fixtureRoot})");
+            Console.WriteLine($"PASS: search protocol v3 fixtures conform; business v1 and v2 remain frozen ({fixtureRoot})");
             return 0;
         }
         catch (Exception error)
@@ -63,7 +65,7 @@ internal static class ConformanceProgram
         FixtureManifest manifest = JsonSerializer.Deserialize<FixtureManifest>(manifestBytes, ManifestOptions())
             ?? throw new InvalidOperationException("Fixture manifest decoded to null.");
 
-        Require(manifest.FixtureFormat == 2, "Unsupported fixture manifest format.");
+        Require(manifest.FixtureFormat == 3, "Unsupported fixture manifest format.");
         Require(manifest.ProtocolRevision == ProtocolConstants.BusinessProtocolRevision, "Manifest protocol revision mismatch.");
         Require(manifest.Valid.Count > 0, "Manifest has no valid fixtures.");
         Require(manifest.Invalid.Count > 0, "Manifest has no invalid fixtures.");
@@ -74,7 +76,9 @@ internal static class ConformanceProgram
             DaemonInstanceId.Parse(manifest.Binding.DaemonInstanceId),
             QueryPolicyId.Parse(manifest.Binding.QueryPolicyId));
 
-        FrozenBusinessInventory frozen = AssertFrozenBusinessV1(fixtureRoot, manifest.FrozenInventory);
+        IReadOnlyList<FrozenBusinessInventory> frozen = AssertFrozenBusiness(
+            fixtureRoot,
+            manifest.FrozenInventories);
         AssertCoverage(manifest);
         AssertManifestOwnsAllJson(fixtureRoot, manifest, frozen);
 
@@ -182,8 +186,8 @@ internal static class ConformanceProgram
             .Select(entry => entry.Operation)
             .ToHashSet(StringComparer.Ordinal);
 
-        Require(requestOperations.SetEquals(OperationNames), "Request fixtures do not cover every v2 operation exactly once.");
-        Require(responseOperations.SetEquals(OperationNames), "Response fixtures do not cover every v2 operation exactly once.");
+        Require(requestOperations.SetEquals(OperationNames), "Request fixtures do not cover every current operation.");
+        Require(responseOperations.SetEquals(OperationNames), "Response fixtures do not cover every current operation.");
         Require(manifest.Valid.Count(entry => entry.Name == "structured error response") == 1, "Structured error fixture is missing or duplicated.");
         Require(manifest.Valid.Any(entry => entry.Kind == "bootstrap_hello"), "Bootstrap hello fixture is missing.");
         Require(manifest.Valid.Count(entry => entry.Kind == "bootstrap_reply") == 2, "Bootstrap accepted/rejected fixtures are incomplete.");
@@ -194,13 +198,16 @@ internal static class ConformanceProgram
     private static void AssertManifestOwnsAllJson(
         string fixtureRoot,
         FixtureManifest manifest,
-        FrozenBusinessInventory frozen)
+        IReadOnlyList<FrozenBusinessInventory> frozen)
     {
         var listed = manifest.Valid.Concat(manifest.Invalid)
             .Select(entry => entry.Path.Replace('/', Path.DirectorySeparatorChar))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
-        listed.Add(manifest.FrozenInventory.Path.Replace('/', Path.DirectorySeparatorChar));
-        foreach (FrozenFixture fixture in frozen.Files)
+        foreach (FrozenInventoryReference reference in manifest.FrozenInventories)
+        {
+            listed.Add(reference.Path.Replace('/', Path.DirectorySeparatorChar));
+        }
+        foreach (FrozenFixture fixture in frozen.SelectMany(inventory => inventory.Files))
         {
             listed.Add(fixture.Path.Replace('/', Path.DirectorySeparatorChar));
         }
@@ -214,56 +221,75 @@ internal static class ConformanceProgram
         }
     }
 
-    private static FrozenBusinessInventory AssertFrozenBusinessV1(
+    private static IReadOnlyList<FrozenBusinessInventory> AssertFrozenBusiness(
         string fixtureRoot,
-        FrozenInventoryReference reference)
+        IReadOnlyList<FrozenInventoryReference> references)
     {
-        Require(reference.BusinessRevision == 1, "Frozen inventory must describe business revision 1.");
-        Require(
-            string.Equals(reference.Sha256, FrozenBusinessV1InventorySha256, StringComparison.Ordinal),
-            "Frozen business v1 inventory digest reference changed.");
-
-        byte[] inventoryBytes = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, reference.Path)));
-        Require(
-            string.Equals(Sha256(inventoryBytes), FrozenBusinessV1InventorySha256, StringComparison.Ordinal),
-            "Frozen business v1 inventory changed.");
-        FrozenBusinessInventory inventory = JsonSerializer.Deserialize<FrozenBusinessInventory>(
-            inventoryBytes,
-            ManifestOptions()) ?? throw new InvalidOperationException("Frozen business inventory decoded to null.");
-        Require(inventory.InventoryFormat == 1, "Unsupported frozen inventory format.");
-        Require(inventory.BusinessRevision == 1, "Frozen inventory business revision mismatch.");
-        Require(inventory.Files.Count > 0, "Frozen business inventory is empty.");
-
-        string? previous = null;
-        var inventoried = new HashSet<string>(StringComparer.Ordinal);
-        foreach (FrozenFixture fixture in inventory.Files)
+        var expectedDigests = new Dictionary<ushort, string>
         {
+            [1] = FrozenBusinessV1InventorySha256,
+            [2] = FrozenBusinessV2InventorySha256,
+        };
+        Require(references.Count == expectedDigests.Count, "Frozen business inventory set is incomplete.");
+        var inventories = new List<FrozenBusinessInventory>(references.Count);
+        ushort previousRevision = 0;
+        foreach (FrozenInventoryReference reference in references)
+        {
+            Require(reference.BusinessRevision > previousRevision, "Frozen business revisions must be strictly sorted.");
+            previousRevision = reference.BusinessRevision;
             Require(
-                previous is null || string.CompareOrdinal(previous, fixture.Path) < 0,
-                "Frozen business inventory paths must be strictly sorted.");
-            previous = fixture.Path;
+                expectedDigests.TryGetValue(reference.BusinessRevision, out string? expectedDigest),
+                $"Unexpected frozen business revision {reference.BusinessRevision}.");
             Require(
-                fixture.Path.EndsWith("-v1.json", StringComparison.Ordinal)
-                    && (fixture.Path.StartsWith("requests/", StringComparison.Ordinal)
-                        || fixture.Path.StartsWith("responses/", StringComparison.Ordinal)
-                        || fixture.Path.StartsWith("invalid/request-", StringComparison.Ordinal)),
-                $"Unexpected frozen business fixture path: {fixture.Path}");
-            Require(inventoried.Add(fixture.Path), $"Duplicate frozen fixture: {fixture.Path}");
+                string.Equals(reference.Sha256, expectedDigest, StringComparison.Ordinal),
+                $"Frozen business v{reference.BusinessRevision} inventory digest reference changed.");
 
-            byte[] payload = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, fixture.Path)));
-            Require(payload.Length == fixture.EncodedBytes, $"{fixture.Path}: encoded byte length changed.");
+            byte[] inventoryBytes = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, reference.Path)));
             Require(
-                string.Equals(Sha256(payload), fixture.Sha256, StringComparison.Ordinal),
-                $"{fixture.Path}: frozen business v1 bytes changed.");
+                string.Equals(Sha256(inventoryBytes), expectedDigest, StringComparison.Ordinal),
+                $"Frozen business v{reference.BusinessRevision} inventory changed.");
+            FrozenBusinessInventory inventory = JsonSerializer.Deserialize<FrozenBusinessInventory>(
+                inventoryBytes,
+                ManifestOptions()) ?? throw new InvalidOperationException("Frozen business inventory decoded to null.");
+            Require(inventory.InventoryFormat == 1, "Unsupported frozen inventory format.");
+            Require(inventory.BusinessRevision == reference.BusinessRevision, "Frozen inventory business revision mismatch.");
+            Require(inventory.Files.Count > 0, "Frozen business inventory is empty.");
+
+            string suffix = $"-v{reference.BusinessRevision}.json";
+            string? previous = null;
+            var inventoried = new HashSet<string>(StringComparer.Ordinal);
+            foreach (FrozenFixture fixture in inventory.Files)
+            {
+                Require(
+                    previous is null || string.CompareOrdinal(previous, fixture.Path) < 0,
+                    "Frozen business inventory paths must be strictly sorted.");
+                previous = fixture.Path;
+                Require(
+                    fixture.Path.EndsWith(suffix, StringComparison.Ordinal)
+                        && (fixture.Path.StartsWith("requests/", StringComparison.Ordinal)
+                            || fixture.Path.StartsWith("responses/", StringComparison.Ordinal)
+                            || fixture.Path.StartsWith("invalid/request-", StringComparison.Ordinal)),
+                    $"Unexpected frozen business fixture path: {fixture.Path}");
+                Require(inventoried.Add(fixture.Path), $"Duplicate frozen fixture: {fixture.Path}");
+
+                byte[] payload = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, fixture.Path)));
+                Require(payload.Length == fixture.EncodedBytes, $"{fixture.Path}: encoded byte length changed.");
+                Require(
+                    string.Equals(Sha256(payload), fixture.Sha256, StringComparison.Ordinal),
+                    $"{fixture.Path}: frozen business v{reference.BusinessRevision} bytes changed.");
+            }
+
+            var archived = Directory.EnumerateFiles(Path.Combine(fixtureRoot, "requests"), $"*-v{reference.BusinessRevision}.json")
+                .Concat(Directory.EnumerateFiles(Path.Combine(fixtureRoot, "responses"), $"*-v{reference.BusinessRevision}.json"))
+                .Concat(Directory.EnumerateFiles(Path.Combine(fixtureRoot, "invalid"), $"request-*-v{reference.BusinessRevision}.json"))
+                .Select(path => Path.GetRelativePath(fixtureRoot, path).Replace(Path.DirectorySeparatorChar, '/'))
+                .ToHashSet(StringComparer.Ordinal);
+            Require(
+                inventoried.SetEquals(archived),
+                $"Frozen business v{reference.BusinessRevision} inventory is incomplete or owns extra files.");
+            inventories.Add(inventory);
         }
-
-        var archived = Directory.EnumerateFiles(Path.Combine(fixtureRoot, "requests"), "*-v1.json")
-            .Concat(Directory.EnumerateFiles(Path.Combine(fixtureRoot, "responses"), "*-v1.json"))
-            .Concat(Directory.EnumerateFiles(Path.Combine(fixtureRoot, "invalid"), "request-*-v1.json"))
-            .Select(path => Path.GetRelativePath(fixtureRoot, path).Replace(Path.DirectorySeparatorChar, '/'))
-            .ToHashSet(StringComparer.Ordinal);
-        Require(inventoried.SetEquals(archived), "Frozen business v1 inventory is incomplete or owns extra files.");
-        return inventory;
+        return inventories;
     }
 
     private static void AssertFramingRejectsLengthMismatch()
@@ -295,7 +321,7 @@ internal static class ConformanceProgram
 
     private static void AssertJsonRequiresCanonicalEncoding(string fixtureRoot, ProtocolBinding binding)
     {
-        string request = ReadFixtureText(fixtureRoot, "requests/search-v2.json");
+        string request = ReadFixtureText(fixtureRoot, "requests/search-v3.json");
         ExpectFailure(
             () => BusinessCodec.DecodeRequest(
                 Encoding.UTF8.GetBytes(request.Insert(1, " ")),
@@ -339,7 +365,7 @@ internal static class ConformanceProgram
             new ushort[] { 1 });
         Require(
             reply is BootstrapRejectedV2 rejected && rejected.Code == "no_common_revision",
-            "Bootstrap negotiation did not reject a peer without business revision 2.");
+            "Bootstrap negotiation did not reject a peer without the current business revision.");
 
         BootstrapReplyV2 fixtureReply = BootstrapCodec.DecodeReply(
             TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "rejected-v2.json"))));
@@ -357,10 +383,39 @@ internal static class ConformanceProgram
 
     private static void AssertContractHardening(string fixtureRoot, ProtocolBinding binding)
     {
-        const string referenceBinding = "reference-query-v1:35aa0af0405db47e75d177436adb2fc23bef67f3046df24e030bc9ec1ff5c02e";
+        const string referenceBinding = "reference-query-v2:d9f13e496b1348267125438d3cef749cbe2f1ef0f31c2b133accdb842f3dca9f";
         const string generation = "blake3-v1:6666666666666666666666666666666666666666666666666666666666666666";
         string policy = binding.QueryPolicyId.Value;
-        string referencesRequest = ReadFixtureText(fixtureRoot, "requests/references-v2.json");
+        string referencesRequest = ReadFixtureText(fixtureRoot, "requests/references-v3.json");
+        string yamlObjectRequest = ReadFixtureText(fixtureRoot, "requests/references-yaml-object-v3.json");
+        BusinessCodec.DecodeRequest(Encoding.UTF8.GetBytes(yamlObjectRequest), binding);
+        ExpectFailure(
+            () => BusinessCodec.DecodeRequest(
+                Encoding.UTF8.GetBytes(ReplaceExactly(
+                    yamlObjectRequest,
+                    "\"file_id\":1001",
+                    "\"file_id\":0",
+                    "zero YAML file ID")),
+                binding),
+            "zero YAML file ID");
+        ExpectFailure(
+            () => BusinessCodec.DecodeRequest(
+                Encoding.UTF8.GetBytes(ReplaceExactly(
+                    yamlObjectRequest,
+                    "\"kind\":\"yaml\",\"version\":2",
+                    "\"kind\":\"yaml\",\"version\":1",
+                    "legacy YAML address version")),
+                binding),
+            "legacy YAML address version");
+        ExpectFailure(
+            () => BusinessCodec.DecodeRequest(
+                Encoding.UTF8.GetBytes(ReplaceExactly(
+                    yamlObjectRequest,
+                    "\"selector\":{\"kind\":\"file_id\",\"file_id\":1001}",
+                    "\"selector\":{\"kind\":\"anchored\",\"anchor\":\"1001\"}",
+                    "legacy YAML selector")),
+                binding),
+            "legacy YAML selector");
         string cursor = $"\"cursor\":{{\"generation\":\"{generation}\",\"query_policy_id\":\"{policy}\",\"after_stable_id\":\"reference:page-1\",\"query_binding\":\"{referenceBinding}\"}}";
         string requestWithCursor = ReplaceExactly(
             referencesRequest,
@@ -387,7 +442,7 @@ internal static class ConformanceProgram
                 Encoding.UTF8.GetBytes(ReplaceExactly(
                     requestWithCursor,
                     referenceBinding,
-                    "reference-query-v1:" + new string('0', 64),
+                    "reference-query-v2:" + new string('0', 64),
                     "cursor query binding")),
                 binding),
             "reference cursor query binding");
@@ -423,8 +478,8 @@ internal static class ConformanceProgram
 
     private static void AssertResponseRequestBindings(string fixtureRoot, ProtocolBinding binding)
     {
-        string searchRequestText = ReadFixtureText(fixtureRoot, "requests/search-v2.json");
-        string searchResponseText = ReadFixtureText(fixtureRoot, "responses/search-v2.json");
+        string searchRequestText = ReadFixtureText(fixtureRoot, "requests/search-v3.json");
+        string searchResponseText = ReadFixtureText(fixtureRoot, "responses/search-v3.json");
         RequestEnvelopeV1 searchRequest = BusinessCodec.DecodeRequest(Encoding.UTF8.GetBytes(searchRequestText), binding);
         ResponseEnvelopeV1 wrongQuery = BusinessCodec.DecodeResponse(Encoding.UTF8.GetBytes(ReplaceExactly(
             searchResponseText,
@@ -439,8 +494,8 @@ internal static class ConformanceProgram
         ResponseEnvelopeV1 searchResponse = BusinessCodec.DecodeResponse(Encoding.UTF8.GetBytes(searchResponseText));
         ExpectFailure(() => searchResponse.ValidateFor(zeroSearchLimit), "search response limit binding");
 
-        string suggestRequestText = ReadFixtureText(fixtureRoot, "requests/suggest-v2.json");
-        string suggestResponseText = ReadFixtureText(fixtureRoot, "responses/suggest-v2.json");
+        string suggestRequestText = ReadFixtureText(fixtureRoot, "requests/suggest-v3.json");
+        string suggestResponseText = ReadFixtureText(fixtureRoot, "responses/suggest-v3.json");
         RequestEnvelopeV1 suggestRequest = BusinessCodec.DecodeRequest(Encoding.UTF8.GetBytes(suggestRequestText), binding);
         ResponseEnvelopeV1 wrongPrefix = BusinessCodec.DecodeResponse(Encoding.UTF8.GetBytes(ReplaceExactly(
             suggestResponseText,
@@ -495,7 +550,7 @@ internal static class ConformanceProgram
 
     private static void AssertStatusPathBudget(string fixtureRoot)
     {
-        JsonObject oversizedStatus = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject oversizedStatus = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         var roots = new JsonArray();
         for (int index = 0; index < 8; index++)
         {
@@ -507,7 +562,7 @@ internal static class ConformanceProgram
             () => BusinessCodec.DecodeResponse(SerializeNode(oversizedStatus)),
             "status response path JSON byte limit");
 
-        JsonObject oversizedFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject oversizedFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         oversizedFailure["value"]!["response"]!["generation"]!["last_failure"] = new JsonObject
         {
             ["code"] = "index_build_failed",
@@ -519,7 +574,7 @@ internal static class ConformanceProgram
             () => BusinessCodec.DecodeResponse(SerializeNode(oversizedFailure)),
             "generation failure message byte limit");
 
-        JsonObject idleBuilding = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject idleBuilding = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         idleBuilding["value"]!["response"]!["generation"]!["building_revision"] =
             "blake3-v1:" + new string('b', 64);
         idleBuilding["value"]!["response"]!["indexing"] = false;
@@ -527,39 +582,39 @@ internal static class ConformanceProgram
             () => BusinessCodec.DecodeResponse(SerializeNode(idleBuilding)),
             "idle status building revision");
 
-        JsonObject unavailableActive = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject unavailableActive = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         unavailableActive["value"]!["response"]!["daemon"]!["serving"] = "unavailable";
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(unavailableActive)),
             "active generation serving availability");
 
-        JsonObject staleCurrent = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject staleCurrent = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         staleCurrent["value"]!["response"]!["daemon"]!["freshness"] = "stale";
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(staleCurrent)),
             "generation freshness evidence");
 
-        JsonObject recoveryWithoutFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject recoveryWithoutFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         recoveryWithoutFailure["value"]!["response"]!["daemon"]!["generation_maintenance"]!["state"] =
             "recovery_required";
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(recoveryWithoutFailure)),
             "generation maintenance failure evidence");
 
-        JsonObject cleanWithFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject cleanWithFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         cleanWithFailure["value"]!["response"]!["daemon"]!["generation_maintenance"]!["last_cleanup_failure"] =
             "staging cleanup failed";
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(cleanWithFailure)),
             "clean generation maintenance cannot retain failure evidence");
 
-        JsonObject retryingWithoutFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject retryingWithoutFailure = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         retryingWithoutFailure["value"]!["response"]!["daemon"]!["watcher"]!["state"] = "retrying";
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(retryingWithoutFailure)),
             "watcher retry failure evidence");
 
-        JsonObject disabledTimerWithDeadline = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject disabledTimerWithDeadline = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         disabledTimerWithDeadline["value"]!["response"]!["daemon"]!["timer"]!["state"] = "disabled";
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(disabledTimerWithDeadline)),
@@ -569,10 +624,10 @@ internal static class ConformanceProgram
     private static void AssertErrorFrameBudget(string fixtureRoot, ProtocolBinding binding)
     {
         RequestEnvelopeV1 shutdown = BusinessCodec.DecodeRequest(
-            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/shutdown-v2.json")),
+            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/shutdown-v3.json")),
             binding);
         JsonObject errorNode = ParseObjectNode(
-            ReadFixtureText(fixtureRoot, "responses/structured-error-v2.json"));
+            ReadFixtureText(fixtureRoot, "responses/structured-error-v3.json"));
         errorNode["request_id"] = shutdown.RequestId.ToString();
         errorNode["value"]!["message"] = new string('x', 16 * 1024);
         ResponseEnvelopeV1 error = BusinessCodec.DecodeResponse(SerializeNode(errorNode));
@@ -593,7 +648,7 @@ internal static class ConformanceProgram
     private static void AssertReindexPublishWarningBudget(string fixtureRoot)
     {
         JsonObject oversizedWarnings = ParseObjectNode(
-            ReadFixtureText(fixtureRoot, "responses/reindex-admit-v2.json"));
+            ReadFixtureText(fixtureRoot, "responses/reindex-admit-v3.json"));
         var warnings = new JsonArray();
         for (int index = 0; index < 64; index++)
         {
@@ -615,12 +670,12 @@ internal static class ConformanceProgram
         string policy)
     {
         string requestText = ReplaceExactly(
-            ReadFixtureText(fixtureRoot, "requests/references-v2.json"),
+            ReadFixtureText(fixtureRoot, "requests/references-v3.json"),
             "\"limit\":25",
             "\"limit\":1",
             "reference request limit");
         RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(Encoding.UTF8.GetBytes(requestText), binding);
-        JsonObject responseRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v2.json"));
+        JsonObject responseRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v3.json"));
         JsonObject response = responseRoot["value"]!["response"]!.AsObject();
         response["request"]!["limit"] = 1;
         JsonObject coverage = response["coverage"]!.AsObject();
@@ -631,13 +686,55 @@ internal static class ConformanceProgram
         ResponseEnvelopeV1 tooManyReferences = BusinessCodec.DecodeResponse(SerializeNode(responseRoot));
         ExpectFailure(() => tooManyReferences.ValidateFor(request), "reference response limit binding");
 
-        JsonObject diagnosticBytes = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v2.json"));
+        JsonObject diagnosticBytes = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v3.json"));
         diagnosticBytes["value"]!["response"]!["diagnostic_coverage"]!["serialized_bytes"] = 3;
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(diagnosticBytes)),
             "reference diagnostic serialized byte accounting");
 
-        JsonObject pagedRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v2.json"));
+        JsonObject diagnosticRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v3.json"));
+        JsonObject diagnosticResponse = diagnosticRoot["value"]!["response"]!.AsObject();
+        var diagnosticAddress = new JsonObject
+        {
+            ["kind"] = "yaml",
+            ["version"] = 2,
+            ["source"] = new JsonObject
+            {
+                ["version"] = 1,
+                ["outer_path"] = "Assets/Prefabs/Player.prefab",
+                ["members"] = new JsonArray(),
+            },
+            ["selector"] = new JsonObject
+            {
+                ["kind"] = "file_id",
+                ["file_id"] = -1,
+            },
+        };
+        var diagnostics = new JsonArray
+        {
+            new JsonObject
+            {
+                ["version"] = (int)ProtocolConstants.CoreDiagnosticVersion,
+                ["severity"] = "warning",
+                ["code"] = "YAML_REFERENCE_TEST",
+                ["message"] = "fixture diagnostic",
+                ["address"] = diagnosticAddress,
+                ["field_path"] = null,
+            },
+        };
+        diagnosticResponse["diagnostics"] = diagnostics;
+        JsonObject diagnosticCoverage = diagnosticResponse["diagnostic_coverage"]!.AsObject();
+        diagnosticCoverage["returned"] = 1;
+        diagnosticCoverage["total"] = 1;
+        diagnosticCoverage["serialized_bytes"] = SerializeNode(diagnostics).Length;
+        BusinessCodec.DecodeResponse(SerializeNode(diagnosticRoot));
+
+        diagnostics[0]!["version"] = 1;
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(diagnosticRoot)),
+            "legacy diagnostic version");
+
+        JsonObject pagedRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/references-v3.json"));
         JsonObject pagedCoverage = pagedRoot["value"]!["response"]!["coverage"]!.AsObject();
         pagedCoverage["truncated"] = true;
         pagedCoverage["next_cursor"] = new JsonObject
@@ -649,11 +746,11 @@ internal static class ConformanceProgram
         };
         ResponseEnvelopeV1 pagedResponse = BusinessCodec.DecodeResponse(SerializeNode(pagedRoot));
         RequestEnvelopeV1 originalRequest = BusinessCodec.DecodeRequest(
-            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/references-v2.json")),
+            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/references-v3.json")),
             binding);
         pagedResponse.ValidateFor(originalRequest);
 
-        string searchResponse = ReadFixtureText(fixtureRoot, "responses/search-v2.json");
+        string searchResponse = ReadFixtureText(fixtureRoot, "responses/search-v3.json");
         const string diagnostic = "{\"code\":\"duplicate_candidate_key\",\"stable_key\":\"asset:duplicate-suppressed\"}";
         string excessiveDiagnostics = ReplaceExactly(
             searchResponse,
@@ -667,10 +764,10 @@ internal static class ConformanceProgram
 
     private static void AssertReindexSucceededState(string fixtureRoot, ProtocolBinding binding)
     {
-        JsonObject operationRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/reindex-status-v2.json"));
+        JsonObject operationRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/reindex-status-v3.json"));
         JsonObject running = operationRoot["value"]!["response"]!.AsObject();
         JsonObject admission = running["admission"]!.AsObject();
-        JsonObject statusRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v2.json"));
+        JsonObject statusRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v3.json"));
         JsonObject status = statusRoot["value"]!["response"]!.AsObject();
         JsonObject activeGeneration = status["generation"]!["active"]!.AsObject();
         var completion = new JsonObject
@@ -693,7 +790,7 @@ internal static class ConformanceProgram
         byte[] succeededJson = SerializeNode(operationRoot);
         ResponseEnvelopeV1 succeeded = BusinessCodec.DecodeResponse(succeededJson);
         RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(
-            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/reindex-status-v2.json")),
+            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/reindex-status-v3.json")),
             binding);
         succeeded.ValidateFor(request);
 
@@ -713,7 +810,7 @@ internal static class ConformanceProgram
 
     private static void AssertCanonicalCoreValues(string fixtureRoot, ProtocolBinding binding)
     {
-        string response = ReadFixtureText(fixtureRoot, "responses/references-v2.json");
+        string response = ReadFixtureText(fixtureRoot, "responses/references-v3.json");
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(Encoding.UTF8.GetBytes(ReplaceExactly(
                 response,
@@ -729,7 +826,7 @@ internal static class ConformanceProgram
                 "uppercase workspace"))),
             "uppercase workspace ID");
 
-        string reindex = ReadFixtureText(fixtureRoot, "requests/reindex-admit-v2.json");
+        string reindex = ReadFixtureText(fixtureRoot, "requests/reindex-admit-v3.json");
         BusinessCodec.DecodeRequest(
             Encoding.UTF8.GetBytes(ReplaceExactly(
                 reindex,
@@ -751,7 +848,7 @@ internal static class ConformanceProgram
     private static void AssertUnicodeScalarPathOrdering(ProtocolBinding binding)
     {
         byte[] scalarOrdered = Encoding.UTF8.GetBytes(
-            "{\"intent\":{\"protocol_revision\":2,\"scope\":{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\\uE000\",\"Assets/\\uD800\\uDC00\"]}}}");
+            $"{{\"intent\":{{\"protocol_revision\":{ProtocolConstants.BusinessProtocolRevision},\"scope\":{{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\\uE000\",\"Assets/\\uD800\\uDC00\"]}}}}}}");
         BusinessCodec.CreateRequest(
             binding,
             RequestId.Parse("request-v1:81818181818181818181818181818181"),
@@ -759,7 +856,7 @@ internal static class ConformanceProgram
             scalarOrdered);
 
         byte[] utf16Ordered = Encoding.UTF8.GetBytes(
-            "{\"intent\":{\"protocol_revision\":2,\"scope\":{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\\uD800\\uDC00\",\"Assets/\\uE000\"]}}}");
+            $"{{\"intent\":{{\"protocol_revision\":{ProtocolConstants.BusinessProtocolRevision},\"scope\":{{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\\uD800\\uDC00\",\"Assets/\\uE000\"]}}}}}}");
         ExpectFailure(
             () => BusinessCodec.CreateRequest(
                 binding,
@@ -811,9 +908,9 @@ internal static class ConformanceProgram
             return (
                 Operation: operation,
                 RequestPayload: TrimTerminalNewline(
-                    ReadNonEmpty(Path.Combine(fixtureRoot, "requests", $"{fixtureName}-v2.json"))),
+                    ReadNonEmpty(Path.Combine(fixtureRoot, "requests", $"{fixtureName}-v3.json"))),
                 ResponsePayload: TrimTerminalNewline(
-                    ReadNonEmpty(Path.Combine(fixtureRoot, "responses", $"{fixtureName}-v2.json"))));
+                    ReadNonEmpty(Path.Combine(fixtureRoot, "responses", $"{fixtureName}-v3.json"))));
         }).ToArray();
         var incomingBytes = new List<byte>(acceptedFrame);
         foreach (var fixture in exchangeFixtures)
@@ -888,9 +985,9 @@ internal static class ConformanceProgram
         Require(exchangeStream.WasDisposed, "Public session did not own and dispose its transport stream.");
 
         byte[] errorRequestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "reindex-admit-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "reindex-admit-v3.json")));
         byte[] errorResponsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "structured-error-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "structured-error-v3.json")));
         var errorStream = new ScriptedDuplexStream(
             acceptedFrame.Concat(FrameCodec.Encode(errorResponsePayload, FrameLimits.ForResponse("reindex_admit"))).ToArray());
         using (ProtocolSession errorSession = await ProtocolSession.ConnectAsync(
@@ -956,9 +1053,9 @@ internal static class ConformanceProgram
         BootstrapAcceptedV2 accepted = ReadAcceptedBootstrap(fixtureRoot);
         byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
         byte[] requestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v3.json")));
         byte[] responsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v3.json")));
         byte[] responseFrame = FrameCodec.Encode(responsePayload, FrameLimits.ForResponse("status"));
 
         using var cancellation = new CancellationTokenSource();
@@ -1031,7 +1128,7 @@ internal static class ConformanceProgram
             new[] { ProtocolConstants.BusinessProtocolRevision });
         byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
         byte[] firstRequestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v3.json")));
         string secondRequestJson = ReplaceExactly(
             Encoding.UTF8.GetString(firstRequestPayload),
             "request-v1:11111111111111111111111111111111",
@@ -1039,7 +1136,7 @@ internal static class ConformanceProgram
             "second public-session request ID");
         byte[] secondRequestPayload = Encoding.UTF8.GetBytes(secondRequestJson);
         byte[] firstResponsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v3.json")));
         string secondResponseJson = ReplaceExactly(
             Encoding.UTF8.GetString(firstResponsePayload),
             "request-v1:11111111111111111111111111111111",
@@ -1091,9 +1188,9 @@ internal static class ConformanceProgram
         BootstrapAcceptedV2 accepted = ReadAcceptedBootstrap(fixtureRoot);
         byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
         byte[] requestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v3.json")));
         byte[] responsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v2.json")));
+            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v3.json")));
         byte[] responseFrame = FrameCodec.Encode(responsePayload, FrameLimits.ForResponse("status"));
         var stream = new ScriptedDuplexStream(
             acceptedFrame.Concat(responseFrame).ToArray(),
@@ -1505,8 +1602,8 @@ internal sealed class FixtureManifest
     [JsonPropertyName("protocol_revision")]
     public ushort ProtocolRevision { get; init; }
 
-    [JsonPropertyName("frozen_inventory")]
-    public FrozenInventoryReference FrozenInventory { get; init; } = new();
+    [JsonPropertyName("frozen_inventories")]
+    public List<FrozenInventoryReference> FrozenInventories { get; init; } = new();
 
     [JsonPropertyName("binding")]
     public FixtureBinding Binding { get; init; } = new();

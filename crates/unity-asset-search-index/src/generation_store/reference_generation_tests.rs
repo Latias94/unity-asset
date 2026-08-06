@@ -1,21 +1,24 @@
 use std::fs;
 use std::path::Path;
 
+use super::source_state::{SOURCE_STATE_CONTRACT_VERSION, SOURCE_STATE_LOGICAL_IDENTITY_VERSION};
 use super::{
-    GenerationBuild, GenerationFailpoint, GenerationPublishWarningKind, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions, activation_file_name,
-    activation_staging_file_name, quarantine_directory_name, staging_directory_name,
+    GenerationActivationEvidence, GenerationBuild, GenerationFailpoint,
+    GenerationPublishWarningKind, GenerationStore, GenerationStoreError, GenerationStoreOptions,
+    TransactionReceiptWindow, activation_file_name, activation_staging_file_name,
+    quarantine_directory_name, staging_directory_name,
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
-    SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, SearchGenerationId, SearchGenerationIdentityV1,
-    SearchGenerationManifestV1,
+    GenerationStorageContract, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, SearchGenerationId,
+    SearchGenerationIdentityV1, SearchGenerationManifestV1, StoredGenerationRef,
 };
+use crate::semantics::SearchSemantics;
 use serde::Serialize;
 use tempfile::TempDir;
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError, DigestV1,
-    WorkspaceId, WorkspaceRevision,
+    AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BudgetError, BudgetedJsonError, ChangeSet,
+    DigestV1, SourceId, SourceKind, TransactionId, WorkspaceId, WorkspaceRevision,
 };
 
 fn digest(label: &str) -> DigestV1 {
@@ -24,6 +27,29 @@ fn digest(label: &str) -> DigestV1 {
 
 fn revision(label: &str) -> WorkspaceRevision {
     WorkspaceRevision::new(digest(label))
+}
+
+fn change_set(
+    label: &str,
+    from_revision: WorkspaceRevision,
+    to_revision: WorkspaceRevision,
+    source_local: u128,
+) -> ChangeSet {
+    let workspace = WorkspaceId::from_u128(0x9001).unwrap();
+    ChangeSet::new(
+        TransactionId::new(digest(label)),
+        workspace,
+        from_revision,
+        to_revision,
+        vec![SourceId::new(workspace, SourceKind::SerializedFile, source_local).unwrap()],
+        Vec::new(),
+        Vec::new(),
+    )
+    .unwrap()
+}
+
+fn receipt_window(changes: &ChangeSet) -> TransactionReceiptWindow {
+    TransactionReceiptWindow::from_change_set(changes, &mut AssetLoadBudget::default()).unwrap()
 }
 
 fn open_store(
@@ -76,13 +102,13 @@ fn create_junction(link: &std::path::Path, target: &std::path::Path) {
     assert!(status.success());
 }
 
-fn source_state_payload(label: &str) -> (Vec<u8>, DigestV1) {
+fn source_state_payload_for_workspace(label: &str, workspace: WorkspaceId) -> (Vec<u8>, DigestV1) {
     #[derive(Serialize)]
     struct LogicalState<'state> {
-        contract_version: u16,
+        identity_version: u16,
         workspace: WorkspaceId,
         revision: WorkspaceRevision,
-        transaction_receipts: &'state [()],
+        analysis_cache_identity: crate::semantics::AnalysisCacheIdentityV1,
         assets: &'state [()],
     }
 
@@ -91,28 +117,30 @@ fn source_state_payload(label: &str) -> (Vec<u8>, DigestV1) {
         contract_version: u16,
         workspace: WorkspaceId,
         revision: WorkspaceRevision,
-        transaction_receipts: &'state [()],
+        analysis_cache_identity: crate::semantics::AnalysisCacheIdentityV1,
         scan_hints: &'state [()],
         assets: &'state [()],
         logical_digest: DigestV1,
     }
 
-    let workspace = WorkspaceId::from_u128(0x9001).unwrap();
     let revision = revision(label);
+    let analysis_cache_identity = SearchSemantics::current()
+        .analysis_cache_identity(digest("options"))
+        .unwrap();
     let assets = [];
     let logical = LogicalState {
-        contract_version: 1,
+        identity_version: SOURCE_STATE_LOGICAL_IDENTITY_VERSION,
         workspace,
         revision,
-        transaction_receipts: &[],
+        analysis_cache_identity,
         assets: &assets,
     };
     let logical_digest = DigestV1::hash_bytes(&serde_json::to_vec(&logical).unwrap());
     let persisted = PersistedState {
-        contract_version: 1,
+        contract_version: SOURCE_STATE_CONTRACT_VERSION,
         workspace,
         revision,
-        transaction_receipts: &[],
+        analysis_cache_identity,
         scan_hints: &[],
         assets: &assets,
         logical_digest,
@@ -120,7 +148,69 @@ fn source_state_payload(label: &str) -> (Vec<u8>, DigestV1) {
     (serde_json::to_vec(&persisted).unwrap(), logical_digest)
 }
 
-fn write_artifacts(build: &GenerationBuild, label: &str) {
+struct LegacyGenerationFixture {
+    generation: SearchGenerationId,
+    workspace: WorkspaceId,
+    revision: WorkspaceRevision,
+    desired_revision: WorkspaceRevision,
+}
+
+fn install_frozen_legacy_generation(
+    root: &Path,
+    activation_contract_version: u16,
+    desired_revision: WorkspaceRevision,
+) -> LegacyGenerationFixture {
+    assert!((1..=3).contains(&activation_contract_version));
+    crate::legacy_storage_v1_fixture_tests::install_frozen_storage_v1_store(root);
+    let activation_path = root
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(1));
+    let mut activation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+    let generation = serde_json::from_value(activation["generation"].clone()).unwrap();
+    let workspace = serde_json::from_value(activation["workspace"].clone()).unwrap();
+    let revision = serde_json::from_value(activation["revision"].clone()).unwrap();
+    let activation_fields = activation.as_object_mut().unwrap();
+    activation_fields.insert(
+        "contract_version".to_owned(),
+        serde_json::json!(activation_contract_version),
+    );
+    activation_fields.remove("generation_storage_contract");
+    activation_fields.remove("parent_generation");
+    activation_fields.remove("transaction_receipts");
+    if activation_contract_version >= 2 {
+        activation_fields.insert(
+            "desired_revision".to_owned(),
+            serde_json::to_value(desired_revision).unwrap(),
+        );
+    } else {
+        activation_fields.remove("desired_revision");
+    }
+    if activation_contract_version == 3 {
+        activation_fields.insert(
+            "generation_storage_contract".to_owned(),
+            serde_json::to_value(GenerationStorageContract::LegacyV1).unwrap(),
+        );
+        activation_fields.insert(
+            "transaction_receipts".to_owned(),
+            serde_json::to_value(TransactionReceiptWindow::empty()).unwrap(),
+        );
+    }
+    fs::write(activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+    LegacyGenerationFixture {
+        generation,
+        workspace,
+        revision,
+        desired_revision: if activation_contract_version == 1 {
+            revision
+        } else {
+            desired_revision
+        },
+    }
+}
+
+fn write_artifacts_for_workspace(build: &GenerationBuild, label: &str, workspace: WorkspaceId) {
     fs::write(
         build.search_directory().join("segments"),
         format!("search:{label}"),
@@ -132,34 +222,56 @@ fn write_artifacts(build: &GenerationBuild, label: &str) {
     )
     .unwrap();
     fs::write(
-        build.source_state_directory().join("source-state-v1.json"),
-        source_state_payload(label).0,
+        build.source_state_directory().join("source-state-v2.json"),
+        source_state_payload_for_workspace(label, workspace).0,
     )
     .unwrap();
 }
 
-fn manifest_for(
+fn write_artifacts(build: &GenerationBuild, label: &str) {
+    write_artifacts_for_workspace(build, label, WorkspaceId::from_u128(0x9001).unwrap());
+}
+
+fn manifest_for_workspace(
     store: &GenerationStore,
     build: &GenerationBuild,
     label: &str,
-    parent: Option<SearchGenerationId>,
+    expected_parent: Option<SearchGenerationId>,
+    workspace: WorkspaceId,
 ) -> SearchGenerationManifestV1 {
+    assert_eq!(
+        store.active().map(super::GenerationSnapshot::generation),
+        expected_parent
+    );
     let evidence = store.measure_artifacts(build).unwrap();
     let identity = SearchGenerationIdentityV1::new(
-        WorkspaceId::from_u128(0x9001).unwrap(),
+        workspace,
         revision(label),
         GenerationProjectionDigests::new(
             digest(&format!("search-projection:{label}")),
             digest(&format!("reference-projection:{label}")),
         ),
         Default::default(),
-        parent,
-        Vec::new(),
         digest("options"),
-        source_state_payload(label).1,
+        source_state_payload_for_workspace(label, workspace).1,
     )
     .unwrap();
     SearchGenerationManifestV1::new(identity, evidence)
+}
+
+fn manifest_for(
+    store: &GenerationStore,
+    build: &GenerationBuild,
+    label: &str,
+    expected_parent: Option<SearchGenerationId>,
+) -> SearchGenerationManifestV1 {
+    manifest_for_workspace(
+        store,
+        build,
+        label,
+        expected_parent,
+        WorkspaceId::from_u128(0x9001).unwrap(),
+    )
 }
 
 fn publish_generation(
@@ -167,9 +279,23 @@ fn publish_generation(
     label: &str,
     parent: Option<SearchGenerationId>,
 ) -> SearchGenerationId {
+    publish_generation_for_workspace(
+        store,
+        label,
+        parent,
+        WorkspaceId::from_u128(0x9001).unwrap(),
+    )
+}
+
+fn publish_generation_for_workspace(
+    store: &mut GenerationStore,
+    label: &str,
+    parent: Option<SearchGenerationId>,
+    workspace: WorkspaceId,
+) -> SearchGenerationId {
     let mut build = store.begin().unwrap();
-    write_artifacts(&build, label);
-    let manifest = manifest_for(store, &build, label, parent);
+    write_artifacts_for_workspace(&build, label, workspace);
+    let manifest = manifest_for_workspace(store, &build, label, parent, workspace);
     let prepared = store.prepare_publish(&mut build, manifest).unwrap();
     assert!(prepared.snapshot().directory().is_dir());
     prepared.activate().unwrap().active.generation()
@@ -337,27 +463,195 @@ fn corrupt_historical_head_does_not_hide_a_valid_latest_head() {
 }
 
 #[test]
-fn legacy_activation_v1_defaults_desired_revision_to_actual_revision() {
+fn legacy_activation_v1_and_v2_open_exact_storage_v1_generations() {
+    for activation_contract_version in [1, 2] {
+        let temporary = TempDir::new().unwrap();
+        let options = GenerationStoreOptions::default();
+        drop(open_store(temporary.path(), options).unwrap());
+        let fixture = install_frozen_legacy_generation(
+            temporary.path(),
+            activation_contract_version,
+            revision("legacy desired"),
+        );
+        let activation: serde_json::Value = serde_json::from_slice(
+            &fs::read(
+                temporary
+                    .path()
+                    .join(super::ACTIVATIONS_DIRECTORY)
+                    .join(activation_file_name(1)),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let activation = activation.as_object().unwrap();
+        assert!(!activation.contains_key("generation_storage_contract"));
+        assert!(!activation.contains_key("parent_generation"));
+        assert!(!activation.contains_key("transaction_receipts"));
+        assert_eq!(
+            activation.contains_key("desired_revision"),
+            activation_contract_version == 2
+        );
+
+        let reopened = open_store(temporary.path(), options).unwrap();
+        let active = reopened.active().unwrap();
+        assert_eq!(active.generation(), fixture.generation);
+        assert_eq!(
+            active.storage_contract(),
+            GenerationStorageContract::LegacyV1
+        );
+        assert_eq!(active.manifest().workspace(), fixture.workspace);
+        assert_eq!(active.manifest().revision(), fixture.revision);
+        assert_eq!(active.desired_revision(), fixture.desired_revision);
+        assert!(
+            active
+                .directory()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("generation-v1-")
+        );
+        assert!(matches!(
+            active
+                .load_source_state(&mut AssetLoadBudget::default())
+                .unwrap(),
+            super::GenerationSourceState::LegacyV1(_)
+        ));
+    }
+}
+
+#[test]
+fn legacy_activation_contracts_reject_fields_outside_their_exact_wire() {
+    let cases = [
+        (1, "desired_revision", serde_json::Value::Null),
+        (1, "generation_storage_contract", serde_json::Value::Null),
+        (1, "parent_generation", serde_json::Value::Null),
+        (1, "transaction_receipts", serde_json::json!([])),
+        (1, "transaction_receipts", serde_json::Value::Null),
+        (2, "generation_storage_contract", serde_json::Value::Null),
+        (2, "parent_generation", serde_json::Value::Null),
+        (2, "transaction_receipts", serde_json::json!([])),
+        (2, "transaction_receipts", serde_json::Value::Null),
+    ];
+
+    for (contract_version, field, value) in cases {
+        let temporary = TempDir::new().unwrap();
+        drop(open_store(temporary.path(), GenerationStoreOptions::default()).unwrap());
+        install_frozen_legacy_generation(
+            temporary.path(),
+            contract_version,
+            revision("legacy desired"),
+        );
+        let activation_path = temporary
+            .path()
+            .join(super::ACTIVATIONS_DIRECTORY)
+            .join(activation_file_name(1));
+        let mut activation: serde_json::Value =
+            serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+        activation
+            .as_object_mut()
+            .unwrap()
+            .insert(field.to_owned(), value);
+        fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::InvalidGenerationHead { .. }
+        ));
+    }
+}
+
+#[test]
+fn activation_v2_requires_a_non_null_desired_revision() {
+    for replacement in [None, Some(serde_json::Value::Null)] {
+        let temporary = TempDir::new().unwrap();
+        drop(open_store(temporary.path(), GenerationStoreOptions::default()).unwrap());
+        install_frozen_legacy_generation(temporary.path(), 2, revision("legacy desired"));
+        let activation_path = temporary
+            .path()
+            .join(super::ACTIVATIONS_DIRECTORY)
+            .join(activation_file_name(1));
+        let mut activation: serde_json::Value =
+            serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+        let fields = activation.as_object_mut().unwrap();
+        match replacement {
+            Some(value) => {
+                fields.insert("desired_revision".to_owned(), value);
+            }
+            None => {
+                fields.remove("desired_revision");
+            }
+        }
+        fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::InvalidGenerationHead { .. }
+        ));
+    }
+}
+
+#[test]
+fn activation_v3_requires_exact_non_null_current_fields() {
+    let cases = [
+        ("generation_storage_contract", None),
+        ("generation_storage_contract", Some(serde_json::Value::Null)),
+        ("desired_revision", None),
+        ("desired_revision", Some(serde_json::Value::Null)),
+        ("transaction_receipts", None),
+        ("transaction_receipts", Some(serde_json::Value::Null)),
+        ("parent_generation", Some(serde_json::Value::Null)),
+    ];
+
+    for (field, replacement) in cases {
+        let temporary = TempDir::new().unwrap();
+        let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+        publish_generation(&mut store, &format!("current-{field}"), None);
+        let ordinal = store.active().unwrap().activation_ordinal();
+        let activation_path = temporary
+            .path()
+            .join(super::ACTIVATIONS_DIRECTORY)
+            .join(activation_file_name(ordinal));
+        drop(store);
+
+        let mut activation: serde_json::Value =
+            serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+        let fields = activation.as_object_mut().unwrap();
+        match replacement {
+            Some(value) => {
+                fields.insert(field.to_owned(), value);
+            }
+            None => {
+                fields.remove(field);
+            }
+        }
+        fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+        let error = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::InvalidGenerationHead { .. }
+        ));
+    }
+}
+
+#[test]
+fn activation_v3_can_pin_legacy_storage_and_a_newer_desired_revision() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions::default();
-    let mut store = open_store(temporary.path(), options).unwrap();
-    let generation = publish_generation(&mut store, "legacy", None);
-    let ordinal = store.active().unwrap().activation_ordinal();
-    let activation_path = temporary
-        .path()
-        .join("activations")
-        .join(activation_file_name(ordinal));
-    let mut value: serde_json::Value =
-        serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
-    value["contract_version"] = serde_json::json!(1);
-    value.as_object_mut().unwrap().remove("desired_revision");
-    fs::write(&activation_path, serde_json::to_vec(&value).unwrap()).unwrap();
+    drop(open_store(temporary.path(), options).unwrap());
+    let desired_revision = revision("legacy-v3-desired");
+    let fixture = install_frozen_legacy_generation(temporary.path(), 3, desired_revision);
 
-    drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     let active = reopened.active().unwrap();
-    assert_eq!(active.generation(), generation);
-    assert_eq!(active.desired_revision(), active.manifest().revision());
+    assert_eq!(active.generation(), fixture.generation);
+    assert_eq!(
+        active.storage_contract(),
+        GenerationStorageContract::LegacyV1
+    );
+    assert_eq!(active.desired_revision(), desired_revision);
 }
 
 #[test]
@@ -499,7 +793,6 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         revision("revision"),
         digest("search projection"),
         digest("reference projection"),
-        Some(SearchGenerationId::new(digest("parent"))),
         digest("options"),
         digest("source state"),
     );
@@ -509,9 +802,7 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         GenerationProjectionDigests::new(arguments.2, arguments.3),
         Default::default(),
         arguments.4,
-        Vec::new(),
         arguments.5,
-        arguments.6,
     )
     .unwrap();
     let second_identity = SearchGenerationIdentityV1::new(
@@ -520,9 +811,7 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         GenerationProjectionDigests::new(arguments.2, arguments.3),
         Default::default(),
         arguments.4,
-        Vec::new(),
         arguments.5,
-        arguments.6,
     )
     .unwrap();
     let first = SearchGenerationManifestV1::new(first_identity, first_evidence);
@@ -536,12 +825,182 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         Some(first.generation_id())
     );
     let directory_name = first.generation_id().directory_name();
-    let encoded = directory_name.strip_prefix("generation-v1-").unwrap();
-    let uppercase_alias = format!("generation-v1-{}", encoded.to_ascii_uppercase());
+    let encoded = directory_name.strip_prefix("generation-v2-").unwrap();
+    let uppercase_alias = format!("generation-v2-{}", encoded.to_ascii_uppercase());
     assert_eq!(
         SearchGenerationId::from_directory_name(&uppercase_alias),
         None
     );
+    let current = StoredGenerationRef::current(first.generation_id());
+    let legacy =
+        StoredGenerationRef::new(GenerationStorageContract::LegacyV1, first.generation_id());
+    assert_eq!(
+        StoredGenerationRef::from_directory_name(&current.directory_name()),
+        Some(current)
+    );
+    assert_eq!(
+        StoredGenerationRef::from_directory_name(&legacy.directory_name()),
+        Some(legacy)
+    );
+    assert!(current.directory_name().starts_with("generation-v2-"));
+    assert!(legacy.directory_name().starts_with("generation-v1-"));
+    assert_ne!(current.directory_name(), legacy.directory_name());
+}
+
+#[test]
+fn activation_provenance_is_not_part_of_the_generation_manifest() {
+    let workspace = WorkspaceId::from_u128(0x9001).unwrap();
+    let revision = revision("shared revision");
+    let projections = GenerationProjectionDigests::new(
+        digest("shared search projection"),
+        digest("shared reference projection"),
+    );
+    let evidence = GenerationArtifactEvidence::new(
+        ArtifactTreeEvidence::new(digest("search artifacts"), 1, 10),
+        ArtifactTreeEvidence::new(digest("reference artifacts"), 1, 10),
+        ArtifactTreeEvidence::new(digest("source-state artifacts"), 1, 10),
+    );
+    let manifest = SearchGenerationManifestV1::new(
+        SearchGenerationIdentityV1::new(
+            workspace,
+            revision,
+            projections,
+            Default::default(),
+            digest("options"),
+            digest("source state"),
+        )
+        .unwrap(),
+        evidence,
+    );
+    let encoded = serde_json::to_value(&manifest).unwrap();
+
+    assert!(encoded.get("parent_generation").is_none());
+    assert!(encoded.get("applied_transactions").is_none());
+    assert!(encoded.get("transaction_receipts").is_none());
+}
+
+#[test]
+fn activation_receipts_advance_without_changing_logical_generation_identity() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let current_revision = revision("stable");
+    let first_change = change_set("transaction a", revision("before a"), current_revision, 1);
+    let first_receipts = receipt_window(&first_change);
+
+    let mut first_build = store.begin().unwrap();
+    write_artifacts(&first_build, "stable");
+    let first_manifest = manifest_for(&store, &first_build, "stable", None);
+    let generation = first_manifest.generation_id();
+    let first_activation = GenerationActivationEvidence::new(None, first_receipts);
+    let first = store
+        .prepare_publish_with_desired_revision_and_budget(
+            &mut first_build,
+            first_manifest,
+            first_activation,
+            current_revision,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap()
+        .activate()
+        .unwrap()
+        .active;
+    let first_ordinal = first.activation_ordinal();
+    drop(first_build);
+
+    let second_change = change_set("transaction b", revision("before b"), current_revision, 2);
+    let second_receipts = first
+        .transaction_receipts()
+        .after_reconciled_target(
+            first.manifest().workspace(),
+            current_revision,
+            &second_change,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let mut second_build = store.begin().unwrap();
+    write_artifacts(&second_build, "stable");
+    let second_manifest = manifest_for(&store, &second_build, "stable", Some(generation));
+    assert_eq!(second_manifest.generation_id(), generation);
+    let second_activation = GenerationActivationEvidence::new(Some(generation), second_receipts);
+    let second = store
+        .prepare_publish_with_desired_revision_and_budget(
+            &mut second_build,
+            second_manifest,
+            second_activation,
+            current_revision,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap()
+        .activate()
+        .unwrap()
+        .active;
+
+    assert_eq!(second.generation(), generation);
+    assert!(second.activation_ordinal() > first_ordinal);
+    assert!(matches!(
+        second
+            .transaction_receipts()
+            .membership(&second_change, &mut AssetLoadBudget::default())
+            .unwrap(),
+        super::TransactionReceiptMembership::Exact
+    ));
+
+    drop(second_build);
+    drop(store);
+    let reopened = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.generation(), generation);
+    assert_eq!(active.activation_ordinal(), second.activation_ordinal());
+    assert!(matches!(
+        active
+            .transaction_receipts()
+            .membership(&second_change, &mut AssetLoadBudget::default())
+            .unwrap(),
+        super::TransactionReceiptMembership::Exact
+    ));
+}
+
+#[test]
+fn each_persisted_semantic_identity_changes_the_generation_id() {
+    let workspace = WorkspaceId::from_u128(0x9001).unwrap();
+    let revision = revision("revision");
+    let projections = GenerationProjectionDigests::new(digest("search"), digest("references"));
+    let evidence = GenerationArtifactEvidence::new(
+        ArtifactTreeEvidence::new(digest("search artifacts"), 1, 10),
+        ArtifactTreeEvidence::new(digest("reference artifacts"), 1, 10),
+        ArtifactTreeEvidence::new(digest("source-state artifacts"), 1, 10),
+    );
+    let manifest = |semantics| {
+        SearchGenerationManifestV1::new(
+            SearchGenerationIdentityV1::new_with_semantics(
+                workspace,
+                revision,
+                projections,
+                Default::default(),
+                semantics,
+                digest("options"),
+                digest("source state"),
+            )
+            .unwrap(),
+            evidence,
+        )
+    };
+    let current = SearchSemantics::current();
+    let current_id = manifest(current).generation_id();
+    let next_analysis_version = current.with_analysis_version(current.analysis_version() + 1);
+    assert_eq!(
+        next_analysis_version.analysis_digest(),
+        current.analysis_digest()
+    );
+
+    for changed in [
+        next_analysis_version,
+        current.with_analysis_digest(digest("analysis semantics v-next")),
+        current.with_search_projection_digest(digest("search projection semantics v-next")),
+        current.with_reference_projection_digest(digest("reference projection semantics v-next")),
+    ] {
+        assert_ne!(manifest(changed).generation_id(), current_id);
+    }
 }
 
 #[test]
@@ -556,8 +1015,6 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
         revision("revision"),
         GenerationProjectionDigests::new(digest("search"), digest("references")),
         Default::default(),
-        None,
-        Vec::new(),
         digest("options"),
         digest("state"),
     )
@@ -575,10 +1032,26 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
         .insert("unexpected".to_owned(), serde_json::json!(true));
     assert!(serde_json::from_value::<SearchGenerationManifestV1>(unknown).is_err());
 
-    let mut unsupported = serde_json::to_value(&manifest).unwrap();
-    unsupported["contract_version"] =
-        serde_json::json!(SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1);
-    assert!(serde_json::from_value::<SearchGenerationManifestV1>(unsupported).is_err());
+    let mut unknown_semantics = serde_json::to_value(&manifest).unwrap();
+    unknown_semantics["semantics"]["unexpected"] = serde_json::json!(true);
+    assert!(serde_json::from_value::<SearchGenerationManifestV1>(unknown_semantics).is_err());
+
+    let mut unsupported_semantics = serde_json::to_value(&manifest).unwrap();
+    unsupported_semantics["semantics"]["contract_version"] = serde_json::json!(2);
+    assert!(serde_json::from_value::<SearchGenerationManifestV1>(unsupported_semantics).is_err());
+
+    let mut zero_semantic_version = serde_json::to_value(&manifest).unwrap();
+    zero_semantic_version["semantics"]["analysis_version"] = serde_json::json!(0);
+    assert!(serde_json::from_value::<SearchGenerationManifestV1>(zero_semantic_version).is_err());
+
+    for unsupported_version in [
+        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION - 1,
+        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1,
+    ] {
+        let mut unsupported = serde_json::to_value(&manifest).unwrap();
+        unsupported["contract_version"] = serde_json::json!(unsupported_version);
+        assert!(serde_json::from_value::<SearchGenerationManifestV1>(unsupported).is_err());
+    }
 
     let mut invalid_summary = serde_json::to_value(&manifest).unwrap();
     invalid_summary["projection_summary"]["incomplete_assets"] = serde_json::json!(1);
@@ -989,8 +1462,6 @@ fn publish_rejects_source_state_that_does_not_match_the_manifest() {
             digest("reference-projection:candidate"),
         ),
         Default::default(),
-        Some(baseline),
-        Vec::new(),
         digest("options"),
         digest("wrong-source-state"),
     )
@@ -1086,6 +1557,51 @@ fn retention_keeps_active_and_configured_previous_generations() {
     drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), third);
+}
+
+#[test]
+fn retention_tracks_legacy_and_current_directories_as_distinct_generations() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 1,
+    };
+    drop(open_store(temporary.path(), options).unwrap());
+    let legacy =
+        install_frozen_legacy_generation(temporary.path(), 3, revision("legacy-retention"));
+    let legacy_ref =
+        StoredGenerationRef::new(GenerationStorageContract::LegacyV1, legacy.generation);
+    let mut store = open_store(temporary.path(), options).unwrap();
+
+    let first_current = publish_generation_for_workspace(
+        &mut store,
+        "first-current",
+        Some(legacy.generation),
+        legacy.workspace,
+    );
+    assert!(
+        temporary
+            .path()
+            .join(super::GENERATIONS_DIRECTORY)
+            .join(legacy_ref.directory_name())
+            .is_dir()
+    );
+    assert!(store.generation_directory(first_current).is_dir());
+
+    let second_current = publish_generation_for_workspace(
+        &mut store,
+        "second-current",
+        Some(first_current),
+        legacy.workspace,
+    );
+    assert!(
+        !temporary
+            .path()
+            .join(super::GENERATIONS_DIRECTORY)
+            .join(legacy_ref.directory_name())
+            .exists()
+    );
+    assert!(store.generation_directory(first_current).is_dir());
+    assert!(store.generation_directory(second_current).is_dir());
 }
 
 #[test]

@@ -12,6 +12,7 @@ use unity_asset::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticError, DiagnosticSeverity,
     FieldPath, FieldPathSegment, ObjectAddress, RevisionedObjectHandle, SourceFingerprint,
     SourceId, SourceKind, SourceLocator, UnityClass, UnityValue, WorkspaceId, WorkspaceRevision,
+    YamlFileId,
 };
 use unity_asset_search_core::{SearchKind, TryToTermsError, try_to_terms};
 
@@ -122,7 +123,7 @@ impl<'view> WorkspaceAnalysisContext<'view> {
         }
 
         let mut handles = view.objects(budget)?;
-        handles.sort();
+        handles.sort_unstable();
         let mut objects_by_root = BTreeMap::<SourceId, Vec<RevisionedObjectHandle>>::new();
         for handle in handles {
             let source = handle.object().source();
@@ -1370,7 +1371,7 @@ fn clone_ambiguous_candidates(
             budget,
         )?);
     }
-    cloned.sort();
+    cloned.sort_unstable();
     cloned.dedup();
     Ok(cloned)
 }
@@ -1523,7 +1524,7 @@ fn dependency_keys(
         | ReferenceResolutionProjection::Missing { target: None }
         | ReferenceResolutionProjection::Invalid => {}
     }
-    keys.sort();
+    keys.sort_unstable();
     keys.dedup();
     Ok(keys)
 }
@@ -1556,7 +1557,7 @@ fn script_guid_from_raw(
 fn address_file_id(address: &ObjectAddress) -> Option<i64> {
     address
         .binary_path_id()
-        .or_else(|| address.yaml_anchor().and_then(|anchor| anchor.parse().ok()))
+        .or_else(|| address.yaml_file_id().map(YamlFileId::get))
         .or_else(|| address.yaml_document_ordinal().map(i64::from))
 }
 
@@ -2653,10 +2654,16 @@ mod tests {
 
     #[test]
     fn hierarchy_path_uses_the_exact_checked_layout() {
-        let root =
-            ObjectAddress::yaml(SourceLocator::path("Assets/Scene.unity").unwrap(), "1").unwrap();
-        let child =
-            ObjectAddress::yaml(SourceLocator::path("Assets/Scene.unity").unwrap(), "2").unwrap();
+        let root = ObjectAddress::yaml(
+            SourceLocator::path("Assets/Scene.unity").unwrap(),
+            "1".parse().unwrap(),
+        )
+        .unwrap();
+        let child = ObjectAddress::yaml(
+            SourceLocator::path("Assets/Scene.unity").unwrap(),
+            "2".parse().unwrap(),
+        )
+        .unwrap();
         let lineage = [(&child, "Child"), (&root, "Root")];
         let expected = "Root/Child";
         let mut exact = AssetLoadBudget::new(AssetLoadLimits {
@@ -2688,8 +2695,8 @@ mod tests {
     fn nested_reference_backings_are_preflighted_before_deep_clones() {
         let locator =
             SourceLocator::archive_member("Assets/References", "nested/target.asset").unwrap();
-        let first = ObjectAddress::yaml(locator.clone(), "100").unwrap();
-        let second = ObjectAddress::yaml(locator, "200").unwrap();
+        let first = ObjectAddress::yaml(locator.clone(), "100".parse().unwrap()).unwrap();
+        let second = ObjectAddress::yaml(locator, "200".parse().unwrap()).unwrap();
         let candidates = vec![first.clone(), second.clone(), first.clone()];
         let candidate_backing = size_of::<ObjectAddress>() * candidates.len();
         let mut candidate_short = AssetLoadBudget::new(AssetLoadLimits {

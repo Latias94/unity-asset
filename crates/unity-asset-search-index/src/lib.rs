@@ -18,18 +18,24 @@ mod anchored_fs;
 mod config;
 mod generation;
 mod generation_store;
+#[cfg(test)]
+mod legacy_storage_v1_fixture_tests;
+mod legacy_wire;
 mod path_semantics;
 mod pipeline;
+mod project_root;
 mod projection;
 mod query;
 mod reference_payload;
 mod reference_query;
 mod scan;
+mod semantics;
 mod store;
 mod wire;
 
 pub use config::{IndexPaths, ScanTraversalLimits, SearchIgnoreV1Limits, SearchIndexOptions};
 pub use generation::{FilesystemReindexIntent, FilesystemReindexScope};
+pub use path_semantics::{ProjectPath, ProjectPathError, ProjectPathSet, ProjectPathSpace};
 pub use unity_asset::workspace::WorkspaceView;
 pub use unity_asset_core::{AssetLoadBudget, ChangeSet, DigestV1, DigestV1Builder};
 pub use unity_asset_search_core::{SearchKind, SearchRequest};
@@ -37,7 +43,7 @@ pub use unity_asset_search_core::{SearchKind, SearchRequest};
 use unity_asset_search_protocol::GenerationMaintenanceState;
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, DaemonLifecycleStatus, GenerationFailure, GenerationMaintenanceStatus,
-    GenerationStatus, ReferenceRequest, ReferencesResponse, ReindexReceipt,
+    GenerationStatus, ProjectId, ReferenceRequest, ReferencesResponse, ReindexReceipt,
     SEARCH_PROTOCOL_REVISION, SearchCapabilities, SearchResponse, StatusResponse, SuggestResponse,
     WireProjectionError,
 };
@@ -267,6 +273,11 @@ impl SearchIndex {
     #[must_use]
     pub fn paths(&self) -> &IndexPaths {
         &self.inner.paths
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> ProjectId {
+        self.inner.paths.project_id()
     }
 
     #[must_use]
@@ -815,6 +826,19 @@ GameObject:
             .collect()
     }
 
+    fn changed_intent<I, P>(index: &SearchIndex, paths: I) -> FilesystemReindexIntent
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<std::path::Path>,
+    {
+        let paths = index
+            .paths()
+            .project_path_space()
+            .resolve_set(paths)
+            .unwrap();
+        FilesystemReindexIntent::changed_paths(paths)
+    }
+
     fn incoming_paths(index: &SearchIndex, guid: &str) -> Vec<String> {
         index
             .references(
@@ -842,7 +866,10 @@ GameObject:
         assert!(incoming_paths(index, OTHER_GUID).is_empty());
     }
 
-    fn rewrite_reference_marker_as_legacy(paths: &IndexPaths, generation: GenerationIdV1) {
+    fn rewrite_reference_marker_as_legacy(
+        paths: &IndexPaths,
+        generation: GenerationIdV1,
+    ) -> GenerationIdV1 {
         let generation_directory = paths
             .index_root()
             .join("generations")
@@ -857,14 +884,49 @@ GameObject:
         let manifest_path = generation_directory.join("manifest.json");
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["semantics"]["reference_projection_version"] = serde_json::Value::from(1);
+        manifest["semantics"]["reference_projection_digest"] = serde_json::to_value(
+            DigestV1::hash_bytes(b"unity-asset:search:reference-projection-semantics:v1\0"),
+        )
+        .unwrap();
+
+        let stale_semantics_manifest: crate::generation::SearchGenerationManifestV1 =
+            serde_json::from_value(manifest.clone()).unwrap();
+        let analysis_cache_identity = stale_semantics_manifest
+            .semantics()
+            .analysis_cache_identity(stale_semantics_manifest.options_digest())
+            .unwrap();
+        let source_state_directory = generation_directory.join("state");
+        let source_state_path = source_state_directory.join("source-state-v2.json");
+        let source_state: crate::generation_store::SourceStateSnapshot =
+            serde_json::from_slice(&fs::read(&source_state_path).unwrap()).unwrap();
+        let source_state = source_state
+            .rebind_analysis_cache_identity(analysis_cache_identity)
+            .unwrap();
+        fs::write(
+            &source_state_path,
+            serde_json::to_vec(&source_state).unwrap(),
+        )
+        .unwrap();
+        manifest["source_state_digest"] =
+            serde_json::to_value(source_state.logical_digest()).unwrap();
+        manifest["artifacts"]["source_state"] = serde_json::to_value(
+            crate::generation_store::measure_artifact_tree(&source_state_directory).unwrap(),
+        )
+        .unwrap();
         manifest["artifacts"]["references"] = serde_json::to_value(
             crate::generation_store::measure_artifact_tree(&reference_directory).unwrap(),
         )
         .unwrap();
         let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
         fs::write(&manifest_path, &manifest_bytes).unwrap();
+        let legacy_manifest: crate::generation::SearchGenerationManifestV1 =
+            serde_json::from_slice(&manifest_bytes).unwrap();
+        let legacy_generation = legacy_manifest.generation_id();
 
         let generation_value = serde_json::to_value(generation).unwrap();
+        let legacy_generation_value =
+            serde_json::to_value(GenerationIdV1::new(legacy_generation.digest())).unwrap();
         let manifest_digest = serde_json::to_value(DigestV1::hash_bytes(&manifest_bytes)).unwrap();
         let mut matching_activations = 0;
         for entry in fs::read_dir(paths.index_root().join("activations")).unwrap() {
@@ -877,11 +939,18 @@ GameObject:
             if activation["generation"] != generation_value {
                 continue;
             }
+            activation["generation"] = legacy_generation_value.clone();
             activation["manifest_digest"] = manifest_digest.clone();
             fs::write(path, serde_json::to_vec(&activation).unwrap()).unwrap();
             matching_activations += 1;
         }
         assert!(matching_activations > 0);
+        let legacy_directory = paths
+            .index_root()
+            .join("generations")
+            .join(legacy_generation.directory_name());
+        fs::rename(generation_directory, legacy_directory).unwrap();
+        GenerationIdV1::new(legacy_generation.digest())
     }
 
     fn assert_publish_failpoint_is_atomic(failpoint: GenerationFailpoint) {
@@ -905,10 +974,8 @@ GameObject:
 
         fs::write(project.join(OWNER_PATH), OWNER_AFTER).unwrap();
         index.inject_generation_failpoint(failpoint).unwrap();
-        let failed = index.reindex(
-            FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
-            &mut AssetLoadBudget::default(),
-        );
+        let intent = changed_intent(&index, [PathBuf::from(OWNER_PATH)]);
+        let failed = index.reindex(intent, &mut AssetLoadBudget::default());
         assert!(failed.is_err(), "{failpoint:?} must stop publication");
         let failed_active = index
             .status()
@@ -933,11 +1000,9 @@ GameObject:
         let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
         assert_baseline_generation(&reopened, &failed_active);
         assert!(reopened.status().unwrap().generation.last_failure.is_none());
+        let intent = changed_intent(&reopened, [PathBuf::from(OWNER_PATH)]);
         let recovered = reopened
-            .reindex(
-                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
-                &mut AssetLoadBudget::default(),
-            )
+            .reindex(intent, &mut AssetLoadBudget::default())
             .unwrap()
             .generation
             .unwrap();
@@ -956,6 +1021,7 @@ GameObject:
 
     #[derive(Debug, Clone, Copy)]
     enum ScanValidationMutation {
+        ProjectRoot,
         RootPolicy,
         AssetsDirectory,
         AssetContents,
@@ -991,8 +1057,24 @@ GameObject:
         }
         let mutation_project = project.clone();
         let replacement_root = temporary.path().join("replacement");
+        let displaced_project = temporary.path().join("displaced-project");
+        let project_root_restore =
+            matches!(mutation, ScanValidationMutation::ProjectRoot).then(|| {
+                (
+                    project.clone(),
+                    replacement_root.clone(),
+                    displaced_project.clone(),
+                )
+            });
+        if matches!(mutation, ScanValidationMutation::ProjectRoot) {
+            write_generation_fixture(&replacement_root);
+        }
         index
             .inject_scan_validation_hook(checkpoint, move || match mutation {
+                ScanValidationMutation::ProjectRoot => {
+                    fs::rename(&mutation_project, &displaced_project).unwrap();
+                    fs::rename(&replacement_root, &mutation_project).unwrap();
+                }
                 ScanValidationMutation::RootPolicy => {
                     fs::write(
                         mutation_project.join(".unity-asset-search-ignore"),
@@ -1039,11 +1121,9 @@ GameObject:
                 }
             })
             .unwrap();
+        let intent = changed_intent(&index, [PathBuf::from(OWNER_PATH)]);
         let failure = index
-            .reindex(
-                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
-                &mut AssetLoadBudget::default(),
-            )
+            .reindex(intent, &mut AssetLoadBudget::default())
             .expect_err("filesystem mutation must invalidate the prepared scan");
         assert_eq!(
             failure.code(),
@@ -1086,6 +1166,11 @@ GameObject:
                 .is_some_and(|failure| failure.retryable),
             "{checkpoint:?}"
         );
+
+        if let Some((project, replacement, displaced)) = project_root_restore {
+            fs::rename(&project, &replacement).unwrap();
+            fs::rename(&displaced, &project).unwrap();
+        }
 
         drop(index);
         let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
@@ -1215,6 +1300,7 @@ GameObject:
     #[test]
     fn filesystem_scan_validation_is_atomic_at_every_publication_boundary() {
         for mutation in [
+            ScanValidationMutation::ProjectRoot,
             ScanValidationMutation::RootPolicy,
             ScanValidationMutation::AssetsDirectory,
             ScanValidationMutation::AssetContents,
@@ -1252,11 +1338,9 @@ GameObject:
             })
             .unwrap();
 
+        let intent = changed_intent(&index, [PathBuf::from(OWNER_PATH)]);
         let failure = index
-            .reindex(
-                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
-                &mut AssetLoadBudget::default(),
-            )
+            .reindex(intent, &mut AssetLoadBudget::default())
             .expect_err("a no-change result must not hide a post-scan filesystem mutation");
 
         assert_eq!(failure.code(), ApiErrorCode::IndexBuildFailed);
@@ -1296,7 +1380,7 @@ GameObject:
         assert_baseline_generation(&index, &baseline);
         drop(index);
 
-        rewrite_reference_marker_as_legacy(&paths, baseline.generation);
+        let legacy_generation = rewrite_reference_marker_as_legacy(&paths, baseline.generation);
 
         let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
         assert!(reopened.status().unwrap().generation.active.is_none());
@@ -1309,12 +1393,13 @@ GameObject:
             .unwrap();
         assert!(receipt.evidence.forced_full_scan);
         let rebuilt = receipt.generation.unwrap();
-        assert_ne!(rebuilt.generation, baseline.generation);
+        assert_ne!(rebuilt.generation, legacy_generation);
+        assert_eq!(rebuilt.generation, baseline.generation);
         assert_baseline_generation(&reopened, &rebuilt);
     }
 
     #[test]
-    fn late_receipt_rebuild_from_legacy_projection_preserves_store_desired_revision() {
+    fn filesystem_rebuild_from_legacy_projection_preserves_store_desired_revision() {
         let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
@@ -1382,26 +1467,21 @@ GameObject:
         assert!(stale.stale);
         drop(index);
 
-        rewrite_reference_marker_as_legacy(&paths, baseline.generation);
+        let legacy_generation = rewrite_reference_marker_as_legacy(&paths, baseline.generation);
         let reopened =
             SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
         assert!(reopened.status().unwrap().generation.active.is_none());
 
-        let late = ChangeSet::new(
-            TransactionId::new(DigestV1::hash_bytes(b"late-transaction")),
-            baseline.workspace,
-            WorkspaceRevision::new(DigestV1::hash_bytes(b"prior-revision")),
-            baseline.actual_revision,
-            vec![owner],
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
         let receipt = reopened
-            .reindex_workspace(late, &workspace.snapshot(), &mut AssetLoadBudget::default())
+            .reindex(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
             .unwrap();
+        assert!(receipt.evidence.forced_full_scan);
         let rebuilt = receipt.generation.unwrap();
-        assert_ne!(rebuilt.generation, baseline.generation);
+        assert_ne!(rebuilt.generation, legacy_generation);
+        assert_eq!(rebuilt.generation, baseline.generation);
         assert_eq!(rebuilt.actual_revision, baseline.actual_revision);
         assert_eq!(rebuilt.desired_revision, future_revision);
         assert!(rebuilt.stale);
@@ -1565,10 +1645,8 @@ GameObject:
 
         let build_index = index.clone();
         let build = thread::spawn(move || {
-            build_index.reindex(
-                FilesystemReindexIntent::changed_paths(vec![PathBuf::from(OWNER_PATH)]),
-                &mut AssetLoadBudget::default(),
-            )
+            let intent = changed_intent(&build_index, [PathBuf::from(OWNER_PATH)]);
+            build_index.reindex(intent, &mut AssetLoadBudget::default())
         });
         entered_rx.recv().unwrap();
 

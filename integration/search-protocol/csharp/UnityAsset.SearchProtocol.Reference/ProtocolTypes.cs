@@ -7,7 +7,8 @@ namespace UnityAsset.SearchProtocol.Reference
     public static class ProtocolConstants
     {
         public const ushort BootstrapVersion = 2;
-        public const ushort BusinessProtocolRevision = 2;
+        public const ushort BusinessProtocolRevision = 3;
+        public const uint CoreDiagnosticVersion = 2;
     }
 
     public sealed class ProtocolValidationException : Exception

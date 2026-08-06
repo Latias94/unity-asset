@@ -13,7 +13,7 @@ use unity_asset_search_index::{
     AssetLoadBudget, FilesystemReindexIntent, SearchIndex, SearchIndexError,
 };
 use unity_asset_search_local::{ClaimedEndpointV1, EndpointClaimV1, EndpointCleanupV1};
-use unity_asset_search_protocol::DaemonInstanceId;
+use unity_asset_search_protocol::{DaemonInstanceId, ProjectId};
 
 use crate::coordinator::{
     ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution, ReindexSource,
@@ -236,7 +236,32 @@ fn assemble_runtime(
         watcher,
         reconcile_interval,
     } = config;
-    let project_root = index.paths().project_root().to_path_buf();
+    index.paths().revalidate_project_root().map_err(|source| {
+        DaemonAssemblyError::ProjectAuthority {
+            component: "search index",
+            source,
+        }
+    })?;
+    let endpoint_project_id = endpoint_claim.project_id();
+    validate_project_binding("search index", endpoint_project_id, index.project_id())?;
+    validate_project_binding(
+        "reindex coordinator",
+        endpoint_project_id,
+        coordinator.project_id(),
+    )?;
+    if let Some(watcher) = watcher.as_ref() {
+        watcher.paths.revalidate_project_root().map_err(|source| {
+            DaemonAssemblyError::ProjectAuthority {
+                component: "filesystem watcher",
+                source,
+            }
+        })?;
+        validate_project_binding(
+            "filesystem watcher",
+            endpoint_project_id,
+            watcher.project_id(),
+        )?;
+    }
     let query_policy_id = index.status()?.query_policy_id;
     let blocking_tasks = BlockingTaskOwner::new();
     let build_index = index.clone();
@@ -263,7 +288,6 @@ fn assemble_runtime(
     let operations = OperationRegistryOwner::new(
         daemon_instance_id,
         coordinator.coordinator(),
-        project_root,
         query_policy_id,
         admission.clone(),
     );
@@ -290,8 +314,37 @@ fn assemble_runtime(
     })
 }
 
+fn validate_project_binding(
+    component: &'static str,
+    expected: ProjectId,
+    actual: ProjectId,
+) -> Result<(), DaemonAssemblyError> {
+    if expected == actual {
+        return Ok(());
+    }
+    Err(DaemonAssemblyError::ProjectMismatch {
+        component,
+        expected,
+        actual,
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 enum DaemonAssemblyError {
+    #[error("daemon project authority is invalid for {component}: {source}")]
+    ProjectAuthority {
+        component: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
+    #[error(
+        "daemon project mismatch for {component}: endpoint project {expected:?}, component project {actual:?}"
+    )]
+    ProjectMismatch {
+        component: &'static str,
+        expected: ProjectId,
+        actual: ProjectId,
+    },
     #[error("inspect search index before daemon assembly: {0}")]
     SearchIndex(#[from] SearchIndexError),
     #[error("start reindex coordinator: {0}")]
@@ -396,10 +449,24 @@ struct RuntimeComponents {
     coordinator: ReindexCoordinatorRuntime,
     operations: OperationRegistryOwner,
     blocking_tasks: BlockingTaskOwner,
-    _index: SearchIndex,
+    index: SearchIndex,
 }
 
 impl RuntimeComponents {
+    fn revalidate_project_root(
+        &self,
+        publication_boundary: &'static str,
+    ) -> Result<(), DaemonRuntimeError> {
+        self.index
+            .paths()
+            .revalidate_project_root()
+            .map_err(|error| {
+                DaemonRuntimeError::single(format!(
+                    "project authority {publication_boundary}: {error:#}"
+                ))
+            })
+    }
+
     async fn shutdown(&mut self) -> Vec<String> {
         let maintenance_result = self.maintenance.shutdown().await;
         let coordinator_result = self.coordinator.shutdown().await;
@@ -460,7 +527,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
                 coordinator,
                 operations,
                 blocking_tasks,
-                _index: index,
+                index,
             },
             #[cfg(test)]
             panic_stage,
@@ -494,12 +561,16 @@ impl SupervisorState {
         #[cfg(test)]
         self.panic_if_requested(SupervisorPanicStage::BeforePublication);
 
+        self.components
+            .revalidate_project_root("before endpoint publication")?;
         let endpoint = self
             .endpoint_claim
             .publish(self.daemon_instance_id)
             .map_err(|error| {
                 DaemonRuntimeError::single(format!("endpoint publication: {error}"))
             })?;
+        self.components
+            .revalidate_project_root("after endpoint publication")?;
         if endpoint.publication_warning().durability_unconfirmed() {
             eprintln!(
                 "endpoint descriptor published but directory durability could not be confirmed"
@@ -782,14 +853,137 @@ mod tests {
     };
 
     use super::{
-        AdmissionGate, BlockingTaskError, BlockingTaskOwner, DaemonRuntime, DaemonRuntimeParts,
-        SupervisorPanicStage,
+        AdmissionGate, BlockingTaskError, BlockingTaskOwner, DaemonAssemblyError, DaemonRuntime,
+        DaemonRuntimeConfig, DaemonRuntimeParts, SupervisorPanicStage, assemble_runtime,
     };
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution,
     };
     use crate::ipc::{Dispatcher, OperationRegistryOwner};
-    use crate::watcher::MaintenanceRuntime;
+    use crate::watcher::{MaintenanceRuntime, WatcherConfig};
+
+    #[derive(Debug, Clone, Copy)]
+    enum ForeignRuntimeComponent {
+        SearchIndex,
+        Coordinator,
+        Watcher,
+    }
+
+    impl ForeignRuntimeComponent {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::SearchIndex => "search index",
+                Self::Coordinator => "reindex coordinator",
+                Self::Watcher => "filesystem watcher",
+            }
+        }
+    }
+
+    #[test]
+    fn runtime_assembly_rejects_foreign_components_before_endpoint_publication() {
+        for component in [
+            ForeignRuntimeComponent::SearchIndex,
+            ForeignRuntimeComponent::Coordinator,
+            ForeignRuntimeComponent::Watcher,
+        ] {
+            assert_runtime_assembly_rejects_foreign_component(component);
+        }
+    }
+
+    fn assert_runtime_assembly_rejects_foreign_component(component: ForeignRuntimeComponent) {
+        let endpoint_project = crate::secure_test_tempdir();
+        fs::create_dir(endpoint_project.path().join("Assets")).unwrap();
+        fs::create_dir(endpoint_project.path().join("ProjectSettings")).unwrap();
+        let endpoint_locator = ProjectLocatorV1::open(endpoint_project.path()).unwrap();
+
+        let foreign_project = crate::secure_test_tempdir();
+        fs::create_dir(foreign_project.path().join("Assets")).unwrap();
+        fs::create_dir(foreign_project.path().join("ProjectSettings")).unwrap();
+        let foreign_locator = ProjectLocatorV1::open(foreign_project.path()).unwrap();
+
+        let roots = PrivateRootsV1::discover_for_current_context().unwrap();
+        let namespace = roots
+            .runtime()
+            .endpoint_namespace(endpoint_locator.project_id())
+            .unwrap();
+        let cleanup_path = namespace.path().to_path_buf();
+        let endpoint_claim = namespace.claim_daemon_endpoint().unwrap();
+        let endpoint_paths = IndexPaths::for_project(
+            endpoint_locator.root().to_path_buf(),
+            Some(endpoint_project.path().join(".endpoint-index")),
+            None,
+        )
+        .unwrap();
+        let foreign_paths = IndexPaths::for_project(
+            foreign_locator.root().to_path_buf(),
+            Some(foreign_project.path().join(".foreign-index")),
+            None,
+        )
+        .unwrap();
+        let index_paths = match component {
+            ForeignRuntimeComponent::SearchIndex => &foreign_paths,
+            ForeignRuntimeComponent::Coordinator | ForeignRuntimeComponent::Watcher => {
+                &endpoint_paths
+            }
+        };
+        let coordinator_paths = match component {
+            ForeignRuntimeComponent::Coordinator => &foreign_paths,
+            ForeignRuntimeComponent::SearchIndex | ForeignRuntimeComponent::Watcher => {
+                &endpoint_paths
+            }
+        };
+        let mut budget = AssetLoadBudget::default();
+        let index = SearchIndex::open_or_create((*index_paths).clone(), &mut budget).unwrap();
+        let watcher =
+            matches!(component, ForeignRuntimeComponent::Watcher).then(|| WatcherConfig {
+                paths: foreign_paths.clone(),
+            });
+        let config = DaemonRuntimeConfig::new(
+            endpoint_claim,
+            generate_daemon_instance_id().unwrap(),
+            index,
+            ReindexCoordinatorConfig::new(coordinator_paths.project_path_space().clone()),
+        )
+        .with_watcher(watcher);
+
+        let error = match assemble_runtime(config) {
+            Ok(_) => {
+                panic!("foreign {component:?} unexpectedly assembled into the endpoint runtime")
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            DaemonAssemblyError::ProjectMismatch {
+                component: actual_component,
+                expected,
+                actual,
+            } if expected == endpoint_locator.project_id()
+                && actual == foreign_locator.project_id()
+                && actual_component == component.label()
+        ));
+        assert!(matches!(
+            namespace.discover_endpoint(),
+            Err(EndpointStoreError::DescriptorMissing)
+        ));
+        let replacement = namespace.claim_daemon_endpoint().unwrap();
+        drop(replacement);
+        drop(namespace);
+        drop(roots);
+        for name in [
+            "binding.v1",
+            ".binding-v1.lock",
+            ".daemon-v1.lock",
+            "windows-pipe-slot.v1.json",
+        ] {
+            let result = fs::remove_file(cleanup_path.join(name));
+            assert!(
+                result.is_ok()
+                    || result.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+        }
+        fs::remove_dir(cleanup_path).unwrap();
+    }
 
     #[tokio::test]
     async fn synchronous_close_rejects_admission_without_waiting_for_an_existing_permit() {
@@ -1148,13 +1342,11 @@ mod tests {
             let index = SearchIndex::open_or_create(index_paths.clone(), &mut budget).unwrap();
             let query_policy_id = index.status().unwrap().query_policy_id;
 
-            let project_root = locator.root().to_path_buf();
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
             let (release_sender, release_receiver) = mpsc::channel();
             let runtime = start_fixture_runtime(
                 endpoint_claim,
                 daemon_instance_id,
-                project_root,
                 query_policy_id,
                 index,
                 started_sender,
@@ -1300,7 +1492,6 @@ mod tests {
     fn start_fixture_runtime(
         endpoint_claim: EndpointClaimV1,
         daemon_instance_id: DaemonInstanceId,
-        project_root: PathBuf,
         query_policy_id: unity_asset_search_protocol::QueryPolicyId,
         index: SearchIndex,
         started: mpsc::SyncSender<()>,
@@ -1320,7 +1511,7 @@ mod tests {
             }));
 
             let coordinator = ReindexCoordinatorRuntime::start(
-                ReindexCoordinatorConfig::new(&project_root),
+                ReindexCoordinatorConfig::new(index.paths().project_path_space().clone()),
                 |_| async {
                     Err::<ReindexExecution, _>(anyhow::anyhow!(
                         "lifecycle fixture must not execute a reindex"
@@ -1331,7 +1522,6 @@ mod tests {
             let operations = OperationRegistryOwner::new(
                 daemon_instance_id,
                 coordinator.coordinator(),
-                project_root,
                 query_policy_id,
                 admission.clone(),
             );

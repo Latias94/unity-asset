@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticError, DigestBuildError, DigestV1,
     DigestV1Builder, FieldPath, FieldPathError, FieldPathSegment, ObjectAddress, SourceLocator,
-    string_allocation_bytes, vec_allocation_bytes,
+    YamlDocumentSelector, string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_search_core::{SearchKind, TryToTermsError, try_to_terms};
 
@@ -16,6 +16,7 @@ use crate::analysis::{
     GuidProjection, RawReferenceProjection, ReferenceDependencyKey, ReferenceProjectionFact,
     ReferenceResolutionProjection,
 };
+use crate::generation::GenerationStorageContract;
 
 #[derive(Debug)]
 pub(crate) enum ProjectionError {
@@ -620,7 +621,7 @@ fn reference_stable_id(
         ),
         "reference stable ID",
     )?;
-    digest_key("reference-v1:", digest, "reference stable ID", budget)
+    digest_key("reference-v2:", digest, "reference stable ID", budget)
 }
 
 fn append_raw_target_keys(
@@ -688,12 +689,95 @@ fn append_dependency_keys(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn reference_object_key(address: &ObjectAddress) -> String {
-    let digest = match streaming_json_digest(address, "query object key") {
-        Ok(digest) => digest,
-        Err(_) => DigestV1::hash_bytes(b"invalid-query-object-key"),
+    reference_object_key_for(GenerationStorageContract::CurrentV2, address)
+}
+
+pub(crate) fn reference_object_key_for(
+    storage: GenerationStorageContract,
+    address: &ObjectAddress,
+) -> String {
+    let digest = match storage {
+        GenerationStorageContract::LegacyV1 => legacy_object_address_digest(address)
+            .unwrap_or_else(|_| DigestV1::hash_bytes(b"invalid-legacy-query-object-key")),
+        GenerationStorageContract::CurrentV2 => streaming_json_digest(address, "query object key")
+            .unwrap_or_else(|_| DigestV1::hash_bytes(b"invalid-query-object-key")),
     };
-    digest_key_unbudgeted("object-v1:", digest)
+    let prefix = match storage {
+        GenerationStorageContract::LegacyV1 => "object-v1:",
+        GenerationStorageContract::CurrentV2 => "object-v2:",
+    };
+    digest_key_unbudgeted(prefix, digest)
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum LegacyObjectAddressRef<'address> {
+    BinaryDirect {
+        version: u8,
+        source: &'address SourceLocator,
+        path_id: i64,
+    },
+    BinaryBundleMember {
+        version: u8,
+        source: &'address SourceLocator,
+        path_id: i64,
+    },
+    Yaml {
+        version: u8,
+        source: &'address SourceLocator,
+        selector: LegacyYamlSelector,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum LegacyYamlSelector {
+    Anchored { anchor: String },
+    Unanchored { document_index: u32 },
+}
+
+fn legacy_object_address_digest(address: &ObjectAddress) -> Result<DigestV1, ProjectionError> {
+    let wire = match address.kind() {
+        unity_asset_core::ObjectKind::Binary => {
+            let path_id = address
+                .binary_path_id()
+                .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+            if address.bundle_member().is_some() {
+                LegacyObjectAddressRef::BinaryBundleMember {
+                    version: 1,
+                    source: address.source_locator(),
+                    path_id,
+                }
+            } else {
+                LegacyObjectAddressRef::BinaryDirect {
+                    version: 1,
+                    source: address.source_locator(),
+                    path_id,
+                }
+            }
+        }
+        unity_asset_core::ObjectKind::Yaml => {
+            let selector = match address.yaml_selector() {
+                Some(YamlDocumentSelector::FileId { file_id }) => LegacyYamlSelector::Anchored {
+                    anchor: file_id.to_string(),
+                },
+                Some(YamlDocumentSelector::Unanchored { document_index }) => {
+                    LegacyYamlSelector::Unanchored {
+                        document_index: *document_index,
+                    }
+                }
+                None => return Err(BudgetError::ArithmeticOverflow { resource: "bytes" }.into()),
+            };
+            LegacyObjectAddressRef::Yaml {
+                version: 1,
+                source: address.source_locator(),
+                selector,
+            }
+        }
+    };
+    streaming_json_digest(&wire, "legacy query object key")
 }
 
 fn reference_object_key_budgeted(
@@ -701,7 +785,7 @@ fn reference_object_key_budgeted(
     budget: &mut AssetLoadBudget,
 ) -> Result<String, ProjectionError> {
     let digest = streaming_json_digest(address, "object reference key")?;
-    digest_key("object-v1:", digest, "object reference key", budget)
+    digest_key("object-v2:", digest, "object reference key", budget)
 }
 
 pub(crate) fn reference_guid_key(guid: &str, file_id: Option<i64>) -> String {
@@ -1438,6 +1522,7 @@ mod tests {
     use crate::analysis::{AnalysisMetrics, AnalyzedSource, SearchFacts};
     use unity_asset_core::{
         AssetLoadLimits, AssetLoadUsage, DiagnosticSeverity, WorkspaceId, WorkspaceRevision,
+        YamlFileId,
     };
 
     fn analyzed_asset(search: SearchFacts) -> AssetAnalysis {
@@ -1538,7 +1623,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_reference_identity_preserves_the_existing_json_digest_domain() {
+    fn streaming_reference_identity_uses_the_v2_prefix_and_exact_json_digest() {
         let asset = analyzed_asset(SearchFacts::default());
         let fact = ReferenceProjectionFact {
             source_object: None,
@@ -1565,7 +1650,7 @@ mod tests {
         ))
         .unwrap();
         let expected = format!(
-            "reference-v1:{}",
+            "reference-v2:{}",
             hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
         );
         let mut budget = AssetLoadBudget::default();
@@ -1573,6 +1658,18 @@ mod tests {
         assert_eq!(
             reference_stable_id(&asset, &fact, ordinal, &mut budget).unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn reference_object_keys_distinguish_equal_numeric_file_ids_and_ordinals() {
+        let locator = SourceLocator::path("Assets/Scene.unity").unwrap();
+        let file_id = ObjectAddress::yaml(locator.clone(), YamlFileId::new(1).unwrap()).unwrap();
+        let ordinal = ObjectAddress::yaml_document(locator, 1).unwrap();
+
+        assert_ne!(
+            reference_object_key(&file_id),
+            reference_object_key(&ordinal)
         );
     }
 

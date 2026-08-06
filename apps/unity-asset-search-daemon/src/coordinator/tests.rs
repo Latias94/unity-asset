@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -9,22 +9,34 @@ use super::{
     ReindexScopeKind, ReindexSource,
 };
 use tokio::sync::{Mutex, Semaphore};
-use unity_asset_search_index::{FilesystemReindexIntent, FilesystemReindexScope};
+use unity_asset_search_index::{
+    FilesystemReindexIntent, FilesystemReindexScope, IndexPaths, ProjectPathSpace,
+};
 use unity_asset_search_protocol::{
     GenerationStatus, PortablePath, QueryPolicyId, ReindexDisposition, ReindexReceipt,
     SEARCH_PROTOCOL_REVISION, SearchCapabilities, StatusResponse,
 };
 
-fn project_root() -> PathBuf {
-    if cfg!(windows) {
-        PathBuf::from(r"C:\unity-asset-coordinator-tests")
-    } else {
-        PathBuf::from("/unity-asset-coordinator-tests")
-    }
+fn project_paths() -> ProjectPathSpace {
+    let project = crate::secure_test_tempdir();
+    let assets = project.path().join("Assets");
+    std::fs::create_dir(&assets).expect("create coordinator Assets root");
+    let index_root = project.path().join(".unity-asset-index");
+    let paths = IndexPaths::for_project(
+        project.path().to_path_buf(),
+        Some(index_root),
+        Some(vec![assets]),
+    )
+    .expect("create coordinator project path space");
+    paths.project_path_space().clone()
 }
 
 fn config() -> ReindexCoordinatorConfig {
-    ReindexCoordinatorConfig::new(project_root())
+    config_for(project_paths())
+}
+
+fn config_for(project_paths: ProjectPathSpace) -> ReindexCoordinatorConfig {
+    ReindexCoordinatorConfig::new(project_paths)
         .with_debounce(Duration::from_millis(20))
         .with_max_debounce(Duration::from_millis(100))
 }
@@ -74,8 +86,12 @@ fn execution(intent: &FilesystemReindexIntent) -> ReindexExecution {
     ReindexExecution::new(receipt, status)
 }
 
-fn changed(path: impl AsRef<Path>) -> FilesystemReindexIntent {
-    FilesystemReindexIntent::changed_paths(vec![path.as_ref().to_path_buf()])
+fn changed(project_paths: &ProjectPathSpace, path: impl AsRef<Path>) -> FilesystemReindexIntent {
+    FilesystemReindexIntent::changed_paths(
+        project_paths
+            .resolve_set([path])
+            .expect("resolve coordinator changed path"),
+    )
 }
 
 async fn wait_for_idle(coordinator: &ReindexCoordinator) {
@@ -101,7 +117,7 @@ async fn wait_for_completion(
 #[test]
 fn invalid_configuration_is_rejected_before_runner_start() {
     let invalid = ReindexCoordinatorRuntime::start(
-        ReindexCoordinatorConfig::new("relative"),
+        ReindexCoordinatorConfig::new(project_paths()).with_debounce(Duration::ZERO),
         |intent| async move { Ok(execution(&intent)) },
     );
     assert!(matches!(
@@ -112,11 +128,12 @@ fn invalid_configuration_is_rejected_before_runner_start() {
 
 #[tokio::test]
 async fn all_boundaries_share_one_serial_coalescing_window() {
+    let project_paths = project_paths();
     let builds = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let overlapped = Arc::new(AtomicBool::new(false));
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let _runtime = ReindexCoordinatorRuntime::start(config(), {
+    let _runtime = ReindexCoordinatorRuntime::start(config_for(project_paths.clone()), {
         let builds = Arc::clone(&builds);
         let active = Arc::clone(&active);
         let overlapped = Arc::clone(&overlapped);
@@ -147,7 +164,10 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
         (ReindexSource::Timer, "Assets/timer.prefab"),
         (ReindexSource::Ipc, "Assets/ipc.prefab"),
     ] {
-        coordinator.admit(source, changed(path)).await.unwrap();
+        coordinator
+            .admit(source, changed(&project_paths, path))
+            .await
+            .unwrap();
     }
     wait_for_idle(&coordinator).await;
 
@@ -162,9 +182,10 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
 }
 
 #[tokio::test]
-async fn changed_paths_are_normalized_and_outside_paths_fail_closed() {
+async fn changed_paths_are_normalized_and_cross_project_paths_fail_closed() {
+    let owned_project_paths = project_paths();
     let observed = Arc::new(Mutex::new(Vec::new()));
-    let _runtime = ReindexCoordinatorRuntime::start(config(), {
+    let _runtime = ReindexCoordinatorRuntime::start(config_for(owned_project_paths.clone()), {
         let observed = Arc::clone(&observed);
         move |intent| {
             let observed = Arc::clone(&observed);
@@ -179,7 +200,7 @@ async fn changed_paths_are_normalized_and_outside_paths_fail_closed() {
     coordinator
         .admit(
             ReindexSource::Ipc,
-            changed(project_root().join("Assets/../Assets/hero.prefab")),
+            changed(&owned_project_paths, "Assets/../Assets/hero.prefab"),
         )
         .await
         .unwrap();
@@ -188,15 +209,20 @@ async fn changed_paths_are_normalized_and_outside_paths_fail_closed() {
     let FilesystemReindexScope::ChangedPaths { paths } = &intents[0].scope else {
         panic!("changed path admission must remain incremental");
     };
-    assert_eq!(paths, &[PathBuf::from("Assets/hero.prefab")]);
+    assert_eq!(
+        paths
+            .iter()
+            .map(|path| path.as_relative_path())
+            .collect::<Vec<_>>(),
+        [Path::new("Assets/hero.prefab")]
+    );
     drop(intents);
 
-    let outside = project_root().parent().unwrap().join("outside.prefab");
+    let foreign_paths = project_paths();
+    let foreign = changed(&foreign_paths, "Assets/foreign.prefab");
     assert!(matches!(
-        coordinator
-            .admit(ReindexSource::Ipc, changed(outside))
-            .await,
-        Err(CoordinatorError::PathOutsideProject { .. })
+        coordinator.admit(ReindexSource::Ipc, foreign).await,
+        Err(CoordinatorError::ChangedPathProjectMismatch { .. })
     ));
 }
 

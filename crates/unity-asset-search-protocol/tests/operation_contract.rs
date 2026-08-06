@@ -1,17 +1,17 @@
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, CapabilitiesRequest, DaemonInstanceId, FilesystemReindexIntent,
-    OperationId, ProjectId, QueryPolicyId, ReferenceRequest, ReindexAdmitRequest,
-    ReindexCancelRequest, ReindexOperationState, ReindexOperationStatus, ReindexStatusRequest,
-    ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope,
-    ResponseOperation, SearchRequest, ShutdownRequest, ShutdownResponse, StatusRequest,
-    SuggestRequest, ValidateContract,
+    ApiError, ApiErrorCode, BUSINESS_PROTOCOL_REVISION, CapabilitiesRequest, DaemonInstanceId,
+    FilesystemReindexIntent, OperationId, ProjectId, QueryPolicyId, ReferenceRequest,
+    ReindexAdmitRequest, ReindexCancelRequest, ReindexOperationState, ReindexOperationStatus,
+    ReindexStatusRequest, ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation,
+    ResponseEnvelope, ResponseOperation, SearchRequest, ShutdownRequest, ShutdownResponse,
+    StatusRequest, SuggestRequest, ValidateContract,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
 
 fn envelope(operation: RequestOperation) -> RequestEnvelope {
     RequestEnvelope::new(
-        2,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([1; 16]),
         ProjectId::from_bytes([2; 32]),
         DaemonInstanceId::from_bytes([3; 16]),
@@ -69,7 +69,7 @@ fn search_zero_is_empty_by_contract_and_over_limit_is_rejected() {
 
     assert!(
         RequestEnvelope::new(
-            2,
+            BUSINESS_PROTOCOL_REVISION,
             RequestId::from_bytes([1; 16]),
             ProjectId::from_bytes([2; 32]),
             DaemonInstanceId::from_bytes([3; 16]),
@@ -87,7 +87,7 @@ fn search_zero_is_empty_by_contract_and_over_limit_is_rejected() {
 fn suggest_limit_is_nonzero_and_bounded() {
     assert!(
         RequestEnvelope::new(
-            2,
+            BUSINESS_PROTOCOL_REVISION,
             RequestId::from_bytes([1; 16]),
             ProjectId::from_bytes([2; 32]),
             DaemonInstanceId::from_bytes([3; 16]),
@@ -105,7 +105,7 @@ fn suggest_limit_is_nonzero_and_bounded() {
     }));
     assert!(
         RequestEnvelope::new(
-            2,
+            BUSINESS_PROTOCOL_REVISION,
             RequestId::from_bytes([1; 16]),
             ProjectId::from_bytes([2; 32]),
             DaemonInstanceId::from_bytes([3; 16]),

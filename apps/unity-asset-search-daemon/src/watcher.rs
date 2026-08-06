@@ -1,7 +1,6 @@
 //! Supervised filesystem watching and independent periodic reconciliation.
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +10,11 @@ use notify::Watcher as _;
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
-use unity_asset_search_index::{FilesystemReindexIntent, is_search_ignore_v1_file_name};
-use unity_asset_search_protocol::ApiError;
+use unity_asset_search_index::{
+    FilesystemReindexIntent, IndexPaths, ProjectPath, ProjectPathSet, ProjectPathSpace,
+    is_search_ignore_v1_file_name,
+};
+use unity_asset_search_protocol::{ApiError, ProjectId};
 
 use crate::coordinator::ReindexSource;
 use crate::ipc::OperationRegistry;
@@ -23,9 +25,14 @@ const MAXIMUM_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub struct WatcherConfig {
-    pub scan_roots: Vec<PathBuf>,
-    pub project_root: PathBuf,
-    pub index_namespace_exclusion: Option<PathBuf>,
+    pub paths: IndexPaths,
+}
+
+impl WatcherConfig {
+    #[must_use]
+    pub(crate) fn project_id(&self) -> ProjectId {
+        self.paths.project_id()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +261,7 @@ struct WatcherEventStream {
 }
 
 enum WatcherSessionEvent {
-    Changed(Vec<PathBuf>),
+    Changed(ProjectPathSet),
     Overflow,
     Failed(String),
     Closed,
@@ -262,12 +269,13 @@ enum WatcherSessionEvent {
 
 #[derive(Debug, PartialEq, Eq)]
 enum WatchSignal {
-    Changed(Vec<PathBuf>),
+    Changed(ProjectPathSet),
     Rescan,
 }
 
 impl WatcherFactory for NotifyWatcherFactory {
     fn open(&self, config: &WatcherConfig) -> anyhow::Result<Box<dyn WatcherSession>> {
+        config.paths.revalidate_project_root()?;
         let (event_sender, event_receiver) = mpsc::channel(WATCH_CHANNEL_CAPACITY);
         let (failure_sender, failure_receiver) = watch::channel(None::<String>);
         let overflowed = Arc::new(AtomicBool::new(false));
@@ -275,16 +283,17 @@ impl WatcherFactory for NotifyWatcherFactory {
         let callback_events = event_sender.clone();
         let callback_failures = failure_sender.clone();
         let callback_overflowed = Arc::clone(&overflowed);
-        let event_project_root = config.project_root.clone();
-        let index_namespace_exclusion = config.index_namespace_exclusion.clone();
+        let project_paths = config.paths.project_path_space().clone();
+        let event_project_paths = project_paths.clone();
+        let index_namespace_exclusion = typed_index_namespace_exclusion(&config.paths)?;
         let mut event_watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                 match event {
                     Ok(event) => send_watch_signal(
                         watch_signal(
                             event,
-                            &event_project_root,
-                            index_namespace_exclusion.as_deref(),
+                            &event_project_paths,
+                            index_namespace_exclusion.as_ref(),
                         ),
                         &callback_events,
                         &callback_overflowed,
@@ -295,26 +304,27 @@ impl WatcherFactory for NotifyWatcherFactory {
                 }
             })?;
 
-        for root in &config.scan_roots {
+        for root in config.paths.scan_roots() {
             event_watcher.watch(root, notify::RecursiveMode::Recursive)?;
         }
 
         let root_watcher = if config
-            .scan_roots
+            .paths
+            .scan_roots()
             .iter()
-            .any(|root| root == &config.project_root)
+            .any(|root| root == config.paths.project_root())
         {
             None
         } else {
             let root_events = event_sender.clone();
             let root_failures = failure_sender;
             let root_overflowed = Arc::clone(&overflowed);
-            let watched_project_root = config.project_root.clone();
+            let root_project_paths = project_paths;
             let mut root_watcher =
                 notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
                     match event {
                         Ok(event) => send_watch_signal(
-                            project_root_watch_signal(event, &watched_project_root),
+                            project_root_watch_signal(event, &root_project_paths),
                             &root_events,
                             &root_overflowed,
                         ),
@@ -323,9 +333,13 @@ impl WatcherFactory for NotifyWatcherFactory {
                         }
                     }
                 })?;
-            root_watcher.watch(&config.project_root, notify::RecursiveMode::NonRecursive)?;
+            root_watcher.watch(
+                config.paths.project_root(),
+                notify::RecursiveMode::NonRecursive,
+            )?;
             Some(root_watcher)
         };
+        config.paths.revalidate_project_root()?;
         drop(event_sender);
 
         Ok(Box::new(NotifyWatcherSession {
@@ -338,6 +352,16 @@ impl WatcherFactory for NotifyWatcherFactory {
             },
         }))
     }
+}
+
+fn typed_index_namespace_exclusion(paths: &IndexPaths) -> anyhow::Result<Option<ProjectPath>> {
+    let Some(exclusion) = paths.index_namespace_exclusion() else {
+        return Ok(None);
+    };
+    let Some(exclusion) = paths.project_path_space().resolve(exclusion)? else {
+        anyhow::bail!("private index namespace exclusion resolved to the project root");
+    };
+    Ok(Some(exclusion))
 }
 
 impl WatcherSession for NotifyWatcherSession {
@@ -606,173 +630,64 @@ async fn reconcile_loop(
 
 fn watch_signal(
     event: notify::Event,
-    project_root: &Path,
-    index_namespace_exclusion: Option<&Path>,
+    project_paths: &ProjectPathSpace,
+    index_namespace_exclusion: Option<&ProjectPath>,
 ) -> Option<WatchSignal> {
     if event.need_rescan() {
         return Some(WatchSignal::Rescan);
     }
-    let paths = event
-        .paths
-        .into_iter()
-        .filter(|path| {
-            !index_namespace_exclusion.is_some_and(|root| platform_path_starts_with(path, root))
-        })
-        .filter(|path| {
-            path.file_name().is_none_or(|name| {
-                !is_legacy_ignore_file_name(name)
-                    && (!is_search_ignore_v1_file_name(name)
-                        || is_project_root_search_policy_path(project_root, path))
-            })
-        })
-        .collect::<Vec<_>>();
-    (!paths.is_empty()).then_some(WatchSignal::Changed(paths))
-}
-
-fn project_root_watch_signal(event: notify::Event, project_root: &Path) -> Option<WatchSignal> {
-    if event.need_rescan() {
+    if index_namespace_exclusion.is_some_and(|root| root.project_id() != project_paths.project_id())
+    {
         return Some(WatchSignal::Rescan);
     }
-    let changed = event
-        .paths
-        .into_iter()
-        .filter(|path| is_project_root_search_policy_path(project_root, path))
-        .collect::<Vec<_>>();
+    let resolved = match project_paths.resolve_set(event.paths) {
+        Ok(paths) => paths,
+        Err(_) => return Some(WatchSignal::Rescan),
+    };
+    let mut changed = ProjectPathSet::new(project_paths);
+    for path in resolved.into_paths() {
+        if index_namespace_exclusion.is_some_and(|root| path.is_at_or_below(root)) {
+            continue;
+        }
+        let Some(file_name) = path.file_name() else {
+            return Some(WatchSignal::Rescan);
+        };
+        if is_legacy_ignore_file_name(file_name)
+            || (is_search_ignore_v1_file_name(file_name)
+                && !is_project_root_search_policy_path(&path))
+        {
+            continue;
+        }
+        if changed.insert(path).is_err() {
+            return Some(WatchSignal::Rescan);
+        }
+    }
     (!changed.is_empty()).then_some(WatchSignal::Changed(changed))
 }
 
-fn is_project_root_search_policy_path(project_root: &Path, path: &Path) -> bool {
-    path.parent()
-        .is_some_and(|parent| platform_paths_equal(parent, project_root))
-        && path.file_name().is_some_and(is_search_ignore_v1_file_name)
-}
-
-#[cfg(all(not(windows), not(target_os = "macos")))]
-fn platform_path_starts_with(path: &Path, prefix: &Path) -> bool {
-    path.starts_with(prefix)
-}
-
-#[cfg(all(not(windows), not(target_os = "macos")))]
-fn platform_paths_equal(left: &Path, right: &Path) -> bool {
-    left == right
-}
-
-#[cfg(target_os = "macos")]
-fn platform_path_starts_with(path: &Path, prefix: &Path) -> bool {
-    path.starts_with(prefix)
-        || (path.is_absolute()
-            && prefix.is_absolute()
-            && canonicalize_with_missing_tail(path)
-                .is_some_and(|canonical| canonical.starts_with(prefix)))
-}
-
-#[cfg(target_os = "macos")]
-fn platform_paths_equal(left: &Path, right: &Path) -> bool {
-    left == right
-        || (left.is_absolute()
-            && right.is_absolute()
-            && canonicalize_with_missing_tail(left)
-                .zip(canonicalize_with_missing_tail(right))
-                .is_some_and(|(left, right)| left == right))
-}
-
-#[cfg(target_os = "macos")]
-fn canonicalize_with_missing_tail(path: &Path) -> Option<PathBuf> {
-    let mut existing = path;
-    let mut missing = Vec::new();
-    loop {
-        match std::fs::canonicalize(existing) {
-            Ok(mut canonical) => {
-                for component in missing.iter().rev() {
-                    canonical.push(component);
-                }
-                return Some(canonical);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                missing.push(existing.file_name()?.to_os_string());
-                existing = existing.parent()?;
-            }
-            Err(_) => return None,
-        }
+fn project_root_watch_signal(
+    event: notify::Event,
+    project_paths: &ProjectPathSpace,
+) -> Option<WatchSignal> {
+    if event.need_rescan() {
+        return Some(WatchSignal::Rescan);
     }
-}
-
-#[cfg(windows)]
-fn platform_path_starts_with(path: &Path, prefix: &Path) -> bool {
-    let mut components = path.components();
-    prefix.components().all(|expected| {
-        components
-            .next()
-            .is_some_and(|actual| windows_path_component_eq(actual, expected))
-    })
-}
-
-#[cfg(windows)]
-fn platform_paths_equal(left: &Path, right: &Path) -> bool {
-    left.components().count() == right.components().count()
-        && platform_path_starts_with(left, right)
-}
-
-#[cfg(windows)]
-fn windows_path_component_eq(
-    left: std::path::Component<'_>,
-    right: std::path::Component<'_>,
-) -> bool {
-    use std::path::Component;
-
-    match (left, right) {
-        (Component::Prefix(left), Component::Prefix(right)) => {
-            windows_prefix_eq(left.kind(), right.kind())
-        }
-        (Component::RootDir, Component::RootDir)
-        | (Component::CurDir, Component::CurDir)
-        | (Component::ParentDir, Component::ParentDir) => true,
-        (Component::Normal(left), Component::Normal(right)) => windows_os_str_eq(left, right),
-        _ => false,
-    }
-}
-
-#[cfg(windows)]
-fn windows_prefix_eq(left: std::path::Prefix<'_>, right: std::path::Prefix<'_>) -> bool {
-    use std::path::Prefix;
-
-    match (left, right) {
-        (Prefix::Disk(left), Prefix::Disk(right))
-        | (Prefix::Disk(left), Prefix::VerbatimDisk(right))
-        | (Prefix::VerbatimDisk(left), Prefix::Disk(right))
-        | (Prefix::VerbatimDisk(left), Prefix::VerbatimDisk(right)) => {
-            left.eq_ignore_ascii_case(&right)
-        }
-        (Prefix::UNC(left_server, left_share), Prefix::UNC(right_server, right_share))
-        | (Prefix::UNC(left_server, left_share), Prefix::VerbatimUNC(right_server, right_share))
-        | (Prefix::VerbatimUNC(left_server, left_share), Prefix::UNC(right_server, right_share))
-        | (
-            Prefix::VerbatimUNC(left_server, left_share),
-            Prefix::VerbatimUNC(right_server, right_share),
-        ) => {
-            windows_os_str_eq(left_server, right_server)
-                && windows_os_str_eq(left_share, right_share)
-        }
-        _ => false,
-    }
-}
-
-#[cfg(windows)]
-fn windows_os_str_eq(left: &std::ffi::OsStr, right: &std::ffi::OsStr) -> bool {
-    use std::os::windows::ffi::OsStrExt as _;
-
-    use windows_sys::Win32::Globalization::{CSTR_EQUAL, CompareStringOrdinal};
-
-    let left = left.encode_wide().collect::<Vec<_>>();
-    let right = right.encode_wide().collect::<Vec<_>>();
-    let (Ok(left_len), Ok(right_len)) = (i32::try_from(left.len()), i32::try_from(right.len()))
-    else {
-        return false;
+    let resolved = match project_paths.resolve_set(event.paths) {
+        Ok(paths) => paths,
+        Err(_) => return Some(WatchSignal::Rescan),
     };
-    // SAFETY: both encoded buffers remain live for their exact lengths during the call.
-    unsafe {
-        CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == CSTR_EQUAL
+    let mut changed = ProjectPathSet::new(project_paths);
+    for path in resolved.into_paths() {
+        if is_project_root_search_policy_path(&path) && changed.insert(path).is_err() {
+            return Some(WatchSignal::Rescan);
+        }
     }
+    (!changed.is_empty()).then_some(WatchSignal::Changed(changed))
+}
+
+fn is_project_root_search_policy_path(path: &ProjectPath) -> bool {
+    path.as_relative_path().components().count() == 1
+        && path.file_name().is_some_and(is_search_ignore_v1_file_name)
 }
 
 #[cfg(not(windows))]
@@ -812,7 +727,9 @@ mod tests {
     use std::time::Duration;
 
     use tokio::sync::{mpsc, watch};
-    use unity_asset_search_index::{FilesystemReindexIntent, FilesystemReindexScope};
+    use unity_asset_search_index::{
+        FilesystemReindexIntent, FilesystemReindexScope, IndexPaths, ProjectPath, ProjectPathSet,
+    };
     use unity_asset_search_protocol::{ApiError, ApiErrorCode};
 
     use super::{
@@ -820,10 +737,8 @@ mod tests {
         TimerLifecycle, WatchSignal, WatcherConfig, WatcherEventFuture, WatcherEventStream,
         WatcherFactory, WatcherLifecycle, WatcherSession, WatcherSessionEvent,
         is_project_root_search_policy_path, project_root_watch_signal, report_backend_failure,
-        run_watcher_session, send_watch_signal, watch_signal,
+        run_watcher_session, send_watch_signal, typed_index_namespace_exclusion, watch_signal,
     };
-    #[cfg(any(windows, target_os = "macos"))]
-    use super::{platform_path_starts_with, platform_paths_equal};
     use crate::coordinator::ReindexSource;
 
     #[derive(Default)]
@@ -945,11 +860,85 @@ mod tests {
         }
     }
 
-    fn watcher_config() -> WatcherConfig {
-        WatcherConfig {
-            scan_roots: vec![PathBuf::from("project/Assets")],
-            project_root: PathBuf::from("project"),
-            index_namespace_exclusion: Some(PathBuf::from("index")),
+    struct WatcherFixture {
+        config: WatcherConfig,
+        project_input: PathBuf,
+        _temporary: tempfile::TempDir,
+    }
+
+    impl WatcherFixture {
+        fn new() -> Self {
+            let temporary = crate::secure_test_tempdir();
+            let project_input = temporary.path().join("Project");
+            let index_base = project_input.join("Assets").join("SearchIndex");
+            Self::create(temporary, project_input, index_base)
+        }
+
+        fn with_ancestor_index() -> Self {
+            let temporary = crate::secure_test_tempdir();
+            let index_base = temporary.path().join("IndexAndProjects");
+            let bootstrap = temporary.path().join("Bootstrap");
+            let bootstrap_assets = bootstrap.join("Assets");
+            std::fs::create_dir_all(&bootstrap_assets)
+                .expect("bootstrap scan root should be created");
+            IndexPaths::for_project(
+                bootstrap,
+                Some(index_base.clone()),
+                Some(vec![bootstrap_assets]),
+            )
+            .expect("ancestor index namespace should be initialized");
+            let project_input = index_base.join("Project");
+            Self::create(temporary, project_input, index_base)
+        }
+
+        fn create(
+            temporary: tempfile::TempDir,
+            project_input: PathBuf,
+            index_base: PathBuf,
+        ) -> Self {
+            let assets = project_input.join("Assets");
+            std::fs::create_dir_all(&assets).expect("project scan root should be created");
+            let paths = IndexPaths::for_project(
+                project_input.clone(),
+                Some(index_base),
+                Some(vec![assets]),
+            )
+            .expect("watcher fixture paths should be valid");
+            Self {
+                config: WatcherConfig { paths },
+                project_input,
+                _temporary: temporary,
+            }
+        }
+
+        fn event_path(&self, relative: impl AsRef<Path>) -> PathBuf {
+            self.project_input.join(relative)
+        }
+
+        fn project_path(&self, relative: impl AsRef<Path>) -> ProjectPath {
+            self.config
+                .paths
+                .project_path_space()
+                .resolve(relative.as_ref())
+                .expect("fixture path should resolve")
+                .expect("fixture path should not denote the project root")
+        }
+
+        fn changed_paths<I, P>(&self, paths: I) -> ProjectPathSet
+        where
+            I: IntoIterator<Item = P>,
+            P: AsRef<Path>,
+        {
+            self.config
+                .paths
+                .project_path_space()
+                .resolve_set(paths)
+                .expect("fixture changed paths should resolve")
+        }
+
+        fn index_namespace_exclusion(&self) -> Option<ProjectPath> {
+            typed_index_namespace_exclusion(&self.config.paths)
+                .expect("fixture index namespace should resolve")
         }
     }
 
@@ -966,59 +955,79 @@ mod tests {
 
     #[test]
     fn only_the_project_root_search_policy_is_watched_outside_scan_roots() {
-        let root = Path::new("project");
+        let fixture = WatcherFixture::new();
 
         assert!(!is_project_root_search_policy_path(
-            root,
-            Path::new("project/.gitignore")
+            &fixture.project_path(".gitignore")
         ));
         assert!(!is_project_root_search_policy_path(
-            root,
-            Path::new("project/.ignore")
+            &fixture.project_path(".ignore")
         ));
         assert!(is_project_root_search_policy_path(
-            root,
-            Path::new("project/.unity-asset-search-ignore")
+            &fixture.project_path(".unity-asset-search-ignore")
         ));
         #[cfg(any(windows, target_os = "macos"))]
         assert!(is_project_root_search_policy_path(
-            root,
-            Path::new("project/.UNITY-ASSET-SEARCH-IGNORE")
+            &fixture.project_path(".UNITY-ASSET-SEARCH-IGNORE")
         ));
         #[cfg(not(any(windows, target_os = "macos")))]
         assert!(!is_project_root_search_policy_path(
-            root,
-            Path::new("project/.UNITY-ASSET-SEARCH-IGNORE")
+            &fixture.project_path(".UNITY-ASSET-SEARCH-IGNORE")
         ));
         assert!(!is_project_root_search_policy_path(
-            root,
-            Path::new("project/Assets/.unity-asset-search-ignore")
+            &fixture.project_path("Assets/.unity-asset-search-ignore")
         ));
         assert!(!is_project_root_search_policy_path(
-            root,
-            Path::new("project/README.md")
+            &fixture.project_path("README.md")
         ));
     }
 
     #[test]
-    fn scan_root_events_filter_the_complete_index_namespace_without_policy_aliases() {
+    fn project_root_watcher_forwards_only_the_root_search_policy() {
+        let fixture = WatcherFixture::new();
         let event = notify::Event {
             kind: notify::EventKind::Any,
             paths: vec![
-                PathBuf::from("project/Assets/Foo.prefab"),
-                PathBuf::from("project/Assets/.gitignore"),
-                PathBuf::from("project/Assets/.unity-asset-search-ignore"),
-                PathBuf::from("project/.unity-asset-search-ignore"),
-                PathBuf::from("project/Assets/SearchIndex/index-v1-a/generation.bin"),
-                PathBuf::from("project/Assets/SearchIndex/index-v1-b/generation.bin"),
+                fixture.event_path(".unity-asset-search-ignore"),
+                fixture.event_path(".gitignore"),
+                fixture.event_path("Assets/.unity-asset-search-ignore"),
+                fixture.event_path("README.md"),
             ],
             attrs: notify::event::EventAttributes::new(),
         };
 
+        let signal = project_root_watch_signal(event, fixture.config.paths.project_path_space())
+            .expect("root policy should be forwarded");
+        let WatchSignal::Changed(paths) = signal else {
+            panic!("root policy should remain an incremental signal")
+        };
+        assert_eq!(paths, fixture.changed_paths([".unity-asset-search-ignore"]));
+    }
+
+    #[test]
+    fn scan_root_events_filter_the_complete_index_namespace_without_policy_aliases() {
+        let fixture = WatcherFixture::new();
+        let event = notify::Event {
+            kind: notify::EventKind::Any,
+            paths: vec![
+                fixture.event_path("Assets/Foo.prefab"),
+                fixture.event_path("Assets/.gitignore"),
+                fixture.event_path("Assets/.ignore"),
+                fixture.event_path("Assets/.unity-asset-search-ignore"),
+                fixture.event_path(".unity-asset-search-ignore"),
+                fixture.event_path("Assets/SearchIndex/index-v1-a/generation.bin"),
+                fixture.event_path("Assets/SearchIndex/index-v1-b/generation.bin"),
+            ],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        let namespace = fixture
+            .index_namespace_exclusion()
+            .expect("nested fixture index namespace should be excludable");
+
         let signal = watch_signal(
             event,
-            Path::new("project"),
-            Some(Path::new("project/Assets/SearchIndex")),
+            fixture.config.paths.project_path_space(),
+            Some(&namespace),
         )
         .expect("source paths must be forwarded");
         let WatchSignal::Changed(paths) = signal else {
@@ -1026,47 +1035,47 @@ mod tests {
         };
         assert_eq!(
             paths,
-            vec![
-                PathBuf::from("project/Assets/Foo.prefab"),
-                PathBuf::from("project/.unity-asset-search-ignore"),
-            ]
+            fixture.changed_paths(["Assets/Foo.prefab", ".unity-asset-search-ignore"])
         );
         assert!(!is_project_root_search_policy_path(
-            Path::new("project"),
-            Path::new("project/.gitignore")
+            &fixture.project_path(".gitignore")
         ));
     }
 
     #[test]
     fn an_ancestor_index_namespace_never_filters_project_events() {
+        let fixture = WatcherFixture::with_ancestor_index();
+        assert_eq!(fixture.index_namespace_exclusion(), None);
         let event = notify::Event {
             kind: notify::EventKind::Any,
-            paths: vec![PathBuf::from("private-base/project/Assets/Foo.prefab")],
+            paths: vec![fixture.event_path("Assets/Foo.prefab")],
             attrs: notify::event::EventAttributes::new(),
         };
 
-        let signal = watch_signal(event, Path::new("private-base/project"), None)
+        let signal = watch_signal(event, fixture.config.paths.project_path_space(), None)
             .expect("an ancestor namespace must not suppress project events");
         let WatchSignal::Changed(paths) = signal else {
             panic!("ordinary source paths must remain an incremental signal")
         };
 
-        assert_eq!(
-            paths,
-            [PathBuf::from("private-base/project/Assets/Foo.prefab")]
-        );
+        assert_eq!(paths, fixture.changed_paths(["Assets/Foo.prefab"]));
     }
 
     #[tokio::test]
     async fn backend_rescan_without_paths_escalates_to_overflow_for_both_watchers() {
+        let fixture = WatcherFixture::new();
         let event =
             notify::Event::new(notify::EventKind::Any).set_flag(notify::event::Flag::Rescan);
         assert_eq!(
-            watch_signal(event.clone(), Path::new("project"), None),
+            watch_signal(
+                event.clone(),
+                fixture.config.paths.project_path_space(),
+                None,
+            ),
             Some(WatchSignal::Rescan)
         );
         assert_eq!(
-            project_root_watch_signal(event, Path::new("project")),
+            project_root_watch_signal(event, fixture.config.paths.project_path_space()),
             Some(WatchSignal::Rescan)
         );
 
@@ -1090,83 +1099,107 @@ mod tests {
         ));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
-    fn watcher_recovers_apfs_case_aliases_for_deleted_namespace_events() {
-        let temporary = tempfile::tempdir().unwrap();
-        let project = temporary.path().join("Project");
-        let namespace = project.join("Assets").join("SearchIndex");
-        std::fs::create_dir_all(&namespace).unwrap();
-        let project_alias = temporary.path().join("project");
-        if !project_alias.exists() {
-            return;
-        }
-        let deleted_alias = project_alias
-            .join("assets")
-            .join("searchindex")
-            .join("deleted-generation.bin");
-        let canonical_project = std::fs::canonicalize(&project).unwrap();
-        let canonical_namespace = std::fs::canonicalize(&namespace).unwrap();
-
-        assert!(platform_paths_equal(&project_alias, &canonical_project));
-        assert!(platform_path_starts_with(
-            &deleted_alias,
-            &canonical_namespace
-        ));
-
+    fn any_event_path_conversion_failure_escalates_the_whole_batch_to_rescan() {
+        let fixture = WatcherFixture::new();
+        let outside = fixture
+            .project_input
+            .parent()
+            .expect("fixture project should have a parent")
+            .join("Outside.asset");
         let event = notify::Event {
             kind: notify::EventKind::Any,
-            paths: vec![deleted_alias],
+            paths: vec![fixture.event_path("Assets/Foo.prefab"), outside],
             attrs: notify::event::EventAttributes::new(),
         };
-        assert!(
-            watch_signal(event, &canonical_project, Some(&canonical_namespace)).is_none(),
-            "an aliased deletion below the private namespace must stay filtered"
+
+        assert_eq!(
+            watch_signal(
+                event.clone(),
+                fixture.config.paths.project_path_space(),
+                fixture.index_namespace_exclusion().as_ref(),
+            ),
+            Some(WatchSignal::Rescan)
+        );
+        assert_eq!(
+            project_root_watch_signal(event, fixture.config.paths.project_path_space()),
+            Some(WatchSignal::Rescan)
+        );
+
+        let project_root_event = notify::Event {
+            kind: notify::EventKind::Any,
+            paths: vec![fixture.project_input.clone()],
+            attrs: notify::event::EventAttributes::new(),
+        };
+        assert_eq!(
+            watch_signal(
+                project_root_event,
+                fixture.config.paths.project_path_space(),
+                None,
+            ),
+            Some(WatchSignal::Rescan)
+        );
+    }
+
+    #[test]
+    fn a_foreign_project_namespace_exclusion_escalates_to_rescan() {
+        let fixture = WatcherFixture::new();
+        let foreign = WatcherFixture::new();
+        let foreign_namespace = foreign
+            .index_namespace_exclusion()
+            .expect("foreign fixture should have a nested namespace");
+        let event = notify::Event {
+            kind: notify::EventKind::Any,
+            paths: vec![fixture.event_path("Assets/Foo.prefab")],
+            attrs: notify::event::EventAttributes::new(),
+        };
+
+        assert_eq!(
+            watch_signal(
+                event,
+                fixture.config.paths.project_path_space(),
+                Some(&foreign_namespace),
+            ),
+            Some(WatchSignal::Rescan)
         );
     }
 
     #[cfg(windows)]
     #[test]
-    fn watcher_matches_drive_and_verbatim_drive_path_aliases() {
-        let ordinary = Path::new(r"C:\Project\Assets\SearchIndex\index-v1-a\state.bin");
-        let verbatim_namespace = Path::new(r"\\?\c:\project\assets\searchindex");
+    fn watcher_delegates_drive_verbatim_and_case_aliases_to_project_path_space() {
+        let fixture = WatcherFixture::new();
+        let event = notify::Event {
+            kind: notify::EventKind::Any,
+            paths: vec![
+                fixture.event_path("assets/HERO.prefab"),
+                fixture
+                    .config
+                    .paths
+                    .project_root()
+                    .join("Assets/Hero.prefab"),
+            ],
+            attrs: notify::event::EventAttributes::new(),
+        };
 
-        assert!(platform_path_starts_with(ordinary, verbatim_namespace));
-        assert!(platform_path_starts_with(
-            Path::new(r"\\?\C:\PROJECT\Assets\SearchIndex\state.bin"),
-            Path::new(r"c:\project\assets\searchindex")
-        ));
-        assert!(is_project_root_search_policy_path(
-            Path::new(r"\\?\C:\PROJECT"),
-            Path::new(r"c:\project\.UNITY-ASSET-SEARCH-IGNORE")
-        ));
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn watcher_matches_unc_and_verbatim_unc_path_aliases() {
-        assert!(platform_path_starts_with(
-            Path::new(r"\\server\share\Project\Assets\SearchIndex\state.bin"),
-            Path::new(r"\\?\UNC\SERVER\SHARE\project\assets\searchindex")
-        ));
-        assert!(platform_paths_equal(
-            Path::new(r"\\?\UNC\server\share\Project"),
-            Path::new(r"\\SERVER\SHARE\project")
-        ));
+        let signal = watch_signal(event, fixture.config.paths.project_path_space(), None)
+            .expect("Windows aliases should remain incremental");
+        let WatchSignal::Changed(paths) = signal else {
+            panic!("Windows aliases should resolve to typed changed paths")
+        };
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths, fixture.changed_paths(["Assets/Hero.prefab"]));
     }
 
     #[tokio::test]
     async fn watcher_session_preserves_changed_paths_and_escalates_overflow() {
+        let fixture = WatcherFixture::new();
         let operations = ScriptedOperations::default();
         let (sender, scripted) = scripted_session();
         let ScriptedOpen::Session(events) = scripted else {
             unreachable!("scripted_session must return a session")
         };
         let mut session = ScriptedWatcherSession { events };
-        let changed = vec![
-            PathBuf::from("project/.unity-asset-search-ignore"),
-            PathBuf::from("project/Assets/Foo.prefab"),
-        ];
+        let changed = fixture.changed_paths([".unity-asset-search-ignore", "Assets/Foo.prefab"]);
         sender
             .send(WatcherSessionEvent::Changed(changed.clone()))
             .unwrap();
@@ -1195,16 +1228,21 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn backend_failure_is_not_hidden_by_a_saturated_event_queue() {
+        let fixture = WatcherFixture::new();
         let (event_sender, event_receiver) = mpsc::channel(1);
         let (failure_sender, failure_receiver) = watch::channel(None::<String>);
         let overflowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         send_watch_signal(
-            Some(WatchSignal::Changed(vec![PathBuf::from("Assets/A.asset")])),
+            Some(WatchSignal::Changed(
+                fixture.changed_paths(["Assets/A.asset"]),
+            )),
             &event_sender,
             overflowed.as_ref(),
         );
         send_watch_signal(
-            Some(WatchSignal::Changed(vec![PathBuf::from("Assets/B.asset")])),
+            Some(WatchSignal::Changed(
+                fixture.changed_paths(["Assets/B.asset"]),
+            )),
             &event_sender,
             overflowed.as_ref(),
         );
@@ -1224,6 +1262,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watcher_retries_with_backoff_and_resets_after_becoming_healthy() {
+        let fixture = WatcherFixture::new();
         let (session_sender, session) = scripted_session();
         let factory = Arc::new(ScriptedWatcherFactory::new([
             ScriptedOpen::Fail("first initialization failure".to_owned()),
@@ -1233,7 +1272,7 @@ mod tests {
         let operations = Arc::new(ScriptedOperations::default());
         let mut maintenance = MaintenanceRuntime::start_with_dependencies(
             operations,
-            Some(watcher_config()),
+            Some(fixture.config.clone()),
             None,
             factory.clone(),
         );
@@ -1320,13 +1359,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn watcher_retry_does_not_block_timer_and_shutdown_joins_both() {
+        let fixture = WatcherFixture::new();
         let factory = Arc::new(ScriptedWatcherFactory::new([ScriptedOpen::Fail(
             "watcher unavailable".to_owned(),
         )]));
         let operations = Arc::new(ScriptedOperations::default());
         let mut maintenance = MaintenanceRuntime::start_with_dependencies(
             operations.clone(),
-            Some(watcher_config()),
+            Some(fixture.config.clone()),
             Some(Duration::from_millis(100)),
             factory,
         );
@@ -1349,11 +1389,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn shutdown_interrupts_an_active_session_and_a_scheduled_timer() {
+        let fixture = WatcherFixture::new();
         let (_session_sender, session) = scripted_session();
         let factory = Arc::new(ScriptedWatcherFactory::new([session]));
         let mut maintenance = MaintenanceRuntime::start_with_dependencies(
             Arc::new(ScriptedOperations::default()),
-            Some(watcher_config()),
+            Some(fixture.config.clone()),
             Some(Duration::from_secs(60 * 60)),
             factory,
         );

@@ -8,10 +8,10 @@ use unity_asset_search_protocol::{
     ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse,
     ReindexAdmitRequest, ReindexDisposition, ReindexEvidence, ReindexOperationState,
     ReindexOperationStatus, ReindexReceipt, RequestEnvelope, RequestId, RequestOperation,
-    ResponseEnvelope, ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest,
-    SearchResponse, ServingAvailability, ShutdownRequest, StatusResponse, SuggestRequest,
-    SuggestResponse, TimerLifecycleState, ValidateContract, WatcherLifecycleState,
-    encode_response_frame,
+    ResponseEnvelope, ResponseOperation, ResponseOutcome, SEARCH_PROTOCOL_REVISION,
+    SearchCapabilities, SearchRequest, SearchResponse, ServingAvailability, ShutdownRequest,
+    StatusResponse, SuggestRequest, SuggestResponse, TimerLifecycleState, ValidateContract,
+    WatcherLifecycleState, encode_response_frame,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -30,7 +30,7 @@ fn generation(seed: u8) -> GenerationStamp {
 
 fn request(operation: RequestOperation) -> RequestEnvelope {
     RequestEnvelope::new(
-        2,
+        SEARCH_PROTOCOL_REVISION,
         RequestId::from_bytes([1; 16]),
         ProjectId::from_bytes([2; 32]),
         DaemonInstanceId::from_bytes([3; 16]),
@@ -42,7 +42,7 @@ fn request(operation: RequestOperation) -> RequestEnvelope {
 
 fn search_response() -> SearchResponse {
     SearchResponse {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         generation: generation(5),
         query_policy_id: query_policy(4),
         query: "player".to_owned(),
@@ -66,7 +66,7 @@ fn search_response() -> SearchResponse {
 
 fn fixture_search_response() -> SearchResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/search-v2.json"
+        "../../../integration/search-protocol/fixtures/responses/search-v3.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -81,7 +81,7 @@ fn fixture_search_response() -> SearchResponse {
 
 fn fixture_references_response() -> ReferencesResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/references-v2.json"
+        "../../../integration/search-protocol/fixtures/responses/references-v3.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -96,13 +96,13 @@ fn fixture_references_response() -> ReferencesResponse {
 
 fn status(active: GenerationStamp, policy: QueryPolicyId) -> StatusResponse {
     let generation = GenerationStatus {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         active: Some(active),
         building_revision: None,
         last_failure: None,
     };
     StatusResponse {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         daemon: unity_asset_search_protocol::DaemonLifecycleStatus::unmanaged(&generation, false),
         generation,
         query_policy_id: policy,
@@ -173,7 +173,7 @@ fn successful_search_and_suggest_responses_are_bound_to_exact_requests() {
     );
 
     let suggest = SuggestResponse {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         generation: generation(5),
         query_policy_id: query_policy(4),
         prefix: "pla".to_owned(),
@@ -326,7 +326,7 @@ fn reference_response_cursor_is_bound_to_generation_and_query_policy() {
     let reference_request = ReferenceRequest::incoming_guid(GUID, None, 10);
     let request = request(RequestOperation::References(reference_request.clone()));
     let mut response = ReferencesResponse {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         generation: generation(5),
         query_policy_id: query_policy(4),
         request: reference_request,
@@ -422,7 +422,7 @@ fn succeeded_reindex_requires_matching_completion_and_status_generation() {
     }));
     let active = generation(5);
     let completion = ReindexReceipt {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         disposition: ReindexDisposition::Applied,
         transaction: None,
         target_revision: Some(active.actual_revision),
@@ -479,7 +479,7 @@ fn reindex_receipt_target_can_precede_the_global_desired_revision() {
     let target = generation(5);
     let later_desired = generation(9).actual_revision;
     ReindexReceipt {
-        protocol_revision: 2,
+        protocol_revision: SEARCH_PROTOCOL_REVISION,
         disposition: ReindexDisposition::AlreadyApplied,
         transaction: None,
         target_revision: Some(target.actual_revision),

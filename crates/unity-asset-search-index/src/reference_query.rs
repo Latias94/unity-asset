@@ -16,7 +16,7 @@ use tantivy::{DocAddress, DocId, IndexReader, Score, Term};
 use unity_asset_core::BudgetedJsonError;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticError, DigestV1, FieldPath, FieldPathError,
-    FieldPathSegment, ObjectAddress, SourceLocator, arc_slice_allocation_bytes,
+    FieldPathSegment, ObjectAddress, SourceLocator, YamlFileId, arc_slice_allocation_bytes,
     string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_search_protocol::{
@@ -27,8 +27,10 @@ use unity_asset_search_protocol::{
 };
 
 use crate::analysis::{GuidProjection, RawReferenceProjection, ReferenceResolutionProjection};
-use crate::generation::GenerationStamp;
-use crate::projection::{reference_guid_key, reference_object_key};
+use crate::generation::{GenerationStamp, GenerationStorageContract};
+#[cfg(test)]
+use crate::projection::reference_object_key;
+use crate::projection::{reference_guid_key, reference_object_key_for};
 use crate::reference_payload::{
     MAX_REFERENCE_PAYLOAD_BYTES, ReferencePayload, ReferencePayloadReadError,
     ReferencePayloadReader,
@@ -44,7 +46,7 @@ const MAX_REFERENCE_HIT_JSON_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REFERENCE_PAGE_HIT_JSON_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REFERENCE_RESPONSE_DIAGNOSTICS: usize = 128;
 const MAX_REFERENCE_RESPONSE_DIAGNOSTIC_JSON_BYTES: usize = 256 * 1024;
-const REFERENCE_CURSOR_BINDING_PREFIX: &str = "reference-query-v1:";
+const REFERENCE_CURSOR_BINDING_PREFIX: &str = "reference-query-v2:";
 
 #[derive(Debug, Clone, Copy)]
 struct ReferenceQueryLimits {
@@ -469,6 +471,7 @@ pub(crate) struct ReferenceQuerySnapshot {
     reader: IndexReader,
     fields: ReferenceProjectionFields,
     payloads: ReferencePayloadReader,
+    storage: GenerationStorageContract,
     completeness: ReferenceQueryCompleteness,
 }
 
@@ -483,6 +486,7 @@ impl ReferenceQuerySnapshot {
             reader: projection.reader().clone(),
             fields: *projection.fields(),
             payloads: projection.payloads().clone(),
+            storage: projection.storage(),
             completeness,
         }
     }
@@ -631,8 +635,12 @@ impl ReferenceQueryEngine {
             usize::try_from(request.limit).map_err(|_| WireProjectionError::NumericOverflow {
                 field: "reference request limit",
             })?;
-        let (field, key) =
-            selector_key(&request.selector, request.direction, self.snapshot.fields)?;
+        let (field, key) = selector_key(
+            &request.selector,
+            request.direction,
+            self.snapshot.fields,
+            self.snapshot.storage,
+        )?;
         let query_binding = request
             .cursor_query_binding()
             .map_err(|_| ReferenceQueryError::InvalidCursorQueryBinding)?;
@@ -695,7 +703,7 @@ impl ReferenceQueryEngine {
             let mut stored = decoded.document;
 
             let fact_diagnostics = std::mem::take(&mut stored.fact.diagnostics);
-            let hit = reference_hit(stored)?;
+            let hit = reference_hit(stored, self.snapshot.storage)?;
             let encoded_hit_bytes = reference_hit_json_bytes(&hit)?;
             if encoded_hit_bytes > limits.max_hit_json_bytes {
                 return Err(ReferenceQueryError::ResponseHitTooLarge {
@@ -1058,13 +1066,14 @@ fn selector_key(
     selector: &ReferenceSelector,
     direction: ReferenceDirection,
     fields: ReferenceProjectionFields,
+    storage: GenerationStorageContract,
 ) -> Result<(Field, String), ReferenceQueryError> {
     let field = match direction {
         ReferenceDirection::Incoming => fields.incoming_key(),
         ReferenceDirection::Outgoing => fields.outgoing_key(),
     };
     let key = match selector {
-        ReferenceSelector::Object { address } => reference_object_key(address),
+        ReferenceSelector::Object { address } => reference_object_key_for(storage, address),
         ReferenceSelector::Guid { guid, file_id } => {
             if guid.is_empty() {
                 return Err(ReferenceQueryError::EmptyGuid);
@@ -1394,7 +1403,7 @@ fn decode_reference_payload(
     }
 
     let document = payloads
-        .read(range, selected.payload_digest, budget)
+        .read(range, selected.payload_digest, &selected.stable_id, budget)
         .map_err(|source| ReferenceQueryError::Payload {
             stable_id: selected.stable_id.clone(),
             source,
@@ -1440,7 +1449,10 @@ fn reference_hit_json_bytes(hit: &ReferenceHit) -> Result<usize, ReferenceQueryE
     })
 }
 
-fn reference_hit(stored: ReferencePayload) -> Result<ReferenceHit, ReferenceQueryError> {
+fn reference_hit(
+    stored: ReferencePayload,
+    storage: GenerationStorageContract,
+) -> Result<ReferenceHit, ReferenceQueryError> {
     let object_count = 1usize.saturating_add(resolution_object_count(&stored.fact.resolution));
     if object_count > MAX_REFERENCE_OBJECTS_PER_HIT {
         return Err(ReferenceQueryError::ResponseHitObjectLimitExceeded {
@@ -1459,12 +1471,12 @@ fn reference_hit(stored: ReferencePayload) -> Result<ReferenceHit, ReferenceQuer
         source_line: None,
         source_column: None,
     };
-    let mut raw_object = raw_reference_object(&stored)?;
+    let mut raw_object = raw_reference_object(&stored, storage)?;
     raw_object
         .field_hints
         .push(resolution_hint(&stored.fact.resolution).to_owned());
     let mut objects = vec![raw_object];
-    objects.extend(resolution_objects(&stored)?);
+    objects.extend(resolution_objects(&stored, storage)?);
 
     Ok(ReferenceHit {
         source_path: wire::portable_path_string(stored.source_path.clone())?,
@@ -1505,7 +1517,10 @@ const fn resolution_hint(resolution: &ReferenceResolutionProjection) -> &'static
     }
 }
 
-fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, ReferenceQueryError> {
+fn raw_reference_object(
+    stored: &ReferencePayload,
+    storage: GenerationStorageContract,
+) -> Result<ReferenceObject, ReferenceQueryError> {
     match &stored.fact.raw_target {
         RawReferenceProjection::Binary {
             file_id,
@@ -1524,7 +1539,7 @@ fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, Re
                 None
             };
             let stable_id = if let Some(address) = &target_address {
-                reference_object_key(address)
+                reference_object_key_for(storage, address)
             } else if let Some(guid) = target_guid.as_deref() {
                 reference_guid_key(guid, Some(*path_id))
             } else {
@@ -1570,12 +1585,14 @@ fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, Re
             });
             let target_address = match (target_guid.as_ref(), file_id, &stored.source_object) {
                 (None, Some(file_id), Some(source)) => {
-                    ObjectAddress::yaml(source.source_locator().clone(), file_id.to_string()).ok()
+                    YamlFileId::new(*file_id).ok().and_then(|file_id| {
+                        ObjectAddress::yaml(source.source_locator().clone(), file_id).ok()
+                    })
                 }
                 _ => None,
             };
             let stable_id = if let Some(address) = &target_address {
-                reference_object_key(address)
+                reference_object_key_for(storage, address)
             } else if let Some(guid) = target_guid.as_deref() {
                 reference_guid_key(guid, *file_id)
             } else {
@@ -1608,6 +1625,7 @@ fn raw_reference_object(stored: &ReferencePayload) -> Result<ReferenceObject, Re
 
 fn resolution_objects(
     stored: &ReferencePayload,
+    storage: GenerationStorageContract,
 ) -> Result<Vec<ReferenceObject>, ReferenceQueryError> {
     let mut objects = Vec::new();
     match &stored.fact.resolution {
@@ -1615,18 +1633,18 @@ fn resolution_objects(
         | ReferenceResolutionProjection::Missing { target: None }
         | ReferenceResolutionProjection::Invalid => {}
         ReferenceResolutionProjection::Resolved { target } => {
-            objects.push(address_object(target, "resolution.resolved")?);
+            objects.push(address_object(target, "resolution.resolved", storage)?);
         }
         ReferenceResolutionProjection::Missing {
             target: Some(target),
         } => {
-            objects.push(address_object(target, "resolution.missing")?);
+            objects.push(address_object(target, "resolution.missing", storage)?);
         }
         ReferenceResolutionProjection::Ambiguous { candidates } => {
             objects.extend(
                 candidates
                     .iter()
-                    .map(|target| address_object(target, "resolution.ambiguous"))
+                    .map(|target| address_object(target, "resolution.ambiguous", storage))
                     .collect::<Result<Vec<_>, _>>()?,
             );
         }
@@ -1652,16 +1670,15 @@ fn resolution_objects(
 fn address_object(
     address: &ObjectAddress,
     resolution: &str,
+    storage: GenerationStorageContract,
 ) -> Result<ReferenceObject, ReferenceQueryError> {
-    let file_id = address.binary_path_id().or_else(|| {
-        address
-            .yaml_anchor()
-            .and_then(|anchor| anchor.parse::<i64>().ok())
-    });
+    let file_id = address
+        .binary_path_id()
+        .or_else(|| address.yaml_file_id().map(YamlFileId::get));
     Ok(ReferenceObject {
         doc_file_id: file_id,
         doc_class_id: None,
-        stable_id: reference_object_key(address),
+        stable_id: reference_object_key_for(storage, address),
         location: wire::locator_location(address.source_locator(), None, file_id, None)?,
         object_name: None,
         hierarchy_path: None,
@@ -1848,7 +1865,7 @@ mod tests {
     fn completeness_deduplicates_borrowed_diagnostics_and_accounts_retained_storage() {
         let address = ObjectAddress::yaml(
             SourceLocator::archive_member("Assets/Archive.zip", "Nested.asset").unwrap(),
-            "12345",
+            "12345".parse().unwrap(),
         )
         .unwrap();
         let field_path = FieldPath::root()
@@ -1904,10 +1921,6 @@ mod tests {
                 .root_alias()
                 .as_str()
                 .as_ptr()
-        );
-        assert_ne!(
-            retained_address.yaml_anchor().unwrap().as_ptr(),
-            input_address.yaml_anchor().unwrap().as_ptr()
         );
         let FieldPathSegment::Field(retained_field) =
             &retained_addressed.field_path().unwrap().segments()[0]
@@ -2481,7 +2494,7 @@ mod tests {
             .coverage
             .next_cursor
             .unwrap();
-        cursor.query_binding = "reference-query-v1:not-a-digest".to_owned();
+        cursor.query_binding = "reference-query-v2:not-a-digest".to_owned();
 
         let error = engine
             .references(
@@ -2799,7 +2812,11 @@ mod tests {
             candidates: vec![source_address(-99); MAX_REFERENCE_OBJECTS_PER_HIT],
         };
 
-        let error = reference_hit(stored_reference(projected)).unwrap_err();
+        let error = reference_hit(
+            stored_reference(projected),
+            GenerationStorageContract::CurrentV2,
+        )
+        .unwrap_err();
 
         assert!(matches!(
             &error,

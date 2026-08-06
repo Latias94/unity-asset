@@ -147,7 +147,11 @@ fn fixture() -> Fixture {
 }
 
 fn target_address() -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(TARGET_ALIAS).unwrap(), "100").unwrap()
+    ObjectAddress::yaml(
+        SourceLocator::path(TARGET_ALIAS).unwrap(),
+        "100".parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn name_path() -> FieldPath {
@@ -576,9 +580,9 @@ fn late_change_set_after_filesystem_reconciliation_persists_its_receipt() {
     assert_eq!(recorded.target_revision, Some(changes.to_revision()));
     assert_eq!(recorded.evidence.analysis, Default::default());
     let recorded_generation = assert_active_receipt(&fixture.index, &recorded);
-    assert_ne!(
-        recorded_generation.generation,
-        reconciled_generation.generation
+    assert_eq!(
+        recorded_generation.generation, reconciled_generation.generation,
+        "activation receipts must not change logical generation identity"
     );
     assert_eq!(
         recorded_generation.actual_revision,
@@ -682,9 +686,9 @@ fn late_receipt_preserves_a_newer_durable_desired_revision() {
     assert_eq!(recorded.evidence.analysis, Default::default());
     let recorded_generation = active_generation(&fixture.index);
     assert_eq!(recorded.generation.as_ref(), Some(&recorded_generation));
-    assert_ne!(
-        recorded_generation.generation,
-        reconciled_generation.generation
+    assert_eq!(
+        recorded_generation.generation, reconciled_generation.generation,
+        "late receipt activation must preserve logical generation identity"
     );
     assert_eq!(recorded_generation.actual_revision, late.to_revision());
     assert_eq!(recorded_generation.desired_revision, future_revision);

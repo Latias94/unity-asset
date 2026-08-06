@@ -103,7 +103,7 @@ fn framed_json_is_exact_and_rejects_oversized_declared_lengths() {
 #[test]
 fn business_requests_bind_project_instance_and_query_policy() {
     let request = RequestEnvelope::new(
-        2,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([0x44; 16]),
         project_id(),
         instance_id(),
@@ -132,7 +132,7 @@ fn business_requests_bind_project_instance_and_query_policy() {
 #[test]
 fn validated_frame_decode_rejects_semantically_invalid_requests() {
     let request = RequestEnvelope::new(
-        2,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([0x44; 16]),
         project_id(),
         instance_id(),
@@ -157,7 +157,7 @@ fn validated_frame_decode_rejects_semantically_invalid_requests() {
 #[test]
 fn request_framing_validates_before_encoding_and_dispatch() {
     let request = RequestEnvelope::new(
-        2,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([0x44; 16]),
         project_id(),
         instance_id(),
@@ -189,7 +189,7 @@ fn frame_encoding_stops_at_the_exact_encoded_byte_limit() {
 #[test]
 fn business_frame_decode_rejects_noncanonical_json_spellings() {
     let request = RequestEnvelope::new(
-        2,
+        BUSINESS_PROTOCOL_REVISION,
         RequestId::from_bytes([0xaa; 16]),
         project_id(),
         instance_id(),

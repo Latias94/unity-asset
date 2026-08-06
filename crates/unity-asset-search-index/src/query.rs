@@ -1703,11 +1703,11 @@ mod tests {
     #[test]
     fn escaped_search_hits_keep_the_largest_frame_safe_prefix() {
         let request_json =
-            include_str!("../../../integration/search-protocol/fixtures/requests/search-v2.json")
+            include_str!("../../../integration/search-protocol/fixtures/requests/search-v3.json")
                 .replace("\"limit\":25", "\"limit\":200");
         let request: RequestEnvelope = serde_json::from_str(&request_json).unwrap();
         let fixture: ResponseEnvelope = serde_json::from_str(include_str!(
-            "../../../integration/search-protocol/fixtures/responses/search-v2.json"
+            "../../../integration/search-protocol/fixtures/responses/search-v3.json"
         ))
         .unwrap();
         let ResponseOutcome::Success(operation) = fixture.into_outcome() else {

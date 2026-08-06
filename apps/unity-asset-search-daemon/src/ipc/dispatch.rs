@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -9,7 +8,7 @@ use tokio::time::Instant;
 use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError};
 use unity_asset_search_index::{
     FilesystemReindexIntent as IndexReindexIntent, FilesystemReindexScope as IndexReindexScope,
-    SearchIndex, SearchRequest as IndexSearchRequest,
+    ProjectPathError, ProjectPathSpace, SearchIndex, SearchRequest as IndexSearchRequest,
 };
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, CapabilitiesResponse, DaemonInstanceId, DaemonLifecycleState,
@@ -388,7 +387,7 @@ pub struct OperationRegistry {
     retention: OperationRetentionPolicy,
     tasks: Arc<StdMutex<OperationTaskState>>,
     coordinator: ReindexCoordinator,
-    project_root: Arc<PathBuf>,
+    project_paths: ProjectPathSpace,
     query_policy_id: QueryPolicyId,
     lifecycle_admission: AdmissionGate,
 }
@@ -456,14 +455,12 @@ impl OperationRegistry {
     fn new(
         daemon_instance_id: DaemonInstanceId,
         coordinator: ReindexCoordinator,
-        project_root: PathBuf,
         query_policy_id: QueryPolicyId,
         lifecycle_admission: AdmissionGate,
     ) -> Self {
         Self::with_retention(
             daemon_instance_id,
             coordinator,
-            project_root,
             query_policy_id,
             lifecycle_admission,
             OperationRetentionPolicy::default(),
@@ -473,13 +470,13 @@ impl OperationRegistry {
     fn with_retention(
         daemon_instance_id: DaemonInstanceId,
         coordinator: ReindexCoordinator,
-        project_root: PathBuf,
         query_policy_id: QueryPolicyId,
         lifecycle_admission: AdmissionGate,
         retention: OperationRetentionPolicy,
     ) -> Self {
         let mut operation_epoch = [0_u8; OPERATION_EPOCH_BYTES];
         operation_epoch.copy_from_slice(&daemon_instance_id.as_bytes()[..OPERATION_EPOCH_BYTES]);
+        let project_paths = coordinator.project_path_space().clone();
         Self {
             admission_gate: Arc::new(Mutex::new(())),
             state: Arc::new(Mutex::new(RegistryState::default())),
@@ -490,7 +487,7 @@ impl OperationRegistry {
                 tasks: JoinSet::new(),
             })),
             coordinator,
-            project_root: Arc::new(project_root),
+            project_paths,
             query_policy_id,
             lifecycle_admission,
         }
@@ -510,8 +507,9 @@ impl OperationRegistry {
         intent: FilesystemReindexIntent,
         idempotency_key: Option<String>,
     ) -> Result<ReindexOperationStatus, ApiError> {
-        let internal = lower_reindex_intent(&self.project_root, intent);
-        self.admit_internal_with_key(ReindexSource::Ipc, internal, idempotency_key, false)
+        let internal =
+            lower_reindex_intent(&self.project_paths, intent).map_err(project_path_error)?;
+        self.admit_internal_with_key(ReindexSource::Ipc, internal, idempotency_key)
             .await
     }
 
@@ -520,20 +518,25 @@ impl OperationRegistry {
         source: ReindexSource,
         intent: IndexReindexIntent,
     ) -> Result<ReindexOperationStatus, ApiError> {
-        self.admit_internal_with_key(source, intent, None, false)
-            .await
+        self.admit_internal_with_key(source, intent, None).await
     }
 
-    pub async fn admit_watcher_overflow(&self) -> Result<ReindexOperationStatus, ApiError> {
-        self.admit_internal_with_key(
-            ReindexSource::Watcher,
-            IndexReindexIntent {
-                scope: IndexReindexScope::Full,
-            },
-            None,
-            true,
-        )
-        .await
+    pub async fn admit_watcher_overflow(&self) -> Result<(), ApiError> {
+        let query_policy = self.query_policy_id;
+        let _lifecycle_admission = self.lifecycle_admission.admit().await.ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCode::NotReady,
+                "operation registry is draining",
+                false,
+            )
+            .with_detail("lifecycle", "draining")
+            .with_query_policy(query_policy)
+        })?;
+        self.coordinator
+            .admit_watcher_overflow_unobserved()
+            .await
+            .map_err(|error| coordinator_error(error, query_policy))?;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -554,7 +557,6 @@ impl OperationRegistry {
         source: ReindexSource,
         internal: IndexReindexIntent,
         idempotency_key: Option<String>,
-        watcher_overflow: bool,
     ) -> Result<ReindexOperationStatus, ApiError> {
         let query_policy = self.query_policy_id;
         let _lifecycle_admission = self.lifecycle_admission.admit().await.ok_or_else(|| {
@@ -623,14 +625,11 @@ impl OperationRegistry {
         }
 
         let operation_id = self.unique_operation_id().await;
-        let observation = if watcher_overflow {
-            self.coordinator.admit_watcher_overflow_observed().await
-        } else {
-            self.coordinator
-                .admit_prepared_observed(source, prepared)
-                .await
-        }
-        .map_err(|error| coordinator_error(error, query_policy))?;
+        let observation = self
+            .coordinator
+            .admit_prepared_observed(source, prepared)
+            .await
+            .map_err(|error| coordinator_error(error, query_policy))?;
         let cancellation = observation.cancellation();
         let state = match observation.admission().disposition {
             ReindexDisposition::Coalesced => ReindexOperationState::Coalesced,
@@ -828,7 +827,6 @@ impl OperationRegistryOwner {
     pub fn new(
         daemon_instance_id: DaemonInstanceId,
         coordinator: ReindexCoordinator,
-        project_root: PathBuf,
         query_policy_id: QueryPolicyId,
         lifecycle_admission: AdmissionGate,
     ) -> Self {
@@ -836,7 +834,6 @@ impl OperationRegistryOwner {
             registry: OperationRegistry::new(
                 daemon_instance_id,
                 coordinator,
-                project_root,
                 query_policy_id,
                 lifecycle_admission,
             ),
@@ -991,20 +988,44 @@ fn coordinator_admission(
 }
 
 fn lower_reindex_intent(
-    project_root: &std::path::Path,
+    project_paths: &ProjectPathSpace,
     intent: FilesystemReindexIntent,
-) -> IndexReindexIntent {
+) -> Result<IndexReindexIntent, ProjectPathError> {
     let scope = match intent.scope {
         FilesystemReindexScope::Full => IndexReindexScope::Full,
         FilesystemReindexScope::Reconcile => IndexReindexScope::Reconcile,
         FilesystemReindexScope::ChangedPaths { paths } => IndexReindexScope::ChangedPaths {
-            paths: paths
-                .into_iter()
-                .map(|path| project_root.join(path.as_str()))
-                .collect(),
+            paths: project_paths
+                .resolve_set(paths.iter().map(|path| std::path::Path::new(path.as_str())))?,
         },
     };
-    IndexReindexIntent { scope }
+    Ok(IndexReindexIntent { scope })
+}
+
+fn project_path_error(error: ProjectPathError) -> ApiError {
+    let detail = bounded_detail(error.to_string());
+    match error {
+        ProjectPathError::OutsideProject { .. }
+        | ProjectPathError::InvalidComponent { .. }
+        | ProjectPathError::ProjectRootChangedPath { .. } => ApiError::new(
+            ApiErrorCode::InvalidRequest,
+            "reindex path is not a valid project-relative coordinate",
+            false,
+        )
+        .with_detail("cause", detail),
+        ProjectPathError::Allocation { .. } => ApiError::new(
+            ApiErrorCode::Busy,
+            "could not allocate normalized reindex paths",
+            true,
+        )
+        .with_detail("cause", detail),
+        _ => ApiError::new(
+            ApiErrorCode::Internal,
+            "could not normalize reindex paths",
+            false,
+        )
+        .with_detail("cause", detail),
+    }
 }
 
 fn coordinator_error(error: CoordinatorError, query_policy: QueryPolicyId) -> ApiError {
@@ -1032,9 +1053,9 @@ fn coordinator_error(error: CoordinatorError, query_policy: QueryPolicyId) -> Ap
             "reindex completion channel closed unexpectedly",
             true,
         ),
-        CoordinatorError::PathOutsideProject { .. } => ApiError::new(
-            ApiErrorCode::InvalidRequest,
-            "reindex path escapes the project root",
+        CoordinatorError::ChangedPathProjectMismatch { .. } => ApiError::new(
+            ApiErrorCode::Internal,
+            "reindex path set belongs to a different project",
             false,
         ),
         CoordinatorError::InvalidConfiguration(_) => ApiError::new(
@@ -1175,6 +1196,7 @@ mod tests {
 
     use tokio::sync::Semaphore;
     use tokio::time::Instant;
+    use unity_asset_search_index::{IndexPaths, ProjectPathSpace};
     use unity_asset_search_protocol::{
         ApiErrorCode, DaemonInstanceId, DaemonLifecycleState, DaemonLifecycleStatus,
         FreshnessMaintenance, GenerationFreshness, OperationId, OperationKind, PortablePath,
@@ -1203,8 +1225,21 @@ mod tests {
         }
     }
 
+    fn project_paths() -> ProjectPathSpace {
+        let project = crate::secure_test_tempdir();
+        let assets = project.path().join("Assets");
+        std::fs::create_dir(&assets).expect("create operation registry Assets root");
+        let paths = IndexPaths::for_project(
+            project.path().to_path_buf(),
+            Some(project.path().join(".unity-asset-index")),
+            Some(vec![assets]),
+        )
+        .expect("create operation registry project path space");
+        paths.project_path_space().clone()
+    }
+
     fn delayed_config() -> ReindexCoordinatorConfig {
-        ReindexCoordinatorConfig::new(project_root())
+        ReindexCoordinatorConfig::new(project_paths())
             .with_debounce(Duration::from_secs(60))
             .with_max_debounce(Duration::from_secs(60))
     }
@@ -1213,7 +1248,6 @@ mod tests {
         OperationRegistry::new(
             DaemonInstanceId::from_bytes([instance_byte; 16]),
             coordinator,
-            project_root(),
             query_policy(),
             AdmissionGate::default(),
         )
@@ -1486,6 +1520,44 @@ mod tests {
         assert_eq!(coordinator.snapshot().await.admissions.ipc, 1);
     }
 
+    #[cfg(windows)]
+    #[tokio::test(start_paused = true)]
+    async fn windows_case_aliases_share_one_idempotent_operation() {
+        let _runtime = ReindexCoordinatorRuntime::start(delayed_config(), |_intent| async move {
+            std::future::pending().await
+        })
+        .unwrap();
+        let coordinator = _runtime.coordinator();
+        let registry = registry(13, coordinator.clone());
+        let first = registry
+            .admit(
+                &coordinator,
+                &project_root(),
+                unity_asset_search_protocol::FilesystemReindexIntent::changed_paths(vec![
+                    PortablePath::new("Assets/Hero.prefab").unwrap(),
+                ]),
+                Some("windows-path-alias".to_owned()),
+                query_policy(),
+            )
+            .await
+            .unwrap();
+        let repeated = registry
+            .admit(
+                &coordinator,
+                &project_root(),
+                unity_asset_search_protocol::FilesystemReindexIntent::changed_paths(vec![
+                    PortablePath::new("assets/HERO.prefab").unwrap(),
+                ]),
+                Some("windows-path-alias".to_owned()),
+                query_policy(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(repeated.operation_id, first.operation_id);
+        assert_eq!(coordinator.snapshot().await.admissions.ipc, 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn idempotency_key_rejects_different_normalized_intents() {
         let _runtime = ReindexCoordinatorRuntime::start(delayed_config(), |_intent| async move {
@@ -1542,7 +1614,6 @@ mod tests {
         let registry = OperationRegistry::new(
             DaemonInstanceId::from_bytes([12; 16]),
             coordinator.clone(),
-            project_root(),
             query_policy(),
             lifecycle_admission.clone(),
         );
@@ -1574,6 +1645,7 @@ mod tests {
             )
             .await
             .unwrap_err();
+        let watcher_overflow_error = registry.admit_watcher_overflow().await.unwrap_err();
         let timer_error = registry
             .admit_internal(
                 crate::coordinator::ReindexSource::Timer,
@@ -1589,7 +1661,13 @@ mod tests {
             .await
             .unwrap_err();
 
-        for error in [ipc_error, watcher_error, timer_error, startup_error] {
+        for error in [
+            ipc_error,
+            watcher_error,
+            watcher_overflow_error,
+            timer_error,
+            startup_error,
+        ] {
             assert_eq!(error.code, ApiErrorCode::NotReady);
             assert_eq!(
                 error.details.get("lifecycle").map(String::as_str),
@@ -1601,6 +1679,52 @@ mod tests {
         assert_eq!(admissions.ipc, 0);
         assert_eq!(admissions.watcher, 0);
         assert_eq!(admissions.timer, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_overflow_bypasses_operation_status_saturation() {
+        let retention = OperationRetentionPolicy {
+            maximum_active: 1,
+            maximum_terminal: 4,
+            maximum_expired: 4,
+            terminal_retention: Duration::from_secs(60),
+            expired_retention: Duration::from_secs(60),
+        };
+        let _runtime = ReindexCoordinatorRuntime::start(delayed_config(), |_intent| async move {
+            std::future::pending().await
+        })
+        .unwrap();
+        let coordinator = _runtime.coordinator();
+        let registry = OperationRegistry::with_retention(
+            DaemonInstanceId::from_bytes([13; 16]),
+            coordinator.clone(),
+            query_policy(),
+            AdmissionGate::default(),
+            retention,
+        );
+        registry
+            .admit_internal(
+                crate::coordinator::ReindexSource::Startup,
+                unity_asset_search_index::FilesystemReindexIntent::reconcile(),
+            )
+            .await
+            .unwrap();
+
+        let busy = registry
+            .admit_client(
+                unity_asset_search_protocol::FilesystemReindexIntent::full(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(busy.code, ApiErrorCode::Busy);
+
+        registry.admit_watcher_overflow().await.unwrap();
+
+        let snapshot = coordinator.snapshot().await;
+        assert_eq!(snapshot.watcher_overflows, 1);
+        assert_eq!(snapshot.full_escalations, 1);
+        assert_eq!(snapshot.admissions.watcher, 1);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1824,7 +1948,6 @@ mod tests {
         let registry = OperationRegistry::with_retention(
             DaemonInstanceId::from_bytes([4; 16]),
             coordinator.clone(),
-            project_root(),
             query_policy(),
             AdmissionGate::default(),
             retention,
@@ -1909,7 +2032,6 @@ mod tests {
         let registry = OperationRegistry::with_retention(
             DaemonInstanceId::from_bytes([8; 16]),
             coordinator.clone(),
-            project_root(),
             query_policy(),
             AdmissionGate::default(),
             retention,
@@ -1971,7 +2093,6 @@ mod tests {
         let registry = OperationRegistry::with_retention(
             DaemonInstanceId::from_bytes([5; 16]),
             coordinator.clone(),
-            project_root(),
             query_policy(),
             AdmissionGate::default(),
             retention,

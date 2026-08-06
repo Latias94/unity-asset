@@ -42,7 +42,11 @@ AudioClip:
 "#;
 
 fn address(anchor: &str) -> ObjectAddress {
-    ObjectAddress::yaml(SourceLocator::path(SOURCE_ALIAS).unwrap(), anchor).unwrap()
+    ObjectAddress::yaml(
+        SourceLocator::path(SOURCE_ALIAS).unwrap(),
+        anchor.parse().unwrap(),
+    )
+    .unwrap()
 }
 
 fn field(name: &str) -> FieldPath {

@@ -14,7 +14,7 @@ use unity_asset_core::{
     string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_search_core::SearchKind;
-use unity_asset_search_local::ProjectIdentityV1;
+use unity_asset_search_protocol::ProjectId;
 
 use super::candidate::{FileHint, ReadSource, ScanCandidate, SourceHints};
 use super::diagnostic::{PathRejection, ScanDiagnostic, SourcePart};
@@ -23,17 +23,22 @@ use super::policy::{
     PolicyDecision, PolicyError, PolicyLimitResource, PolicyMatchBudget, SEARCH_IGNORE_V1_FILE,
     SearchIgnoreV1,
 };
+#[cfg(test)]
+use crate::anchored_fs::OpenPolicy;
 use crate::anchored_fs::{
-    AnchoredFsError, DirectoryEntryHint, EntryKindHint, OpenPolicy, ReadDirectory, RegularFile,
+    AnchoredFsError, DirectoryEntryHint, EntryKindHint, ReadDirectory, RegularFile,
     StableDirectoryIdentity, StableDirectoryObjectIdentity, StableFileIdentity,
 };
-use crate::path_semantics::{compare_portable_paths, strip_prefix as strip_project_root};
+use crate::path_semantics::{
+    compare_portable_paths, is_portable_component, strip_prefix as strip_project_root,
+};
 #[cfg(windows)]
 use crate::path_semantics::{
     windows_component_cmp as windows_path_component_cmp,
     windows_component_eq as windows_path_component_eq,
 };
-use crate::{IndexPaths, SearchIndexOptions};
+use crate::project_root::ProjectRootAuthority;
+use crate::{IndexPaths, ProjectPathSet, SearchIndexOptions};
 
 const SOURCE_IDENTITY_DOMAIN: &[u8] = b"unity-asset-search:source:v3";
 const ASSET_COMPLETE: &[u8] = b"asset:complete";
@@ -48,7 +53,7 @@ const READ_META_PATH_EXTRA_CAPACITY: usize = 16;
 pub(crate) enum ScanIntent {
     Full,
     Reconcile,
-    ChangedPaths(Vec<PathBuf>),
+    ChangedPaths(ProjectPathSet),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +162,10 @@ pub(crate) enum ScanError {
         observed_at_least: u64,
         limit: u64,
     },
+    ChangedPathProjectMismatch {
+        expected: ProjectId,
+        actual: ProjectId,
+    },
 }
 
 impl fmt::Display for ScanError {
@@ -201,6 +210,10 @@ impl fmt::Display for ScanError {
                 "scan {resource} limit exceeded: observed at least {observed_at_least}, limit \
                  {limit}"
             ),
+            Self::ChangedPathProjectMismatch { expected, actual } => write!(
+                formatter,
+                "changed paths belong to project {actual}, but this scanner owns {expected}"
+            ),
         }
     }
 }
@@ -216,7 +229,8 @@ impl StdError for ScanError {
             Self::PolicyChangedDuringScan
             | Self::TraversalChangedDuringScan
             | Self::SourceChangedDuringScan
-            | Self::TraversalLimitExceeded { .. } => None,
+            | Self::TraversalLimitExceeded { .. }
+            | Self::ChangedPathProjectMismatch { .. } => None,
         }
     }
 }
@@ -268,9 +282,7 @@ impl ReadSourceOutcome {
 
 #[derive(Debug)]
 pub(crate) struct ProjectScanner {
-    project_root: PathBuf,
-    read_root: ReadDirectory,
-    project_root_object_identity: StableDirectoryObjectIdentity,
+    project: ProjectRootAuthority,
     /// Project-root-relative scan roots. An empty path denotes the project root itself.
     scan_roots: Vec<PathBuf>,
     /// Project-root-relative private index namespace when it is nested inside the project.
@@ -287,54 +299,27 @@ impl ProjectScanner {
         options: SearchIndexOptions,
         limits: ScanReadLimits,
     ) -> Result<Self> {
-        let project_root = paths.project_root().to_path_buf();
+        let project = paths.project_authority().clone();
+        project
+            .revalidate()
+            .context("revalidate retained project authority before scanner construction")?;
+        let project_root = project.root();
         let expected_project_id = paths.private_index_root().project_id();
-        let actual_project_id = ProjectIdentityV1::for_existing_root(&project_root)
-            .with_context(|| {
-                format!(
-                    "derive current project identity: {}",
-                    project_root.display()
-                )
-            })?
-            .project_id();
+        let actual_project_id = project.project_id();
         if actual_project_id != expected_project_id {
             return Err(anyhow!(
                 "project root identity no longer matches its private index root: {}",
                 project_root.display()
             ));
         }
-        let read_root = ReadDirectory::open(&project_root, OpenPolicy::ProjectSource)
-            .with_context(|| {
-                format!(
-                    "open identity-bound project root: {}",
-                    project_root.display()
-                )
-            })?;
-        let project_root_object_identity = read_root
-            .object_identity()
-            .context("capture project root object identity")?;
-        let rebound = ReadDirectory::open(&project_root, OpenPolicy::ProjectSource)
-            .context("reopen project root identity")?;
-        rebound
-            .ensure_object(project_root_object_identity)
-            .context("bind project root path to the opened scanner authority")?;
-        let rebound_project_id = ProjectIdentityV1::for_existing_root(&project_root)
-            .context("revalidate project identity after opening the scanner authority")?
-            .project_id();
-        if rebound_project_id != expected_project_id {
-            return Err(anyhow!(
-                "project root identity changed while binding its private index root: {}",
-                project_root.display()
-            ));
-        }
         let mut scan_roots = paths
             .scan_roots()
             .iter()
-            .map(|root| configured_relative_path(&project_root, root))
+            .map(|root| configured_relative_path(project_root, root))
             .collect::<Result<Vec<_>>>()?;
         for root in &scan_roots {
             if !root.as_os_str().is_empty() {
-                read_root.open_directory(root).with_context(|| {
+                project.directory().open_directory(root).with_context(|| {
                     format!(
                         "open scan root without following links: {}",
                         project_root.join(root).display()
@@ -349,15 +334,16 @@ impl ProjectScanner {
 
         let index_namespace_root = paths
             .index_namespace_exclusion()
-            .map(|root| configured_relative_path(&project_root, root))
+            .map(|root| configured_relative_path(project_root, root))
             .transpose()?;
         let index_namespace_identity = match index_namespace_root.as_ref() {
             Some(relative) if relative.as_os_str().is_empty() => Some(
-                read_root
+                project
+                    .directory()
                     .object_identity()
                     .context("capture project-root index namespace identity")?,
             ),
-            Some(relative) => match read_root.open_directory(relative) {
+            Some(relative) => match project.directory().open_directory(relative) {
                 Ok(directory) => Some(directory.object_identity().with_context(|| {
                     format!(
                         "capture nested index namespace identity: {}",
@@ -378,15 +364,21 @@ impl ProjectScanner {
         };
 
         Ok(Self {
-            project_root,
-            read_root,
-            project_root_object_identity,
+            project,
             scan_roots,
             index_namespace_root,
             index_namespace_identity,
             options,
             limits,
         })
+    }
+
+    fn project_root(&self) -> &Path {
+        self.project.root()
+    }
+
+    fn read_root(&self) -> &ReadDirectory {
+        self.project.directory()
     }
 
     pub(crate) fn plan(
@@ -402,7 +394,7 @@ impl ProjectScanner {
             PolicyMatchBudget::new(self.options.scan_limits.max_policy_matches);
         let policy = self.load_policy(budget)?;
         let root_identity = self
-            .read_root
+            .read_root()
             .stable_identity()
             .map_err(directory_revalidation_error)?;
         let mut directory_proofs = Vec::new();
@@ -447,6 +439,12 @@ impl ProjectScanner {
                 (ScanMode::Reconcile, present, deleted, Vec::new())
             }
             ScanIntent::ChangedPaths(paths) => {
+                if paths.project_id() != self.project.project_id() {
+                    return Err(ScanError::ChangedPathProjectMismatch {
+                        expected: self.project.project_id(),
+                        actual: paths.project_id(),
+                    });
+                }
                 let changed = self.discover_changed(
                     paths,
                     known_rel_paths,
@@ -516,13 +514,8 @@ impl ProjectScanner {
     }
 
     pub(crate) fn validate_project_root_binding(&self) -> std::result::Result<(), ScanError> {
-        self.read_root
-            .ensure_object(self.project_root_object_identity)
-            .map_err(directory_revalidation_error)?;
-        let rebound = ReadDirectory::open(&self.project_root, OpenPolicy::ProjectSource)
-            .map_err(directory_revalidation_error)?;
-        rebound
-            .ensure_object(self.project_root_object_identity)
+        self.project
+            .validate_binding()
             .map_err(directory_revalidation_error)
     }
 
@@ -540,7 +533,7 @@ impl ProjectScanner {
             return rejected_with_spec(
                 ReadDiagnosticSpec::PathRejected {
                     path: DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: asset_relative,
                     },
                     reason: PathRejection::UnsupportedFileType,
@@ -557,7 +550,7 @@ impl ProjectScanner {
                     &failure,
                     &candidate.rel_path,
                     DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: asset_relative,
                     },
                     metrics,
@@ -572,7 +565,7 @@ impl ProjectScanner {
                     &failure,
                     &candidate.rel_path,
                     DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: asset_relative,
                     },
                     metrics,
@@ -580,7 +573,7 @@ impl ProjectScanner {
                 );
             }
         };
-        let meta_file = match self.read_root.open_regular(&meta_relative) {
+        let meta_file = match self.read_root().open_regular(&meta_relative) {
             Ok(file) => Some(file),
             Err(AnchoredFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
             Err(source) => {
@@ -592,7 +585,7 @@ impl ProjectScanner {
                     &failure,
                     &candidate.rel_path,
                     DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: &meta_relative,
                     },
                     metrics,
@@ -615,7 +608,7 @@ impl ProjectScanner {
                     &failure,
                     &candidate.rel_path,
                     DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: asset_relative,
                     },
                     metrics,
@@ -639,7 +632,7 @@ impl ProjectScanner {
                         &failure,
                         &candidate.rel_path,
                         DiagnosticPath::Joined {
-                            root: &self.project_root,
+                            root: self.project_root(),
                             relative: &meta_relative,
                         },
                         metrics,
@@ -657,7 +650,7 @@ impl ProjectScanner {
                 &failure,
                 &candidate.rel_path,
                 DiagnosticPath::Joined {
-                    root: &self.project_root,
+                    root: self.project_root(),
                     relative: asset_relative,
                 },
                 metrics,
@@ -672,7 +665,7 @@ impl ProjectScanner {
                     &failure,
                     &candidate.rel_path,
                     DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: &meta_relative,
                     },
                     metrics,
@@ -684,7 +677,7 @@ impl ProjectScanner {
                 &failure,
                 &candidate.rel_path,
                 DiagnosticPath::Joined {
-                    root: &self.project_root,
+                    root: self.project_root(),
                     relative: &meta_relative,
                 },
                 metrics,
@@ -706,7 +699,7 @@ impl ProjectScanner {
                     &failure,
                     &candidate.rel_path,
                     DiagnosticPath::Joined {
-                        root: &self.project_root,
+                        root: self.project_root(),
                         relative: asset_relative,
                     },
                     metrics,
@@ -770,7 +763,7 @@ impl ProjectScanner {
         let meta_hint = meta.as_ref().map(|meta| meta.hint);
         let meta_bytes = meta.as_ref().and_then(|meta| meta.bytes.clone());
         let abs_path = match prepared_joined_path(
-            &self.project_root,
+            self.project_root(),
             asset_relative,
             budget,
             "read source absolute path",
@@ -819,7 +812,7 @@ impl ProjectScanner {
         &self,
         budget: &mut AssetLoadBudget,
     ) -> std::result::Result<PolicySnapshot, ScanError> {
-        let file = match self.read_root.open_regular(SEARCH_IGNORE_V1_FILE) {
+        let file = match self.read_root().open_regular(SEARCH_IGNORE_V1_FILE) {
             Ok(file) => file,
             Err(AnchoredFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(PolicySnapshot {
@@ -869,7 +862,10 @@ impl ProjectScanner {
         &self,
         expected: Option<StableFileIdentity>,
     ) -> std::result::Result<(), ScanError> {
-        match (expected, self.read_root.open_regular(SEARCH_IGNORE_V1_FILE)) {
+        match (
+            expected,
+            self.read_root().open_regular(SEARCH_IGNORE_V1_FILE),
+        ) {
             (None, Err(AnchoredFsError::Io(error))) if error.kind() == io::ErrorKind::NotFound => {
                 Ok(())
             }
@@ -899,9 +895,9 @@ impl ProjectScanner {
     ) -> std::result::Result<(), ScanError> {
         for proof in proofs {
             let reopened = if proof.relative.as_os_str().is_empty() {
-                ReadDirectory::open(&self.project_root, OpenPolicy::ProjectSource)
+                self.project.reopen_bound()
             } else {
-                self.read_root.open_directory(&proof.relative)
+                self.read_root().open_directory(&proof.relative)
             }
             .map_err(directory_revalidation_error)?;
             reopened
@@ -927,7 +923,7 @@ impl ProjectScanner {
         relative: &Path,
         expected: FileProof,
     ) -> std::result::Result<(), ScanError> {
-        let reopened = match self.read_root.open_regular(relative) {
+        let reopened = match self.read_root().open_regular(relative) {
             Ok(file) => file,
             Err(source) => return Err(source_revalidation_error(source)),
         };
@@ -942,7 +938,7 @@ impl ProjectScanner {
     }
 
     fn validate_absent_source_file(&self, relative: &Path) -> std::result::Result<(), ScanError> {
-        match self.read_root.open_regular(relative) {
+        match self.read_root().open_regular(relative) {
             Err(AnchoredFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Ok(_) => Err(ScanError::SourceChangedDuringScan),
             Err(source) => Err(source_revalidation_error(source)),
@@ -985,7 +981,7 @@ impl ProjectScanner {
 
     fn discover_changed(
         &self,
-        mut paths: Vec<PathBuf>,
+        paths: ProjectPathSet,
         known: &[String],
         policy: &SearchIgnoreV1,
         policy_match_budget: &mut PolicyMatchBudget,
@@ -994,8 +990,6 @@ impl ProjectScanner {
         ledger: &mut ScanLedger,
         budget: &mut AssetLoadBudget,
     ) -> std::result::Result<ChangedDiscovery, ScanError> {
-        paths.sort_unstable();
-        paths.dedup();
         let mut exact_files = Vec::new();
         let mut rescan_dirs = Vec::new();
         let mut requested = Vec::new();
@@ -1003,13 +997,18 @@ impl ProjectScanner {
         let mut absence_proofs = Vec::new();
         let mut policy_changed = false;
 
-        for supplied in paths {
-            let normalized = match self.normalized_changed_path(&supplied, budget)? {
+        for supplied in paths.into_paths() {
+            let relative_input = supplied.as_relative_path();
+            let normalized = match prepared_portable_relative_path(
+                relative_input,
+                budget,
+                "changed relative path",
+            )? {
                 Ok(path) => path,
                 Err(reason) => {
-                    let diagnostic_path = prepared_absolute_input_path(
-                        &self.project_root,
-                        &supplied,
+                    let diagnostic_path = prepared_joined_path(
+                        self.project_root(),
+                        relative_input,
                         budget,
                         "changed path diagnostic",
                     )?;
@@ -1039,7 +1038,7 @@ impl ProjectScanner {
             let relative = Path::new(&normalized);
             if let Err(reason) = self.validate_relative_boundary(relative) {
                 let path = prepared_joined_path(
-                    &self.project_root,
+                    self.project_root(),
                     relative,
                     budget,
                     "changed path boundary diagnostic",
@@ -1078,7 +1077,7 @@ impl ProjectScanner {
                 }
                 Ok(OpenedEntry::File(_)) | Ok(OpenedEntry::Other) => {
                     let path = prepared_joined_path(
-                        &self.project_root,
+                        self.project_root(),
                         relative,
                         budget,
                         "changed unsupported path diagnostic",
@@ -1124,7 +1123,7 @@ impl ProjectScanner {
                 Err(source) => {
                     push_anchored_diagnostic(
                         diagnostics,
-                        &self.project_root,
+                        self.project_root(),
                         relative,
                         source,
                         ledger,
@@ -1263,16 +1262,16 @@ impl ProjectScanner {
                 continue;
             }
             let handle = if root.as_os_str().is_empty() {
-                ReadDirectory::open(&self.project_root, OpenPolicy::ProjectSource)
+                self.project.reopen_bound()
             } else {
-                self.read_root.open_directory(root)
+                self.read_root().open_directory(root)
             };
             let handle = match handle {
                 Ok(handle) => handle,
                 Err(source) => {
                     push_anchored_diagnostic(
                         diagnostics,
-                        &self.project_root,
+                        self.project_root(),
                         root,
                         source,
                         ledger,
@@ -1307,9 +1306,9 @@ impl ProjectScanner {
         let mut present = Vec::new();
         while let Some(directory) = pending.pop() {
             let handle = if directory.relative.as_os_str().is_empty() {
-                ReadDirectory::open(&self.project_root, OpenPolicy::ProjectSource)
+                self.project.reopen_bound()
             } else {
-                self.read_root.open_directory(&directory.relative)
+                self.read_root().open_directory(&directory.relative)
             }
             .map_err(directory_revalidation_error)?;
             handle
@@ -1333,9 +1332,9 @@ impl ProjectScanner {
                 .ensure_identity(identity)
                 .map_err(directory_revalidation_error)?;
             let handle = if directory.relative.as_os_str().is_empty() {
-                ReadDirectory::open(&self.project_root, OpenPolicy::ProjectSource)
+                self.project.reopen_bound()
             } else {
-                self.read_root.open_directory(&directory.relative)
+                self.read_root().open_directory(&directory.relative)
             }
             .map_err(directory_revalidation_error)?;
             handle
@@ -1365,7 +1364,7 @@ impl ProjectScanner {
                         diagnostics,
                         ScanDiagnostic::PathRejected {
                             path: prepared_joined_path(
-                                &self.project_root,
+                                self.project_root(),
                                 &path,
                                 budget,
                                 "non-UTF8 path diagnostic",
@@ -1391,7 +1390,7 @@ impl ProjectScanner {
                         diagnostics,
                         ScanDiagnostic::PathRejected {
                             path: prepared_joined_path(
-                                &self.project_root,
+                                self.project_root(),
                                 &path,
                                 budget,
                                 "invalid portable path diagnostic",
@@ -1462,7 +1461,7 @@ impl ProjectScanner {
                         }
                         let Some(stem) = relative.file_stem().and_then(OsStr::to_str) else {
                             let path = prepared_joined_path(
-                                &self.project_root,
+                                self.project_root(),
                                 &relative,
                                 budget,
                                 "candidate stem diagnostic",
@@ -1494,7 +1493,7 @@ impl ProjectScanner {
                     Ok(OpenedEntry::Other) => {}
                     Err(source) => push_anchored_diagnostic(
                         diagnostics,
-                        &self.project_root,
+                        self.project_root(),
                         &relative,
                         source,
                         ledger,
@@ -1535,28 +1534,27 @@ impl ProjectScanner {
         hint: EntryKindHint,
     ) -> std::result::Result<OpenedEntry, AnchoredFsError> {
         if relative.as_os_str().is_empty() {
-            return ReadDirectory::open(&self.project_root, OpenPolicy::ProjectSource)
-                .map(OpenedEntry::Directory);
+            return self.project.reopen_bound().map(OpenedEntry::Directory);
         }
         let directory_first = !matches!(hint, EntryKindHint::RegularFile);
         if directory_first {
-            match self.read_root.open_directory(relative) {
+            match self.read_root().open_directory(relative) {
                 Ok(directory) => return Ok(OpenedEntry::Directory(directory)),
                 Err(error) if !is_anchored_type_mismatch(&error) => return Err(error),
                 Err(_) => {}
             }
-            match self.read_root.open_regular(relative) {
+            match self.read_root().open_regular(relative) {
                 Ok(file) => Ok(OpenedEntry::File(file)),
                 Err(error) if is_anchored_type_mismatch(&error) => Ok(OpenedEntry::Other),
                 Err(error) => Err(error),
             }
         } else {
-            match self.read_root.open_regular(relative) {
+            match self.read_root().open_regular(relative) {
                 Ok(file) => return Ok(OpenedEntry::File(file)),
                 Err(error) if !is_anchored_type_mismatch(&error) => return Err(error),
                 Err(_) => {}
             }
-            match self.read_root.open_directory(relative) {
+            match self.read_root().open_directory(relative) {
                 Ok(directory) => Ok(OpenedEntry::Directory(directory)),
                 Err(error) if is_anchored_type_mismatch(&error) => Ok(OpenedEntry::Other),
                 Err(error) => Err(error),
@@ -1612,28 +1610,12 @@ impl ProjectScanner {
         })
     }
 
-    fn normalized_changed_path(
-        &self,
-        supplied: &Path,
-        budget: &AssetLoadBudget,
-    ) -> std::result::Result<std::result::Result<String, PathRejection>, ScanError> {
-        let relative = if supplied.is_absolute() {
-            match strip_project_root(&self.project_root, supplied) {
-                Ok(relative) => relative,
-                Err(_) => return Ok(Err(PathRejection::OutsideProject)),
-            }
-        } else {
-            supplied
-        };
-        prepared_portable_relative_path(relative, budget, "changed relative path")
-    }
-
     fn open_read_file(
         &self,
         relative: &Path,
         part: SourcePart,
     ) -> std::result::Result<RegularFile, ReadFailure> {
-        self.read_root
+        self.read_root()
             .open_regular(relative)
             .map_err(|source| ReadFailure::Anchored { part, source })
     }
@@ -1645,7 +1627,7 @@ impl ProjectScanner {
         blob: &ReadBlob,
         metrics: &mut ScanMetrics,
     ) -> std::result::Result<(), ReadFailure> {
-        let mut reopened = match self.read_root.open_regular(relative) {
+        let mut reopened = match self.read_root().open_regular(relative) {
             Ok(file) => file,
             Err(AnchoredFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 return Err(ReadFailure::Changed {
@@ -1680,7 +1662,7 @@ impl ProjectScanner {
         relative: &Path,
         metrics: &mut ScanMetrics,
     ) -> std::result::Result<(), ReadFailure> {
-        let mut file = match self.read_root.open_regular(relative) {
+        let mut file = match self.read_root().open_regular(relative) {
             Err(AnchoredFsError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 return Ok(());
             }
@@ -2740,7 +2722,8 @@ fn rejected_scan_error(
         | ScanError::TraversalRead { .. }
         | ScanError::TraversalChangedDuringScan
         | ScanError::SourceChangedDuringScan
-        | ScanError::TraversalLimitExceeded { .. } => ReadDiagnosticSpec::ReadFailed {
+        | ScanError::TraversalLimitExceeded { .. }
+        | ScanError::ChangedPathProjectMismatch { .. } => ReadDiagnosticSpec::ReadFailed {
             rel_path: "",
             part,
             kind: io::ErrorKind::InvalidData,
@@ -3379,21 +3362,6 @@ fn append_joined_path(path: &mut PathBuf, root: &Path, relative: &Path) {
     }
 }
 
-fn prepared_absolute_input_path(
-    project_root: &Path,
-    supplied: &Path,
-    budget: &mut AssetLoadBudget,
-    allocation: &'static str,
-) -> std::result::Result<PathBuf, ScanError> {
-    if supplied.is_absolute() {
-        let path = prepared_path_clone(supplied, budget, allocation)?;
-        budget.consume_bytes(path_backing_bytes(&path)?)?;
-        Ok(path)
-    } else {
-        prepared_joined_path(project_root, supplied, budget, allocation)
-    }
-}
-
 fn prepared_relative_child_path(
     parent: &Path,
     name: &OsStr,
@@ -3892,14 +3860,6 @@ fn is_portable_known_path(path: &str) -> bool {
     path.split('/').all(is_portable_component)
 }
 
-pub(crate) fn is_portable_component(component: &str) -> bool {
-    !component.is_empty()
-        && !matches!(component, "." | "..")
-        && !component
-            .chars()
-            .any(|character| matches!(character, '\\' | '\0' | ':'))
-}
-
 fn configured_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
     configured_relative_path_if_inside(project_root, path)?.ok_or_else(|| {
         anyhow!(
@@ -4336,6 +4296,14 @@ mod tests {
             .unwrap()
     }
 
+    fn changed_paths<I, P>(scanner: &ProjectScanner, paths: I) -> ScanIntent
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        ScanIntent::ChangedPaths(scanner.project.path_space().resolve_set(paths).unwrap())
+    }
+
     #[test]
     fn selected_scope_queries_sorted_exact_paths_and_prefixes() {
         let mut exact_files = vec![
@@ -4397,7 +4365,11 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("no longer matches"));
+        assert!(
+            error
+                .to_string()
+                .contains("revalidate retained project authority")
+        );
     }
 
     #[test]
@@ -4429,8 +4401,8 @@ mod tests {
 
         fs::write(&policy, b"exact:Assets/Hidden.asset\n").unwrap();
 
-        let changed =
-            plan_with_default_budget(&scanner, ScanIntent::ChangedPaths(vec![policy]), &known);
+        let intent = changed_paths(&scanner, [policy]);
+        let changed = plan_with_default_budget(&scanner, intent, &known);
         assert!(changed.present.is_empty());
         assert_eq!(changed.deleted, ["Assets/Hidden.asset"]);
     }
@@ -4935,7 +4907,7 @@ mod tests {
 
         let plan = plan_with_default_budget(
             &scanner,
-            ScanIntent::ChangedPaths(vec![project.path().join("assets/owner.prefab")]),
+            changed_paths(&scanner, [project.path().join("assets/owner.prefab")]),
             &[],
         );
         assert_eq!(
@@ -4950,7 +4922,7 @@ mod tests {
         let known = ["Assets/Owner.prefab".to_owned()];
         let plan = plan_with_default_budget(
             &scanner,
-            ScanIntent::ChangedPaths(vec![project.path().join("assets/owner.prefab")]),
+            changed_paths(&scanner, [project.path().join("assets/owner.prefab")]),
             &known,
         );
         assert_eq!(plan.deleted, ["Assets/Owner.prefab"]);
@@ -5351,11 +5323,8 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(&ignore_path, b"exact:Assets/Keep.asset\n").unwrap();
 
-        let changed = plan_with_default_budget(
-            &scanner,
-            ScanIntent::ChangedPaths(vec![ignore_path]),
-            &known,
-        );
+        let changed =
+            plan_with_default_budget(&scanner, changed_paths(&scanner, [ignore_path]), &known);
         let full = plan_with_default_budget(&scanner, ScanIntent::Full, &known);
 
         assert_eq!(
@@ -5401,11 +5370,8 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(&ignore_path, b"exact:Root.asset\n").unwrap();
 
-        let changed = plan_with_default_budget(
-            &scanner,
-            ScanIntent::ChangedPaths(vec![ignore_path]),
-            &known,
-        );
+        let changed =
+            plan_with_default_budget(&scanner, changed_paths(&scanner, [ignore_path]), &known);
         let full = plan_with_default_budget(&scanner, ScanIntent::Full, &known);
 
         assert_eq!(changed.present, full.present);
@@ -5436,11 +5402,8 @@ mod tests {
             .collect::<Vec<_>>();
         fs::write(&ignore_path, b"exact:Assets/Hidden.asset\n").unwrap();
 
-        let changed = plan_with_default_budget(
-            &scanner,
-            ScanIntent::ChangedPaths(vec![ignore_path]),
-            &known,
-        );
+        let changed =
+            plan_with_default_budget(&scanner, changed_paths(&scanner, [ignore_path]), &known);
         let full = plan_with_default_budget(&scanner, ScanIntent::Full, &known);
 
         assert_eq!(changed.present, full.present);
@@ -5461,7 +5424,7 @@ mod tests {
 
         let error = scanner
             .plan(
-                ScanIntent::ChangedPaths(vec![PathBuf::from("Assets/Missing.asset")]),
+                changed_paths(&scanner, [PathBuf::from("Assets/Missing.asset")]),
                 &[],
                 &mut budget,
             )
@@ -5509,20 +5472,36 @@ mod tests {
     fn changed_path_diagnostics_have_stable_structural_order() {
         let project = tempfile::tempdir().unwrap();
         let scanner = scanner(&project, ScanReadLimits::default());
-        let outside = tempfile::tempdir().unwrap();
-        let first = outside.path().join("A.asset");
-        let second = outside.path().join("Z.asset");
+        let first = project.path().join("Assets/.a.asset");
+        let second = project.path().join("Assets/.B.asset");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
 
         let left = plan_with_default_budget(
             &scanner,
-            ScanIntent::ChangedPaths(vec![second.clone(), first.clone()]),
+            changed_paths(&scanner, [second.clone(), first.clone()]),
             &[],
         );
-        let right =
-            plan_with_default_budget(&scanner, ScanIntent::ChangedPaths(vec![first, second]), &[]);
+        let right_intent = changed_paths(&scanner, [first.clone(), second.clone()]);
+        let right = plan_with_default_budget(&scanner, right_intent, &[]);
 
         assert_eq!(left.diagnostics, right.diagnostics);
         assert_eq!(left.deleted, right.deleted);
+        assert_eq!(left.diagnostics.len(), 2);
+        assert!(matches!(
+            &left.diagnostics[0],
+            ScanDiagnostic::PathRejected {
+                path,
+                reason: PathRejection::UnsupportedFileType,
+            } if path.file_name() == second.file_name()
+        ));
+        assert!(matches!(
+            &left.diagnostics[1],
+            ScanDiagnostic::PathRejected {
+                path,
+                reason: PathRejection::UnsupportedFileType,
+            } if path.file_name() == first.file_name()
+        ));
         assert!(
             left.diagnostics
                 .windows(2)
@@ -5906,8 +5885,8 @@ mod tests {
             "Assets/Area/Removed.asset".to_owned(),
         ];
 
-        let plan =
-            plan_with_default_budget(&scanner, ScanIntent::ChangedPaths(vec![directory]), &known);
+        let intent = changed_paths(&scanner, [directory]);
+        let plan = plan_with_default_budget(&scanner, intent, &known);
         assert_eq!(plan.deleted, ["Assets/Area/Removed.asset"]);
         assert_eq!(
             plan.present
@@ -5929,7 +5908,7 @@ mod tests {
 
         let plan = plan_with_default_budget(
             &scanner,
-            ScanIntent::ChangedPaths(vec![PathBuf::from("Assets/Removed")]),
+            changed_paths(&scanner, [PathBuf::from("Assets/Removed")]),
             &known,
         );
 
@@ -5957,7 +5936,7 @@ mod tests {
             let mut budget = AssetLoadBudget::default();
             let plan = scanner
                 .plan(
-                    ScanIntent::ChangedPaths(vec![PathBuf::from(relative)]),
+                    changed_paths(&scanner, [PathBuf::from(relative)]),
                     &known,
                     &mut budget,
                 )
@@ -6126,7 +6105,8 @@ mod tests {
         create_file_symlink(&outside_file, &link).unwrap();
         let scanner = scanner(&project, ScanReadLimits::default());
 
-        let plan = plan_with_default_budget(&scanner, ScanIntent::ChangedPaths(vec![link]), &[]);
+        let intent = changed_paths(&scanner, [link]);
+        let plan = plan_with_default_budget(&scanner, intent, &[]);
 
         assert!(plan.present.is_empty());
         assert!(plan.diagnostics.iter().any(|diagnostic| {

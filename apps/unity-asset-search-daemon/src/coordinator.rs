@@ -3,12 +3,11 @@
 //! Admission is intentionally centralized here. Filesystem events, timers, IPC requests, and
 //! startup reconciliation must not grow independent scheduling rules around the index builder.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -18,9 +17,12 @@ use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
-use unity_asset_search_index::{FilesystemReindexIntent, FilesystemReindexScope};
+use unity_asset_search_index::{
+    FilesystemReindexIntent, FilesystemReindexScope, ProjectPathSet, ProjectPathSpace,
+};
 use unity_asset_search_protocol::{
-    ReindexDisposition, ReindexReceipt, SEARCH_PROTOCOL_REVISION, StatusResponse, ValidateContract,
+    ProjectId, ReindexDisposition, ReindexReceipt, SEARCH_PROTOCOL_REVISION, StatusResponse,
+    ValidateContract,
 };
 
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(75);
@@ -108,7 +110,7 @@ impl ReindexSource {
 /// Bounded scheduling policy for [`ReindexCoordinator`].
 #[derive(Debug, Clone)]
 pub struct ReindexCoordinatorConfig {
-    project_root: PathBuf,
+    project_paths: ProjectPathSpace,
     debounce: Duration,
     max_debounce: Duration,
     max_dirty_paths: usize,
@@ -118,15 +120,20 @@ pub struct ReindexCoordinatorConfig {
 
 impl ReindexCoordinatorConfig {
     #[must_use]
-    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+    pub fn new(project_paths: ProjectPathSpace) -> Self {
         Self {
-            project_root: project_root.into(),
+            project_paths,
             debounce: DEFAULT_DEBOUNCE,
             max_debounce: DEFAULT_MAX_DEBOUNCE,
             max_dirty_paths: DEFAULT_MAX_DIRTY_PATHS,
             max_pending_events: DEFAULT_MAX_PENDING_EVENTS,
             max_failure_history: DEFAULT_MAX_FAILURE_HISTORY,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn project_id(&self) -> ProjectId {
+        self.project_paths.project_id()
     }
 
     #[must_use]
@@ -161,13 +168,7 @@ impl ReindexCoordinatorConfig {
         self
     }
 
-    fn validate(mut self) -> Result<Self, CoordinatorError> {
-        if !self.project_root.is_absolute() {
-            return Err(CoordinatorError::InvalidConfiguration(
-                "project_root must be absolute",
-            ));
-        }
-        self.project_root = normalize_absolute_root(&self.project_root)?;
+    fn validate(self) -> Result<Self, CoordinatorError> {
         if self.debounce.is_zero() {
             return Err(CoordinatorError::InvalidConfiguration(
                 "debounce must be greater than zero",
@@ -404,7 +405,7 @@ impl fmt::Debug for ReindexCoordinator {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ReindexCoordinator")
-            .field("project_root", &self.inner.config.project_root)
+            .field("project_paths", &self.inner.config.project_paths)
             .finish_non_exhaustive()
     }
 }
@@ -478,6 +479,11 @@ impl fmt::Debug for ReindexCoordinatorRuntime {
 }
 
 impl ReindexCoordinator {
+    #[must_use]
+    pub(crate) fn project_path_space(&self) -> &ProjectPathSpace {
+        &self.inner.config.project_paths
+    }
+
     /// Atomically admits, rejects, or coalesces one reindex request.
     #[cfg(test)]
     pub async fn admit(
@@ -485,7 +491,9 @@ impl ReindexCoordinator {
         source: ReindexSource,
         intent: FilesystemReindexIntent,
     ) -> Result<ReindexReceipt, CoordinatorError> {
-        self.admit_inner(source, intent, false).await
+        let prepared = self.prepare_intent(&intent)?;
+        self.admit_prepared_unobserved_with(source, prepared, false)
+            .await
     }
 
     /// Atomically admits one request and returns an independently awaitable completion handle.
@@ -512,18 +520,17 @@ impl ReindexCoordinator {
         source: ReindexSource,
         prepared: PreparedReindexIntent,
     ) -> Result<ReindexObservation, CoordinatorError> {
-        self.admit_prepared_observed_with(source, prepared, false)
-            .await
+        self.admit_prepared_observed_with(source, prepared).await
     }
 
-    pub(crate) async fn admit_watcher_overflow_observed(
+    pub(crate) async fn admit_watcher_overflow_unobserved(
         &self,
-    ) -> Result<ReindexObservation, CoordinatorError> {
+    ) -> Result<ReindexReceipt, CoordinatorError> {
         let prepared = PreparedReindexIntent::new(NormalizedGeneralScope {
             scope: GeneralScope::Full,
             escalated: true,
         });
-        self.admit_prepared_observed_with(ReindexSource::Watcher, prepared, true)
+        self.admit_prepared_unobserved_with(ReindexSource::Watcher, prepared, true)
             .await
     }
 
@@ -531,7 +538,6 @@ impl ReindexCoordinator {
         &self,
         source: ReindexSource,
         prepared: PreparedReindexIntent,
-        watcher_overflow: bool,
     ) -> Result<ReindexObservation, CoordinatorError> {
         let observation_id = self.next_observation_id();
         let (event_sender, event_receiver) = mpsc::channel(OBSERVATION_EVENT_CAPACITY);
@@ -547,9 +553,6 @@ impl ReindexCoordinator {
                 return Err(CoordinatorError::ShuttingDown);
             }
             state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
-            if watcher_overflow {
-                state.watcher_overflows = state.watcher_overflows.saturating_add(1);
-            }
             let escalated = prepared.escalated;
             let disposition = state.admit_general(
                 prepared.scope,
@@ -580,12 +583,7 @@ impl ReindexCoordinator {
     /// Records a lossy watcher overflow and upgrades pending filesystem work to a full scan.
     #[cfg(test)]
     pub async fn watcher_overflow(&self) -> Result<ReindexReceipt, CoordinatorError> {
-        self.admit_inner(
-            ReindexSource::Watcher,
-            FilesystemReindexIntent::full(),
-            true,
-        )
-        .await
+        self.admit_watcher_overflow_unobserved().await
     }
 
     /// Waits until the runner has drained every admitted request.
@@ -608,11 +606,10 @@ impl ReindexCoordinator {
         state.snapshot()
     }
 
-    #[cfg(test)]
-    async fn admit_inner(
+    async fn admit_prepared_unobserved_with(
         &self,
         source: ReindexSource,
-        intent: FilesystemReindexIntent,
+        prepared: PreparedReindexIntent,
         watcher_overflow: bool,
     ) -> Result<ReindexReceipt, CoordinatorError> {
         let mut state = self.inner.state.lock().await;
@@ -621,29 +618,19 @@ impl ReindexCoordinator {
         }
         state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
 
-        let disposition = if watcher_overflow {
+        if watcher_overflow {
             state.watcher_overflows = state.watcher_overflows.saturating_add(1);
+        }
+        if prepared.escalated {
             state.full_escalations = state.full_escalations.saturating_add(1);
-            state.admit_general(
-                GeneralScope::Full,
-                Instant::now(),
-                &self.inner.config,
-                true,
-                None,
-            )?
-        } else {
-            let prepared = self.prepare_intent(&intent)?;
-            if prepared.escalated {
-                state.full_escalations = state.full_escalations.saturating_add(1);
-            }
-            state.admit_general(
-                prepared.scope,
-                Instant::now(),
-                &self.inner.config,
-                prepared.escalated,
-                None,
-            )?
-        };
+        }
+        let disposition = state.admit_general(
+            prepared.scope,
+            Instant::now(),
+            &self.inner.config,
+            prepared.escalated,
+            None,
+        )?;
 
         let should_start = state.start_runner_if_needed();
         let receipt = admission_receipt(disposition);
@@ -1002,30 +989,26 @@ fn normalize_general_scope(
             escalated: false,
         }),
         FilesystemReindexScope::ChangedPaths { paths } => {
-            let mut normalized = BTreeSet::new();
-            for path in paths {
-                let Some(path) = normalize_changed_path(&config.project_root, path)? else {
-                    return Ok(NormalizedGeneralScope {
-                        scope: GeneralScope::Full,
-                        escalated: true,
-                    });
-                };
-                normalized.insert(path);
-                if normalized.len() > config.max_dirty_paths {
-                    return Ok(NormalizedGeneralScope {
-                        scope: GeneralScope::Full,
-                        escalated: true,
-                    });
-                }
+            if paths.project_id() != config.project_paths.project_id() {
+                return Err(CoordinatorError::ChangedPathProjectMismatch {
+                    expected: config.project_paths.project_id(),
+                    actual: paths.project_id(),
+                });
             }
-            if normalized.is_empty() {
+            if paths.len() > config.max_dirty_paths {
+                return Ok(NormalizedGeneralScope {
+                    scope: GeneralScope::Full,
+                    escalated: true,
+                });
+            }
+            if paths.is_empty() {
                 return Ok(NormalizedGeneralScope {
                     scope: GeneralScope::Reconcile,
                     escalated: false,
                 });
             }
             Ok(NormalizedGeneralScope {
-                scope: GeneralScope::ChangedPaths(normalized),
+                scope: GeneralScope::ChangedPaths(paths.clone()),
                 escalated: false,
             })
         }
@@ -1036,7 +1019,7 @@ fn normalize_general_scope(
 enum GeneralScope {
     Full,
     Reconcile,
-    ChangedPaths(BTreeSet<PathBuf>),
+    ChangedPaths(ProjectPathSet),
 }
 
 fn reindex_intent_fingerprint(scope: &GeneralScope) -> [u8; 32] {
@@ -1048,40 +1031,12 @@ fn reindex_intent_fingerprint(scope: &GeneralScope) -> [u8; 32] {
         GeneralScope::ChangedPaths(paths) => {
             hasher.update([2]);
             hasher.update((paths.len() as u64).to_le_bytes());
-            for path in paths {
-                update_path_fingerprint(&mut hasher, path);
+            for path in paths.iter() {
+                hasher.update(path.identity().as_bytes());
             }
         }
     }
     hasher.finalize().into()
-}
-
-#[cfg(unix)]
-fn update_path_fingerprint(hasher: &mut Sha256, path: &Path) {
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let encoded = path.as_os_str().as_bytes();
-    hasher.update((encoded.len() as u64).to_le_bytes());
-    hasher.update(encoded);
-}
-
-#[cfg(windows)]
-fn update_path_fingerprint(hasher: &mut Sha256, path: &Path) {
-    use std::os::windows::ffi::OsStrExt as _;
-
-    let encoded = path.as_os_str().encode_wide();
-    let length = encoded.clone().count() as u64;
-    hasher.update(length.to_le_bytes());
-    for unit in encoded {
-        hasher.update(unit.to_le_bytes());
-    }
-}
-
-#[cfg(not(any(unix, windows)))]
-fn update_path_fingerprint(hasher: &mut Sha256, path: &Path) {
-    let encoded = path.to_string_lossy();
-    hasher.update((encoded.len() as u64).to_le_bytes());
-    hasher.update(encoded.as_bytes());
 }
 
 impl GeneralScope {
@@ -1103,7 +1058,9 @@ impl GeneralScope {
             Self::ChangedPaths(incoming) => match self {
                 Self::Full | Self::Reconcile => false,
                 Self::ChangedPaths(current) => {
-                    current.extend(incoming);
+                    current
+                        .extend(incoming)
+                        .expect("coordinator admits paths from one project space");
                     if current.len() > max_dirty_paths {
                         *self = Self::Full;
                         true
@@ -1127,9 +1084,7 @@ impl GeneralScope {
         match self {
             Self::Full => FilesystemReindexIntent::full(),
             Self::Reconcile => FilesystemReindexIntent::reconcile(),
-            Self::ChangedPaths(paths) => {
-                FilesystemReindexIntent::changed_paths(paths.into_iter().collect())
-            }
+            Self::ChangedPaths(paths) => FilesystemReindexIntent::changed_paths(paths),
         }
     }
 }
@@ -1190,65 +1145,6 @@ impl PendingGeneral {
     }
 }
 
-fn normalize_absolute_root(root: &Path) -> Result<PathBuf, CoordinatorError> {
-    let mut normalized = PathBuf::new();
-    for component in root.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(CoordinatorError::InvalidConfiguration(
-                        "project_root escapes its filesystem root",
-                    ));
-                }
-            }
-            Component::Normal(segment) => normalized.push(segment),
-        }
-    }
-    Ok(normalized)
-}
-
-fn normalize_changed_path(
-    project_root: &Path,
-    supplied: &Path,
-) -> Result<Option<PathBuf>, CoordinatorError> {
-    let relative = if supplied.is_absolute() {
-        supplied
-            .strip_prefix(project_root)
-            .map_err(|_| CoordinatorError::PathOutsideProject {
-                path: supplied.to_path_buf(),
-                project_root: project_root.to_path_buf(),
-            })?
-    } else {
-        supplied
-    };
-
-    let mut normalized = PathBuf::new();
-    for component in relative.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(segment) => normalized.push(segment),
-            Component::ParentDir => {
-                if !normalized.pop() {
-                    return Err(CoordinatorError::PathOutsideProject {
-                        path: supplied.to_path_buf(),
-                        project_root: project_root.to_path_buf(),
-                    });
-                }
-            }
-            Component::Prefix(_) | Component::RootDir => {
-                return Err(CoordinatorError::PathOutsideProject {
-                    path: supplied.to_path_buf(),
-                    project_root: project_root.to_path_buf(),
-                });
-            }
-        }
-    }
-    Ok((!normalized.as_os_str().is_empty()).then_some(normalized))
-}
-
 fn admission_receipt(disposition: ReindexDisposition) -> ReindexReceipt {
     ReindexReceipt {
         protocol_revision: SEARCH_PROTOCOL_REVISION,
@@ -1293,9 +1189,9 @@ pub enum CoordinatorError {
     CompletionChannelClosed {
         admission: Box<ReindexReceipt>,
     },
-    PathOutsideProject {
-        path: PathBuf,
-        project_root: PathBuf,
+    ChangedPathProjectMismatch {
+        expected: ProjectId,
+        actual: ProjectId,
     },
 }
 
@@ -1328,11 +1224,9 @@ impl fmt::Display for CoordinatorError {
             Self::CompletionChannelClosed { .. } => {
                 formatter.write_str("reindex completion channel closed before reporting a result")
             }
-            Self::PathOutsideProject { path, project_root } => write!(
+            Self::ChangedPathProjectMismatch { expected, actual } => write!(
                 formatter,
-                "changed path {} is outside project root {}",
-                path.display(),
-                project_root.display()
+                "changed paths belong to project {actual}, but this coordinator owns {expected}"
             ),
         }
     }

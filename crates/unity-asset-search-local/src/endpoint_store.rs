@@ -147,6 +147,11 @@ pub struct EndpointClaimV1 {
 
 impl EndpointClaimV1 {
     #[must_use]
+    pub const fn project_id(&self) -> ProjectId {
+        self.namespace.project_id()
+    }
+
+    #[must_use]
     pub const fn stale_cleanup(&self) -> EndpointCleanupV1 {
         self.stale_cleanup
     }

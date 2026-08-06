@@ -30,7 +30,7 @@ use crate::anchored_fs::{
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
-    SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+    GenerationStorageContract, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
 };
 use crate::generation_store::measure_artifact_tree;
 use crate::projection::{GenerationProjection, ReferenceDocument, SearchDocument};
@@ -62,7 +62,7 @@ const SCHEMA_MARKER_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
     SCHEMA_MARKER_JSON_RESOURCES,
 );
 const SEARCH_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:search-projection:v1\0";
-const REFERENCE_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:reference-projection:v1\0";
+const REFERENCE_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:reference-projection:v2\0";
 const MIN_WRITER_MEMORY_PER_THREAD: usize = 15_000_000;
 const MAX_WRITER_MEMORY_PER_THREAD: usize = u32::MAX as usize - 1_000_000;
 const MAX_WRITER_THREADS: usize = 8;
@@ -512,6 +512,18 @@ impl ProjectionReaders {
         complete_generation_dir: &Path,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self> {
+        Self::open_for(
+            complete_generation_dir,
+            GenerationStorageContract::CurrentV2,
+            budget,
+        )
+    }
+
+    pub(crate) fn open_for(
+        complete_generation_dir: &Path,
+        storage: GenerationStorageContract,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self> {
         ensure_directory_no_follow(complete_generation_dir)
             .context("validate completed projection generation directory")?;
 
@@ -533,9 +545,14 @@ impl ProjectionReaders {
                 .context("open completed reference artifact directory without following links")?,
         );
 
-        let search = SearchProjectionReader::open(&search_directory, &opened_search, budget)?;
-        let references =
-            ReferenceProjectionReader::open(&reference_directory, &opened_references, budget)?;
+        let search =
+            SearchProjectionReader::open(&search_directory, &opened_search, storage, budget)?;
+        let references = ReferenceProjectionReader::open(
+            &reference_directory,
+            &opened_references,
+            storage,
+            budget,
+        )?;
         Ok(Self { search, references })
     }
 
@@ -558,6 +575,7 @@ impl SearchProjectionReader {
     fn open(
         directory: &Path,
         opened_directory: &Arc<SecureReadDirectory>,
+        storage: GenerationStorageContract,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self> {
         validate_schema_marker(
@@ -565,6 +583,7 @@ impl SearchProjectionReader {
             opened_directory,
             SEARCH_SCHEMA_CONTRACT,
             SEARCH_SCHEMA_VERSION,
+            storage,
             budget,
         )?;
         let index = Index::open(AnchoredTantivyDirectory::new(Arc::clone(opened_directory)))
@@ -731,12 +750,14 @@ pub(crate) struct ReferenceProjectionReader {
     reader: IndexReader,
     fields: ReferenceProjectionFields,
     payloads: ReferencePayloadReader,
+    storage: GenerationStorageContract,
 }
 
 impl ReferenceProjectionReader {
     fn open(
         directory: &Path,
         opened_directory: &Arc<SecureReadDirectory>,
+        storage: GenerationStorageContract,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self> {
         validate_schema_marker(
@@ -744,6 +765,7 @@ impl ReferenceProjectionReader {
             opened_directory,
             REFERENCE_SCHEMA_CONTRACT,
             REFERENCE_SCHEMA_VERSION,
+            storage,
             budget,
         )?;
         let index = Index::open(AnchoredTantivyDirectory::new(Arc::clone(opened_directory)))
@@ -774,7 +796,8 @@ impl ReferenceProjectionReader {
         Ok(Self {
             reader,
             fields,
-            payloads: ReferencePayloadReader::new(payload),
+            payloads: ReferencePayloadReader::new_for(payload, storage),
+            storage,
         })
     }
 
@@ -788,6 +811,10 @@ impl ReferenceProjectionReader {
 
     pub(crate) const fn payloads(&self) -> &ReferencePayloadReader {
         &self.payloads
+    }
+
+    pub(crate) const fn storage(&self) -> GenerationStorageContract {
+        self.storage
     }
 }
 
@@ -1047,9 +1074,9 @@ struct SchemaMarker {
 }
 
 impl SchemaMarker {
-    fn new(schema_contract: &str, schema_version: u16) -> Self {
+    fn new(schema_contract: &str, schema_version: u16, storage: GenerationStorageContract) -> Self {
         Self {
-            generation_contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            generation_contract_version: storage.wire_version(),
             schema_contract: schema_contract.to_owned(),
             schema_version,
         }
@@ -1058,8 +1085,12 @@ impl SchemaMarker {
 
 fn write_schema_marker(directory: &Path, contract: &str, version: u16) -> Result<()> {
     let path = directory.join(SCHEMA_MARKER_FILE);
-    let bytes = serde_json::to_vec(&SchemaMarker::new(contract, version))
-        .context("serialize projection schema marker")?;
+    let bytes = serde_json::to_vec(&SchemaMarker::new(
+        contract,
+        version,
+        GenerationStorageContract::CurrentV2,
+    ))
+    .context("serialize projection schema marker")?;
     ensure!(
         bytes.len() <= MAX_SCHEMA_MARKER_BYTES as usize,
         "projection schema marker exceeds its byte limit"
@@ -1213,6 +1244,7 @@ fn validate_schema_marker(
     opened_directory: &SecureReadDirectory,
     contract: &str,
     version: u16,
+    storage: GenerationStorageContract,
     budget: &mut AssetLoadBudget,
 ) -> Result<()> {
     let path = directory.join(SCHEMA_MARKER_FILE);
@@ -1232,9 +1264,10 @@ fn validate_schema_marker(
     file.ensure_unchanged()
         .with_context(|| format!("revalidate schema marker {}", path.display()))?;
     let actual = decoded.with_context(|| format!("decode schema marker {}", path.display()))?;
-    let expected = SchemaMarker::new(contract, version);
+    let expected = SchemaMarker::new(contract, version, storage);
     if contract == REFERENCE_SCHEMA_CONTRACT
         && version == REFERENCE_SCHEMA_VERSION
+        && storage == GenerationStorageContract::CurrentV2
         && actual.generation_contract_version == SEARCH_GENERATION_STORAGE_CONTRACT_VERSION
         && actual.schema_contract == contract
         && matches!(actual.schema_version, 1 | 2)
@@ -1501,6 +1534,19 @@ mod tests {
         .unwrap()
     }
 
+    fn write_schema_marker_for_test(
+        directory: &Path,
+        contract: &str,
+        version: u16,
+        storage: GenerationStorageContract,
+    ) {
+        fs::write(
+            directory.join(SCHEMA_MARKER_FILE),
+            serde_json::to_vec(&SchemaMarker::new(contract, version, storage)).unwrap(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn schema_marker_contract_accepts_exact_and_rejects_one_short_budget() {
         let directory = tempdir().unwrap();
@@ -1519,6 +1565,7 @@ mod tests {
             &opened,
             SEARCH_SCHEMA_CONTRACT,
             SEARCH_SCHEMA_VERSION,
+            GenerationStorageContract::CurrentV2,
             &mut measured,
         )
         .unwrap();
@@ -1537,6 +1584,7 @@ mod tests {
             &opened,
             SEARCH_SCHEMA_CONTRACT,
             SEARCH_SCHEMA_VERSION,
+            GenerationStorageContract::CurrentV2,
             &mut exact,
         )
         .unwrap();
@@ -1552,6 +1600,7 @@ mod tests {
             &opened,
             SEARCH_SCHEMA_CONTRACT,
             SEARCH_SCHEMA_VERSION,
+            GenerationStorageContract::CurrentV2,
             &mut one_short,
         )
         .unwrap_err();
@@ -1577,6 +1626,7 @@ mod tests {
                 &opened,
                 REFERENCE_SCHEMA_CONTRACT,
                 REFERENCE_SCHEMA_VERSION,
+                GenerationStorageContract::CurrentV2,
                 &mut generous_load_budget(),
             )
             .unwrap_err();
@@ -1596,6 +1646,7 @@ mod tests {
             &opened,
             REFERENCE_SCHEMA_CONTRACT,
             REFERENCE_SCHEMA_VERSION,
+            GenerationStorageContract::CurrentV2,
             &mut generous_load_budget(),
         )
         .unwrap_err();
@@ -1615,6 +1666,76 @@ mod tests {
             &opened,
             SEARCH_SCHEMA_CONTRACT,
             SEARCH_SCHEMA_VERSION,
+            GenerationStorageContract::CurrentV2,
+            &mut generous_load_budget(),
+        )
+        .unwrap_err();
+        assert!(!is_rebuildable_projection_schema_version(&error));
+    }
+
+    #[test]
+    fn legacy_projection_markers_require_the_exact_storage_v1_pair() {
+        for (contract, version) in [
+            (SEARCH_SCHEMA_CONTRACT, SEARCH_SCHEMA_VERSION),
+            (REFERENCE_SCHEMA_CONTRACT, REFERENCE_SCHEMA_VERSION),
+        ] {
+            let directory = tempdir().unwrap();
+            write_schema_marker_for_test(
+                directory.path(),
+                contract,
+                version,
+                GenerationStorageContract::LegacyV1,
+            );
+            let opened =
+                SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
+            validate_schema_marker(
+                directory.path(),
+                &opened,
+                contract,
+                version,
+                GenerationStorageContract::LegacyV1,
+                &mut generous_load_budget(),
+            )
+            .unwrap();
+        }
+
+        let wrong_storage = tempdir().unwrap();
+        write_schema_marker_for_test(
+            wrong_storage.path(),
+            SEARCH_SCHEMA_CONTRACT,
+            SEARCH_SCHEMA_VERSION,
+            GenerationStorageContract::CurrentV2,
+        );
+        let opened =
+            SecureReadDirectory::open(wrong_storage.path(), OpenPolicy::PersistedState).unwrap();
+        assert!(
+            validate_schema_marker(
+                wrong_storage.path(),
+                &opened,
+                SEARCH_SCHEMA_CONTRACT,
+                SEARCH_SCHEMA_VERSION,
+                GenerationStorageContract::LegacyV1,
+                &mut generous_load_budget(),
+            )
+            .is_err()
+        );
+
+        let wrong_reference_schema = tempdir().unwrap();
+        write_schema_marker_for_test(
+            wrong_reference_schema.path(),
+            REFERENCE_SCHEMA_CONTRACT,
+            REFERENCE_SCHEMA_VERSION - 1,
+            GenerationStorageContract::LegacyV1,
+        );
+        let opened =
+            SecureReadDirectory::open(wrong_reference_schema.path(), OpenPolicy::PersistedState)
+                .unwrap();
+        let error = validate_schema_marker(
+            wrong_reference_schema.path(),
+            &opened,
+            REFERENCE_SCHEMA_CONTRACT,
+            REFERENCE_SCHEMA_VERSION,
+            GenerationStorageContract::LegacyV1,
             &mut generous_load_budget(),
         )
         .unwrap_err();

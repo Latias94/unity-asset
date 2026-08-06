@@ -885,7 +885,7 @@ mod tests {
         )
         .unwrap();
         let _coordinator_runtime = ReindexCoordinatorRuntime::start(
-            ReindexCoordinatorConfig::new(project.path().to_path_buf())
+            ReindexCoordinatorConfig::new(index.paths().project_path_space().clone())
                 .with_debounce(Duration::from_secs(60))
                 .with_max_debounce(Duration::from_secs(60)),
             |_intent| async move { std::future::pending().await },
@@ -915,7 +915,6 @@ mod tests {
         let operation_registry = super::OperationRegistryOwner::new(
             instance_id,
             coordinator.clone(),
-            project.path().to_path_buf(),
             query_policy_id,
             lifecycle_admission.clone(),
         );
@@ -1154,7 +1153,7 @@ mod tests {
         )
         .unwrap();
         let mut coordinator_runtime = ReindexCoordinatorRuntime::start(
-            ReindexCoordinatorConfig::new(project.path().to_path_buf())
+            ReindexCoordinatorConfig::new(index.paths().project_path_space().clone())
                 .with_debounce(Duration::from_secs(60))
                 .with_max_debounce(Duration::from_secs(60)),
             |_intent| async move { std::future::pending().await },
@@ -1178,7 +1177,6 @@ mod tests {
         let mut operation_registry = super::OperationRegistryOwner::new(
             instance_id,
             coordinator.clone(),
-            project.path().to_path_buf(),
             query_policy_id,
             lifecycle_admission.clone(),
         );

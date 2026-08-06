@@ -43,12 +43,13 @@ use crate::generation::{
 #[cfg(test)]
 use crate::generation_store::GenerationFailpoint;
 use crate::generation_store::{
-    GenerationBuild, GenerationDiskEstimate, GenerationPublishWarning,
-    GenerationPublishWarningKind, GenerationSnapshot, GenerationStore, GenerationStoreError,
-    GenerationStoreOptions, SourceScanHint, SourceStateError, SourceStateSnapshot,
-    TransactionReceiptMembership, TransactionReceiptWindow,
+    GenerationActivationEvidence, GenerationBuild, GenerationDiskEstimate,
+    GenerationPublishWarning, GenerationPublishWarningKind, GenerationSnapshot,
+    GenerationSourceState, GenerationStore, GenerationStoreError, GenerationStoreOptions,
+    SourceScanHint, SourceStateError, SourceStateSnapshot, TransactionReceiptMembership,
+    TransactionReceiptWindow,
 };
-use crate::path_semantics::compare_portable_paths;
+use crate::path_semantics::{ProjectPath, ProjectPathError, compare_portable_paths};
 use crate::projection::{
     GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
     project_batch,
@@ -62,6 +63,7 @@ use crate::scan::{
     FileHint, PathRejection, ProjectScanner, ReadSource, ScanDiagnostic, ScanError, ScanIntent,
     ScanMetrics, ScanMode, ScanValidation, SourceHints, SourcePart,
 };
+use crate::semantics::{AnalysisCacheIdentityV1, SearchSemantics};
 use crate::store::{ProjectionReaders, ProjectionStore, is_rebuildable_projection_schema_version};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,20 +120,24 @@ impl fmt::Debug for ActiveGeneration {
 impl ActiveGeneration {
     fn open(
         snapshot: GenerationSnapshot,
-        source_state: &SourceStateSnapshot,
+        source_state: &GenerationSourceState,
         readers: &ProjectionReaders,
         projection: Option<&GenerationProjection>,
         options: SearchIndexOptions,
-        projection_options_match: bool,
+        semantics_current: bool,
+        configuration_current: bool,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, PipelineError> {
         let manifest = snapshot.manifest();
+        let generation_current = semantics_current && configuration_current;
         let stamp = GenerationStamp::current(
             snapshot.generation(),
             manifest.workspace(),
             manifest.revision(),
         )
-        .with_desired_revision(snapshot.desired_revision());
+        .with_desired_revision(snapshot.desired_revision())
+        .with_semantics_current(semantics_current)
+        .with_configuration_current(configuration_current);
         let search_fields = SearchQueryFields::from_schema(&readers.search().index().schema())
             .map_err(PipelineError::Query)?;
         let query_snapshot = match projection {
@@ -145,13 +151,18 @@ impl ActiveGeneration {
                     .map(|document| document.path.as_str()),
                 budget,
             ),
-            None if projection_options_match => QuerySnapshot::new(
-                stamp.clone(),
-                readers.search().reader().clone(),
-                search_fields.clone(),
-                suggestion_paths_from_state(source_state, options),
-                budget,
-            ),
+            None if generation_current => {
+                let current_state = source_state.as_current().ok_or(PipelineError::Invariant(
+                    "current generation semantics require current source-state storage",
+                ))?;
+                QuerySnapshot::new(
+                    stamp.clone(),
+                    readers.search().reader().clone(),
+                    search_fields.clone(),
+                    suggestion_paths_from_state(current_state, options),
+                    budget,
+                )
+            }
             None => {
                 let paths = readers
                     .search()
@@ -168,12 +179,14 @@ impl ActiveGeneration {
         };
         let query = QueryEngine::new(Arc::new(query_snapshot.map_err(PipelineError::Query)?));
 
-        let analysis_complete = source_state
-            .assets()
-            .iter()
-            .all(|analysis| analysis.complete);
+        let analysis_complete = source_state.analysis_complete();
         let projection_complete = projection.map_or_else(
-            || projection_options_match && projection_is_complete(source_state, options),
+            || {
+                generation_current
+                    && source_state
+                        .as_current()
+                        .is_some_and(|state| projection_is_complete(state, options))
+            },
             |projection| {
                 projection.truncations.iter().all(|truncation| {
                     !matches!(&truncation.category, ProjectionCategory::References)
@@ -187,15 +200,23 @@ impl ActiveGeneration {
                 projection.diagnostics.iter(),
                 budget,
             ),
-            None => ReferenceQueryCompleteness::new(
-                analysis_complete,
-                projection_complete,
-                source_state
-                    .assets()
-                    .iter()
-                    .flat_map(|analysis| analysis.diagnostics.iter()),
-                budget,
-            ),
+            None => match source_state.as_current() {
+                Some(state) => ReferenceQueryCompleteness::new(
+                    analysis_complete,
+                    projection_complete,
+                    state
+                        .assets()
+                        .iter()
+                        .flat_map(|analysis| analysis.diagnostics.iter()),
+                    budget,
+                ),
+                None => ReferenceQueryCompleteness::new(
+                    false,
+                    false,
+                    std::iter::empty::<&Diagnostic>(),
+                    budget,
+                ),
+            },
         }
         .map_err(|error| match error {
             ReferenceQueryCompletenessError::Budget(error) => PipelineError::Budget(error),
@@ -300,11 +321,14 @@ pub(crate) struct SearchGenerationPipeline {
     paths: IndexPaths,
     options: SearchIndexOptions,
     options_digest: DigestV1,
+    semantics: SearchSemantics,
+    analysis_cache_identity: AnalysisCacheIdentityV1,
     scanner: ProjectScanner,
     workspace: AssetWorkspace,
     workspace_roots: WorkspaceRoots,
     workspace_hydrated: bool,
-    active_options_match: bool,
+    active_analysis_match: bool,
+    active_compatibility_match: bool,
     store: GenerationStore,
     source_state: Option<SourceStateSnapshot>,
     active: Option<Arc<ActiveGeneration>>,
@@ -325,7 +349,11 @@ impl fmt::Debug for SearchGenerationPipeline {
             .field("options", &self.options)
             .field("workspace", &self.workspace)
             .field("workspace_hydrated", &self.workspace_hydrated)
-            .field("active_options_match", &self.active_options_match)
+            .field("active_analysis_match", &self.active_analysis_match)
+            .field(
+                "active_compatibility_match",
+                &self.active_compatibility_match,
+            )
             .field(
                 "active_generation",
                 &self.active.as_ref().map(|active| active.stamp()),
@@ -340,10 +368,22 @@ impl SearchGenerationPipeline {
         options: SearchIndexOptions,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, PipelineError> {
+        Self::open_with_semantics(paths, options, SearchSemantics::current(), budget)
+    }
+
+    fn open_with_semantics(
+        paths: IndexPaths,
+        options: SearchIndexOptions,
+        semantics: SearchSemantics,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, PipelineError> {
         let options = options.validate().map_err(PipelineError::Configuration)?;
-        let options_digest = options
-            .logical_digest()
+        let options_digest = paths
+            .logical_configuration_digest(options)
             .map_err(PipelineError::Configuration)?;
+        let analysis_cache_identity = semantics
+            .analysis_cache_identity(options_digest)
+            .map_err(|error| PipelineError::Configuration(anyhow::Error::new(error)))?;
         let scanner = ProjectScanner::new(&paths, options, options.scan_limits())
             .map_err(PipelineError::Configuration)?;
         let store = GenerationStore::open_private(
@@ -367,19 +407,41 @@ impl SearchGenerationPipeline {
             }
             None => AssetWorkspace::new()?,
         };
-        let mut active_options_match = recovered
-            .as_ref()
-            .is_none_or(|snapshot| snapshot.manifest().options_digest() == options_digest);
+        let (
+            active_analysis_match,
+            active_semantics_match,
+            active_configuration_match,
+            mut active_compatibility_match,
+        ) = recovered.as_ref().zip(source_state.as_ref()).map_or(
+            (true, true, true, true),
+            |(snapshot, state)| {
+                let configuration_match = snapshot.manifest().options_digest() == options_digest;
+                let analysis_match =
+                    state.analysis_cache_identity() == Some(analysis_cache_identity);
+                let semantics_match = snapshot.manifest().semantics() == Some(semantics);
+                (
+                    analysis_match,
+                    semantics_match,
+                    configuration_match,
+                    semantics_match && configuration_match,
+                )
+            },
+        );
         let active = match (recovered, source_state.as_ref()) {
             (Some(snapshot), Some(state)) => {
-                match ProjectionReaders::open(snapshot.directory(), budget) {
+                match ProjectionReaders::open_for(
+                    snapshot.directory(),
+                    snapshot.storage_contract(),
+                    budget,
+                ) {
                     Ok(readers) => Some(Arc::new(ActiveGeneration::open(
                         snapshot,
                         state,
                         &readers,
                         None,
                         options,
-                        active_options_match,
+                        active_semantics_match,
+                        active_configuration_match,
                         budget,
                     )?)),
                     Err(error) if is_rebuildable_projection_schema_version(&error) => {
@@ -387,7 +449,7 @@ impl SearchGenerationPipeline {
                         // workspace identity and incrementality baseline. Only this derived
                         // projection layout is obsolete, so force the next request through a
                         // complete v3 rebuild instead of treating recovery as a corrupt store.
-                        active_options_match = false;
+                        active_compatibility_match = false;
                         None
                     }
                     Err(error) => return Err(PipelineError::Projection(error)),
@@ -400,15 +462,19 @@ impl SearchGenerationPipeline {
                 ));
             }
         };
+        let source_state = source_state.and_then(GenerationSourceState::into_current);
         Ok(Self {
             paths,
             options,
             options_digest,
+            semantics,
+            analysis_cache_identity,
             scanner,
             workspace,
             workspace_roots: WorkspaceRoots::default(),
             workspace_hydrated: false,
-            active_options_match,
+            active_analysis_match,
+            active_compatibility_match,
             store,
             source_state,
             active,
@@ -485,13 +551,19 @@ impl SearchGenerationPipeline {
                 }
             }
         }
-        let force_full = !self.workspace_hydrated || !self.active_options_match;
+        let discard_cached_analysis = !self.active_analysis_match;
+        let force_full = !self.workspace_hydrated || !self.active_compatibility_match;
         let scan_intent = if force_full {
             ScanIntent::Full
         } else {
             requested
         };
-        let prepared = self.prepare_filesystem_batch(scan_intent, force_full, budget)?;
+        let prepared = self.prepare_filesystem_batch(
+            scan_intent,
+            force_full,
+            discard_cached_analysis,
+            budget,
+        )?;
         self.publish_batch(prepared, None, None, started, budget)
     }
 
@@ -502,6 +574,9 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let started = Instant::now();
+        if !self.active_compatibility_match {
+            return Err(PipelineError::FilesystemReindexRequired);
+        }
         let indexed = self
             .source_state
             .as_ref()
@@ -513,14 +588,14 @@ impl SearchGenerationPipeline {
                     actual: changes.workspace(),
                 });
             }
-            match self
-                .source_state
-                .as_ref()
+            let receipts = self
+                .store
+                .active()
                 .ok_or(PipelineError::Invariant(
-                    "indexed workspace disappeared during receipt lookup",
+                    "active generation disappeared during receipt lookup",
                 ))?
-                .transaction_membership(&changes, budget)?
-            {
+                .transaction_receipts();
+            match receipts.membership(&changes, budget)? {
                 TransactionReceiptMembership::Exact => {
                     return Ok(PipelineBuildOutput {
                         disposition: PipelineBuildDisposition::AlreadyApplied,
@@ -588,8 +663,14 @@ impl SearchGenerationPipeline {
             ));
         }
 
-        let transaction_receipts =
-            state.transaction_receipts_after_reconciled_target(changes, budget)?;
+        let transaction_receipts = self
+            .store
+            .active()
+            .ok_or(PipelineError::Invariant(
+                "active generation disappeared during reconciled receipt update",
+            ))?
+            .transaction_receipts()
+            .after_reconciled_target(state.workspace(), state.revision(), changes, budget)?;
 
         let mut assets = reserve_retained_vec(
             state.assets().len(),
@@ -635,25 +716,33 @@ impl SearchGenerationPipeline {
         &mut self,
         intent: ScanIntent,
         forced_full_scan: bool,
+        discard_cached_analysis: bool,
         budget: &mut AssetLoadBudget,
     ) -> Result<PreparedBatch, PipelineError> {
-        let mut cached = self.clone_previous_assets(budget)?;
+        let mut cached = if discard_cached_analysis {
+            CachedAssets::empty()
+        } else {
+            self.clone_previous_assets(budget)?
+        };
         let mut workspace = self.workspace.fork_candidate();
         let known_paths = clone_known_paths(&cached, budget)?;
-        let mut plan =
-            self.scanner
-                .plan(intent, &known_paths, budget)
-                .map_err(|error| match error {
-                    ScanError::Budget(error) => PipelineError::Budget(error),
-                    error => PipelineError::Scan(error.into()),
-                })?;
+        let mut plan = self.scanner.plan(intent, &known_paths, budget).map_err(
+            |error| match error {
+                ScanError::Budget(error) => PipelineError::Budget(error),
+                ScanError::ChangedPathProjectMismatch { expected, actual } => {
+                    PipelineError::Configuration(anyhow::anyhow!(
+                        "changed paths belong to project {actual}, but this index owns {expected}"
+                    ))
+                }
+                error => PipelineError::Scan(error.into()),
+            },
+        )?;
         let invalid_changed_path = matches!(plan.mode, ScanMode::ChangedPaths)
             && plan.diagnostics.iter().any(|diagnostic| {
                 matches!(
                     diagnostic,
                     ScanDiagnostic::PathRejected {
                         reason: PathRejection::InvalidPath
-                            | PathRejection::OutsideProject
                             | PathRejection::Symlink
                             | PathRejection::UnsupportedFileType
                             | PathRejection::NonUtf8RelativePath,
@@ -970,7 +1059,14 @@ impl SearchGenerationPipeline {
         )?;
         let workspace_hydrated =
             was_hydrated || matches!(plan.mode, ScanMode::Full | ScanMode::Reconcile);
-        self.mark_desired_revision(workspace.revision(), budget)?;
+        let observed_revision = workspace.revision();
+        let actual_revision_unchanged = self
+            .store
+            .active()
+            .is_some_and(|active| active.manifest().revision() == observed_revision);
+        if !actual_revision_unchanged {
+            self.mark_desired_revision(observed_revision, budget)?;
+        }
 
         let snapshot = workspace.snapshot();
         let graph = snapshot.reference_graph(ReferenceGraphBuildOptions::unbounded(), budget)?;
@@ -1003,8 +1099,8 @@ impl SearchGenerationPipeline {
             &changed_roots,
             budget,
         )?;
-        let force_full_analysis =
-            !changed_paths.is_empty() && (!graph.is_complete() || changed_evidence_incomplete);
+        let force_full_analysis = discard_cached_analysis
+            || (!changed_paths.is_empty() && (!graph.is_complete() || changed_evidence_incomplete));
         let dependency_candidate_assets = cached.len();
         metrics.forced_full_analysis = force_full_analysis;
         metrics.full_dependency_scan =
@@ -1158,9 +1254,9 @@ impl SearchGenerationPipeline {
         metrics.analysis.source_opens = metrics.scan.opened;
         metrics.analysis.source_bytes_read = metrics.scan.read_bytes;
 
-        let transaction_receipts = match &self.source_state {
-            Some(state) if state.workspace() == snapshot.workspace_id() => {
-                state.transaction_receipts().try_clone_with_budget(budget)?
+        let transaction_receipts = match self.store.active() {
+            Some(active) if active.manifest().workspace() == snapshot.workspace_id() => {
+                active.transaction_receipts().clone()
             }
             Some(_) | None => TransactionReceiptWindow::empty(),
         };
@@ -1193,9 +1289,19 @@ impl SearchGenerationPipeline {
         view: &dyn WorkspaceView,
         budget: &mut AssetLoadBudget,
     ) -> Result<PreparedBatch, PipelineError> {
-        let transaction_receipts = match &self.source_state {
-            Some(state) => state.transaction_receipts_after(changes, budget)?,
-            None => TransactionReceiptWindow::from_change_set(changes, budget)?,
+        let transaction_receipts = match (self.source_state.as_ref(), self.store.active()) {
+            (Some(state), Some(active)) => active.transaction_receipts().after_change_set(
+                state.workspace(),
+                state.revision(),
+                changes,
+                budget,
+            )?,
+            (None, None) => TransactionReceiptWindow::from_change_set(changes, budget)?,
+            _ => {
+                return Err(PipelineError::Invariant(
+                    "generation and source-state lifecycle diverged during receipt update",
+                ));
+            }
         };
         let mut cached = self.clone_previous_assets(budget)?;
         let mut sources = view.sources(budget)?;
@@ -1298,7 +1404,7 @@ impl SearchGenerationPipeline {
             match workspace_source(&sources, object.source()) {
                 Some(source) => {
                     if object.binary_path_id().is_none()
-                        && object.yaml_anchor().is_none()
+                        && object.yaml_file_id().is_none()
                         && object.yaml_document_ordinal().is_none()
                     {
                         return Err(PipelineError::Invariant(
@@ -1475,11 +1581,16 @@ impl SearchGenerationPipeline {
             workspace,
             filesystem_validation,
         } = prepared;
-        if self.active_options_match
+        if self.active_compatibility_match
             && self
                 .source_state
                 .as_ref()
                 .is_some_and(|state| batch_matches_state(&batch, state))
+            && self.store.active().is_some_and(|active| {
+                active
+                    .transaction_receipts()
+                    .matches_canonical_ids(&batch.transactions)
+            })
         {
             if let Some(validation) = filesystem_validation.as_ref() {
                 #[cfg(test)]
@@ -1491,7 +1602,7 @@ impl SearchGenerationPipeline {
                     .validate_scan(validation)
                     .map_err(|error| PipelineError::Scan(error.into()))?;
             }
-            self.active_options_match = true;
+            self.active_compatibility_match = true;
             self.install_workspace(workspace);
             let warnings = self.take_pending_publish_warnings();
             return Ok(PipelineBuildOutput {
@@ -1524,7 +1635,7 @@ impl SearchGenerationPipeline {
         })?;
         metrics.projection = projection.metrics;
         let source_state =
-            SourceStateSnapshot::from_batch(batch, scan_hints, transaction_receipts)?;
+            SourceStateSnapshot::from_batch(batch, scan_hints, self.analysis_cache_identity)?;
         let mut build = self.store.begin()?;
         let staged = (|| -> Result<_, PipelineError> {
             let projection_evidence = ProjectionStore::build(build.directory(), &projection)
@@ -1546,7 +1657,6 @@ impl SearchGenerationPipeline {
                     "projection evidence changed before generation publication",
                 ));
             }
-            let parent = self.store.active().map(GenerationSnapshot::generation);
             let projection_summary = GenerationProjectionSummary::new(
                 u64::try_from(source_state.assets().len())
                     .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?,
@@ -1564,7 +1674,7 @@ impl SearchGenerationPipeline {
                 )
                 .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?,
             )?;
-            let identity = SearchGenerationIdentityV1::new(
+            let identity = SearchGenerationIdentityV1::new_with_semantics(
                 source_state.workspace(),
                 source_state.revision(),
                 GenerationProjectionDigests::new(
@@ -1572,8 +1682,7 @@ impl SearchGenerationPipeline {
                     projection_evidence.logical_digests().references(),
                 ),
                 projection_summary,
-                parent,
-                canonical_transaction_ids(source_state.transaction_receipts(), budget)?,
+                self.semantics,
                 self.options_digest,
                 source_state.logical_digest(),
             )?;
@@ -1590,6 +1699,10 @@ impl SearchGenerationPipeline {
             Ok(staged) => staged,
             Err(primary) => return Err(self.abort_generation_build(&mut build, primary)),
         };
+        let activation = GenerationActivationEvidence::new(
+            self.store.active().map(GenerationSnapshot::generation),
+            transaction_receipts,
+        );
         #[cfg(test)]
         let prepared_result = match self.publish_failpoint.take() {
             Some(failpoint) => self
@@ -1597,6 +1710,7 @@ impl SearchGenerationPipeline {
                 .prepare_publish_with_desired_revision_failpoint_and_budget(
                     &mut build,
                     manifest,
+                    activation,
                     desired_revision,
                     budget,
                     failpoint,
@@ -1604,6 +1718,7 @@ impl SearchGenerationPipeline {
             None => self.store.prepare_publish_with_desired_revision_and_budget(
                 &mut build,
                 manifest,
+                activation,
                 desired_revision,
                 budget,
             ),
@@ -1612,6 +1727,7 @@ impl SearchGenerationPipeline {
         let prepared_result = self.store.prepare_publish_with_desired_revision_and_budget(
             &mut build,
             manifest,
+            activation,
             desired_revision,
             budget,
         );
@@ -1625,12 +1741,14 @@ impl SearchGenerationPipeline {
         let candidate_snapshot = prepared.snapshot().clone();
         let readers = ProjectionReaders::open(candidate_snapshot.directory(), budget)
             .map_err(PipelineError::Projection)?;
+        let source_state = GenerationSourceState::CurrentV2(source_state);
         let active = Arc::new(ActiveGeneration::open(
             candidate_snapshot,
             &source_state,
             &readers,
             Some(&projection),
             self.options,
+            true,
             true,
             budget,
         )?);
@@ -1647,9 +1765,10 @@ impl SearchGenerationPipeline {
         let report = prepared.activate_with_budget(budget)?;
         self.append_pending_publish_warnings(report.warnings);
         let warnings = self.take_pending_publish_warnings();
-        self.source_state = Some(source_state);
+        self.source_state = source_state.into_current();
         self.active = Some(Arc::clone(&active));
-        self.active_options_match = true;
+        self.active_analysis_match = true;
+        self.active_compatibility_match = true;
         self.install_workspace(workspace);
 
         Ok(PipelineBuildOutput {
@@ -2204,6 +2323,13 @@ struct CachedAssets {
 }
 
 impl CachedAssets {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            workspace_roots: Vec::new(),
+        }
+    }
+
     fn get(&self, relative_path: &str) -> Option<&AssetAnalysis> {
         let index = self
             .entries
@@ -2279,10 +2405,10 @@ impl CachedAssets {
 
 fn validate_projection_summary(
     summary: GenerationProjectionSummary,
-    state: &SourceStateSnapshot,
+    state: &GenerationSourceState,
     readers: &ProjectionReaders,
 ) -> Result<(), PipelineError> {
-    let actual_assets = u64::try_from(state.assets().len())
+    let actual_assets = u64::try_from(state.asset_count())
         .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?;
     validate_summary_count("assets", summary.assets(), actual_assets)?;
     validate_summary_count(
@@ -2295,14 +2421,8 @@ fn validate_projection_summary(
         summary.reference_documents(),
         readers.references().reader().searcher().num_docs(),
     )?;
-    let actual_incomplete = u64::try_from(
-        state
-            .assets()
-            .iter()
-            .filter(|analysis| !analysis.complete)
-            .count(),
-    )
-    .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?;
+    let actual_incomplete = u64::try_from(state.incomplete_asset_count())
+        .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?;
     validate_summary_count(
         "incomplete assets",
         summary.incomplete_assets(),
@@ -2356,9 +2476,6 @@ fn projection_is_complete(state: &SourceStateSnapshot, options: SearchIndexOptio
 fn batch_matches_state(batch: &AssetAnalysisBatch, state: &SourceStateSnapshot) -> bool {
     batch.workspace == state.workspace()
         && batch.revision == state.revision()
-        && state
-            .transaction_receipts()
-            .matches_canonical_ids(&batch.transactions)
         && batch.assets.as_slice() == state.assets()
 }
 
@@ -2517,7 +2634,7 @@ impl<'source> DependencyImpact<'source> {
             || self.changed_objects.iter().any(|candidate| {
                 address.source_locator() == candidate.locator
                     && address.binary_path_id() == candidate.object.binary_path_id()
-                    && address.yaml_anchor() == candidate.object.yaml_anchor()
+                    && address.yaml_file_id() == candidate.object.yaml_file_id()
                     && address.yaml_document_ordinal() == candidate.object.yaml_document_ordinal()
             })
     }
@@ -2915,13 +3032,8 @@ fn workspace_root_paths(
         .filter(|source| source.parent().is_none())
         .count();
     for root in sources.iter().filter(|source| source.parent().is_none()) {
-        let retained_bytes = match root.physical_origin() {
-            Some(origin) => match origin.strip_prefix(paths.project_root()) {
-                Ok(relative) if !relative.as_os_str().is_empty() => {
-                    portable_relative_path_len(relative)?
-                }
-                Ok(_) | Err(_) => root.locator().root_alias().as_str().len(),
-            },
+        let retained_bytes = match workspace_root_project_path(paths, root)? {
+            Some(relative) => portable_relative_path_len(relative.as_relative_path())?,
             None => root.locator().root_alias().as_str().len(),
         };
         let retained_bytes = u64::try_from(retained_bytes)
@@ -2931,16 +3043,8 @@ fn workspace_root_paths(
     }
     let mut by_path = reserve_retained_vec(root_count, "workspace root paths", budget)?;
     for root in sources.iter().filter(|source| source.parent().is_none()) {
-        let relative_path = match root.physical_origin() {
-            Some(origin) => match origin.strip_prefix(paths.project_root()) {
-                Ok(relative) if !relative.as_os_str().is_empty() => {
-                    portable_relative_path_precharged(relative)?
-                }
-                Ok(_) | Err(_) => clone_precharged_string(
-                    root.locator().root_alias().as_str(),
-                    "workspace root path",
-                )?,
-            },
+        let relative_path = match workspace_root_project_path(paths, root)? {
+            Some(relative) => portable_relative_path_precharged(relative.as_relative_path())?,
             None => clone_precharged_string(
                 root.locator().root_alias().as_str(),
                 "workspace root path",
@@ -2948,9 +3052,20 @@ fn workspace_root_paths(
         };
         by_path.push((relative_path, root.id()));
     }
-    by_path.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    sort_workspace_root_paths(&mut by_path)?;
+    Ok(by_path)
+}
+
+fn sort_workspace_root_paths(by_path: &mut Vec<(String, SourceId)>) -> Result<(), PipelineError> {
+    by_path.sort_unstable_by(|left, right| {
+        compare_portable_paths(&left.0, &right.0)
+            .then_with(|| left.0.cmp(&right.0))
+            .then_with(|| left.1.cmp(&right.1))
+    });
     for index in 1..by_path.len() {
-        if by_path[index - 1].0 == by_path[index].0 {
+        if compare_portable_paths(&by_path[index - 1].0, &by_path[index].0)
+            == std::cmp::Ordering::Equal
+        {
             let (relative_path, second) = by_path.remove(index);
             let first = by_path[index - 1].1;
             return Err(PipelineError::RelativePathCollision {
@@ -2960,7 +3075,21 @@ fn workspace_root_paths(
             });
         }
     }
-    Ok(by_path)
+    Ok(())
+}
+
+fn workspace_root_project_path(
+    paths: &IndexPaths,
+    root: &WorkspaceSource,
+) -> Result<Option<ProjectPath>, PipelineError> {
+    let Some(origin) = root.physical_origin() else {
+        return Ok(None);
+    };
+    match paths.project_path_space().resolve(origin) {
+        Ok(relative) => Ok(relative),
+        Err(ProjectPathError::OutsideProject { .. }) => Ok(None),
+        Err(error) => Err(PipelineError::Configuration(anyhow::Error::new(error))),
+    }
 }
 
 fn portable_relative_path_len(path: &Path) -> Result<usize, PipelineError> {
@@ -3287,7 +3416,7 @@ fn apply_source_scan_diagnostics(
                     clone_precharged_string(code, "analysis diagnostic code")?,
                     message,
                 )?);
-                analysis.diagnostics.sort();
+                analysis.diagnostics.sort_unstable();
                 analysis.diagnostics.dedup();
             }
             ScanDiagnostic::PayloadNotRetained { rel_path, .. } => {
@@ -3529,6 +3658,7 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
 
 #[derive(Debug)]
 pub(crate) enum PipelineError {
+    FilesystemReindexRequired,
     WorkspaceMismatch {
         expected: WorkspaceId,
         actual: WorkspaceId,
@@ -3602,6 +3732,7 @@ impl PipelineError {
     pub(crate) fn api_code(&self) -> ApiErrorCode {
         match self {
             Self::StagingAbortFailed { primary, .. } => primary.api_code(),
+            Self::FilesystemReindexRequired => ApiErrorCode::NotReady,
             Self::Configuration(_)
             | Self::Contract(_)
             | Self::Diagnostic(_)
@@ -3649,6 +3780,7 @@ impl PipelineError {
             Self::StagingAbortFailed { primary, cleanup } => {
                 primary.retryable() || cleanup.is_retryable()
             }
+            Self::FilesystemReindexRequired => true,
             Self::ScanPlanRejected { .. } | Self::SourceReadRejected { .. } | Self::Scan(_) => true,
             Self::SourceAdmission(error) => matches!(
                 error.category(),
@@ -3691,6 +3823,9 @@ impl PipelineError {
 impl fmt::Display for PipelineError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::FilesystemReindexRequired => formatter.write_str(
+                "the active generation uses incompatible persisted semantics; run a full filesystem reindex before applying workspace changes",
+            ),
             Self::WorkspaceMismatch { expected, actual } => write!(
                 formatter,
                 "workspace {actual:?} does not match indexed workspace {expected:?}"
@@ -3819,7 +3954,8 @@ impl StdError for PipelineError {
             Self::Manifest(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Allocation { source, .. } => Some(source),
-            Self::WorkspaceMismatch { .. }
+            Self::FilesystemReindexRequired
+            | Self::WorkspaceMismatch { .. }
             | Self::ViewRevisionMismatch { .. }
             | Self::RevisionBarrierMismatch { .. }
             | Self::TransactionConflict { .. }
@@ -3935,7 +4071,7 @@ impl From<serde_json::Error> for PipelineError {
 mod tests {
     use super::*;
     use crate::analysis::{AnalyzedSource, SearchFacts};
-    use unity_asset::{AssetLoadLimits, BudgetedSourceBytes};
+    use unity_asset::{AssetLoadLimits, BudgetedSourceBytes, SourceKind};
 
     fn tier_zero_analysis(path: &str) -> AssetAnalysis {
         AssetAnalysis::new(
@@ -3955,6 +4091,30 @@ mod tests {
             Vec::new(),
             true,
         )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn workspace_root_collision_uses_windows_project_path_equivalence() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let first = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
+        let second = SourceId::new(workspace, SourceKind::Yaml, 2).unwrap();
+        let mut roots = vec![
+            ("Assets/Hero".to_owned(), first),
+            ("assets/HERO".to_owned(), second),
+        ];
+
+        let error = sort_workspace_root_paths(&mut roots).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::RelativePathCollision {
+                first: actual_first,
+                second: actual_second,
+                ..
+            } if [actual_first, actual_second].contains(&first)
+                && [actual_first, actual_second].contains(&second)
+        ));
     }
 
     #[test]
@@ -4209,6 +4369,146 @@ mod tests {
         assert_eq!(unchanged.disposition, PipelineBuildDisposition::NoChange);
         assert_eq!(unchanged.warnings, ["committed head warning"]);
         assert!(pipeline.pending_publish_warnings.is_empty());
+    }
+
+    #[test]
+    fn semantic_mismatch_keeps_the_old_generation_queryable_and_forces_a_full_rebuild() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut current = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let published = current
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let old_generation = published.active.unwrap().snapshot.generation();
+        drop(current);
+
+        let changed_semantics = SearchSemantics::current()
+            .with_reference_projection_digest(DigestV1::hash_bytes(b"reference projection v-next"));
+        let mut reopened = SearchGenerationPipeline::open_with_semantics(
+            paths,
+            SearchIndexOptions::default(),
+            changed_semantics,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let stale = reopened.active.as_ref().unwrap();
+        assert_eq!(stale.snapshot.generation(), old_generation);
+        assert!(!stale.stamp.semantics_current);
+        assert!(stale.stamp.configuration_current);
+        assert!(stale.stamp.stale);
+        assert!(!reopened.active_analysis_match);
+        assert!(!reopened.active_compatibility_match);
+
+        let rebuilt = reopened
+            .reindex_filesystem(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.disposition, PipelineBuildDisposition::Published);
+        assert!(rebuilt.metrics.forced_full_analysis);
+        let active = rebuilt.active.unwrap();
+        assert_ne!(active.snapshot.generation(), old_generation);
+        assert!(active.stamp.semantics_current);
+        assert!(active.stamp.configuration_current);
+        assert!(!active.stamp.stale);
+    }
+
+    #[test]
+    fn scan_root_change_is_stale_until_a_full_cache_discarding_rebuild() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        std::fs::create_dir_all(project_root.join("Packages")).unwrap();
+        std::fs::write(project_root.join("Assets/Current.txt"), b"current").unwrap();
+        std::fs::write(project_root.join("Packages/Removed.txt"), b"removed").unwrap();
+        let index_root = temporary.path().join("index");
+        let all_paths = IndexPaths::for_project(
+            project_root.clone(),
+            Some(index_root.clone()),
+            Some(vec![PathBuf::from("Assets"), PathBuf::from("Packages")]),
+        )
+        .unwrap();
+        let mut current = SearchGenerationPipeline::open(
+            all_paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let published = current
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let old_generation = published.active.unwrap().snapshot.generation();
+        drop(current);
+
+        let assets_only = IndexPaths::for_project(
+            project_root,
+            Some(index_root),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut reopened = SearchGenerationPipeline::open(
+            assets_only,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let stale = reopened.active.as_ref().unwrap();
+        assert_eq!(stale.snapshot.generation(), old_generation);
+        assert!(stale.stamp.semantics_current);
+        assert!(!stale.stamp.configuration_current);
+        assert!(stale.stamp.stale);
+        assert!(!reopened.active_analysis_match);
+        assert!(!reopened.active_compatibility_match);
+        assert!(
+            reopened
+                .source_state
+                .as_ref()
+                .unwrap()
+                .analysis("Packages/Removed.txt")
+                .is_some()
+        );
+
+        let rebuilt = reopened
+            .reindex_filesystem(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.disposition, PipelineBuildDisposition::Published);
+        assert!(rebuilt.metrics.forced_full_scan);
+        assert!(rebuilt.metrics.forced_full_analysis);
+        assert!(
+            reopened
+                .source_state
+                .as_ref()
+                .unwrap()
+                .analysis("Packages/Removed.txt")
+                .is_none()
+        );
+        let active = rebuilt.active.unwrap();
+        assert_ne!(active.snapshot.generation(), old_generation);
+        assert!(active.stamp.semantics_current);
+        assert!(active.stamp.configuration_current);
+        assert!(!active.stamp.stale);
     }
 
     #[test]

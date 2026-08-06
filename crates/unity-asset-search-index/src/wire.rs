@@ -15,7 +15,7 @@ use crate::pipeline::{PipelineBuildDisposition, PipelineBuildOutput};
 
 const QUERY_POLICY_DOMAIN: &str = "unity-asset:search-query-policy:v1";
 const INDEX_QUERY_SEMANTICS: &str = "index-query-projection:v1";
-const REFERENCE_QUERY_SEMANTICS: &str = "reference-query-cursor-binding:v1";
+const REFERENCE_QUERY_SEMANTICS: &str = "reference-query-cursor-binding:v2";
 const SUGGEST_QUERY_SEMANTICS: &str = "path-and-kind-suggestions:v1";
 
 #[must_use]
@@ -103,6 +103,8 @@ pub(crate) fn generation_stamp(generation: &GenerationStamp) -> WireGenerationSt
         workspace: generation.workspace,
         actual_revision: generation.actual_revision,
         desired_revision: generation.desired_revision,
+        semantics_current: generation.semantics_current,
+        configuration_current: generation.configuration_current,
         stale: generation.stale,
     }
 }

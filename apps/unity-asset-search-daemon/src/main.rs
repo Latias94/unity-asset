@@ -1,10 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
 
 use unity_asset_search_index::{
-    AssetLoadBudget, FilesystemReindexIntent, IndexPaths, SearchIndex, SearchIndexOptions,
+    AssetLoadBudget, FilesystemReindexIntent, IndexPaths, ProjectPathSpace, SearchIndex,
+    SearchIndexOptions,
 };
 use unity_asset_search_local::{PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id};
 
@@ -42,7 +43,7 @@ struct Args {
     #[arg(long)]
     project_root: PathBuf,
 
-    /// Private base directory under which a project-bound index directory is derived.
+    /// Absolute private base directory under which a project-bound index directory is derived.
     #[arg(long, value_name = "PRIVATE_BASE")]
     index_dir: Option<PathBuf>,
 
@@ -87,15 +88,6 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let project = ProjectLocatorV1::open(&args.project_root)?;
-    let roots = PrivateRootsV1::discover_for_current_context()?;
-    let namespace = roots.runtime().endpoint_namespace(project.project_id())?;
-    let endpoint_claim = namespace.claim_daemon_endpoint()?;
-    let stale_cleanup = endpoint_claim.stale_cleanup();
-    if stale_cleanup == unity_asset_search_local::EndpointCleanupV1::Removed {
-        eprintln!("retired stale endpoint descriptor before daemon initialization");
-    }
-    let daemon_instance_id = generate_daemon_instance_id()?;
-
     let scan_roots = if args.scan_all {
         Some(vec![PathBuf::from(".")])
     } else if args.scan_root.is_empty() {
@@ -108,6 +100,21 @@ async fn main() -> anyhow::Result<()> {
         args.index_dir.clone(),
         scan_roots,
     )?;
+    anyhow::ensure!(
+        paths.project_id() == project.project_id(),
+        "project identity changed while preparing the search index"
+    );
+    project.revalidate()?;
+    paths.revalidate_project_root()?;
+
+    let roots = PrivateRootsV1::discover_for_current_context()?;
+    let namespace = roots.runtime().endpoint_namespace(paths.project_id())?;
+    let endpoint_claim = namespace.claim_daemon_endpoint()?;
+    let stale_cleanup = endpoint_claim.stale_cleanup();
+    if stale_cleanup == unity_asset_search_local::EndpointCleanupV1::Removed {
+        eprintln!("retired stale endpoint descriptor before daemon initialization");
+    }
+    let daemon_instance_id = generate_daemon_instance_id()?;
     let options = SearchIndexOptions {
         index_bundle_container_entries: args.index_bundle_container_entries,
         max_bundle_container_entries_per_bundle: args.max_bundle_container_entries_per_bundle,
@@ -117,11 +124,10 @@ async fn main() -> anyhow::Result<()> {
     let mut open_budget = AssetLoadBudget::default();
     let index = SearchIndex::open_or_create_with_options(paths.clone(), options, &mut open_budget)?;
     project.revalidate()?;
-    let coordinator_config = coordinator_config(&args, paths.project_root());
+    paths.revalidate_project_root()?;
+    let coordinator_config = coordinator_config(&args, paths.project_path_space());
     let watcher = args.watch.then(|| WatcherConfig {
-        scan_roots: paths.scan_roots().to_vec(),
-        project_root: paths.project_root().to_path_buf(),
-        index_namespace_exclusion: paths.index_namespace_exclusion().map(PathBuf::from),
+        paths: paths.clone(),
     });
     let reconcile_interval = reconciliation_interval(&args);
     let startup_reindex = (!args.no_startup_reindex).then(FilesystemReindexIntent::reconcile);
@@ -140,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn coordinator_config(args: &Args, project_root: &Path) -> ReindexCoordinatorConfig {
+fn coordinator_config(args: &Args, project_paths: &ProjectPathSpace) -> ReindexCoordinatorConfig {
     let debounce = Duration::from_millis(args.watch_debounce_ms.max(100));
     let max_debounce = Duration::from_millis(args.watch_debounce_ms.max(100).saturating_mul(4));
     let maximum_dirty_paths = if args.watch_full_scan_threshold == 0 {
@@ -148,7 +154,7 @@ fn coordinator_config(args: &Args, project_root: &Path) -> ReindexCoordinatorCon
     } else {
         args.watch_full_scan_threshold
     };
-    ReindexCoordinatorConfig::new(project_root.to_path_buf())
+    ReindexCoordinatorConfig::new(project_paths.clone())
         .with_debounce(debounce)
         .with_max_debounce(max_debounce)
         .with_max_dirty_paths(maximum_dirty_paths)

@@ -12,7 +12,7 @@ use crate::output::{CLI_CONTRACT_VERSION, CliFailure};
 
 const MAX_CLI_REQUEST_BYTES: usize = 512 * 1024;
 const CLI_REQUEST_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
-    "unity_asset_search_cli_request_v1",
+    "unity_asset_search_cli_request_v2",
     MAX_CLI_REQUEST_BYTES,
     32,
     65_536,

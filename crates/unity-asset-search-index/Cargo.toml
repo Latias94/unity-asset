@@ -35,6 +35,7 @@ rustix = { workspace = true, features = ["fs"] }
 windows-sys = { version = "0.61", features = [
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
     "Win32_Foundation",
     "Win32_Globalization",
     "Win32_Security",
@@ -44,6 +45,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+sha2.workspace = true
 tempfile.workspace = true
 
 [package.metadata.docs.rs]

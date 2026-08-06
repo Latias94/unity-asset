@@ -19,7 +19,7 @@ use unity_asset_search_core::{
 use crate::validation::{ContractValidationError, ValidateContract, ensure_revision};
 use crate::{MAX_REFERENCE_RESULTS, QueryPolicyId};
 
-pub const SEARCH_PROTOCOL_REVISION: u16 = 2;
+pub const SEARCH_PROTOCOL_REVISION: u16 = 3;
 pub const MAX_API_ERROR_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_PORTABLE_PATH_BYTES: usize = 32 * 1024;
@@ -36,8 +36,8 @@ pub const MAX_STATUS_SCAN_ROOTS: usize = 64;
 pub const MAX_STATUS_PATHS_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_SUGGESTION_BYTES: usize = 32 * 1024;
 pub const MAX_SUGGESTIONS_JSON_BYTES: u64 = 224 * 1024;
-const REFERENCE_CURSOR_BINDING_DOMAIN: &[u8] = b"unity-asset:reference-query:cursor-binding:v1\0";
-const REFERENCE_CURSOR_BINDING_PREFIX: &str = "reference-query-v1:";
+const REFERENCE_CURSOR_BINDING_DOMAIN: &[u8] = b"unity-asset:reference-query:cursor-binding:v2\0";
+const REFERENCE_CURSOR_BINDING_PREFIX: &str = "reference-query-v2:";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortablePath(String);
@@ -228,6 +228,8 @@ pub struct GenerationStamp {
     pub workspace: WorkspaceId,
     pub actual_revision: WorkspaceRevision,
     pub desired_revision: WorkspaceRevision,
+    pub semantics_current: bool,
+    pub configuration_current: bool,
     pub stale: bool,
 }
 
@@ -244,6 +246,8 @@ impl GenerationStamp {
             workspace,
             actual_revision: revision,
             desired_revision: revision,
+            semantics_current: true,
+            configuration_current: true,
             stale: false,
         }
     }
@@ -251,8 +255,28 @@ impl GenerationStamp {
     #[must_use]
     pub fn with_desired_revision(mut self, desired_revision: WorkspaceRevision) -> Self {
         self.desired_revision = desired_revision;
-        self.stale = self.actual_revision != desired_revision;
+        self.refresh_stale();
         self
+    }
+
+    #[must_use]
+    pub fn with_semantics_current(mut self, semantics_current: bool) -> Self {
+        self.semantics_current = semantics_current;
+        self.refresh_stale();
+        self
+    }
+
+    #[must_use]
+    pub fn with_configuration_current(mut self, configuration_current: bool) -> Self {
+        self.configuration_current = configuration_current;
+        self.refresh_stale();
+        self
+    }
+
+    fn refresh_stale(&mut self) {
+        self.stale = self.actual_revision != self.desired_revision
+            || !self.semantics_current
+            || !self.configuration_current;
     }
 }
 
@@ -263,7 +287,11 @@ impl ValidateContract for GenerationStamp {
             self.protocol_revision,
             SEARCH_PROTOCOL_REVISION,
         )?;
-        if self.stale != (self.actual_revision != self.desired_revision) {
+        if self.stale
+            != (self.actual_revision != self.desired_revision
+                || !self.semantics_current
+                || !self.configuration_current)
+        {
             return Err(ContractValidationError::Inconsistent {
                 field: "generation.stale",
             });

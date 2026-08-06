@@ -665,12 +665,14 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
     assert_version_is_queryable(&index, &changed_draft_stamp, "DraftHero", "FinalHero");
 
     fixture.write_version(ProjectVersion::Final);
+    let changed_paths = index
+        .paths()
+        .project_path_space()
+        .resolve_set([PathBuf::from(HERO_PATH), PathBuf::from(SCRIPT_PATH)])
+        .unwrap();
     let changed_receipt = reindex(
         &index,
-        FilesystemReindexIntent::changed_paths(vec![
-            PathBuf::from(HERO_PATH),
-            PathBuf::from(SCRIPT_PATH),
-        ]),
+        FilesystemReindexIntent::changed_paths(changed_paths),
     );
     assert!(!changed_receipt.evidence.forced_full_scan);
     let changed_stamp = published_stamp(&index, &changed_receipt);
@@ -968,13 +970,23 @@ fn failed_changed_path_reindex_keeps_the_prior_generation_queryable() {
     );
     let before_status = index.status().unwrap();
 
-    let outside = TempDir::new().unwrap();
+    let outside = common::secure_tempdir();
     let outside_path = outside.path().join("Outside.asset");
     fs::write(&outside_path, FINAL_PREFAB).unwrap();
+    let outside_paths = IndexPaths::for_project(
+        outside.path().to_path_buf(),
+        Some(outside.path().join("index")),
+        None,
+    )
+    .unwrap();
+    let foreign_changed_paths = outside_paths
+        .project_path_space()
+        .resolve_set([outside_path])
+        .unwrap();
     let mut budget = AssetLoadBudget::default();
     let error = index
         .reindex(
-            FilesystemReindexIntent::changed_paths(vec![outside_path]),
+            FilesystemReindexIntent::changed_paths(foreign_changed_paths),
             &mut budget,
         )
         .unwrap_err();

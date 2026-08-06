@@ -428,6 +428,7 @@ mod tests {
 
     use super::{Action, Args};
     use crate::json_input;
+    use crate::output::CLI_CONTRACT_VERSION;
 
     const GUID: &str = "0123456789abcdef0123456789abcdef";
     const OPERATION_ID: &str = "operation-v1:11111111111111111111111111111111";
@@ -470,7 +471,7 @@ mod tests {
             fs::write(
                 &path,
                 serde_json::to_vec(&serde_json::json!({
-                    "cli_contract_version": 1,
+                    "cli_contract_version": CLI_CONTRACT_VERSION,
                     "operation": &operation,
                 }))
                 .expect("serialize CLI request"),
