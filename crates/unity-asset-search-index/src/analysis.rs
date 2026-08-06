@@ -26,7 +26,9 @@ impl AssetAnalysisBatch {
     ) -> Self {
         transactions.sort_unstable();
         transactions.dedup();
-        assets.sort_by(|left, right| left.source.relative_path.cmp(&right.source.relative_path));
+        assets.sort_unstable_by(|left, right| {
+            left.source.relative_path.cmp(&right.source.relative_path)
+        });
         Self {
             workspace,
             revision,
@@ -163,13 +165,13 @@ impl AssetAnalysis {
         for reference in &mut references {
             reference.normalize();
         }
-        references.sort();
+        references.sort_unstable();
         references.dedup();
-        container_entries.sort();
+        container_entries.sort_unstable();
         container_entries.dedup();
-        diagnostics.sort();
+        diagnostics.sort_unstable();
         diagnostics.dedup();
-        truncations.sort();
+        truncations.sort_unstable();
         truncations.dedup();
         let complete = complete && truncations.is_empty();
         Self {
@@ -190,10 +192,10 @@ impl AssetAnalysis {
         truncation: AnalysisTruncation,
     ) {
         self.diagnostics.push(diagnostic);
-        self.diagnostics.sort();
+        self.diagnostics.sort_unstable();
         self.diagnostics.dedup();
         self.truncations.push(truncation);
-        self.truncations.sort();
+        self.truncations.sort_unstable();
         self.truncations.dedup();
         self.complete = false;
     }
@@ -220,7 +222,7 @@ impl WorkspaceGraphInputs {
     }
 
     fn normalize(&mut self) {
-        self.objects.sort();
+        self.objects.sort_unstable();
         self.objects
             .dedup_by(|left, right| left.address == right.address);
     }
@@ -348,9 +350,9 @@ pub(crate) struct ReferenceProjectionFact {
 
 impl ReferenceProjectionFact {
     pub(crate) fn normalize(&mut self) {
-        self.diagnostics.sort();
+        self.diagnostics.sort_unstable();
         self.diagnostics.dedup();
-        self.dependency_keys.sort();
+        self.dependency_keys.sort_unstable();
         self.dependency_keys.dedup();
     }
 }
@@ -429,6 +431,6 @@ pub(crate) enum ReferenceDependencyKey {
 }
 
 fn sort_strings(values: &mut Vec<String>) {
-    values.sort();
+    values.sort_unstable();
     values.dedup();
 }
