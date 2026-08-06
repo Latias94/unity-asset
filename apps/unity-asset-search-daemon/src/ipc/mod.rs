@@ -18,8 +18,8 @@ use unity_asset_search_protocol::{
     encode_frame, encode_response_frame,
 };
 
+pub use dispatch::Dispatcher;
 pub(crate) use dispatch::DispatcherShutdown;
-pub use dispatch::{Dispatcher, OperationRegistry, OperationRegistryOwner};
 
 const MAX_WORK_IN_FLIGHT: usize = 16;
 const MAX_WAIT_IN_FLIGHT: usize = 16;
@@ -318,7 +318,11 @@ impl IpcService {
                     }
                     ServeEvent::SessionJoined(joined) => {
                         if let Err(error) = joined {
-                            eprintln!("local IPC session task failed: {error}");
+                            let message = crate::truncate_utf8(error.to_string(), 4 * 1024);
+                            self.dispatcher.begin_draining().await;
+                            fatal =
+                                Some(anyhow::anyhow!("local IPC session task failed: {message}"));
+                            break fatal_drain_deadline();
                         }
                     }
                 }
@@ -329,7 +333,14 @@ impl IpcService {
         // Active sessions are already bound to the verified process and may drain within the
         // requested limit.
         let cleanup = endpoint.withdraw();
-        self.drain_to(drain_deadline).await;
+        if let Some(message) = self.drain_to(drain_deadline).await {
+            fatal = Some(match fatal {
+                Some(existing) => anyhow::anyhow!(
+                    "{existing}; local IPC session task also failed while draining: {message}"
+                ),
+                None => anyhow::anyhow!("local IPC session task failed while draining: {message}"),
+            });
+        }
 
         match (fatal, cleanup) {
             (None, Ok(cleanup)) => Ok(cleanup),
@@ -342,14 +353,19 @@ impl IpcService {
     }
 
     /// Drain every owned session after the supervisor has closed discovery and admission.
-    pub(crate) async fn shutdown(&mut self) {
+    pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
         self.dispatcher.begin_draining().await;
         let deadline = (*self.shutdown.borrow_and_update()).unwrap_or_else(fatal_drain_deadline);
-        self.drain_to(deadline).await;
+        match self.drain_to(deadline).await {
+            Some(message) => Err(anyhow::anyhow!(
+                "local IPC session task failed while shutting down: {message}"
+            )),
+            None => Ok(()),
+        }
     }
 
-    async fn drain_to(&mut self, deadline: Instant) {
-        drain_sessions(&mut self.sessions, &mut self.shutdown, deadline).await;
+    async fn drain_to(&mut self, deadline: Instant) -> Option<String> {
+        drain_sessions(&mut self.sessions, &mut self.shutdown, deadline).await
     }
 }
 
@@ -406,11 +422,12 @@ async fn drain_sessions(
     sessions: &mut JoinSet<()>,
     shutdown: &mut watch::Receiver<Option<Instant>>,
     mut deadline: Instant,
-) {
+) -> Option<String> {
     let mut observe_tightening = true;
+    let mut first_failure = None;
     loop {
         if sessions.is_empty() {
-            return;
+            return first_failure;
         }
         if deadline <= Instant::now() {
             break;
@@ -426,15 +443,25 @@ async fn drain_sessions(
                 }
             }
             joined = sessions.join_next() => {
-                if let Some(Err(error)) = joined {
-                    eprintln!("local IPC session task failed during shutdown: {error}");
+                if let Some(Err(error)) = joined
+                    && first_failure.is_none()
+                {
+                    first_failure = Some(crate::truncate_utf8(error.to_string(), 4 * 1024));
                 }
             }
             () = tokio::time::sleep_until(deadline) => break,
         }
     }
     sessions.abort_all();
-    while sessions.join_next().await.is_some() {}
+    while let Some(result) = sessions.join_next().await {
+        if let Err(error) = result
+            && !error.is_cancelled()
+            && first_failure.is_none()
+        {
+            first_failure = Some(crate::truncate_utf8(error.to_string(), 4 * 1024));
+        }
+    }
+    first_failure
 }
 
 struct PeerRejectionLog {
@@ -660,6 +687,7 @@ mod tests {
     };
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
+    use crate::operations::OperationServiceOwner;
     use crate::watcher::MaintenanceRuntime;
 
     #[tokio::test]
@@ -767,7 +795,10 @@ mod tests {
         sessions.spawn(std::future::pending::<()>());
         let (_shutdown, mut receiver) = watch::channel(None);
 
-        drain_sessions(&mut sessions, &mut receiver, Instant::now()).await;
+        assert_eq!(
+            drain_sessions(&mut sessions, &mut receiver, Instant::now()).await,
+            None
+        );
 
         assert!(sessions.is_empty());
     }
@@ -778,12 +809,15 @@ mod tests {
         sessions.spawn(std::future::pending::<()>());
         let (_shutdown, mut receiver) = watch::channel(None);
 
-        drain_sessions(
-            &mut sessions,
-            &mut receiver,
-            Instant::now() + Duration::from_millis(5),
-        )
-        .await;
+        assert_eq!(
+            drain_sessions(
+                &mut sessions,
+                &mut receiver,
+                Instant::now() + Duration::from_millis(5),
+            )
+            .await,
+            None
+        );
 
         assert!(sessions.is_empty());
     }
@@ -795,16 +829,36 @@ mod tests {
         let (shutdown, mut receiver) = watch::channel(None);
         let initial = Instant::now() + Duration::from_secs(60);
         let drain = tokio::spawn(async move {
-            drain_sessions(&mut sessions, &mut receiver, initial).await;
-            sessions
+            let failure = drain_sessions(&mut sessions, &mut receiver, initial).await;
+            (sessions, failure)
         });
         tokio::task::yield_now().await;
 
         shutdown.send(Some(Instant::now())).unwrap();
-        let sessions = drain.await.unwrap();
+        let (sessions, failure) = drain.await.unwrap();
 
         assert!(sessions.is_empty());
+        assert_eq!(failure, None);
         assert!(Instant::now() < initial);
+    }
+
+    #[tokio::test]
+    async fn session_join_failure_is_returned_as_lifecycle_evidence() {
+        let mut sessions = tokio::task::JoinSet::new();
+        sessions.spawn(async move {
+            panic!("session fixture panic");
+        });
+        let (_shutdown, mut receiver) = watch::channel(None);
+
+        let failure = drain_sessions(
+            &mut sessions,
+            &mut receiver,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+
+        assert!(failure.is_some_and(|message| message.contains("session fixture panic")));
+        assert!(sessions.is_empty());
     }
 
     #[derive(Debug, Clone, Copy)]
@@ -912,17 +966,17 @@ mod tests {
         let _blocking_tasks = BlockingTaskOwner::new();
         let query_policy_id = index.status().unwrap().query_policy_id;
         let lifecycle_admission = AdmissionGate::default();
-        let operation_registry = super::OperationRegistryOwner::new(
+        let operation_service = OperationServiceOwner::new(
             instance_id,
             coordinator.clone(),
-            query_policy_id,
             lifecycle_admission.clone(),
         );
-        let maintenance = MaintenanceRuntime::start(operation_registry.registry(), None, None);
+        let maintenance = MaintenanceRuntime::start(operation_service.service(), None, None);
         let dispatcher = Dispatcher::new(
             index,
             _blocking_tasks.handle(),
-            operation_registry.registry(),
+            operation_service.service(),
+            query_policy_id,
             lifecycle_admission,
             maintenance.handle(),
         );
@@ -1174,17 +1228,17 @@ mod tests {
         let mut blocking_tasks = BlockingTaskOwner::new();
         let query_policy_id = index.status().unwrap().query_policy_id;
         let lifecycle_admission = AdmissionGate::default();
-        let mut operation_registry = super::OperationRegistryOwner::new(
+        let mut operation_service = OperationServiceOwner::new(
             instance_id,
             coordinator.clone(),
-            query_policy_id,
             lifecycle_admission.clone(),
         );
-        let mut maintenance = MaintenanceRuntime::start(operation_registry.registry(), None, None);
+        let mut maintenance = MaintenanceRuntime::start(operation_service.service(), None, None);
         let dispatcher = Dispatcher::new(
             index,
             blocking_tasks.handle(),
-            operation_registry.registry(),
+            operation_service.service(),
+            query_policy_id,
             lifecycle_admission,
             maintenance.handle(),
         );
@@ -1349,7 +1403,7 @@ mod tests {
         assert_eq!(serve_result.unwrap(), EndpointCleanupV1::Removed);
         maintenance.shutdown().await.unwrap();
         coordinator_runtime.shutdown().await.unwrap();
-        operation_registry.shutdown().await.unwrap();
+        operation_service.shutdown().await.unwrap();
         blocking_tasks.shutdown().await.unwrap();
         drop(endpoint);
         drop(namespace);

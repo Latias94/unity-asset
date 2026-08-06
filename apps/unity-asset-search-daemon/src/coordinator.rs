@@ -93,6 +93,7 @@ pub enum ReindexSource {
     Startup,
     Watcher,
     Timer,
+    SemanticUpgrade,
     Ipc,
 }
 
@@ -102,7 +103,8 @@ impl ReindexSource {
             Self::Startup => 0,
             Self::Watcher => 1,
             Self::Timer => 2,
-            Self::Ipc => 3,
+            Self::SemanticUpgrade => 3,
+            Self::Ipc => 4,
         }
     }
 }
@@ -229,16 +231,18 @@ pub struct ReindexAdmissionCounts {
     pub startup: u64,
     pub watcher: u64,
     pub timer: u64,
+    pub semantic_upgrade: u64,
     pub ipc: u64,
 }
 
 impl ReindexAdmissionCounts {
-    fn from_array(counts: [u64; 4]) -> Self {
+    fn from_array(counts: [u64; 5]) -> Self {
         Self {
             startup: counts[0],
             watcher: counts[1],
             timer: counts[2],
-            ipc: counts[3],
+            semantic_upgrade: counts[3],
+            ipc: counts[4],
         }
     }
 }
@@ -455,7 +459,7 @@ impl ReindexCoordinatorRuntime {
         let result = runner.await;
         self.runner.take();
         result.map_err(|error| CoordinatorError::RunnerTerminated {
-            message: truncate_message(error.to_string()),
+            message: crate::truncate_utf8(error.to_string(), MAX_FAILURE_MESSAGE_BYTES),
         })
     }
 }
@@ -492,8 +496,7 @@ impl ReindexCoordinator {
         intent: FilesystemReindexIntent,
     ) -> Result<ReindexReceipt, CoordinatorError> {
         let prepared = self.prepare_intent(&intent)?;
-        self.admit_prepared_unobserved_with(source, prepared, false)
-            .await
+        self.admit_prepared_unobserved(source, prepared).await
     }
 
     /// Atomically admits one request and returns an independently awaitable completion handle.
@@ -520,17 +523,18 @@ impl ReindexCoordinator {
         source: ReindexSource,
         prepared: PreparedReindexIntent,
     ) -> Result<ReindexObservation, CoordinatorError> {
-        self.admit_prepared_observed_with(source, prepared).await
+        self.admit_prepared_observed_with(source, prepared, false)
+            .await
     }
 
-    pub(crate) async fn admit_watcher_overflow_unobserved(
+    pub(crate) async fn admit_watcher_overflow_observed(
         &self,
-    ) -> Result<ReindexReceipt, CoordinatorError> {
+    ) -> Result<ReindexObservation, CoordinatorError> {
         let prepared = PreparedReindexIntent::new(NormalizedGeneralScope {
             scope: GeneralScope::Full,
             escalated: true,
         });
-        self.admit_prepared_unobserved_with(ReindexSource::Watcher, prepared, true)
+        self.admit_prepared_observed_with(ReindexSource::Watcher, prepared, true)
             .await
     }
 
@@ -538,6 +542,7 @@ impl ReindexCoordinator {
         &self,
         source: ReindexSource,
         prepared: PreparedReindexIntent,
+        watcher_overflow: bool,
     ) -> Result<ReindexObservation, CoordinatorError> {
         let observation_id = self.next_observation_id();
         let (event_sender, event_receiver) = mpsc::channel(OBSERVATION_EVENT_CAPACITY);
@@ -553,6 +558,9 @@ impl ReindexCoordinator {
                 return Err(CoordinatorError::ShuttingDown);
             }
             state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
+            if watcher_overflow {
+                state.watcher_overflows = state.watcher_overflows.saturating_add(1);
+            }
             let escalated = prepared.escalated;
             let disposition = state.admit_general(
                 prepared.scope,
@@ -583,7 +591,9 @@ impl ReindexCoordinator {
     /// Records a lossy watcher overflow and upgrades pending filesystem work to a full scan.
     #[cfg(test)]
     pub async fn watcher_overflow(&self) -> Result<ReindexReceipt, CoordinatorError> {
-        self.admit_watcher_overflow_unobserved().await
+        self.admit_watcher_overflow_observed()
+            .await
+            .map(|observation| observation.admission().clone())
     }
 
     /// Waits until the runner has drained every admitted request.
@@ -606,11 +616,11 @@ impl ReindexCoordinator {
         state.snapshot()
     }
 
-    async fn admit_prepared_unobserved_with(
+    #[cfg(test)]
+    async fn admit_prepared_unobserved(
         &self,
         source: ReindexSource,
         prepared: PreparedReindexIntent,
-        watcher_overflow: bool,
     ) -> Result<ReindexReceipt, CoordinatorError> {
         let mut state = self.inner.state.lock().await;
         if self.inner.shutting_down.load(Ordering::Acquire) {
@@ -618,9 +628,6 @@ impl ReindexCoordinator {
         }
         state.admissions[source.index()] = state.admissions[source.index()].saturating_add(1);
 
-        if watcher_overflow {
-            state.watcher_overflows = state.watcher_overflows.saturating_add(1);
-        }
         if prepared.escalated {
             state.full_escalations = state.full_escalations.saturating_add(1);
         }
@@ -678,7 +685,7 @@ struct CoordinatorState {
     failure_sequence: u64,
     full_escalations: u64,
     watcher_overflows: u64,
-    admissions: [u64; 4],
+    admissions: [u64; 5],
     completion_waiter_count: usize,
 }
 
@@ -813,7 +820,7 @@ impl CoordinatorState {
         self.failures.push_back(ReindexFailure {
             sequence: self.failure_sequence,
             scope: ReindexScopeKind::from_intent(intent),
-            message: truncate_message(message),
+            message: crate::truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
         });
         while self.failures.len() > maximum {
             self.failures.pop_front();
@@ -894,7 +901,7 @@ impl ExecutionFailure {
     fn new(intent: &FilesystemReindexIntent, message: String) -> Self {
         Self {
             scope: ReindexScopeKind::from_intent(intent),
-            message: truncate_message(message),
+            message: crate::truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES),
         }
     }
 }
@@ -1154,18 +1161,6 @@ fn admission_receipt(disposition: ReindexDisposition) -> ReindexReceipt {
         generation: None,
         evidence: Default::default(),
     }
-}
-
-fn truncate_message(mut message: String) -> String {
-    if message.len() <= MAX_FAILURE_MESSAGE_BYTES {
-        return message;
-    }
-    let mut boundary = MAX_FAILURE_MESSAGE_BYTES;
-    while !message.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    message.truncate(boundary);
-    message
 }
 
 /// Admission and execution failures owned by the daemon coordinator.

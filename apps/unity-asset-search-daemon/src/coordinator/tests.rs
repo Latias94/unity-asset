@@ -162,6 +162,10 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
         (ReindexSource::Startup, "Assets/start.prefab"),
         (ReindexSource::Watcher, "Assets/watch.prefab"),
         (ReindexSource::Timer, "Assets/timer.prefab"),
+        (
+            ReindexSource::SemanticUpgrade,
+            "Assets/semantic-upgrade.prefab",
+        ),
         (ReindexSource::Ipc, "Assets/ipc.prefab"),
     ] {
         coordinator
@@ -177,6 +181,7 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
     assert_eq!(snapshot.admissions.startup, 1);
     assert_eq!(snapshot.admissions.watcher, 1);
     assert_eq!(snapshot.admissions.timer, 1);
+    assert_eq!(snapshot.admissions.semantic_upgrade, 1);
     assert_eq!(snapshot.admissions.ipc, 1);
     assert!(!seen.lock().await.is_empty());
 }

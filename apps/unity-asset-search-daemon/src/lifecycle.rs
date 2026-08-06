@@ -15,10 +15,9 @@ use unity_asset_search_index::{
 use unity_asset_search_local::{ClaimedEndpointV1, EndpointClaimV1, EndpointCleanupV1};
 use unity_asset_search_protocol::{DaemonInstanceId, ProjectId};
 
-use crate::coordinator::{
-    ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution, ReindexSource,
-};
-use crate::ipc::{Dispatcher, DispatcherShutdown, IpcService, OperationRegistryOwner};
+use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution};
+use crate::ipc::{Dispatcher, DispatcherShutdown, IpcService};
+use crate::operations::{OperationOrigin, OperationServiceOwner, SemanticUpgradeRuntime};
 use crate::watcher::{MaintenanceRuntime, WatcherConfig};
 
 const DAEMON_RUNTIME_WORKER_THREADS: usize = 2;
@@ -136,8 +135,9 @@ struct DaemonRuntimeParts {
     startup_reindex: Option<FilesystemReindexIntent>,
     dispatcher: Dispatcher,
     maintenance: MaintenanceRuntime,
+    semantic_upgrade: SemanticUpgradeRuntime,
     coordinator: ReindexCoordinatorRuntime,
-    operations: OperationRegistryOwner,
+    operations: OperationServiceOwner,
     blocking_tasks: BlockingTaskOwner,
     index: SearchIndex,
     #[cfg(test)]
@@ -262,7 +262,16 @@ fn assemble_runtime(
             watcher.project_id(),
         )?;
     }
-    let query_policy_id = index.status()?.query_policy_id;
+    let initial_status = index.status()?;
+    let query_policy_id = initial_status.query_policy_id;
+    let semantic_upgrade_required =
+        initial_status
+            .generation
+            .active
+            .as_ref()
+            .is_some_and(|generation| {
+                !generation.semantics_current || !generation.configuration_current
+            });
     let blocking_tasks = BlockingTaskOwner::new();
     let build_index = index.clone();
     let build_tasks = blocking_tasks.handle();
@@ -285,17 +294,19 @@ fn assemble_runtime(
         }
     })?;
     let admission = AdmissionGate::default();
-    let operations = OperationRegistryOwner::new(
+    let operations = OperationServiceOwner::new(
         daemon_instance_id,
         coordinator.coordinator(),
-        query_policy_id,
         admission.clone(),
     );
-    let maintenance = MaintenanceRuntime::start(operations.registry(), watcher, reconcile_interval);
+    let semantic_upgrade =
+        SemanticUpgradeRuntime::start(semantic_upgrade_required, operations.service());
+    let maintenance = MaintenanceRuntime::start(operations.service(), watcher, reconcile_interval);
     let dispatcher = Dispatcher::new(
         index.clone(),
         blocking_tasks.handle(),
-        operations.registry(),
+        operations.service(),
+        query_policy_id,
         admission,
         maintenance.handle(),
     );
@@ -305,6 +316,7 @@ fn assemble_runtime(
         startup_reindex,
         dispatcher,
         maintenance,
+        semantic_upgrade,
         coordinator,
         operations,
         blocking_tasks,
@@ -446,8 +458,9 @@ fn run_supervisor<F, E>(
 
 struct RuntimeComponents {
     maintenance: MaintenanceRuntime,
+    semantic_upgrade: SemanticUpgradeRuntime,
     coordinator: ReindexCoordinatorRuntime,
-    operations: OperationRegistryOwner,
+    operations: OperationServiceOwner,
     blocking_tasks: BlockingTaskOwner,
     index: SearchIndex,
 }
@@ -469,14 +482,16 @@ impl RuntimeComponents {
 
     async fn shutdown(&mut self) -> Vec<String> {
         let maintenance_result = self.maintenance.shutdown().await;
+        let semantic_upgrade_result = self.semantic_upgrade.shutdown().await;
         let coordinator_result = self.coordinator.shutdown().await;
         let operation_result = self.operations.shutdown().await;
         let blocking_result = self.blocking_tasks.shutdown().await;
 
         let mut failures = Vec::new();
         collect_shutdown_failure(&mut failures, "maintenance", maintenance_result);
+        collect_shutdown_failure(&mut failures, "semantic upgrade", semantic_upgrade_result);
         collect_shutdown_failure(&mut failures, "coordinator", coordinator_result);
-        collect_shutdown_failure(&mut failures, "operation registry", operation_result);
+        collect_shutdown_failure(&mut failures, "operation service", operation_result);
         collect_shutdown_failure(&mut failures, "blocking tasks", blocking_result);
         failures
     }
@@ -503,6 +518,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             startup_reindex,
             dispatcher,
             maintenance,
+            semantic_upgrade,
             coordinator,
             operations,
             blocking_tasks,
@@ -524,6 +540,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             ipc,
             components: RuntimeComponents {
                 maintenance,
+                semantic_upgrade,
                 coordinator,
                 operations,
                 blocking_tasks,
@@ -545,16 +562,24 @@ impl SupervisorState {
             return Ok(());
         }
 
+        self.components
+            .semantic_upgrade
+            .ensure_first_admission()
+            .await
+            .map_err(|error| {
+                DaemonRuntimeError::single(format!("semantic upgrade admission: {error:#}"))
+            })?;
+
         if let Some(intent) = self.startup_reindex.take()
             && let Err(error) = self
                 .components
                 .operations
-                .registry()
-                .admit_internal(ReindexSource::Startup, intent)
+                .service()
+                .admit(OperationOrigin::Startup, intent, None)
                 .await
         {
             return Err(DaemonRuntimeError::single(format!(
-                "startup reindex admission: {error:?}"
+                "startup reindex admission: {error}"
             )));
         }
 
@@ -569,15 +594,20 @@ impl SupervisorState {
             .map_err(|error| {
                 DaemonRuntimeError::single(format!("endpoint publication: {error}"))
             })?;
+        self.endpoint = Some(endpoint);
         self.components
             .revalidate_project_root("after endpoint publication")?;
-        if endpoint.publication_warning().durability_unconfirmed() {
+        if self
+            .endpoint
+            .as_ref()
+            .expect("published endpoint is retained before revalidation")
+            .publication_warning()
+            .durability_unconfirmed()
+        {
             eprintln!(
                 "endpoint descriptor published but directory durability could not be confirmed"
             );
         }
-        self.endpoint = Some(endpoint);
-
         #[cfg(test)]
         self.panic_if_requested(SupervisorPanicStage::AfterPublication);
 
@@ -605,7 +635,9 @@ impl SupervisorState {
         if let Err(error) = self.withdraw_endpoint() {
             failures.push(format!("endpoint cleanup: {error}"));
         }
-        self.ipc.shutdown().await;
+        if let Err(error) = self.ipc.shutdown().await {
+            failures.push(format!("IPC sessions: {error:#}"));
+        }
         failures.extend(self.components.shutdown().await);
         failures
     }
@@ -859,7 +891,8 @@ mod tests {
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution,
     };
-    use crate::ipc::{Dispatcher, OperationRegistryOwner};
+    use crate::ipc::Dispatcher;
+    use crate::operations::{OperationServiceOwner, SemanticUpgradeRuntime};
     use crate::watcher::{MaintenanceRuntime, WatcherConfig};
 
     #[derive(Debug, Clone, Copy)]
@@ -1519,17 +1552,18 @@ mod tests {
                 },
             )?;
             let admission = AdmissionGate::default();
-            let operations = OperationRegistryOwner::new(
+            let operations = OperationServiceOwner::new(
                 daemon_instance_id,
                 coordinator.coordinator(),
-                query_policy_id,
                 admission.clone(),
             );
-            let maintenance = MaintenanceRuntime::start(operations.registry(), None, None);
+            let semantic_upgrade = SemanticUpgradeRuntime::start(false, operations.service());
+            let maintenance = MaintenanceRuntime::start(operations.service(), None, None);
             let dispatcher = Dispatcher::new(
                 index.clone(),
                 blocking_tasks.handle(),
-                operations.registry(),
+                operations.service(),
+                query_policy_id,
                 admission,
                 maintenance.handle(),
             );
@@ -1539,6 +1573,7 @@ mod tests {
                 startup_reindex: None,
                 dispatcher,
                 maintenance,
+                semantic_upgrade,
                 coordinator,
                 operations,
                 blocking_tasks,

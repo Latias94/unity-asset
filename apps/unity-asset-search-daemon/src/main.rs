@@ -12,6 +12,7 @@ use unity_asset_search_local::{PrivateRootsV1, ProjectLocatorV1, generate_daemon
 mod coordinator;
 mod ipc;
 mod lifecycle;
+mod operations;
 mod watcher;
 
 use crate::coordinator::ReindexCoordinatorConfig;
@@ -19,6 +20,18 @@ use crate::lifecycle::{DaemonRuntime, DaemonRuntimeConfig};
 use crate::watcher::WatcherConfig;
 
 const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+
+fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
+}
 
 #[cfg(test)]
 fn secure_test_tempdir() -> tempfile::TempDir {
@@ -170,7 +183,7 @@ mod tests {
 
     use clap::Parser as _;
 
-    use super::{Args, DEFAULT_RECONCILE_INTERVAL_MS, reconciliation_interval};
+    use super::{Args, DEFAULT_RECONCILE_INTERVAL_MS, reconciliation_interval, truncate_utf8};
 
     #[test]
     fn periodic_reconciliation_is_independent_of_watching_and_can_be_disabled() {
@@ -191,5 +204,25 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(reconciliation_interval(&disabled), None);
+    }
+
+    #[test]
+    fn removed_network_listener_option_stays_rejected() {
+        assert!(
+            Args::try_parse_from([
+                "unity-asset-search-daemon",
+                "--project-root",
+                ".",
+                "--listen",
+                "127.0.0.1:7777",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate_utf8("a界b".to_owned(), 4), "a界");
+        assert_eq!(truncate_utf8("short".to_owned(), 5), "short");
     }
 }

@@ -14,10 +14,10 @@ use unity_asset_search_index::{
     FilesystemReindexIntent, IndexPaths, ProjectPath, ProjectPathSet, ProjectPathSpace,
     is_search_ignore_v1_file_name,
 };
-use unity_asset_search_protocol::{ApiError, ProjectId};
+use unity_asset_search_protocol::ProjectId;
 
 use crate::coordinator::ReindexSource;
-use crate::ipc::OperationRegistry;
+use crate::operations::{OperationError, OperationOrigin, OperationService};
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(250);
@@ -89,7 +89,7 @@ struct MaintenanceState {
 
 impl MaintenanceRuntime {
     pub fn start(
-        operations: OperationRegistry,
+        operations: OperationService,
         watcher: Option<WatcherConfig>,
         reconcile_interval: Option<Duration>,
     ) -> Self {
@@ -206,7 +206,7 @@ fn remaining_millis(deadline: Option<Instant>) -> Option<u64> {
     })
 }
 
-type AdmissionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), ApiError>> + Send + 'a>>;
+type AdmissionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), OperationError>> + Send + 'a>>;
 
 trait MaintenanceOperations: Send + Sync {
     fn admit(&self, source: ReindexSource, intent: FilesystemReindexIntent) -> AdmissionFuture<'_>;
@@ -214,17 +214,24 @@ trait MaintenanceOperations: Send + Sync {
     fn admit_watcher_overflow(&self) -> AdmissionFuture<'_>;
 }
 
-impl MaintenanceOperations for OperationRegistry {
+impl MaintenanceOperations for OperationService {
     fn admit(&self, source: ReindexSource, intent: FilesystemReindexIntent) -> AdmissionFuture<'_> {
+        let origin = match source {
+            ReindexSource::Startup => OperationOrigin::Startup,
+            ReindexSource::Watcher => OperationOrigin::Watcher,
+            ReindexSource::Timer => OperationOrigin::Timer,
+            ReindexSource::SemanticUpgrade => OperationOrigin::SemanticUpgrade,
+            ReindexSource::Ipc => OperationOrigin::Ipc,
+        };
         Box::pin(async move {
-            OperationRegistry::admit_internal(self, source, intent).await?;
+            OperationService::admit(self, origin, intent, None).await?;
             Ok(())
         })
     }
 
     fn admit_watcher_overflow(&self) -> AdmissionFuture<'_> {
         Box::pin(async move {
-            OperationRegistry::admit_watcher_overflow(self).await?;
+            OperationService::admit_watcher_overflow(self).await?;
             Ok(())
         })
     }
@@ -515,18 +522,15 @@ async fn run_watcher_session(
     loop {
         match session.next().await {
             WatcherSessionEvent::Changed(paths) => {
-                record_admission_failure(
-                    operations
-                        .admit(
-                            ReindexSource::Watcher,
-                            FilesystemReindexIntent::changed_paths(paths),
-                        )
-                        .await,
-                    "watcher changed-path admission",
-                );
+                let intent = FilesystemReindexIntent::changed_paths(paths);
+                if let Err(failure) = admit_watcher_intent(operations, intent).await {
+                    return failure;
+                }
             }
             WatcherSessionEvent::Overflow => {
-                admit_watcher_overflow(operations).await;
+                if let Err(failure) = admit_watcher_overflow(operations).await {
+                    return failure;
+                }
             }
             WatcherSessionEvent::Failed(message) => return bounded_failure(message),
             WatcherSessionEvent::Closed => {
@@ -560,18 +564,45 @@ fn report_backend_failure(message: String, failures: &watch::Sender<Option<Strin
     drop(failures.send_replace(Some(bounded_failure(message))));
 }
 
-async fn admit_watcher_overflow(operations: &dyn MaintenanceOperations) {
-    record_admission_failure(
-        operations.admit_watcher_overflow().await,
-        "watcher overflow admission",
-    );
+async fn admit_watcher_intent(
+    operations: &dyn MaintenanceOperations,
+    intent: FilesystemReindexIntent,
+) -> Result<(), String> {
+    let mut backoff = INITIAL_RETRY_BACKOFF;
+    loop {
+        match operations
+            .admit(ReindexSource::Watcher, intent.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_retryable_admission() => {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(MAXIMUM_RETRY_BACKOFF);
+            }
+            Err(error) => {
+                return Err(bounded_failure(format!(
+                    "watcher changed-path admission failed: {error}"
+                )));
+            }
+        }
+    }
 }
 
-fn record_admission_failure(result: Result<(), ApiError>, context: &str) {
-    if let Err(error) = result
-        && error.code != unity_asset_search_protocol::ApiErrorCode::NotReady
-    {
-        eprintln!("{context} failed: {error:?}");
+async fn admit_watcher_overflow(operations: &dyn MaintenanceOperations) -> Result<(), String> {
+    let mut backoff = INITIAL_RETRY_BACKOFF;
+    loop {
+        match operations.admit_watcher_overflow().await {
+            Ok(()) => return Ok(()),
+            Err(error) if error.is_retryable_admission() => {
+                tokio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(MAXIMUM_RETRY_BACKOFF);
+            }
+            Err(error) => {
+                return Err(bounded_failure(format!(
+                    "watcher overflow admission failed: {error}"
+                )));
+            }
+        }
     }
 }
 
@@ -702,20 +733,12 @@ fn is_legacy_ignore_file_name(name: &std::ffi::OsStr) -> bool {
     })
 }
 
-fn bounded_failure(mut message: String) -> String {
+fn bounded_failure(message: String) -> String {
     const MAXIMUM: usize = 4 * 1024;
     if message.trim().is_empty() {
         return "maintenance task failed without diagnostic evidence".to_owned();
     }
-    if message.len() <= MAXIMUM {
-        return message;
-    }
-    let mut boundary = MAXIMUM;
-    while !message.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    message.truncate(boundary);
-    message
+    crate::truncate_utf8(message, MAXIMUM)
 }
 
 #[cfg(test)]
@@ -730,20 +753,21 @@ mod tests {
     use unity_asset_search_index::{
         FilesystemReindexIntent, FilesystemReindexScope, IndexPaths, ProjectPath, ProjectPathSet,
     };
-    use unity_asset_search_protocol::{ApiError, ApiErrorCode};
 
     use super::{
-        AdmissionFuture, MaintenanceOperations, MaintenanceRuntime, NotifyWatcherFactory,
-        TimerLifecycle, WatchSignal, WatcherConfig, WatcherEventFuture, WatcherEventStream,
-        WatcherFactory, WatcherLifecycle, WatcherSession, WatcherSessionEvent,
+        AdmissionFuture, INITIAL_RETRY_BACKOFF, MaintenanceOperations, MaintenanceRuntime,
+        NotifyWatcherFactory, TimerLifecycle, WatchSignal, WatcherConfig, WatcherEventFuture,
+        WatcherEventStream, WatcherFactory, WatcherLifecycle, WatcherSession, WatcherSessionEvent,
         is_project_root_search_policy_path, project_root_watch_signal, report_backend_failure,
         run_watcher_session, send_watch_signal, typed_index_namespace_exclusion, watch_signal,
     };
     use crate::coordinator::ReindexSource;
+    use crate::operations::OperationError;
 
     #[derive(Default)]
     struct ScriptedOperations {
-        timer_results: Mutex<VecDeque<Result<(), ApiError>>>,
+        timer_results: Mutex<VecDeque<Result<(), OperationError>>>,
+        watcher_results: Mutex<VecDeque<Result<(), OperationError>>>,
         timer_calls: AtomicUsize,
         watcher_calls: AtomicUsize,
         admissions: Mutex<Vec<ScriptedAdmission>>,
@@ -759,9 +783,20 @@ mod tests {
     }
 
     impl ScriptedOperations {
-        fn with_timer_results(results: impl IntoIterator<Item = Result<(), ApiError>>) -> Self {
+        fn with_timer_results(
+            results: impl IntoIterator<Item = Result<(), OperationError>>,
+        ) -> Self {
             Self {
                 timer_results: Mutex::new(results.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn with_watcher_results(
+            results: impl IntoIterator<Item = Result<(), OperationError>>,
+        ) -> Self {
+            Self {
+                watcher_results: Mutex::new(results.into_iter().collect()),
                 ..Self::default()
             }
         }
@@ -793,7 +828,11 @@ mod tests {
                     .unwrap_or(Ok(()))
             } else {
                 self.watcher_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                self.watcher_results
+                    .lock()
+                    .expect("watcher result script should not be poisoned")
+                    .pop_front()
+                    .unwrap_or(Ok(()))
             };
             Box::pin(std::future::ready(result))
         }
@@ -1227,6 +1266,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn watcher_retries_the_same_event_when_operation_capacity_is_temporarily_full() {
+        let fixture = WatcherFixture::new();
+        let operations = Arc::new(ScriptedOperations::with_watcher_results([
+            Err(OperationError::Saturated { maximum: 256 }),
+            Ok(()),
+        ]));
+        let (sender, scripted) = scripted_session();
+        let ScriptedOpen::Session(events) = scripted else {
+            unreachable!("scripted_session must return a session")
+        };
+        let changed = fixture.changed_paths(["Assets/Retained.prefab"]);
+        sender
+            .send(WatcherSessionEvent::Changed(changed.clone()))
+            .unwrap();
+        sender.send(WatcherSessionEvent::Closed).unwrap();
+        let task_operations = Arc::clone(&operations);
+        let task = tokio::spawn(async move {
+            let mut session = ScriptedWatcherSession { events };
+            run_watcher_session(task_operations.as_ref(), &mut session).await
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(operations.watcher_calls.load(Ordering::Relaxed), 1);
+        tokio::time::advance(INITIAL_RETRY_BACKOFF).await;
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(operations.watcher_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            operations.admissions(),
+            vec![
+                ScriptedAdmission::Reindex {
+                    source: ReindexSource::Watcher,
+                    intent: FilesystemReindexIntent::changed_paths(changed.clone()),
+                },
+                ScriptedAdmission::Reindex {
+                    source: ReindexSource::Watcher,
+                    intent: FilesystemReindexIntent::changed_paths(changed),
+                },
+            ]
+        );
+        assert_eq!(
+            task.await.unwrap(),
+            "filesystem watcher event channel closed unexpectedly"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn backend_failure_is_not_hidden_by_a_saturated_event_queue() {
         let fixture = WatcherFixture::new();
         let (event_sender, event_receiver) = mpsc::channel(1);
@@ -1326,7 +1414,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn timer_failure_remains_scheduled_and_success_clears_evidence() {
         let operations = Arc::new(ScriptedOperations::with_timer_results([
-            Err(ApiError::new(ApiErrorCode::Busy, "busy", true)),
+            Err(OperationError::Saturated { maximum: 1 }),
             Ok(()),
         ]));
         let mut maintenance = MaintenanceRuntime::start_with_dependencies(
