@@ -6,8 +6,9 @@ use thiserror::Error;
 use unity_asset_core::{
     AllocationSizeError, AssetLoadBudget, BudgetError, DigestBuildError, DigestV1, FieldPath,
     ObjectId, ObjectKind, SemanticDigestError, SourceId, UnityClass, UnityValue,
-    UnityValueCloneError, UnityValueKind, ValuePathError, YamlFileId, arc_value_allocation_bytes,
-    semantic_value_digest, yaml_field_schema_digest, yaml_schema_digest,
+    UnityValueCloneError, UnityValueKind, ValuePathError, YamlDocumentSelector,
+    arc_value_allocation_bytes, semantic_value_digest, yaml_field_schema_digest,
+    yaml_schema_digest,
 };
 
 use crate::schema::SchemaProvenance;
@@ -443,10 +444,19 @@ impl YamlObjectCandidate {
 }
 
 fn yaml_identity_matches(object: &ObjectId, document_index: usize, class: &UnityClass) -> bool {
-    match (object.yaml_file_id(), object.yaml_document_ordinal()) {
-        (Some(file_id), None) => YamlFileId::parse_canonical(class.anchor()).ok() == Some(file_id),
-        (None, Some(ordinal)) => usize::try_from(ordinal) == Ok(document_index),
-        (Some(_), Some(_)) | (None, None) => false,
+    let Ok(selector) = YamlDocumentSelector::from_document_header(
+        document_index,
+        class.class_id(),
+        class.class_name(),
+        class.anchor(),
+    ) else {
+        return false;
+    };
+    match selector {
+        YamlDocumentSelector::FileId { file_id } => object.yaml_file_id() == Some(file_id),
+        YamlDocumentSelector::Unanchored { document_index } => {
+            object.yaml_document_ordinal() == Some(document_index)
+        }
     }
 }
 
@@ -974,7 +984,7 @@ mod tests {
     use indexmap::IndexMap;
     use unity_asset_core::{
         AssetLoadLimits, RevisionedObjectHandle, SourceId, SourceKind, WorkspaceId,
-        WorkspaceRevision, semantic_value_digest,
+        WorkspaceRevision, YamlFileId, semantic_value_digest,
     };
 
     use super::*;

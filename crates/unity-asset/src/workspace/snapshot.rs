@@ -8,8 +8,7 @@ use unity_asset_binary::asset::SerializedFile;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticSeverity, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, YamlFileId,
-    vec_allocation_bytes,
+    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, vec_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
 
@@ -723,27 +722,8 @@ pub(super) fn yaml_object_id(
     index: usize,
     class: &UnityClass,
 ) -> Result<ObjectId, WorkspaceError> {
-    if is_plain_yaml_document(index, class) {
-        let index = u32::try_from(index).map_err(|_| BudgetError::ArithmeticOverflow {
-            resource: "yaml_document_ordinal",
-        })?;
-        Ok(ObjectId::yaml_document(source, index)?)
-    } else {
-        Ok(ObjectId::yaml(
-            source,
-            YamlFileId::parse_canonical(class.anchor())?,
-        )?)
-    }
-}
-
-pub(super) fn is_plain_yaml_document(index: usize, class: &UnityClass) -> bool {
-    class.class_id() == 0
-        && class.class_name() == "YamlDocument"
-        && class
-            .anchor()
-            .strip_prefix("doc_")
-            .and_then(|ordinal| ordinal.parse::<usize>().ok())
-            == Some(index)
+    let selector = yaml_document_selector(index, class)?;
+    Ok(ObjectId::from_yaml_selector(source, &selector)?)
 }
 
 fn yaml_selector_matches(
@@ -751,26 +731,29 @@ fn yaml_selector_matches(
     index: usize,
     class: &UnityClass,
 ) -> bool {
+    selector.matches_document_header(index, class.class_id(), class.class_name(), class.anchor())
+}
+
+fn yaml_object_matches(object: &ObjectId, index: usize, class: &UnityClass) -> bool {
+    let Ok(selector) = yaml_document_selector(index, class) else {
+        return false;
+    };
     match selector {
-        YamlDocumentSelector::FileId { file_id } => {
-            !is_plain_yaml_document(index, class)
-                && YamlFileId::parse_canonical(class.anchor()).ok() == Some(*file_id)
-        }
+        YamlDocumentSelector::FileId { file_id } => object.yaml_file_id() == Some(file_id),
         YamlDocumentSelector::Unanchored { document_index } => {
-            usize::try_from(*document_index) == Ok(index) && is_plain_yaml_document(index, class)
+            object.yaml_document_ordinal() == Some(document_index)
         }
     }
 }
 
-fn yaml_object_matches(object: &ObjectId, index: usize, class: &UnityClass) -> bool {
-    if let Some(file_id) = object.yaml_file_id() {
-        !is_plain_yaml_document(index, class)
-            && YamlFileId::parse_canonical(class.anchor()).ok() == Some(file_id)
-    } else {
-        object
-            .yaml_document_ordinal()
-            .and_then(|ordinal| usize::try_from(ordinal).ok())
-            == Some(index)
-            && is_plain_yaml_document(index, class)
-    }
+fn yaml_document_selector(
+    index: usize,
+    class: &UnityClass,
+) -> Result<YamlDocumentSelector, ContractError> {
+    YamlDocumentSelector::from_document_header(
+        index,
+        class.class_id(),
+        class.class_name(),
+        class.anchor(),
+    )
 }

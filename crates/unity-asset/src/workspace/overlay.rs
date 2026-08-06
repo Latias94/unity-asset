@@ -27,13 +27,13 @@ use crate::reference::{
 };
 use crate::schema::SchemaProvenance;
 
-use super::interface::{map_yaml_error, validate_yaml_identities};
 use super::preflight::PrepareStage;
 use super::snapshot::{
     WorkspaceSnapshot, consume_retained_bytes, consume_single_result, invalid_lookup,
     project_catalog_source, yaml_object_id,
 };
 use super::source_catalog::{LocatorResolution, SourceCatalog};
+use super::source_loading::{map_yaml_error, validate_yaml_identities};
 use super::view::{
     self, WorkspaceByteRange, WorkspaceError, WorkspaceLookup, WorkspaceObject,
     WorkspaceObjectValue, WorkspaceSource, WorkspaceView, validate_prepared_artifact,

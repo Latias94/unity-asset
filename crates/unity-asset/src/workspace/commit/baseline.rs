@@ -19,12 +19,12 @@ use super::super::adapter::binary::{BinaryPayload, BinaryWorkspaceAdapter};
 use super::super::inspection::{
     AssetBundleSummary, SerializedFileSummary, WebFileSummary, WorkspaceSourceFormatInspection,
 };
-use super::super::interface::{
-    map_binary_adapter_error, map_yaml_error, promote_value_to_arc, validate_yaml_identities,
-};
 use super::super::overlay::PreparedStateCore;
 use super::super::preflight::PreparedChange;
 use super::super::source_catalog::{CatalogError, PhysicalDomainChange, SourceDescriptor};
+use super::super::source_loading::{
+    map_binary_adapter_error, map_yaml_error, promote_value_to_arc, validate_yaml_identities,
+};
 use super::super::state::{
     FrozenSourceParse, PreparedWorkspaceState, SourceStoreError, VerifiedSourceContent,
     WorkspaceState, WorkspaceStateError, WorkspaceStateTransaction,

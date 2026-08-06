@@ -1,8 +1,8 @@
 use indexmap::IndexMap;
 use std::sync::Arc;
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, FieldPath, UnityClass, UnityDocument,
-    UnityValue, YamlDocumentSelector, YamlFileId,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, ContractError, FieldPath, UnityClass,
+    UnityDocument, UnityValue, YamlDocumentSelector, YamlFileId,
 };
 use unity_asset_yaml::{
     YamlDocument, YamlReferenceClassification, YamlReferenceDiagnostic, YamlReferenceField,
@@ -248,7 +248,7 @@ fn accepts_unity_alias_spellings_and_preserves_unanchored_document_identity() {
     pointer.insert("m_Type".to_string(), UnityValue::Integer(-3));
 
     let class = with_property(
-        UnityClass::new(0, "PlainDocument".to_string(), "doc_0".to_string()),
+        UnityClass::new(0, "YamlDocument".to_string(), "doc_0".to_string()),
         "target",
         UnityValue::Object(pointer),
     );
@@ -264,6 +264,26 @@ fn accepts_unity_alias_spellings_and_preserves_unanchored_document_identity() {
                 && target.guid.as_deref() == Some("ABCDEF0123456789ABCDEF0123456789")
                 && target.type_id == Some(-3)
     ));
+}
+
+#[test]
+fn rejects_noncanonical_or_mistyped_unanchored_document_selectors() {
+    for class in [
+        UnityClass::new(0, "YamlDocument".to_owned(), "doc_00".to_owned()),
+        UnityClass::new(0, "PlainDocument".to_owned(), "doc_0".to_owned()),
+    ] {
+        let document = YamlDocument::from_entries(vec![class]);
+        let error =
+            scan_reference_occurrences(&document, &mut AssetLoadBudget::default()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            YamlReferenceScanError::InvalidDocumentSelector {
+                document_index: 0,
+                source: ContractError::InvalidYamlFileId,
+            }
+        ));
+    }
 }
 
 #[test]

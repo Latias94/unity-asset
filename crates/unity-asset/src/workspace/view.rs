@@ -31,7 +31,7 @@ pub(crate) mod sealed {
     use super::super::ReferenceViewParts;
     use super::{SourceObjectDescriptor, WorkspaceError, WorkspaceObject};
 
-    pub trait Sealed {
+    pub(crate) trait Sealed {
         fn reference_view_parts(&self) -> ReferenceViewParts<'_>;
 
         fn object_count_in_source(
@@ -780,6 +780,7 @@ pub enum WorkspaceLookup<T> {
 }
 
 /// Common immutable query interface for committed snapshots and future prepared views.
+#[allow(private_bounds)]
 pub trait WorkspaceView: sealed::Sealed + Send + Sync {
     fn workspace_id(&self) -> WorkspaceId;
 

@@ -621,28 +621,20 @@ fn selector_ref(
     class: &UnityClass,
     document_index: usize,
 ) -> Result<SelectorRef, YamlReferenceScanError> {
-    if is_synthetic_document_anchor(class, document_index) {
-        let document_index = u32::try_from(document_index)
-            .map_err(|_| YamlReferenceScanError::DocumentIndexOverflow { document_index })?;
-        return Ok(SelectorRef::Ordinal(document_index));
-    }
-
-    let file_id = YamlFileId::parse_canonical(class.anchor()).map_err(|source| {
-        YamlReferenceScanError::InvalidDocumentSelector {
-            document_index,
-            source,
-        }
+    let selector = YamlDocumentSelector::from_document_header(
+        document_index,
+        class.class_id(),
+        class.class_name(),
+        class.anchor(),
+    )
+    .map_err(|source| YamlReferenceScanError::InvalidDocumentSelector {
+        document_index,
+        source,
     })?;
-    Ok(SelectorRef::FileId(file_id))
-}
-
-fn is_synthetic_document_anchor(class: &UnityClass, document_index: usize) -> bool {
-    class.class_id() == 0
-        && class
-            .anchor()
-            .strip_prefix("doc_")
-            .and_then(|ordinal| ordinal.parse::<usize>().ok())
-            == Some(document_index)
+    Ok(match selector {
+        YamlDocumentSelector::FileId { file_id } => SelectorRef::FileId(file_id),
+        YamlDocumentSelector::Unanchored { document_index } => SelectorRef::Ordinal(document_index),
+    })
 }
 
 fn build_selector(

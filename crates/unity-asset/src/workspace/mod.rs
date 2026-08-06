@@ -12,6 +12,7 @@ mod preflight;
 mod snapshot;
 mod source_admission;
 mod source_catalog;
+mod source_loading;
 mod state;
 mod view;
 
@@ -78,8 +79,7 @@ pub(crate) use state::TestSourceBackingOwner;
 pub use state::WorkspaceInstallationDigest;
 pub(crate) use state::{WeakSourceBackingOwner, WorkspaceState};
 
-#[doc(hidden)]
-pub struct ReferenceViewParts<'a> {
+pub(crate) struct ReferenceViewParts<'a> {
     pub(crate) state: ReferenceViewState<'a>,
     pub(crate) store: &'a std::sync::Arc<crate::reference::ReferenceStore>,
     pub(crate) typetree: unity_asset_binary::typetree::TypeTreeParseOptions,
