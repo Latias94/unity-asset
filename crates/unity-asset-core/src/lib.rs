@@ -33,7 +33,7 @@ pub use budget::{
     AssetLoadUsage, BudgetError, BudgetedJsonError, DecompressionBudget, DecompressionUsage,
 };
 pub use change::{CHANGE_SET_VERSION, ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
-pub use constants::*;
+pub use constants::{LineEnding, UNITY_TAG_URI, UNITY_YAML_VERSION, class_ids, class_names};
 pub use contract_json::{
     ContractJsonLimits, ContractJsonResourceModel, read_contract_json, read_contract_json_slice,
 };
@@ -61,12 +61,12 @@ pub use unity_value::{UnityValue, UnityValueCloneError, UnityValueKind, ValuePat
 
 /// Get Unity class name from class ID
 pub fn get_class_name(class_id: i32) -> Option<String> {
-    GLOBAL_CLASS_ID_MAP.get_class_name(class_id)
+    get_class_name_str(class_id).map(str::to_owned)
 }
 
 /// Get Unity class name from class ID without allocating.
 pub fn get_class_name_str(class_id: i32) -> Option<&'static str> {
-    GLOBAL_CLASS_ID_MAP.get_class_name_str(class_id)
+    constants::class_id_name(class_id)
 }
 
 #[cfg(test)]

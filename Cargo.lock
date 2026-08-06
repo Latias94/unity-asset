@@ -2811,7 +2811,6 @@ dependencies = [
  "futures",
  "hex",
  "indexmap",
- "lazy_static",
  "serde",
  "serde_bytes",
  "serde_json",
