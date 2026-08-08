@@ -90,7 +90,7 @@ impl SourceRecognition {
 pub fn recognize_source(path: &Path, prefix: &[u8]) -> SourceRecognition {
     let prefix = &prefix[..prefix.len().min(SOURCE_RECOGNITION_PREFIX_LEN)];
     let extension = path.extension().and_then(|extension| extension.to_str());
-    if looks_like_zip(prefix) || has_extension(extension, &["zip", "apk"]) {
+    if looks_like_zip(prefix) {
         return SourceRecognition {
             kind: SourceRecognitionKind::Recognized(SourceKind::Archive),
         };
@@ -103,6 +103,11 @@ pub fn recognize_source(path: &Path, prefix: &[u8]) -> SourceRecognition {
     if let Some(kind) = sniff_unity_file_kind_prefix(prefix) {
         return SourceRecognition {
             kind: SourceRecognitionKind::Recognized(binary_file_kind(kind)),
+        };
+    }
+    if has_extension(extension, &["zip", "apk"]) {
+        return SourceRecognition {
+            kind: SourceRecognitionKind::Recognized(SourceKind::Archive),
         };
     }
     if has_yaml_extension(extension) {

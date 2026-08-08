@@ -38,6 +38,16 @@ fn source_recognition_owns_the_complete_extension_and_signature_matrix() {
         Some(SourceKind::Archive)
     );
     assert_eq!(
+        recognize_source(Path::new("bundle.zip"), b"UnityFS\0").kind_hint(),
+        Some(SourceKind::AssetBundle),
+        "Unity wire evidence takes precedence over an archive extension"
+    );
+    assert_eq!(
+        recognize_source(Path::new("archive.unity3d"), b"PK\x03\x04").kind_hint(),
+        Some(SourceKind::Archive),
+        "ZIP wire evidence takes precedence over a bundle extension"
+    );
+    assert_eq!(
         recognize_source(Path::new("payload.resS"), b"%YAML 1.1").kind_hint(),
         Some(SourceKind::Yaml),
         "content evidence takes precedence over the resource extension"

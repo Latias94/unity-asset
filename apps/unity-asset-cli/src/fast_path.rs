@@ -1,22 +1,20 @@
 use anyhow::Result;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
-use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{SOURCE_RECOGNITION_PREFIX_LEN, recognize_source};
+use unity_asset::{AssetLoadBudget, SourceKind};
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions};
-use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
-
-const BUNDLE_SNIFF_PREFIX_LEN: usize = 16;
 
 pub(crate) fn bundle_list_options() -> BundleLoadOptions {
     BundleLoadOptions::lazy()
 }
 
 pub(crate) fn is_assetbundle_path(path: &Path) -> bool {
-    let mut prefix = [0_u8; BUNDLE_SNIFF_PREFIX_LEN];
+    let mut prefix = [0_u8; SOURCE_RECOGNITION_PREFIX_LEN];
     let Ok(prefix_len) = read_prefix_into(path, &mut prefix) else {
         return false;
     };
-    sniff_unity_file_kind_prefix(&prefix[..prefix_len]) == Some(UnityFileKind::AssetBundle)
+    recognize_source(path, &prefix[..prefix_len]).kind_hint() == Some(SourceKind::AssetBundle)
 }
 
 pub(crate) fn collect_candidate_paths(input: &Path) -> Result<Vec<PathBuf>> {
