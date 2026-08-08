@@ -91,24 +91,26 @@ impl From<io::Error> for AnchoredFsError {
 /// Security and sharing semantics for files opened below an anchored directory.
 ///
 /// Persisted state is immutable once published. Project sources are live inputs and allow
-/// concurrent replacement. Both policies reject hard-link aliases so an anchored project or
-/// generation root remains a real content boundary.
+/// concurrent replacement. Both authority-bearing policies reject hard-link aliases so an
+/// anchored project or generation root remains a real content boundary. `RecoveryAlias` is a
+/// private repair capability used only to compare the two exact names of an interrupted
+/// hard-link publication before restoring the single-link invariant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OpenPolicy {
     PersistedState,
     ProjectSource,
+    RecoveryAlias,
 }
 
 impl OpenPolicy {
     pub(super) const fn requires_single_link(self) -> bool {
-        let _ = self;
-        true
+        !matches!(self, Self::RecoveryAlias)
     }
 
     #[cfg(windows)]
     pub(super) const fn allows_concurrent_replacement(self) -> bool {
         match self {
-            Self::PersistedState => false,
+            Self::PersistedState | Self::RecoveryAlias => false,
             Self::ProjectSource => true,
         }
     }
@@ -834,6 +836,24 @@ mod tests {
         let project = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
         let error = project.open_regular(OsStr::new("state.json")).unwrap_err();
         assert!(matches!(error, AnchoredFsError::IdentityChanged));
+    }
+
+    #[test]
+    fn recovery_alias_compares_exact_hard_link_names_without_weakening_authority_policies() {
+        let temporary = tempdir().unwrap();
+        fs::write(temporary.path().join("staging.json"), b"original").unwrap();
+        fs::hard_link(
+            temporary.path().join("staging.json"),
+            temporary.path().join("committed.json"),
+        )
+        .unwrap();
+
+        let recovery = ReadDirectory::open(temporary.path(), OpenPolicy::RecoveryAlias).unwrap();
+        let staging = recovery.open_regular(OsStr::new("staging.json")).unwrap();
+        let committed = recovery.open_regular(OsStr::new("committed.json")).unwrap();
+
+        assert!(committed.same_identity(staging.stable_identity()).unwrap());
+        staging.ensure_unchanged().unwrap();
     }
 
     #[test]

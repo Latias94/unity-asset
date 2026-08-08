@@ -6,8 +6,9 @@ use super::{
     GenerationActivationEvidence, GenerationBuild, GenerationFailpoint,
     GenerationPublishWarningKind, GenerationStartupDisposition, GenerationStore,
     GenerationStoreError, GenerationStoreOptions, IndexRebuildReason, SOURCE_STATE_FILE,
-    TransactionReceiptWindow, activation_file_name, activation_staging_file_name,
-    quarantine_directory_name, staging_directory_name,
+    TransactionReceiptWindow, activation_file_name, activation_pending_file_name,
+    activation_recovery_file_name, legacy_activation_staging_file_name, quarantine_directory_name,
+    staging_directory_name,
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
@@ -444,6 +445,124 @@ fn desired_revision_head_survives_reopen_and_new_generation_clears_stale_state()
 }
 
 #[test]
+fn unsynced_desired_revision_head_recovers_after_the_final_link_is_lost() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let desired = revision("desired");
+
+    let warnings = store
+        .record_desired_revision_with_failpoint(
+            desired,
+            &mut AssetLoadBudget::default(),
+            Some(GenerationFailpoint::ActivationDirectorySync),
+        )
+        .unwrap();
+    assert!(warnings.iter().any(|warning| {
+        warning.kind() == GenerationPublishWarningKind::PostCommitDurability
+            && warning.message().contains("ActivationDirectorySync")
+    }));
+
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(ordinal));
+    let recovery = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_recovery_file_name(ordinal));
+    assert!(activation.is_file());
+    assert!(recovery.is_file());
+
+    drop(store);
+    fs::remove_file(&activation).unwrap();
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.generation(), baseline);
+    assert_eq!(active.manifest().revision(), revision("baseline"));
+    assert_eq!(active.desired_revision(), desired);
+    assert!(!recovery.exists());
+}
+
+#[test]
+fn uncertain_activation_rollback_requires_reopen_before_same_process_recovery() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let baseline_ordinal = store.active().unwrap().activation_ordinal();
+    let desired = revision("desired");
+
+    let error = store
+        .record_desired_revision_with_failpoint(
+            desired,
+            &mut AssetLoadBudget::default(),
+            Some(GenerationFailpoint::ActivationRecoverySyncAndRollbackCleanup),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationRollbackFailed {
+            primary,
+            cleanup,
+        } if matches!(
+            *primary,
+            GenerationStoreError::InjectedFailure {
+                checkpoint: GenerationFailpoint::ActivationRecoveryDirectorySync,
+            }
+        ) && matches!(
+            *cleanup,
+            GenerationStoreError::InjectedFailure {
+                checkpoint: GenerationFailpoint::ActivationRollbackCleanup,
+            }
+        )
+    ));
+    assert_eq!(
+        store.active().unwrap().desired_revision(),
+        revision("baseline")
+    );
+
+    let uncertain_ordinal = baseline_ordinal + 1;
+    let activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(uncertain_ordinal));
+    let pending = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_pending_file_name(uncertain_ordinal));
+    let recovery = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_recovery_file_name(uncertain_ordinal));
+    assert!(activation.is_file());
+    assert!(pending.is_file());
+    assert!(recovery.is_file());
+
+    assert!(matches!(
+        store.reconcile_abandoned_staging(&mut AssetLoadBudget::default()),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+    assert!(matches!(
+        store.begin(),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+    assert_eq!(store.active().unwrap().generation(), baseline);
+
+    drop(store);
+    let reopened = open_store(temporary.path(), options).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.generation(), baseline);
+    assert_eq!(active.manifest().revision(), revision("baseline"));
+    assert_eq!(active.desired_revision(), desired);
+    assert!(!pending.exists());
+    assert!(!recovery.exists());
+}
+
+#[test]
 fn corrupt_latest_desired_revision_head_fails_closed() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
@@ -841,12 +960,14 @@ fn reconciliation_removes_only_abandoned_staging_and_preserves_the_active_genera
     let staging = temporary.path().join(".staging");
     let abandoned_build = staging.join(staging_directory_name(91));
     let abandoned_quarantine = staging.join(quarantine_directory_name(92, active));
-    let abandoned_activation = staging.join(activation_staging_file_name(93));
+    let abandoned_activation = staging.join(activation_pending_file_name(93));
+    let legacy_activation = staging.join(legacy_activation_staging_file_name(94));
     fs::create_dir(&abandoned_build).unwrap();
     fs::write(abandoned_build.join("partial"), b"partial").unwrap();
     fs::create_dir(&abandoned_quarantine).unwrap();
     fs::write(abandoned_quarantine.join("old"), b"old").unwrap();
     fs::write(&abandoned_activation, b"partial activation").unwrap();
+    fs::write(&legacy_activation, b"legacy partial activation").unwrap();
 
     let live_build = store.begin().unwrap();
     assert!(matches!(
@@ -858,10 +979,11 @@ fn reconciliation_removes_only_abandoned_staging_and_preserves_the_active_genera
     let report = store
         .reconcile_abandoned_staging(&mut AssetLoadBudget::default())
         .unwrap();
-    assert_eq!(report.removed_entries(), 3);
+    assert_eq!(report.removed_entries(), 4);
     assert!(!abandoned_build.exists());
     assert!(!abandoned_quarantine.exists());
     assert!(!abandoned_activation.exists());
+    assert!(!legacy_activation.exists());
     assert!(active_directory.is_dir());
     assert!(active_activation.is_file());
     assert_eq!(store.active().unwrap().generation(), active);
@@ -1426,7 +1548,11 @@ fn activation_precommit_failure_cleans_staging_and_preserves_the_active_generati
     let staging_activation = temporary
         .path()
         .join(".staging")
-        .join(activation_staging_file_name(activation_ordinal));
+        .join(activation_recovery_file_name(activation_ordinal));
+    let pending_activation = temporary
+        .path()
+        .join(".staging")
+        .join(activation_pending_file_name(activation_ordinal));
 
     assert!(matches!(
         prepared.activate(),
@@ -1435,6 +1561,7 @@ fn activation_precommit_failure_cleans_staging_and_preserves_the_active_generati
         })
     ));
     assert!(!staging_activation.exists());
+    assert!(!pending_activation.exists());
     assert_eq!(store.active().unwrap().generation(), baseline);
 
     drop(build);
@@ -1465,6 +1592,20 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
         .unwrap()
         .activate()
         .unwrap();
+    let pending =
+        temporary
+            .path()
+            .join(super::STAGING_DIRECTORY)
+            .join(activation_pending_file_name(
+                report.active.activation_ordinal(),
+            ));
+    let recovery =
+        temporary
+            .path()
+            .join(super::STAGING_DIRECTORY)
+            .join(activation_recovery_file_name(
+                report.active.activation_ordinal(),
+            ));
 
     assert_eq!(report.active.generation(), candidate);
     assert_eq!(store.active().unwrap().generation(), candidate);
@@ -1472,11 +1613,15 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
         warning.kind() == GenerationPublishWarningKind::PostCommitDurability
             && warning.message().contains("ActivationDirectorySync")
     }));
+    assert!(pending.is_file());
+    assert!(recovery.is_file());
 
     drop(build);
     drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), candidate);
+    assert!(!pending.exists());
+    assert!(!recovery.exists());
 }
 
 #[test]
@@ -1562,10 +1707,13 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
         .unwrap()
         .activate()
         .unwrap();
-    let abandoned_staging_activation = temporary.path().join(".staging").join(format!(
-        "activation-{:020}.json",
-        report.active.activation_ordinal()
-    ));
+    let abandoned_staging_activation =
+        temporary
+            .path()
+            .join(".staging")
+            .join(activation_recovery_file_name(
+                report.active.activation_ordinal(),
+            ));
 
     assert_eq!(report.active.generation(), candidate);
     assert_eq!(store.active().unwrap().generation(), candidate);
@@ -1586,12 +1734,15 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
 fn staging_recovery_requires_a_successful_directory_sync_before_reporting_clean() {
     let temporary = TempDir::new().unwrap();
     let staging = temporary.path().join(super::STAGING_DIRECTORY);
+    let activations = temporary.path().join(super::ACTIVATIONS_DIRECTORY);
     fs::create_dir(&staging).unwrap();
-    let residue = staging.join(activation_staging_file_name(7));
+    fs::create_dir(&activations).unwrap();
+    let residue = staging.join(activation_pending_file_name(7));
     fs::write(&residue, b"staging residue").unwrap();
 
     let error = super::recover_owned_staging(
         &staging,
+        &activations,
         &mut AssetLoadBudget::default(),
         Some(GenerationFailpoint::StartupStagingDirectorySync),
     )
@@ -1604,8 +1755,13 @@ fn staging_recovery_requires_a_successful_directory_sync_before_reporting_clean(
     ));
     assert!(!residue.exists());
 
-    let recovered =
-        super::recover_owned_staging(&staging, &mut AssetLoadBudget::default(), None).unwrap();
+    let recovered = super::recover_owned_staging(
+        &staging,
+        &activations,
+        &mut AssetLoadBudget::default(),
+        None,
+    )
+    .unwrap();
     assert_eq!(recovered.removed_entries(), 0);
 }
 
@@ -1689,8 +1845,8 @@ fn repeated_activation_cleanup_failure_rejects_the_multiply_linked_head() {
         .unwrap()
         .activate()
         .unwrap();
-    let abandoned_staging_activation =
-        activation_staging_file_name(report.active.activation_ordinal());
+    let recovery = activation_recovery_file_name(report.active.activation_ordinal());
+    let pending = activation_pending_file_name(report.active.activation_ordinal());
 
     drop(build);
     drop(store);
@@ -1703,9 +1859,8 @@ fn repeated_activation_cleanup_failure_rejects_the_multiply_linked_head() {
     let GenerationStoreError::PersistedIdentityChanged { path } = error else {
         panic!("unexpected multiply-linked activation error: {error:?}");
     };
-    assert_eq!(
-        path.file_name(),
-        Some(abandoned_staging_activation.as_ref())
+    assert!(
+        matches!(path.file_name(), Some(name) if name == std::ffi::OsStr::new(&recovery) || name == std::ffi::OsStr::new(&pending))
     );
 }
 
@@ -1930,7 +2085,7 @@ fn obsolete_activation_bootstrap_survives_reopen_until_current_activation_commit
 }
 
 #[test]
-fn activation_sync_failure_preserves_obsolete_bootstrap_if_the_new_head_is_lost() {
+fn activation_sync_failure_recovers_the_new_head_if_its_final_link_is_lost() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions::default();
     drop(open_store(temporary.path(), options).unwrap());
@@ -1964,6 +2119,7 @@ fn activation_sync_failure_preserves_obsolete_bootstrap_if_the_new_head_is_lost(
         .unwrap()
         .activate()
         .unwrap();
+    let rebuilt = report.active.generation();
     let new_activation = activations.join(activation_file_name(report.active.activation_ordinal()));
     assert!(report.warnings.iter().any(|warning| {
         warning.kind() == GenerationPublishWarningKind::PostCommitDurability
@@ -1979,14 +2135,9 @@ fn activation_sync_failure_preserves_obsolete_bootstrap_if_the_new_head_is_lost(
 
     let reopened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
     let (store, recovery, disposition) = reopened.into_parts();
-    assert_eq!(store.active(), None);
-    assert_eq!(recovery.unwrap().removed_entries(), 1);
-    assert_rebuild_required(
-        disposition,
-        IndexRebuildReason::ObsoleteActivationContract { actual: 2 },
-        1,
-        obsolete,
-    );
+    assert_eq!(recovery.unwrap().removed_entries(), 2);
+    assert_eq!(disposition, GenerationStartupDisposition::Ready);
+    assert_eq!(store.active().unwrap().generation(), rebuilt);
     assert!(obsolete_activation.is_file());
 }
 
@@ -2029,7 +2180,7 @@ fn surviving_newer_current_head_supersedes_an_obsolete_bootstrap() {
     drop(store);
     let reopened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
     let (store, recovery, disposition) = reopened.into_parts();
-    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    assert_eq!(recovery.unwrap().removed_entries(), 2);
     assert_eq!(disposition, GenerationStartupDisposition::Ready);
     assert_eq!(store.active().unwrap().generation(), rebuilt);
 }

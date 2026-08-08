@@ -1874,7 +1874,13 @@ impl SearchGenerationPipeline {
                 .validate_scan(validation)
                 .map_err(|error| PipelineError::Scan(Box::new(error)))?;
         }
-        let report = prepared.activate_with_budget(budget)?;
+        let report = match prepared.activate_with_budget(budget) {
+            Ok(report) => report,
+            Err(error) => {
+                self.record_store_reopen_requirement(&error);
+                return Err(PipelineError::Store(Box::new(error)));
+            }
+        };
         self.append_pending_publish_warnings(report.warnings);
         let warnings = self.take_pending_publish_warnings();
         self.source_state = Some(source_state);
@@ -2125,7 +2131,13 @@ impl SearchGenerationPipeline {
         desired: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), PipelineError> {
-        let warnings = self.store.record_desired_revision(desired, budget)?;
+        let warnings = match self.store.record_desired_revision(desired, budget) {
+            Ok(warnings) => warnings,
+            Err(error) => {
+                self.record_store_reopen_requirement(&error);
+                return Err(PipelineError::Store(Box::new(error)));
+            }
+        };
         self.append_pending_publish_warnings(warnings);
         if let Some(active) = &mut self.active {
             Arc::make_mut(active).set_desired_revision(desired);
@@ -2166,6 +2178,7 @@ impl SearchGenerationPipeline {
             if matches!(
                 kind,
                 GenerationPublishWarningKind::PreparationCleanup
+                    | GenerationPublishWarningKind::PostCommitDurability
                     | GenerationPublishWarningKind::PostCommitCleanup
             ) {
                 self.record_generation_cleanup_failure(message.clone());
@@ -2203,6 +2216,12 @@ impl SearchGenerationPipeline {
             last_recovered_entries: self.generation_maintenance.last_recovered_entries,
             last_cleanup_failure: Some(crate::wire::bounded_error_message(message)),
         };
+    }
+
+    fn record_store_reopen_requirement(&mut self, error: &GenerationStoreError) {
+        if error.requires_reopen() {
+            self.record_generation_cleanup_failure(error.to_string());
+        }
     }
 
     fn record_generation_recovery(&mut self, removed_entries: u64) {
@@ -4614,6 +4633,10 @@ mod tests {
             GenerationPublishWarningKind::PostCommitDurability,
             "committed head warning",
         )]);
+        assert_eq!(
+            pipeline.generation_maintenance().state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
         let unchanged = pipeline
             .reindex_filesystem(
                 FilesystemReindexIntent::reconcile(),
@@ -5069,6 +5092,39 @@ mod tests {
         );
         assert!(pipeline.pending_publish_warnings.is_empty());
         assert!(!pipeline.pending_publish_warnings_omitted);
+    }
+
+    #[test]
+    fn unknown_activation_outcome_marks_generation_maintenance_recovery_required() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut pipeline = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+        pipeline.record_store_reopen_requirement(&GenerationStoreError::ActivationOutcomeUnknown);
+
+        assert_eq!(
+            pipeline.generation_maintenance().state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+        assert!(
+            pipeline
+                .generation_maintenance()
+                .last_cleanup_failure
+                .as_deref()
+                .is_some_and(|message| message.contains("reopen the generation store"))
+        );
     }
 
     #[test]

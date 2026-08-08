@@ -304,38 +304,57 @@ impl Drop for GenerationBuild {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActivationStagingState {
     Armed,
-    Committed,
+    RecoveryOwned,
     Relinquished,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActivationDurability {
+    Durable,
+    RecoveryRequired,
 }
 
 struct ActivationWriteOutcome {
     warnings: Vec<GenerationPublishWarning>,
-    directory_synced: bool,
+    durability: ActivationDurability,
 }
 
-/// Owns one activation staging file from creation through commit or explicit cleanup.
+/// Owns one activation pending file and its recovery authority through publication or rollback.
 #[derive(Debug)]
 struct ActivationStagingFile {
-    path: PathBuf,
+    pending_path: PathBuf,
+    recovery_path: PathBuf,
     parent: PathBuf,
     state: ActivationStagingState,
 }
 
 impl ActivationStagingFile {
-    fn create(path: PathBuf, bytes: &[u8]) -> Result<Self, GenerationStoreError> {
-        let parent = path
+    fn create(
+        pending_path: PathBuf,
+        recovery_path: PathBuf,
+        bytes: &[u8],
+    ) -> Result<Self, GenerationStoreError> {
+        let parent = pending_path
             .parent()
             .ok_or(GenerationStoreError::ForeignBuild)?
             .to_path_buf();
+        if recovery_path.parent() != Some(parent.as_path()) || recovery_path == pending_path {
+            return Err(GenerationStoreError::ForeignBuild);
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&path)
+            .open(&pending_path)
             .map_err(|source| {
-                GenerationStoreError::io("create activation staging file", path.clone(), source)
+                GenerationStoreError::io(
+                    "create activation staging file",
+                    pending_path.clone(),
+                    source,
+                )
             })?;
         let mut staging = Self {
-            path,
+            pending_path,
+            recovery_path,
             parent,
             state: ActivationStagingState::Armed,
         };
@@ -344,7 +363,7 @@ impl ActivationStagingFile {
             .map_err(|source| {
                 GenerationStoreError::io(
                     "write activation staging file",
-                    staging.path.clone(),
+                    staging.pending_path.clone(),
                     source,
                 )
             })
@@ -352,11 +371,12 @@ impl ActivationStagingFile {
                 file.sync_all().map_err(|source| {
                     GenerationStoreError::io(
                         "sync activation staging file",
-                        staging.path.clone(),
+                        staging.pending_path.clone(),
                         source,
                     )
                 })
-            });
+            })
+            .and_then(|()| sync_directory(&staging.parent));
         drop(file);
         match write_result {
             Ok(()) => Ok(staging),
@@ -372,7 +392,7 @@ impl ActivationStagingFile {
         debug_assert_eq!(self.state, ActivationStagingState::Armed);
         let publish_result = inject_failure(failpoint, GenerationFailpoint::ActivationPreCommit)
             .and_then(|()| {
-                fs::hard_link(&self.path, final_path).map_err(|source| {
+                fs::hard_link(&self.pending_path, final_path).map_err(|source| {
                     GenerationStoreError::io(
                         "activate generation",
                         final_path.to_path_buf(),
@@ -380,22 +400,58 @@ impl ActivationStagingFile {
                     )
                 })
             });
-        match publish_result {
-            Ok(()) => {
-                self.state = ActivationStagingState::Committed;
-                Ok(())
-            }
-            Err(primary) => Err(self.precommit_failure(primary)),
+        if let Err(primary) = publish_result {
+            return Err(self.precommit_failure(primary));
+        }
+
+        self.state = ActivationStagingState::RecoveryOwned;
+        let commit_result = fs::hard_link(&self.pending_path, &self.recovery_path)
+            .map_err(|source| {
+                GenerationStoreError::io(
+                    "create activation recovery authority",
+                    self.recovery_path.clone(),
+                    source,
+                )
+            })
+            .and_then(|()| {
+                inject_failure(
+                    failpoint,
+                    GenerationFailpoint::ActivationRecoveryDirectorySync,
+                )
+            })
+            .and_then(|()| sync_directory(&self.parent));
+        match commit_result {
+            Ok(()) => Ok(()),
+            Err(primary) => Err(self.rollback_uncommitted(final_path, primary, failpoint)),
         }
     }
 
     fn cleanup_after_commit(&mut self) -> Result<(), GenerationStoreError> {
-        debug_assert_eq!(self.state, ActivationStagingState::Committed);
-        self.cleanup_and_relinquish("remove committed activation staging file")
+        debug_assert_eq!(self.state, ActivationStagingState::RecoveryOwned);
+        fs::remove_file(&self.pending_path)
+            .map_err(|source| {
+                GenerationStoreError::io(
+                    "remove committed activation pending file",
+                    self.pending_path.clone(),
+                    source,
+                )
+            })
+            .and_then(|()| sync_directory(&self.parent))?;
+        fs::remove_file(&self.recovery_path)
+            .map_err(|source| {
+                GenerationStoreError::io(
+                    "remove committed activation recovery authority",
+                    self.recovery_path.clone(),
+                    source,
+                )
+            })
+            .and_then(|()| sync_directory(&self.parent))?;
+        self.state = ActivationStagingState::Relinquished;
+        Ok(())
     }
 
     fn precommit_failure(&mut self, primary: GenerationStoreError) -> GenerationStoreError {
-        match self.cleanup_and_relinquish("remove uncommitted activation staging file") {
+        match self.cleanup_pending_and_relinquish("remove uncommitted activation staging file") {
             Ok(()) => primary,
             Err(cleanup) => GenerationStoreError::ActivationPreCommitCleanupFailed {
                 primary: Box::new(primary),
@@ -404,25 +460,97 @@ impl ActivationStagingFile {
         }
     }
 
-    fn cleanup_and_relinquish(
+    fn rollback_uncommitted(
+        &mut self,
+        final_path: &Path,
+        primary: GenerationStoreError,
+        failpoint: Option<GenerationFailpoint>,
+    ) -> GenerationStoreError {
+        match self.rollback_uncommitted_inner(final_path, failpoint) {
+            Ok(()) => primary,
+            Err(cleanup) => GenerationStoreError::ActivationRollbackFailed {
+                primary: Box::new(primary),
+                cleanup: Box::new(cleanup),
+            },
+        }
+    }
+
+    fn rollback_uncommitted_inner(
+        &mut self,
+        final_path: &Path,
+        failpoint: Option<GenerationFailpoint>,
+    ) -> Result<(), GenerationStoreError> {
+        inject_failure(failpoint, GenerationFailpoint::ActivationRollbackCleanup)?;
+        if path_exists_no_follow(&self.recovery_path)? {
+            verify_activation_alias(
+                &self.parent,
+                &self.parent,
+                self.pending_path
+                    .file_name()
+                    .ok_or(GenerationStoreError::ForeignBuild)?,
+                self.recovery_path
+                    .file_name()
+                    .ok_or(GenerationStoreError::ForeignBuild)?,
+                &self.recovery_path,
+            )?;
+            fs::remove_file(&self.recovery_path).map_err(|source| {
+                GenerationStoreError::io(
+                    "remove uncommitted activation recovery authority",
+                    self.recovery_path.clone(),
+                    source,
+                )
+            })?;
+            sync_directory(&self.parent)?;
+        }
+
+        let final_parent = final_path
+            .parent()
+            .ok_or(GenerationStoreError::ForeignBuild)?;
+        verify_activation_alias(
+            &self.parent,
+            final_parent,
+            self.pending_path
+                .file_name()
+                .ok_or(GenerationStoreError::ForeignBuild)?,
+            final_path
+                .file_name()
+                .ok_or(GenerationStoreError::ForeignBuild)?,
+            final_path,
+        )?;
+        fs::remove_file(final_path).map_err(|source| {
+            GenerationStoreError::io(
+                "rollback uncommitted activation",
+                final_path.to_path_buf(),
+                source,
+            )
+        })?;
+        sync_directory(final_parent)?;
+        self.cleanup_pending_and_relinquish("remove rolled-back activation pending file")
+    }
+
+    fn cleanup_pending_and_relinquish(
         &mut self,
         operation: &'static str,
     ) -> Result<(), GenerationStoreError> {
         if self.state == ActivationStagingState::Relinquished {
             return Ok(());
         }
-        let result = fs::remove_file(&self.path)
-            .map_err(|source| GenerationStoreError::io(operation, self.path.clone(), source))
+        let result = fs::remove_file(&self.pending_path)
+            .map_err(|source| {
+                GenerationStoreError::io(operation, self.pending_path.clone(), source)
+            })
             .and_then(|()| sync_directory(&self.parent));
-        self.state = ActivationStagingState::Relinquished;
+        if result.is_ok() {
+            self.state = ActivationStagingState::Relinquished;
+        }
         result
     }
 }
 
 impl Drop for ActivationStagingFile {
     fn drop(&mut self) {
-        if self.state != ActivationStagingState::Relinquished {
-            let _ = self.cleanup_and_relinquish("remove dropped activation staging file");
+        if self.state == ActivationStagingState::Armed {
+            let _ = self.cleanup_pending_and_relinquish("remove dropped activation staging file");
         }
     }
 }
@@ -991,7 +1119,13 @@ impl PreparedGenerationPublish<'_> {
         match activation {
             PreparedActivation::AlreadyActive => {
                 let mut maintenance_budget = AssetLoadBudget::default();
-                if let Err(error) = store.prune_retention(&mut maintenance_budget) {
+                let recovery = store.reconcile_abandoned_staging(&mut maintenance_budget);
+                if let Err(error) = recovery {
+                    warnings.push(GenerationPublishWarning::new(
+                        GenerationPublishWarningKind::PostCommitCleanup,
+                        error.to_string(),
+                    ));
+                } else if let Err(error) = store.prune_retention(&mut maintenance_budget) {
                     warnings.push(GenerationPublishWarning::new(
                         GenerationPublishWarningKind::Retention,
                         error.to_string(),
@@ -1042,6 +1176,10 @@ pub(crate) enum GenerationFailpoint {
     StartupGenerationDirectorySync,
     Activation,
     ActivationPreCommit,
+    ActivationRecoveryDirectorySync,
+    ActivationRollbackCleanup,
+    #[cfg(test)]
+    ActivationRecoverySyncAndRollbackCleanup,
     ActivationDirectorySync,
     ActivationCleanup,
 }
@@ -1263,6 +1401,7 @@ pub(crate) struct GenerationStore {
     active: Option<GenerationSnapshot>,
     next_staging_ordinal: u64,
     next_activation_ordinal: u64,
+    activation_outcome_unknown: bool,
     lease: Arc<WriterLease>,
     live_build: Arc<LiveBuildClaim>,
 }
@@ -1353,13 +1492,13 @@ impl GenerationStore {
         // A prior open may have created these entries and then failed to sync their parent. Every
         // successful open therefore confirms the complete managed namespace, not only new entries.
         sync_directory(&root)?;
-        // Staging is recovery input, not persisted authority. Remove crash residue before opening
-        // committed heads because an activation residue may still be the second hard link of an
-        // already-committed head. Obsolete activation heads remain append-only in `activations`
-        // until a newer current head is durably committed.
+        // Staging contains both disposable preparations and explicit activation recovery
+        // authorities. Resolve that protocol before opening committed heads so persisted reads can
+        // retain their strict single-link invariant.
         let mut recovery_budget = AssetLoadBudget::default();
         let mut staging_recovery = recover_owned_staging(
             &staging,
+            &activations,
             &mut recovery_budget,
             #[cfg(test)]
             startup_recovery_failpoint,
@@ -1426,6 +1565,7 @@ impl GenerationStore {
             active,
             next_staging_ordinal,
             next_activation_ordinal,
+            activation_outcome_unknown: false,
             lease,
             live_build: Arc::new(LiveBuildClaim::default()),
         };
@@ -1452,6 +1592,7 @@ impl GenerationStore {
         &mut self,
         budget: &mut AssetLoadBudget,
     ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
+        self.ensure_activation_outcome_known()?;
         if self.live_build.is_held() {
             return Err(GenerationStoreError::BuildAlreadyActive);
         }
@@ -1460,6 +1601,7 @@ impl GenerationStore {
         )?;
         let report = recover_owned_staging(
             &self.staging,
+            &self.activations,
             budget,
             #[cfg(test)]
             None,
@@ -1467,16 +1609,27 @@ impl GenerationStore {
         Ok(report)
     }
 
-    /// Appends a durable head for the current immutable generation before derived work starts.
+    /// Appends a crash-recoverable head for the current immutable generation before derived work
+    /// starts.
     ///
-    /// The hard-linked head is the commit point. A later generation activation records
-    /// `desired_revision == actual_revision`, so no mutable sidecar or cross-file clearing
-    /// protocol is required.
+    /// The staging recovery authority is the durable commit point. Recovery can reconstruct a
+    /// final link whose directory sync was not confirmed. A later generation activation records
+    /// `desired_revision == actual_revision`, so no mutable freshness sidecar is required.
     pub fn record_desired_revision(
         &mut self,
         desired_revision: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<GenerationPublishWarning>, GenerationStoreError> {
+        self.record_desired_revision_with_failpoint(desired_revision, budget, None)
+    }
+
+    fn record_desired_revision_with_failpoint(
+        &mut self,
+        desired_revision: WorkspaceRevision,
+        budget: &mut AssetLoadBudget,
+        failpoint: Option<GenerationFailpoint>,
+    ) -> Result<Vec<GenerationPublishWarning>, GenerationStoreError> {
+        self.ensure_activation_outcome_known()?;
         let Some(active) = self.active.clone() else {
             return Ok(Vec::new());
         };
@@ -1491,7 +1644,7 @@ impl GenerationStore {
             updated.clone(),
             updated.manifest_digest,
             Vec::new(),
-            None,
+            failpoint,
             budget,
         )?;
         Ok(report.warnings)
@@ -1503,6 +1656,7 @@ impl GenerationStore {
     }
 
     pub fn begin(&mut self) -> Result<GenerationBuild, GenerationStoreError> {
+        self.ensure_activation_outcome_known()?;
         self.revalidate_private_root("revalidate private index root before creating generation")?;
         let claim = self.live_build.acquire()?;
         loop {
@@ -1750,6 +1904,7 @@ impl GenerationStore {
         budget: &mut AssetLoadBudget,
         failpoint: Option<GenerationFailpoint>,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
+        self.ensure_activation_outcome_known()?;
         self.validate_build(build)?;
         activation
             .transaction_receipts()
@@ -1968,8 +2123,19 @@ impl GenerationStore {
             transaction_receipts: snapshot.transaction_receipts().clone(),
         };
         self.revalidate_private_root("revalidate private index root before writing activation")?;
+        // A prior post-commit warning may have left multiply-linked recovery authority. Resolve it
+        // before any persisted-state enumeration so the ordinary reader policy never needs to
+        // weaken its single-link invariant.
+        self.reconcile_abandoned_staging(budget)?;
         self.ensure_activation_capacity(budget)?;
-        let activation = self.write_activation(&record, failpoint, budget)?;
+        let activation = match self.write_activation(&record, failpoint, budget) {
+            Ok(activation) => activation,
+            Err(error @ GenerationStoreError::ActivationRollbackFailed { .. }) => {
+                self.activation_outcome_unknown = true;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
         warnings.extend(activation.warnings);
 
         self.active = Some(snapshot.clone());
@@ -1979,7 +2145,7 @@ impl GenerationStore {
         // following links and fails closed if the unsafe entry remains.
         // If activation-directory durability was not confirmed, the previous head remains the
         // only crash-stable bootstrap and must not be pruned.
-        if activation.directory_synced {
+        if activation.durability == ActivationDurability::Durable {
             let mut maintenance_budget = AssetLoadBudget::default();
             if let Err(error) = self.prune_retention(&mut maintenance_budget) {
                 warnings.push(GenerationPublishWarning::new(
@@ -1996,6 +2162,14 @@ impl GenerationStore {
 
     fn revalidate_private_root(&self, operation: &'static str) -> Result<(), GenerationStoreError> {
         self.root_authority.revalidate(operation)
+    }
+
+    fn ensure_activation_outcome_known(&self) -> Result<(), GenerationStoreError> {
+        if self.activation_outcome_unknown {
+            Err(GenerationStoreError::ActivationOutcomeUnknown)
+        } else {
+            Ok(())
+        }
     }
 
     fn validate_build(&self, build: &GenerationBuild) -> Result<(), GenerationStoreError> {
@@ -2048,8 +2222,12 @@ impl GenerationStore {
                 .checked_add(1)
                 .ok_or(GenerationStoreError::OrdinalOverflow)?;
             let final_path = self.activations.join(activation_file_name(ordinal));
-            let temporary_path = self.staging.join(activation_staging_file_name(ordinal));
-            if !path_exists_no_follow(&final_path)? && !path_exists_no_follow(&temporary_path)? {
+            let pending_path = self.staging.join(activation_pending_file_name(ordinal));
+            let recovery_path = self.staging.join(activation_recovery_file_name(ordinal));
+            if !path_exists_no_follow(&final_path)?
+                && !path_exists_no_follow(&pending_path)?
+                && !path_exists_no_follow(&recovery_path)?
+            {
                 return Ok(ordinal);
             }
         }
@@ -2087,37 +2265,41 @@ impl GenerationStore {
         failpoint: Option<GenerationFailpoint>,
         budget: &mut AssetLoadBudget,
     ) -> Result<ActivationWriteOutcome, GenerationStoreError> {
-        let temporary_path = self
+        let pending_path = self
             .staging
-            .join(activation_staging_file_name(record.ordinal));
+            .join(activation_pending_file_name(record.ordinal));
+        let recovery_path = self
+            .staging
+            .join(activation_recovery_file_name(record.ordinal));
         let final_path = self.activations.join(activation_file_name(record.ordinal));
         let bytes = encode_generation_head_json(record, &final_path, budget)?;
-        let mut staging = ActivationStagingFile::create(temporary_path, &bytes)?;
-        // A hard link publishes the complete file atomically and never replaces an existing ordinal.
+        let mut staging = ActivationStagingFile::create(pending_path, recovery_path, &bytes)?;
+        // The final hard link publishes complete bytes atomically. The separately synced recovery
+        // link makes that visible commit reconstructible until the activation directory is durable.
         staging.publish(&final_path, failpoint)?;
 
-        // The final hard link is the commit point: reopen selects this highest valid activation
-        // immediately after it becomes visible. Every later failure is reported as evidence rather
-        // than returning an error that would disagree with the persisted active generation.
+        // The recovery authority is already durable here. Every later failure is reported as
+        // evidence rather than returning an error that would disagree with the recoverable active
+        // generation.
         let mut warnings = Vec::new();
-        let directory_synced =
+        let durability =
             match inject_failure(failpoint, GenerationFailpoint::ActivationDirectorySync)
                 .and_then(|()| sync_directory(&self.activations))
             {
-                Ok(()) => true,
+                Ok(()) => ActivationDurability::Durable,
                 Err(error) => {
                     warnings.push(GenerationPublishWarning::new(
                         GenerationPublishWarningKind::PostCommitDurability,
                         error.to_string(),
                     ));
-                    false
+                    ActivationDurability::RecoveryRequired
                 }
             };
 
-        if let Err(error) = inject_failure(failpoint, GenerationFailpoint::ActivationCleanup)
-            .and_then(|()| staging.cleanup_after_commit())
+        if durability == ActivationDurability::Durable
+            && let Err(error) = inject_failure(failpoint, GenerationFailpoint::ActivationCleanup)
+                .and_then(|()| staging.cleanup_after_commit())
         {
-            staging.state = ActivationStagingState::Relinquished;
             warnings.push(GenerationPublishWarning::new(
                 GenerationPublishWarningKind::PostCommitCleanup,
                 error.to_string(),
@@ -2125,7 +2307,7 @@ impl GenerationStore {
         }
         Ok(ActivationWriteOutcome {
             warnings,
-            directory_synced,
+            durability,
         })
     }
 
@@ -2605,10 +2787,12 @@ fn revalidate_opened_directory_snapshot(
 
 fn recover_owned_staging(
     staging: &Path,
+    activations: &Path,
     budget: &mut AssetLoadBudget,
     #[cfg(test)] failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
     let mut removed_entries = 0_u64;
+    let mut committed_recovery_paths = Vec::new();
     visit_directory_entries_budgeted(staging, budget, |entry, budget| {
         let metadata = metadata_no_follow(&entry.path)?;
         let Some(name) = entry.file_name.to_str() else {
@@ -2644,7 +2828,105 @@ fn recover_owned_staging(
                     })?;
             return Ok(());
         }
-        if parse_activation_staging_file_name(name).is_some() {
+        if let Some(ordinal) = parse_activation_pending_file_name(name) {
+            if !metadata.is_file() {
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
+            }
+            #[cfg(test)]
+            inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
+            let recovery_path = staging.join(activation_recovery_file_name(ordinal));
+            if path_exists_no_follow(&recovery_path)? {
+                verify_activation_alias(
+                    staging,
+                    staging,
+                    &entry.file_name,
+                    recovery_path
+                        .file_name()
+                        .ok_or(GenerationStoreError::ForeignBuild)?,
+                    &recovery_path,
+                )?;
+            } else {
+                let final_path = activations.join(activation_file_name(ordinal));
+                if path_exists_no_follow(&final_path)? {
+                    verify_activation_alias(
+                        staging,
+                        activations,
+                        &entry.file_name,
+                        final_path
+                            .file_name()
+                            .ok_or(GenerationStoreError::ForeignBuild)?,
+                        &final_path,
+                    )?;
+                    fs::remove_file(&final_path).map_err(|source| {
+                        GenerationStoreError::io(
+                            "rollback interrupted activation publication",
+                            final_path.clone(),
+                            source,
+                        )
+                    })?;
+                    sync_directory(activations)?;
+                }
+            }
+            fs::remove_file(&entry.path).map_err(|source| {
+                GenerationStoreError::io(
+                    "remove abandoned activation pending file",
+                    entry.path.clone(),
+                    source,
+                )
+            })?;
+            removed_entries =
+                removed_entries
+                    .checked_add(1)
+                    .ok_or(GenerationStoreError::SizeOverflow {
+                        resource: "recovered staging entries",
+                    })?;
+            return Ok(());
+        }
+        if let Some(ordinal) = parse_activation_recovery_file_name(name) {
+            if !metadata.is_file() {
+                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
+            }
+            let pending_path = staging.join(activation_pending_file_name(ordinal));
+            if path_exists_no_follow(&pending_path)? {
+                verify_activation_alias(
+                    staging,
+                    staging,
+                    pending_path
+                        .file_name()
+                        .ok_or(GenerationStoreError::ForeignBuild)?,
+                    &entry.file_name,
+                    &entry.path,
+                )?;
+            }
+            let final_path = activations.join(activation_file_name(ordinal));
+            if !path_exists_no_follow(&final_path)? {
+                fs::hard_link(&entry.path, &final_path).map_err(|source| {
+                    GenerationStoreError::io(
+                        "recover committed activation",
+                        final_path.clone(),
+                        source,
+                    )
+                })?;
+            }
+            verify_activation_alias(
+                staging,
+                activations,
+                &entry.file_name,
+                final_path
+                    .file_name()
+                    .ok_or(GenerationStoreError::ForeignBuild)?,
+                &final_path,
+            )?;
+            reserve_artifact_vec(
+                &mut committed_recovery_paths,
+                1,
+                "activation recovery cleanup queue",
+                budget,
+            )?;
+            committed_recovery_paths.push(entry.path);
+            return Ok(());
+        }
+        if parse_legacy_activation_staging_file_name(name).is_some() {
             if !metadata.is_file() {
                 return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
             }
@@ -2652,8 +2934,8 @@ fn recover_owned_staging(
             inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
             fs::remove_file(&entry.path).map_err(|source| {
                 GenerationStoreError::io(
-                    "remove abandoned activation staging file",
-                    entry.path,
+                    "remove legacy activation staging residue",
+                    entry.path.clone(),
                     source,
                 )
             })?;
@@ -2666,12 +2948,99 @@ fn recover_owned_staging(
         }
         Ok(())
     })?;
+
+    if !committed_recovery_paths.is_empty() {
+        // The recovery marker remains durable until every reconstructed or surviving final link is
+        // confirmed in the activation directory.
+        sync_directory(activations)?;
+        for path in committed_recovery_paths {
+            #[cfg(test)]
+            inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
+            fs::remove_file(&path).map_err(|source| {
+                GenerationStoreError::io(
+                    "remove recovered activation authority",
+                    path.clone(),
+                    source,
+                )
+            })?;
+            removed_entries =
+                removed_entries
+                    .checked_add(1)
+                    .ok_or(GenerationStoreError::SizeOverflow {
+                        resource: "recovered staging entries",
+                    })?;
+        }
+    }
     #[cfg(test)]
     inject_failure(failpoint, GenerationFailpoint::StartupStagingDirectorySync)?;
     // A successful pass is the evidence used to clear RecoveryRequired. Sync even when the
     // namespace is already empty so a previous remove-then-sync failure cannot be forgotten.
     sync_directory(staging)?;
     Ok(GenerationStagingRecoveryReport { removed_entries })
+}
+
+fn verify_activation_alias(
+    first_directory: &Path,
+    second_directory: &Path,
+    first_name: &OsStr,
+    second_name: &OsStr,
+    error_path: &Path,
+) -> Result<(), GenerationStoreError> {
+    let first_directory = SecureReadDirectory::open(first_directory, OpenPolicy::RecoveryAlias)
+        .map_err(|source| {
+            persisted_read_error(
+                "open first activation recovery directory",
+                first_directory.to_path_buf(),
+                source,
+            )
+        })?;
+    let second_directory = SecureReadDirectory::open(second_directory, OpenPolicy::RecoveryAlias)
+        .map_err(|source| {
+        persisted_read_error(
+            "open second activation recovery directory",
+            second_directory.to_path_buf(),
+            source,
+        )
+    })?;
+    let first = first_directory.open_regular(first_name).map_err(|source| {
+        persisted_read_error(
+            "open first activation recovery alias",
+            error_path.to_path_buf(),
+            source,
+        )
+    })?;
+    let second = second_directory
+        .open_regular(second_name)
+        .map_err(|source| {
+            persisted_read_error(
+                "open second activation recovery alias",
+                error_path.to_path_buf(),
+                source,
+            )
+        })?;
+    let same = second
+        .same_identity(first.stable_identity())
+        .map_err(|source| {
+            persisted_read_error(
+                "compare activation recovery aliases",
+                error_path.to_path_buf(),
+                source,
+            )
+        })?;
+    first.ensure_unchanged().map_err(|source| {
+        persisted_read_error(
+            "revalidate activation recovery authority",
+            error_path.to_path_buf(),
+            source,
+        )
+    })?;
+    if same {
+        Ok(())
+    } else {
+        Err(GenerationStoreError::PersistedIdentityChanged {
+            path: error_path.to_path_buf(),
+        })
+    }
 }
 
 fn activation_directory_has_capacity(
@@ -4734,7 +5103,17 @@ fn inject_failure(
     configured: Option<GenerationFailpoint>,
     checkpoint: GenerationFailpoint,
 ) -> Result<(), GenerationStoreError> {
-    if configured == Some(checkpoint) {
+    #[cfg(test)]
+    let should_fail = configured == Some(checkpoint)
+        || configured == Some(GenerationFailpoint::ActivationRecoverySyncAndRollbackCleanup)
+            && matches!(
+                checkpoint,
+                GenerationFailpoint::ActivationRecoveryDirectorySync
+                    | GenerationFailpoint::ActivationRollbackCleanup
+            );
+    #[cfg(not(test))]
+    let should_fail = configured == Some(checkpoint);
+    if should_fail {
         return Err(GenerationStoreError::InjectedFailure { checkpoint });
     }
     Ok(())
@@ -4803,11 +5182,28 @@ fn parse_activation_file_name(value: &str) -> Option<u64> {
     parse_ordinal_component(value, "", ".json")
 }
 
-fn activation_staging_file_name(ordinal: u64) -> String {
+fn activation_recovery_file_name(ordinal: u64) -> String {
+    format!("activation-recovery-v1-{ordinal:020}.json")
+}
+
+fn parse_activation_recovery_file_name(value: &str) -> Option<u64> {
+    parse_ordinal_component(value, "activation-recovery-v1-", ".json")
+}
+
+fn activation_pending_file_name(ordinal: u64) -> String {
+    format!("activation-pending-v1-{ordinal:020}.json")
+}
+
+fn parse_activation_pending_file_name(value: &str) -> Option<u64> {
+    parse_ordinal_component(value, "activation-pending-v1-", ".json")
+}
+
+#[cfg(test)]
+fn legacy_activation_staging_file_name(ordinal: u64) -> String {
     format!("activation-{ordinal:020}.json")
 }
 
-fn parse_activation_staging_file_name(value: &str) -> Option<u64> {
+fn parse_legacy_activation_staging_file_name(value: &str) -> Option<u64> {
     parse_ordinal_component(value, "activation-", ".json")
 }
 
@@ -4945,6 +5341,11 @@ pub(crate) enum GenerationStoreError {
         primary: Box<GenerationStoreError>,
         cleanup: Box<GenerationStoreError>,
     },
+    ActivationRollbackFailed {
+        primary: Box<GenerationStoreError>,
+        cleanup: Box<GenerationStoreError>,
+    },
+    ActivationOutcomeUnknown,
     OrdinalOverflow,
     SizeOverflow {
         resource: &'static str,
@@ -5031,8 +5432,16 @@ impl GenerationStoreError {
             Self::ActivationPreCommitCleanupFailed { primary, cleanup } => {
                 primary.is_retryable() || cleanup.is_retryable()
             }
+            Self::ActivationRollbackFailed { .. } | Self::ActivationOutcomeUnknown => true,
             _ => false,
         }
+    }
+
+    pub(crate) const fn requires_reopen(&self) -> bool {
+        matches!(
+            self,
+            Self::ActivationRollbackFailed { .. } | Self::ActivationOutcomeUnknown
+        )
     }
 }
 
@@ -5234,6 +5643,13 @@ impl fmt::Display for GenerationStoreError {
                 formatter,
                 "activation publication failed before commit ({primary}); activation staging cleanup also failed ({cleanup})"
             ),
+            Self::ActivationRollbackFailed { primary, cleanup } => write!(
+                formatter,
+                "activation recovery durability was not confirmed ({primary}); rolling back the uncertain activation also failed ({cleanup}); reopen the generation store before continuing"
+            ),
+            Self::ActivationOutcomeUnknown => formatter.write_str(
+                "activation outcome is unknown; reopen the generation store before continuing",
+            ),
             Self::OrdinalOverflow => formatter.write_str("generation ordinal overflow"),
             Self::SizeOverflow { resource } => write!(formatter, "{resource} size overflow"),
             Self::InjectedFailure { checkpoint } => {
@@ -5255,7 +5671,8 @@ impl Error for GenerationStoreError {
             Self::SourceState { source, .. } => Some(source.as_ref()),
             Self::ActivationProvenance { source, .. } => Some(source.as_ref()),
             Self::QuarantineRollbackFailed { primary, .. }
-            | Self::ActivationPreCommitCleanupFailed { primary, .. } => Some(primary.as_ref()),
+            | Self::ActivationPreCommitCleanupFailed { primary, .. }
+            | Self::ActivationRollbackFailed { primary, .. } => Some(primary.as_ref()),
             _ => None,
         }
     }
