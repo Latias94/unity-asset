@@ -28,7 +28,7 @@ fn graph(input: PathBuf, unity_project: bool, max_facts: u64, context: &AppConte
     } else {
         DiscoveryPolicy::Generic
     };
-    let workspace = load_workspace(&input, true, None, policy, None, context, &mut budget)?;
+    let workspace = load_workspace(&input, None, policy, None, context, &mut budget)?;
     let snapshot = workspace.snapshot();
     let graph = snapshot
         .reference_graph(ReferenceGraphBuildOptions::unbounded(), &mut budget)

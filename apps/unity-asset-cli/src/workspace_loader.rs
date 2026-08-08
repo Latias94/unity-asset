@@ -4,12 +4,10 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use unity_asset::workspace::{
     AssetWorkspace, SourceAdmissionBatch, SourceAdmissionDisposition, SourceAdmissionOperation,
-    SourceAdmissionPolicy, SourceOpenRequest, WorkspaceOptions,
+    SourceAdmissionPolicy, SourceOpenRequest, WorkspaceOptions, recognize_source,
 };
 use unity_asset::{AssetLoadBudget, SourceAlias, SourceKind, WorkspaceId};
-use unity_asset_binary::file::UnityFileKind;
 
-const PROBE_PREFIX_LEN: usize = 64;
 const INTERNAL_DIRECTORY_NAMES: &[&str] = &[".unity-asset-recovery"];
 const SKIPPED_DIRECTORY_NAMES: &[&str] = &[
     "Library",
@@ -28,6 +26,25 @@ struct Candidate {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    File,
+    Directory,
+    Other,
+}
+
+impl InputKind {
+    fn inspect(path: &Path) -> Self {
+        if path.is_file() {
+            Self::File
+        } else if path.is_dir() {
+            Self::Directory
+        } else {
+            Self::Other
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DiscoveryPolicy {
     Generic,
     UnityProject,
@@ -35,7 +52,6 @@ pub(crate) enum DiscoveryPolicy {
 
 pub(crate) fn load_workspace(
     input: &Path,
-    include_yaml: bool,
     excluded_root: Option<&Path>,
     discovery_policy: DiscoveryPolicy,
     workspace_id: Option<WorkspaceId>,
@@ -43,12 +59,18 @@ pub(crate) fn load_workspace(
     budget: &mut AssetLoadBudget,
 ) -> Result<AssetWorkspace> {
     let input = std::path::absolute(input).context("Failed to normalize the input path")?;
-    if !input.exists() {
-        anyhow::bail!("Input does not exist: {}", input.display());
-    }
-    let input = std::fs::canonicalize(&input)
-        .with_context(|| format!("Failed to resolve input path {}", input.display()))?;
+    let input = match std::fs::canonicalize(&input) {
+        Ok(input) => input,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("Input does not exist: {}", input.display());
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to resolve input path {}", input.display()));
+        }
+    };
     let input = input.as_path();
+    let input_kind = InputKind::inspect(input);
 
     let workspace_options = if ctx.strict {
         WorkspaceOptions::strict()
@@ -65,12 +87,12 @@ pub(crate) fn load_workspace(
     .context("Failed to initialize asset workspace")?;
 
     let discovery =
-        discover_candidates(input, include_yaml, excluded_root, discovery_policy, budget)?;
+        discover_candidates(input, input_kind, excluded_root, discovery_policy, budget)?;
     let discovery_len = discovery.len();
     let mut batch = SourceAdmissionBatch::with_capacity(discovery_len, budget)
         .context("Failed to reserve the workspace source-admission batch")?;
     for (path, candidate) in discovery {
-        let alias = source_alias(input, &path, budget)?;
+        let alias = source_alias(input, input_kind, &path, budget)?;
         let request = SourceOpenRequest::new(path, alias);
         let request = match candidate.kind_hint {
             Some(kind) => request.with_kind_hint(kind),
@@ -112,7 +134,7 @@ pub(crate) fn load_workspace(
         debug_assert_ne!(report.base_revision(), report.revision());
     }
 
-    if root_sources_loaded == 0 && input.is_file() {
+    if root_sources_loaded == 0 && input_kind == InputKind::File {
         anyhow::bail!("Input is not a supported Unity source: {}", input.display());
     }
     if root_sources_loaded == 0 {
@@ -165,7 +187,6 @@ fn load_full_workspace_with_id(
 ) -> Result<AssetWorkspace> {
     load_workspace(
         input,
-        true,
         excluded_root,
         DiscoveryPolicy::Generic,
         workspace_id,
@@ -176,7 +197,7 @@ fn load_full_workspace_with_id(
 
 fn discover_candidates(
     input: &Path,
-    include_yaml: bool,
+    input_kind: InputKind,
     excluded_path: Option<&Path>,
     discovery_policy: DiscoveryPolicy,
     budget: &mut AssetLoadBudget,
@@ -200,9 +221,9 @@ fn discover_candidates(
             .as_ref()
             .is_none_or(|excluded| !path.starts_with(excluded))
     });
-    let explicit_file = input.is_file();
+    let explicit_file = input_kind == InputKind::File;
     let explicit_candidate = if explicit_file {
-        classify_candidate(input, include_yaml, true, budget)?
+        classify_candidate(input, true, budget)?
     } else {
         None
     };
@@ -242,7 +263,7 @@ fn discover_candidates(
         let candidate = if explicit_file && path == input {
             explicit_candidate
         } else {
-            classify_candidate(&path, include_yaml, false, budget)?
+            classify_candidate(&path, false, budget)?
         };
         if let Some(candidate) = candidate {
             candidates.push((path, candidate));
@@ -279,13 +300,11 @@ fn collect_serialized_file_companions(
             continue;
         }
         let path = entry.path();
-        if !is_streamed_resource_path(&path) {
+        if !recognize_source(&path, &[]).is_streamed_resource() {
             continue;
         }
         append_discovered_path(&mut companions, path, budget)?;
     }
-    companions.sort_unstable();
-    companions.dedup();
     Ok(companions)
 }
 
@@ -387,87 +406,27 @@ fn canonicalize_output_boundary(path: &Path) -> std::io::Result<PathBuf> {
 
 fn classify_candidate(
     path: &Path,
-    include_yaml: bool,
     explicit_file: bool,
     budget: &mut AssetLoadBudget,
 ) -> Result<Option<Candidate>> {
-    let extension = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or_default();
-    if is_streamed_resource_extension(extension) {
-        return Ok(Some(Candidate {
-            kind_hint: Some(SourceKind::StreamedResource),
-        }));
-    }
-    if extension.eq_ignore_ascii_case("meta") {
-        return Ok(Some(Candidate {
-            kind_hint: Some(SourceKind::Yaml),
-        }));
-    }
-
-    let mut prefix = [0_u8; PROBE_PREFIX_LEN];
+    let mut prefix = [0_u8; unity_asset::workspace::SOURCE_RECOGNITION_PREFIX_LEN];
     let prefix_len = fast_path::read_prefix_into(path, &mut prefix)
         .with_context(|| format!("Failed to probe {}", path.display()))?;
     budget.consume_bytes(
         u64::try_from(prefix_len).context("Unity source probe length does not fit u64")?,
     )?;
     let prefix = &prefix[..prefix_len];
-    if let Some(kind) = fast_path::sniff_unity_file_kind_prefix(prefix) {
-        let kind_hint = match kind {
-            UnityFileKind::SerializedFile => SourceKind::SerializedFile,
-            UnityFileKind::AssetBundle => SourceKind::AssetBundle,
-            UnityFileKind::WebFile => SourceKind::WebFile,
-        };
+    let recognition = recognize_source(path, prefix);
+    if recognition.is_candidate() {
         return Ok(Some(Candidate {
-            kind_hint: Some(kind_hint),
-        }));
-    }
-    if is_archive(path, prefix) {
-        return Ok(Some(Candidate {
-            kind_hint: Some(SourceKind::Archive),
-        }));
-    }
-    if include_yaml && is_project_yaml_extension(extension) {
-        return Ok(Some(Candidate {
-            // `.asset` can also contain a SerializedFile. Let the workspace perform its
-            // binary-first format decision instead of forcing a YAML parse.
-            kind_hint: None,
+            // Shared Unity extensions carry no hint, so admission keeps its binary-first parser.
+            kind_hint: recognition.kind_hint(),
         }));
     }
     if explicit_file {
         return Ok(Some(Candidate { kind_hint: None }));
     }
     Ok(None)
-}
-
-fn is_project_yaml_extension(extension: &str) -> bool {
-    ["asset", "prefab", "unity"]
-        .iter()
-        .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-}
-
-fn is_streamed_resource_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(is_streamed_resource_extension)
-}
-
-fn is_streamed_resource_extension(extension: &str) -> bool {
-    extension.eq_ignore_ascii_case("resS") || extension.eq_ignore_ascii_case("resource")
-}
-
-fn is_archive(path: &Path, prefix: &[u8]) -> bool {
-    let zip_signature = prefix.starts_with(b"PK\x03\x04")
-        || prefix.starts_with(b"PK\x05\x06")
-        || prefix.starts_with(b"PK\x07\x08");
-    zip_signature
-        || path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                extension.eq_ignore_ascii_case("zip") || extension.eq_ignore_ascii_case("apk")
-            })
 }
 
 fn is_skipped_root_project_directory(root: &Path, path: &Path) -> bool {
@@ -492,8 +451,13 @@ fn is_internal_workspace_directory(path: &Path) -> bool {
         })
 }
 
-fn source_alias(root: &Path, path: &Path, budget: &AssetLoadBudget) -> Result<SourceAlias> {
-    let relative = if root.is_dir() {
+fn source_alias(
+    root: &Path,
+    input_kind: InputKind,
+    path: &Path,
+    budget: &AssetLoadBudget,
+) -> Result<SourceAlias> {
+    let relative = if input_kind == InputKind::Directory {
         path.strip_prefix(root).with_context(|| {
             format!(
                 "Discovered source {} is outside input root {}",
@@ -590,7 +554,7 @@ mod tests {
 
         let discovery = discover_candidates(
             &input,
-            true,
+            InputKind::File,
             Some(&excluded),
             DiscoveryPolicy::Generic,
             &mut AssetLoadBudget::default(),
@@ -610,28 +574,40 @@ mod tests {
         let root = directory.path();
         let source = root.join("Assets").join("Shared").join("thing.asset");
         assert_eq!(
-            source_alias(root, &source, &AssetLoadBudget::default())
-                .unwrap()
-                .as_str(),
+            source_alias(
+                root,
+                InputKind::Directory,
+                &source,
+                &AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .as_str(),
             "Assets/Shared/thing.asset"
         );
     }
 
     #[test]
-    fn meta_is_selected_even_when_yaml_documents_are_disabled() {
-        let candidate = classify_candidate(
-            Path::new("asset.prefab.meta"),
-            false,
-            false,
-            &mut AssetLoadBudget::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            candidate,
-            Some(Candidate {
-                kind_hint: Some(SourceKind::Yaml),
-            })
-        );
+    fn every_workspace_yaml_extension_is_selected_by_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        for name in [
+            "clip.anim",
+            "data.asset",
+            "state.controller",
+            "material.mat",
+            "asset.meta",
+            "object.prefab",
+            "scene.unity",
+        ] {
+            let path = directory.path().join(name);
+            std::fs::write(&path, []).unwrap();
+            let candidate =
+                classify_candidate(&path, false, &mut AssetLoadBudget::default()).unwrap();
+            assert_eq!(
+                candidate,
+                Some(Candidate { kind_hint: None }),
+                "extension was not selected: {name}"
+            );
+        }
     }
 
     #[test]
@@ -660,7 +636,7 @@ mod tests {
 
         let discovery = discover_candidates(
             &project_root,
-            true,
+            InputKind::Directory,
             None,
             DiscoveryPolicy::UnityProject,
             &mut AssetLoadBudget::default(),
@@ -672,7 +648,7 @@ mod tests {
 
         let generic = discover_candidates(
             &project_root,
-            true,
+            InputKind::Directory,
             None,
             DiscoveryPolicy::Generic,
             &mut AssetLoadBudget::default(),
@@ -684,7 +660,7 @@ mod tests {
         std::fs::write(&output, b"stale output").unwrap();
         let discovery = discover_candidates(
             &project_root,
-            true,
+            InputKind::Directory,
             Some(&output),
             DiscoveryPolicy::UnityProject,
             &mut AssetLoadBudget::default(),
@@ -702,7 +678,7 @@ mod tests {
         .unwrap();
         let discovery = discover_candidates(
             &project_root,
-            true,
+            InputKind::Directory,
             Some(&output_directory),
             DiscoveryPolicy::UnityProject,
             &mut AssetLoadBudget::default(),
@@ -724,7 +700,7 @@ mod tests {
         .unwrap();
         let discovery = discover_candidates(
             &project_root,
-            true,
+            InputKind::Directory,
             None,
             DiscoveryPolicy::Generic,
             &mut AssetLoadBudget::default(),

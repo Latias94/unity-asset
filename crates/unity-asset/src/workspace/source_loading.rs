@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use unity_asset_binary::asset::{ObjectInfo, SerializedFile, SerializedType};
+use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
 use unity_asset_binary::typetree::{
     TypeTree, TypeTreeNode, TypeTreeRegistry, TypeTreeSchema, TypeTreeSemanticDigestError,
 };
@@ -38,6 +39,86 @@ use super::view::{
 };
 
 const MAX_CONTAINER_DEPTH: u32 = 64;
+
+/// Maximum prefix inspected by the source-recognition authority.
+pub const SOURCE_RECOGNITION_PREFIX_LEN: usize = 64;
+
+/// Format evidence derived from a path and a bounded source prefix.
+///
+/// Recognition is advisory for discovery callers. Workspace admission always parses and verifies
+/// the complete retained image before installing a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceRecognition {
+    kind: SourceRecognitionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceRecognitionKind {
+    Recognized(SourceKind),
+    YamlOrBinary,
+    Unknown,
+}
+
+impl SourceRecognition {
+    /// Returns whether discovery should retain the path as a workspace source candidate.
+    #[must_use]
+    pub const fn is_candidate(self) -> bool {
+        !matches!(self.kind, SourceRecognitionKind::Unknown)
+    }
+
+    /// Returns the safe parser hint carried by decisive recognition evidence.
+    #[must_use]
+    pub const fn kind_hint(self) -> Option<SourceKind> {
+        match self.kind {
+            SourceRecognitionKind::Recognized(kind) => Some(kind),
+            SourceRecognitionKind::YamlOrBinary | SourceRecognitionKind::Unknown => None,
+        }
+    }
+
+    /// Returns whether the source is recognized as a raw streamed-resource sidecar.
+    #[must_use]
+    pub const fn is_streamed_resource(self) -> bool {
+        matches!(
+            self.kind,
+            SourceRecognitionKind::Recognized(SourceKind::StreamedResource)
+        )
+    }
+}
+
+/// Applies the canonical source-recognition rules without opening the path.
+#[must_use]
+pub fn recognize_source(path: &Path, prefix: &[u8]) -> SourceRecognition {
+    let prefix = &prefix[..prefix.len().min(SOURCE_RECOGNITION_PREFIX_LEN)];
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    if looks_like_zip(prefix) || has_extension(extension, &["zip", "apk"]) {
+        return SourceRecognition {
+            kind: SourceRecognitionKind::Recognized(SourceKind::Archive),
+        };
+    }
+    if looks_like_yaml(prefix) {
+        return SourceRecognition {
+            kind: SourceRecognitionKind::Recognized(SourceKind::Yaml),
+        };
+    }
+    if let Some(kind) = sniff_unity_file_kind_prefix(prefix) {
+        return SourceRecognition {
+            kind: SourceRecognitionKind::Recognized(binary_file_kind(kind)),
+        };
+    }
+    if has_yaml_extension(extension) {
+        return SourceRecognition {
+            kind: SourceRecognitionKind::YamlOrBinary,
+        };
+    }
+    if has_resource_extension(extension) {
+        return SourceRecognition {
+            kind: SourceRecognitionKind::Recognized(SourceKind::StreamedResource),
+        };
+    }
+    SourceRecognition {
+        kind: SourceRecognitionKind::Unknown,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FrozenRegistryKey {
@@ -118,20 +199,27 @@ pub(super) fn prepare_root(
             }
             prepare_binary_payload(image, payload, binary, source_registry, budget, 0)
         }
-        None if looks_like_zip(&image) || has_extension(path, &["zip", "apk"]) => {
-            prepare_archive(image, binary, source_registry, budget, 0)
-        }
-        None if looks_like_yaml(&image) => prepare_yaml(image, budget, 0),
-        None if has_yaml_extension(path) => {
-            prepare_binary_or_yaml(image, binary, source_registry, budget, 0)
-        }
-        None if has_resource_extension(path) => Ok(prepared_raw(image)),
-        None => {
-            let payload = binary
-                .parse_budgeted(&image, budget)
-                .map_err(map_binary_adapter_error)?;
-            prepare_binary_payload(image, payload, binary, source_registry, budget, 0)
-        }
+        None => match recognize_source(path, &image).kind {
+            SourceRecognitionKind::Recognized(SourceKind::Archive) => {
+                prepare_archive(image, binary, source_registry, budget, 0)
+            }
+            SourceRecognitionKind::Recognized(SourceKind::Yaml) => prepare_yaml(image, budget, 0),
+            SourceRecognitionKind::YamlOrBinary => {
+                prepare_binary_or_yaml(image, binary, source_registry, budget, 0)
+            }
+            SourceRecognitionKind::Recognized(SourceKind::StreamedResource) => {
+                Ok(prepared_raw(image))
+            }
+            SourceRecognitionKind::Recognized(
+                SourceKind::SerializedFile | SourceKind::AssetBundle | SourceKind::WebFile,
+            )
+            | SourceRecognitionKind::Unknown => {
+                let payload = binary
+                    .parse_budgeted(&image, budget)
+                    .map_err(map_binary_adapter_error)?;
+                prepare_binary_payload(image, payload, binary, source_registry, budget, 0)
+            }
+        },
     }
 }
 
@@ -365,21 +453,35 @@ fn prepare_member(
     image.validate_budget(budget)?;
     observe_container_depth(depth, budget)?;
     let path = Path::new(name);
-    if looks_like_zip(&image) || has_extension(path, &["zip", "apk"]) {
-        return prepare_archive(image, binary, source_registry, budget, depth);
-    }
-    if looks_like_yaml(&image) {
-        return prepare_yaml(image, budget, depth);
-    }
-    if has_yaml_extension(path) {
-        return if binary_already_rejected {
-            prepare_yaml(image, budget, depth)
-        } else {
-            prepare_binary_or_yaml(image, binary, source_registry, budget, depth)
-        };
-    }
-    if has_resource_extension(path) || binary_already_rejected {
-        return Ok(prepared_raw(image));
+    match recognize_source(path, &image).kind {
+        SourceRecognitionKind::Recognized(SourceKind::Archive) => {
+            return prepare_archive(image, binary, source_registry, budget, depth);
+        }
+        SourceRecognitionKind::Recognized(SourceKind::Yaml) => {
+            return prepare_yaml(image, budget, depth);
+        }
+        SourceRecognitionKind::YamlOrBinary => {
+            return if binary_already_rejected {
+                prepare_yaml(image, budget, depth)
+            } else {
+                prepare_binary_or_yaml(image, binary, source_registry, budget, depth)
+            };
+        }
+        SourceRecognitionKind::Recognized(SourceKind::StreamedResource) => {
+            return Ok(prepared_raw(image));
+        }
+        SourceRecognitionKind::Recognized(
+            SourceKind::SerializedFile | SourceKind::AssetBundle | SourceKind::WebFile,
+        )
+        | SourceRecognitionKind::Unknown
+            if binary_already_rejected =>
+        {
+            return Ok(prepared_raw(image));
+        }
+        SourceRecognitionKind::Recognized(
+            SourceKind::SerializedFile | SourceKind::AssetBundle | SourceKind::WebFile,
+        )
+        | SourceRecognitionKind::Unknown => {}
     }
 
     let binary_result = {
@@ -410,6 +512,14 @@ fn binary_payload_kind(payload: &BinaryPayload) -> SourceKind {
         BinaryPayload::SerializedFile(_) => SourceKind::SerializedFile,
         BinaryPayload::AssetBundle(_) => SourceKind::AssetBundle,
         BinaryPayload::WebFile(_) => SourceKind::WebFile,
+    }
+}
+
+const fn binary_file_kind(kind: UnityFileKind) -> SourceKind {
+    match kind {
+        UnityFileKind::SerializedFile => SourceKind::SerializedFile,
+        UnityFileKind::AssetBundle => SourceKind::AssetBundle,
+        UnityFileKind::WebFile => SourceKind::WebFile,
     }
 }
 
@@ -1038,16 +1148,13 @@ fn looks_like_zip(bytes: &[u8]) -> bool {
 
 fn looks_like_yaml(bytes: &[u8]) -> bool {
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
-    let Some(text) = std::str::from_utf8(bytes).ok() else {
-        return false;
-    };
-    let start = text.trim_start();
-    start.starts_with("%YAML") || start.starts_with("--- !u!")
+    let start = bytes.trim_ascii_start();
+    start.starts_with(b"%YAML") || start.starts_with(b"--- !u!")
 }
 
-fn has_yaml_extension(path: &Path) -> bool {
+fn has_yaml_extension(extension: Option<&str>) -> bool {
     has_extension(
-        path,
+        extension,
         &[
             "anim",
             "asset",
@@ -1060,18 +1167,16 @@ fn has_yaml_extension(path: &Path) -> bool {
     )
 }
 
-fn has_resource_extension(path: &Path) -> bool {
-    has_extension(path, &["resource", "ress"])
+fn has_resource_extension(extension: Option<&str>) -> bool {
+    has_extension(extension, &["resource", "ress"])
 }
 
-fn has_extension(path: &Path, expected: &[&str]) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            expected
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
+fn has_extension(extension: Option<&str>, expected: &[&str]) -> bool {
+    extension.is_some_and(|extension| {
+        expected
+            .iter()
+            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
+    })
 }
 
 #[cfg(test)]

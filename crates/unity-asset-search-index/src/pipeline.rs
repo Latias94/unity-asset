@@ -14,7 +14,7 @@ use unity_asset::workspace::{
     SourceAdmissionBatchPushError, SourceAdmissionDisposition, SourceAdmissionError,
     SourceAdmissionErrorCategory, SourceAdmissionOperation, SourceAdmissionPolicy,
     SourceOpenRequest, WorkspaceError, WorkspaceLookup, WorkspaceOptions, WorkspaceSource,
-    WorkspaceView,
+    WorkspaceView, recognize_source,
 };
 use unity_asset::{
     AssetLoadBudget, BudgetError, ChangeSet, ContractError, Diagnostic, DiagnosticError,
@@ -3647,39 +3647,12 @@ fn is_workspace_candidate(
     source: &ReadSource,
     budget: &AssetLoadBudget,
 ) -> Result<bool, PipelineError> {
-    if matches!(
-        source.kind,
-        SearchKind::Prefab
-            | SearchKind::Scene
-            | SearchKind::Material
-            | SearchKind::AnimationClip
-            | SearchKind::AnimatorController
-            | SearchKind::Asset
-    ) {
-        return Ok(true);
-    }
     let Some(bytes) = source.bytes.as_ref() else {
         return Ok(false);
     };
     bytes.validate_budget(budget)?;
-    let bytes = bytes.as_bytes();
-    if bytes.starts_with(b"%YAML")
-        || bytes.starts_with(b"--- !u!")
-        || bytes.starts_with(b"UnityFS")
-        || bytes.starts_with(b"UnityWeb")
-        || bytes.starts_with(b"UnityRaw")
-        || bytes.starts_with(b"PK\x03\x04")
-    {
-        return Ok(true);
-    }
-    Ok(Path::new(&source.rel_path)
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            ["assets", "sharedassets", "bundle", "unity3d", "zip", "apk"]
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        }))
+    let recognition = recognize_source(Path::new(&source.rel_path), bytes.as_bytes());
+    Ok(recognition.is_candidate() && !recognition.is_streamed_resource())
 }
 
 fn search_kind_for_path(path: &Path) -> SearchKind {
@@ -4302,28 +4275,7 @@ mod tests {
     #[test]
     fn workspace_sniff_rejects_source_bytes_from_another_budget_domain() {
         let mut source_budget = AssetLoadBudget::default();
-        let bytes =
-            BudgetedSourceBytes::from_vec(b"%YAML 1.1\n".to_vec(), &mut source_budget).unwrap();
-        let source = ReadSource {
-            coordinate: test_coordinate("Assets/Unknown.data"),
-            rel_path: "Assets/Unknown.data".to_owned(),
-            abs_path: PathBuf::from("Assets/Unknown.data"),
-            name: "Unknown.data".to_owned(),
-            kind: SearchKind::File,
-            guid: None,
-            bytes: Some(bytes),
-            meta_bytes: None,
-            length: 10,
-            content_identity: DigestV1::hash_bytes(b"%YAML 1.1\n"),
-            hints: SourceHints {
-                asset: FileHint {
-                    size: 10,
-                    mtime_ms: None,
-                },
-                meta: None,
-            },
-            unchanged: false,
-        };
+        let source = test_read_source("Assets/Unknown.data", b"%YAML 1.1\n", &mut source_budget);
 
         assert!(is_workspace_candidate(&source, &source_budget).unwrap());
         let error = is_workspace_candidate(&source, &AssetLoadBudget::default()).unwrap_err();
@@ -4333,6 +4285,55 @@ mod tests {
                 resource: "source bytes"
             })
         ));
+    }
+
+    #[test]
+    fn workspace_candidates_reuse_the_workspace_recognition_matrix() {
+        for (path, bytes, expected) in [
+            ("Assets/material.mat", b"".as_slice(), true),
+            ("Assets/clip.anim", b"", true),
+            ("Assets/state.controller", b"", true),
+            ("Assets/archive.bin", b"PK\x06\x06", true),
+            ("Assets/not-an-archive.bin", b"PK\x07\x08", false),
+            ("Assets/CAB-data.resS", b"", false),
+        ] {
+            let mut budget = AssetLoadBudget::default();
+            let source = test_read_source(path, bytes, &mut budget);
+
+            assert_eq!(
+                is_workspace_candidate(&source, &budget).unwrap(),
+                expected,
+                "unexpected workspace-candidate decision for {path}"
+            );
+        }
+    }
+
+    fn test_read_source(path: &str, bytes: &[u8], budget: &mut AssetLoadBudget) -> ReadSource {
+        let length = u64::try_from(bytes.len()).unwrap();
+        ReadSource {
+            coordinate: test_coordinate(path),
+            rel_path: path.to_owned(),
+            abs_path: PathBuf::from(path),
+            name: Path::new(path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            kind: search_kind_for_path(Path::new(path)),
+            guid: None,
+            bytes: Some(BudgetedSourceBytes::from_vec(bytes.to_vec(), budget).unwrap()),
+            meta_bytes: None,
+            length,
+            content_identity: DigestV1::hash_bytes(bytes),
+            hints: SourceHints {
+                asset: FileHint {
+                    size: length,
+                    mtime_ms: None,
+                },
+                meta: None,
+            },
+            unchanged: false,
+        }
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use unity_asset::AssetLoadBudget;
 use unity_asset_binary::bundle::{AssetBundle, BundleLoadOptions};
+use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
 
 const BUNDLE_SNIFF_PREFIX_LEN: usize = 16;
 
@@ -10,18 +11,12 @@ pub(crate) fn bundle_list_options() -> BundleLoadOptions {
     BundleLoadOptions::lazy()
 }
 
-pub(crate) fn sniff_unity_file_kind_prefix(
-    prefix: &[u8],
-) -> Option<unity_asset_binary::file::UnityFileKind> {
-    unity_asset_binary::file::sniff_unity_file_kind_prefix(prefix)
-}
-
 pub(crate) fn is_assetbundle_path(path: &Path) -> bool {
-    let Ok(prefix) = read_prefix(path, BUNDLE_SNIFF_PREFIX_LEN) else {
+    let mut prefix = [0_u8; BUNDLE_SNIFF_PREFIX_LEN];
+    let Ok(prefix_len) = read_prefix_into(path, &mut prefix) else {
         return false;
     };
-    sniff_unity_file_kind_prefix(&prefix)
-        == Some(unity_asset_binary::file::UnityFileKind::AssetBundle)
+    sniff_unity_file_kind_prefix(&prefix[..prefix_len]) == Some(UnityFileKind::AssetBundle)
 }
 
 pub(crate) fn collect_candidate_paths(input: &Path) -> Result<Vec<PathBuf>> {
@@ -140,13 +135,6 @@ fn collect_files_recursive_budgeted(
     Ok(())
 }
 
-pub(crate) fn read_prefix(path: &Path, max_len: usize) -> Result<Vec<u8>> {
-    let mut buf = vec![0u8; max_len];
-    let n = read_prefix_into(path, &mut buf)?;
-    buf.truncate(n);
-    Ok(buf)
-}
-
 pub(crate) fn read_prefix_into(path: &Path, output: &mut [u8]) -> Result<usize> {
     use std::io::Read;
 
@@ -159,4 +147,27 @@ pub(crate) fn load_bundle_for_list(
     budget: &mut AssetLoadBudget,
 ) -> Result<AssetBundle> {
     Ok(unity_asset_binary::file::load_bundle_file_with_options_and_budget(path, options, budget)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_sniff_uses_wire_kind_even_when_extension_is_archive_like() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("bundle.zip");
+        std::fs::write(&path, b"UnityFS\0").expect("write bundle signature");
+
+        assert!(is_assetbundle_path(&path));
+    }
+
+    #[test]
+    fn bundle_sniff_does_not_treat_archive_magic_as_assetbundle() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("bundle.unity3d");
+        std::fs::write(&path, b"PK\x03\x04").expect("write archive signature");
+
+        assert!(!is_assetbundle_path(&path));
+    }
 }

@@ -41,7 +41,7 @@ pub use inspection::{
     WorkspaceCompression, WorkspaceInspector, WorkspaceObjectFormatInspection,
     WorkspaceObjectInspection, WorkspaceSourceFormatInspection, WorkspaceSourceInspection,
 };
-pub use interface::{AssetWorkspace, SourceOpenRequest, WorkspaceOptions};
+pub use interface::{AssetWorkspace, WorkspaceOptions};
 pub use overlay::PreparedView;
 pub use plan::{
     FieldGuard, Float64Bits, GenericMutation, MUTATION_PLAN_VERSION, MutationField,
@@ -62,8 +62,10 @@ pub use source_admission::{
     SourceAdmissionError, SourceAdmissionErrorCategory, SourceAdmissionFailure,
     SourceAdmissionFailureSite, SourceAdmissionOperation, SourceAdmissionOperationLocation,
     SourceAdmissionOutcome, SourceAdmissionPolicy, SourceAdmissionRejection, SourceAdmissionReport,
+    SourceOpenRequest,
 };
 pub use source_catalog::SourceLocationKind;
+pub use source_loading::{SOURCE_RECOGNITION_PREFIX_LEN, SourceRecognition, recognize_source};
 pub(crate) use view::SourceObjectDescriptor;
 pub use view::{
     WorkspaceAllocationUnit, WorkspaceByteRange, WorkspaceByteRangeReader, WorkspaceError,

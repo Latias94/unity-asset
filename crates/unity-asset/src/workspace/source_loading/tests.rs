@@ -13,6 +13,58 @@ fn tree_with_child() -> TypeTree {
 }
 
 #[test]
+fn source_recognition_owns_the_complete_extension_and_signature_matrix() {
+    for path in [
+        "clip.anim",
+        "data.asset",
+        "state.controller",
+        "material.mat",
+        "asset.meta",
+        "object.prefab",
+        "scene.unity",
+    ] {
+        let recognition = recognize_source(Path::new(path), &[]);
+        assert!(recognition.is_candidate(), "missing YAML extension: {path}");
+        assert_eq!(recognition.kind_hint(), None);
+    }
+    for signature in [b"PK\x03\x04".as_slice(), b"PK\x05\x06", b"PK\x06\x06"] {
+        assert_eq!(
+            recognize_source(Path::new("archive.bin"), signature).kind_hint(),
+            Some(SourceKind::Archive)
+        );
+    }
+    assert_eq!(
+        recognize_source(Path::new("archive.zip"), b"not a ZIP header").kind_hint(),
+        Some(SourceKind::Archive)
+    );
+    assert_eq!(
+        recognize_source(Path::new("payload.resS"), b"%YAML 1.1").kind_hint(),
+        Some(SourceKind::Yaml),
+        "content evidence takes precedence over the resource extension"
+    );
+    assert!(recognize_source(Path::new("payload.resS"), &[]).is_streamed_resource());
+    assert!(
+        !recognize_source(Path::new("descriptor.bin"), b"PK\x07\x08").is_candidate(),
+        "a data-descriptor signature is not an archive start"
+    );
+}
+
+#[test]
+fn source_recognition_maps_binary_prefixes_without_forcing_unknown_sources() {
+    let mut serialized = [0_u8; 17];
+    serialized[0..4].copy_from_slice(&1_u32.to_be_bytes());
+    serialized[4..8].copy_from_slice(&17_u32.to_be_bytes());
+    serialized[8..12].copy_from_slice(&8_u32.to_be_bytes());
+    serialized[12..16].copy_from_slice(&16_u32.to_be_bytes());
+
+    assert_eq!(
+        recognize_source(Path::new("sharedassets0.assets"), &serialized).kind_hint(),
+        Some(SourceKind::SerializedFile)
+    );
+    assert!(!recognize_source(Path::new("notes.txt"), b"plain text").is_candidate());
+}
+
+#[test]
 fn frozen_leaf_root_uses_the_same_zero_based_depth_as_embedded_trees() {
     let tree = TypeTree {
         nodes: vec![TypeTreeNode::new()],
