@@ -7,10 +7,10 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use unity_asset_binary::asset::SerializedFile;
 use unity_asset_core::{
-    AssetLoadBudget, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath, ObjectAddress, ObjectId,
-    ObjectKind, RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator,
-    UnityDocument, UnityValue, arc_value_allocation_bytes, index_map_allocation_bytes,
-    string_allocation_bytes, vec_allocation_bytes,
+    AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath,
+    ObjectAddress, ObjectId, ObjectKind, RevisionedObjectHandle, SourceFingerprint, SourceId,
+    SourceKind, SourceLocator, UnityDocument, UnityValue, arc_value_allocation_bytes,
+    index_map_allocation_bytes, string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactBuildError, ArtifactBuildFailurePhase,
@@ -45,7 +45,7 @@ use super::yaml::{
 use super::{
     PREPARE_REPORT_VERSION, PrepareArtifactReport, PrepareDiagnostic, PrepareError,
     PrepareFailureReport, PrepareOptions, PrepareReport, PrepareStage, PreparedChange,
-    PreparedSourceReport,
+    PreparedLogicalChanges, PreparedPublicationError, PreparedPublicationSet, PreparedSourceReport,
 };
 use crate::schema::protected_plain_field_owner;
 use crate::workspace::overlay::{PreparedSourceBinding, PreparedState};
@@ -203,9 +203,6 @@ fn prepare_with_observer(
         .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
     }
     drop(codec.take());
-    changed_objects.sort_unstable();
-    changed_objects.dedup();
-
     let resource_domain_count = resource_manifest_index
         .as_ref()
         .map_or(0, |index| index.domains.len());
@@ -555,23 +552,9 @@ fn prepare_with_observer(
         .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
     let artifact_usage = artifact_budget.usage();
 
-    let publication_bindings = build_publication_bindings(&artifacts, &output_specs, budget)
-        .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
-
-    let mut destinations = budgeted_vec::<PublicationDestination<'_>>(
-        publication_bindings.len(),
-        "prepare publication destinations",
-        PrepareStage::DestinationValidation,
-        budget,
-    )
-    .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
-    for binding in &publication_bindings {
-        destinations.push(PublicationDestination::exact(
-            binding.output,
-            &binding.destination.target,
-            binding.destination.expectation,
-        ));
-    }
+    let publication_destinations =
+        build_publication_destinations(&artifacts, &output_specs, budget)
+            .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
     source_proofs.revalidate(budget).map_err(|error| {
         reject(
             &snapshot,
@@ -579,20 +562,22 @@ fn prepare_with_observer(
             source_proof_failure(snapshot.state().catalog(), error, budget),
         )
     })?;
-    let destination_proofs = DestinationProofSet::observe(&artifacts, &destinations, budget)
-        .map_err(|error| {
-            reject(
-                &snapshot,
-                Some(plan_digest),
-                destination_failure(
-                    error,
-                    "PREPARE_DESTINATION_REJECTED",
-                    &publication_bindings,
-                    graph_catalog,
-                    budget,
-                ),
-            )
-        })?;
+    let destination_proofs =
+        DestinationProofSet::observe(&artifacts, &publication_destinations, budget).map_err(
+            |error| {
+                reject(
+                    &snapshot,
+                    Some(plan_digest),
+                    destination_failure(
+                        error,
+                        "PREPARE_DESTINATION_REJECTED",
+                        &publication_destinations,
+                        graph_catalog,
+                        budget,
+                    ),
+                )
+            },
+        )?;
     observer(PrepareCheckpoint::DestinationObservationComplete);
 
     let candidate_catalog = build_candidate_catalog(graph_catalog, &graph, &artifacts, budget)
@@ -642,14 +627,23 @@ fn prepare_with_observer(
         )
     })?;
 
-    destination_proofs.revalidate(budget).map_err(|error| {
+    let publications =
+        PreparedPublicationSet::seal(destination_proofs, &state, budget).map_err(|error| {
+            reject(
+                &snapshot,
+                Some(plan_digest),
+                prepared_publication_failure(error),
+            )
+        })?;
+
+    publications.revalidate(budget).map_err(|error| {
         reject(
             &snapshot,
             Some(plan_digest),
             destination_failure(
                 error,
                 "PREPARE_DESTINATION_CHANGED",
-                &publication_bindings,
+                &publication_destinations,
                 graph_catalog,
                 budget,
             ),
@@ -674,6 +668,27 @@ fn prepare_with_observer(
             ),
         ));
     }
+
+    let changed_source_count = source_reports
+        .iter()
+        .filter(|source| source.base_fingerprint() != Some(source.prepared_fingerprint()))
+        .count();
+    let mut changed_sources = budgeted_vec(
+        changed_source_count,
+        "prepare changed sources",
+        PrepareStage::PreparedView,
+        budget,
+    )
+    .map_err(|failure| reject(&snapshot, Some(plan_digest), failure))?;
+    for source in &source_reports {
+        if source.base_fingerprint() != Some(source.prepared_fingerprint()) {
+            changed_sources.push(source.source_id());
+        }
+    }
+    let logical_changes = PreparedLogicalChanges::from_actual_sources_and_touched_objects(
+        changed_sources,
+        changed_objects,
+    );
 
     let footprint = artifacts.footprint();
     let counters = artifacts.build_counters();
@@ -708,9 +723,9 @@ fn prepare_with_observer(
         state,
         report,
         artifact_usage,
-        changed_objects,
+        logical_changes,
         source_proofs,
-        destination_proofs,
+        publications,
     })
 }
 
@@ -3084,12 +3099,6 @@ struct DeclaredOutputSpec {
     destination: OutputDestinationSpec,
 }
 
-#[derive(Clone, Copy)]
-struct PublicationBinding<'output> {
-    output: &'output LogicalArtifactName,
-    destination: &'output OutputDestinationSpec,
-}
-
 fn build_output_specs(
     catalog: &SourceCatalog,
     roots: &[SourceId],
@@ -3205,14 +3214,14 @@ fn build_output_destination(
     })
 }
 
-fn build_publication_bindings<'output>(
+fn build_publication_destinations<'output>(
     artifacts: &'output PreparedArtifactSet,
     outputs: &'output [DeclaredOutputSpec],
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<PublicationBinding<'output>>, RunnerFailure> {
-    let mut bindings = budgeted_vec(
+) -> Result<Vec<PublicationDestination<'output>>, RunnerFailure> {
+    let mut destinations = budgeted_vec(
         outputs.len(),
-        "prepare publication bindings",
+        "prepare publication destinations",
         PrepareStage::DestinationValidation,
         budget,
     )?;
@@ -3220,13 +3229,16 @@ fn build_publication_bindings<'output>(
         let output = artifacts
             .output(spec.slot)
             .map_err(|error| artifact_failure(PrepareStage::DestinationValidation, error))?;
-        bindings.push(PublicationBinding {
-            output: output.name(),
-            destination: &spec.destination,
-        });
+        destinations.push(PublicationDestination::exact(
+            spec.destination.source,
+            output.slot(),
+            output.name(),
+            &spec.destination.target,
+            spec.destination.expectation,
+        ));
     }
-    bindings.sort_unstable_by(|left, right| left.output.cmp(right.output));
-    Ok(bindings)
+    destinations.sort_unstable_by(|left, right| left.output_name().cmp(right.output_name()));
+    Ok(destinations)
 }
 
 fn bind_publication_roots(
@@ -4036,7 +4048,7 @@ fn budgeted_os_string(
 fn destination_failure(
     error: DestinationProofError,
     code: &'static str,
-    outputs: &[PublicationBinding<'_>],
+    outputs: &[PublicationDestination<'_>],
     catalog: &SourceCatalog,
     budget: &mut AssetLoadBudget,
 ) -> RunnerFailure {
@@ -4052,7 +4064,7 @@ fn destination_failure(
     failure.0.actual = actual;
     if let Some(binding) = output.and_then(|output| outputs.get(output)) {
         failure.0.source = catalog
-            .source_locator(binding.destination.source)
+            .source_locator(binding.source())
             .ok()
             .and_then(|locator| {
                 budgeted_source_locator_clone(
@@ -4105,6 +4117,7 @@ fn source_proof_failure(
 fn destination_error_output(error: &DestinationProofError) -> Option<usize> {
     match error {
         DestinationProofError::OutputNameMismatch { output, .. }
+        | DestinationProofError::OutputAuthorityMismatch { output }
         | DestinationProofError::NonAbsoluteTarget { output }
         | DestinationProofError::UnsupportedTargetEncoding { output }
         | DestinationProofError::TargetEscapesRoot { output }
@@ -4181,6 +4194,23 @@ fn mutation_field_path(action: &GenericMutation) -> Option<&FieldPath> {
 
 fn artifact_failure(stage: PrepareStage, error: ArtifactBuildError) -> RunnerFailure {
     RunnerFailure::new(None, stage, "PREPARE_ARTIFACT_REJECTED", error.to_string())
+}
+
+fn prepared_publication_failure(error: PreparedPublicationError) -> RunnerFailure {
+    let code = match &error {
+        PreparedPublicationError::Budget(BudgetError::ArithmeticOverflow { .. }) => {
+            "PREPARE_ALLOCATION_OVERFLOW"
+        }
+        PreparedPublicationError::Budget(_) => "PREPARE_BUDGET_REJECTED",
+        PreparedPublicationError::IndexAllocation { .. } => "PREPARE_ALLOCATION_REJECTED",
+        PreparedPublicationError::CountMismatch { .. }
+        | PreparedPublicationError::SourceBindingMissing { .. }
+        | PreparedPublicationError::NonCanonicalOutputOrder { .. }
+        | PreparedPublicationError::SourceBindingMismatch { .. }
+        | PreparedPublicationError::DuplicateSource { .. }
+        | PreparedPublicationError::Artifact { .. } => "PREPARE_PUBLICATION_AUTHORITY_REJECTED",
+    };
+    RunnerFailure::new(None, PrepareStage::PreparedView, code, error.to_string())
 }
 
 fn artifact_prepare_failure(error: ArtifactBuildError) -> RunnerFailure {
@@ -4394,6 +4424,38 @@ mod tests {
     }
 
     #[test]
+    fn publication_failure_preserves_resource_and_authority_classification() {
+        let budget =
+            prepared_publication_failure(PreparedPublicationError::Budget(BudgetError::Exceeded {
+                resource: "members",
+                limit: 1,
+                requested: 2,
+            }));
+        assert_eq!(budget.0.code, "PREPARE_BUDGET_REJECTED");
+
+        let overflow = prepared_publication_failure(PreparedPublicationError::Budget(
+            BudgetError::ArithmeticOverflow {
+                resource: "prepared publication authority members",
+            },
+        ));
+        assert_eq!(overflow.0.code, "PREPARE_ALLOCATION_OVERFLOW");
+
+        let mut allocation_probe = Vec::<u8>::new();
+        let allocation = allocation_probe.try_reserve(usize::MAX).unwrap_err();
+        let allocation = prepared_publication_failure(PreparedPublicationError::IndexAllocation {
+            requested: usize::MAX,
+            source: allocation,
+        });
+        assert_eq!(allocation.0.code, "PREPARE_ALLOCATION_REJECTED");
+
+        let authority = prepared_publication_failure(PreparedPublicationError::CountMismatch {
+            outputs: 1,
+            destinations: 0,
+        });
+        assert_eq!(authority.0.code, "PREPARE_PUBLICATION_AUTHORITY_REJECTED");
+    }
+
+    #[test]
     fn retained_artifact_set_arc_has_an_exact_atomic_budget_boundary() {
         let required = arc_value_allocation_bytes::<PreparedArtifactSet>().unwrap();
         let mut exact = AssetLoadBudget::new(AssetLoadLimits {
@@ -4603,6 +4665,8 @@ mod tests {
         let artifacts = one_yaml_artifact("output/0000000000000000");
         let output = artifacts.outputs().next().unwrap();
         let destinations = [PublicationDestination::exact(
+            source,
+            output.slot(),
             output.name(),
             &target,
             DestinationExpectation::Existing(expected),
@@ -4618,19 +4682,10 @@ mod tests {
         let conflict = proof
             .revalidate(&mut AssetLoadBudget::default())
             .unwrap_err();
-        let destination = OutputDestinationSpec {
-            source,
-            target,
-            expectation: DestinationExpectation::Existing(expected),
-        };
-        let bindings = [PublicationBinding {
-            output: output.name(),
-            destination: &destination,
-        }];
         let failure = destination_failure(
             conflict,
             "PREPARE_DESTINATION_CHANGED",
-            &bindings,
+            &destinations,
             snapshot.state().catalog(),
             &mut AssetLoadBudget::default(),
         );

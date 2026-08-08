@@ -2,8 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use unity_asset::workspace::{
-    AssetWorkspace, GenericMutation, MutationPlan, PlanPayload, PrepareOptions, SourceExpectation,
-    SourceOpenRequest, UnsafeRawAcknowledgement,
+    AssetWorkspace, GenericMutation, MutationPlan, PlanPayload, PrepareOptions, PublicationTarget,
+    SourceExpectation, SourceOpenRequest, UnsafeRawAcknowledgement,
 };
 use unity_asset::{
     AssetLoadBudget, DigestV1, ObjectAddress, SourceAlias, SourceFingerprint, SourceKind,
@@ -102,5 +102,95 @@ fn earlier_stale_raw_guard_precedes_a_lower_path_id_failure() {
             &ObjectAddress::binary_at(SourceLocator::path(SOURCE_ALIAS).unwrap(), high_path_id)
                 .unwrap()
         )
+    );
+}
+
+#[test]
+fn repeated_identical_raw_replacement_remains_a_prepared_noop() {
+    let (bytes, file) = serialized_fixture();
+    let path_id = file.objects().first().unwrap().path_id();
+    let raw = file
+        .find_object_handle(path_id)
+        .unwrap()
+        .raw_data()
+        .unwrap()
+        .to_vec();
+    let raw_digest = DigestV1::hash_bytes(&raw);
+
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join(SOURCE_ALIAS);
+    fs::write(&source_path, &bytes).unwrap();
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_source(
+            SourceOpenRequest::new(&source_path, SourceAlias::new(SOURCE_ALIAS).unwrap())
+                .with_kind_hint(SourceKind::SerializedFile),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    let locator = SourceLocator::path(SOURCE_ALIAS).unwrap();
+    let first_payload = PlanPayload::new(raw.clone());
+    let first_plan = MutationPlan::new(
+        workspace.workspace_id(),
+        workspace.revision(),
+        vec![SourceExpectation::new(
+            locator.clone(),
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, &bytes),
+        )],
+        vec![first_payload.clone()],
+        vec![GenericMutation::UnsafeRawReplace {
+            target: ObjectAddress::binary_at(locator.clone(), path_id).unwrap(),
+            expected_raw_digest: raw_digest,
+            payload: first_payload.digest(),
+            acknowledgement: UnsafeRawAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+        }],
+    )
+    .unwrap();
+
+    let first = workspace
+        .prepare(
+            first_plan,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    workspace
+        .commit(
+            first,
+            PublicationTarget::in_place(directory.path()).unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    let canonical = fs::read(&source_path).unwrap();
+    let second_payload = PlanPayload::new(raw);
+    let second_plan = MutationPlan::new(
+        workspace.workspace_id(),
+        workspace.revision(),
+        vec![SourceExpectation::new(
+            locator.clone(),
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, &canonical),
+        )],
+        vec![second_payload.clone()],
+        vec![GenericMutation::UnsafeRawReplace {
+            target: ObjectAddress::binary_at(locator, path_id).unwrap(),
+            expected_raw_digest: raw_digest,
+            payload: second_payload.digest(),
+            acknowledgement: UnsafeRawAcknowledgement::WireInvariantsAreCallersResponsibilityV1,
+        }],
+    )
+    .unwrap();
+    let prepared = workspace
+        .prepare(
+            second_plan,
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    assert_eq!(
+        prepared.report().base_revision(),
+        prepared.report().prepared_revision()
     );
 }

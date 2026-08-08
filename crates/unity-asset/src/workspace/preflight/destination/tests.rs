@@ -3,10 +3,11 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, SourceFingerprint, SourceKind,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, SourceFingerprint, SourceId, SourceKind,
+    WorkspaceId,
 };
 use unity_asset_write::artifact::{
-    ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, LogicalArtifactName,
+    ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, LogicalArtifactName, OutputSlot,
     PreparedArtifactSet,
 };
 
@@ -38,6 +39,28 @@ fn artifacts(names: &[&str]) -> PreparedArtifactSet {
     batch.finish().unwrap()
 }
 
+fn destination_source() -> SourceId {
+    SourceId::new(WorkspaceId::from_u128(1).unwrap(), SourceKind::Yaml, 1).unwrap()
+}
+
+fn exact_destination<'path>(
+    slot: OutputSlot,
+    name: &'path LogicalArtifactName,
+    target: &'path Path,
+    expectation: DestinationExpectation,
+) -> PublicationDestination<'path> {
+    PublicationDestination::exact(destination_source(), slot, name, target, expectation)
+}
+
+fn destination_under_root<'path>(
+    slot: OutputSlot,
+    name: &'path LogicalArtifactName,
+    root: &'path Path,
+    expectation: DestinationExpectation,
+) -> PublicationDestination<'path> {
+    PublicationDestination::under_root(destination_source(), slot, name, root, expectation)
+}
+
 fn declarations_under_root<'a>(
     artifacts: &'a PreparedArtifactSet,
     root: &'a Path,
@@ -45,7 +68,12 @@ fn declarations_under_root<'a>(
     artifacts
         .outputs()
         .map(|output| {
-            PublicationDestination::under_root(output.name(), root, DestinationExpectation::Observe)
+            destination_under_root(
+                output.slot(),
+                output.name(),
+                root,
+                DestinationExpectation::Observe,
+            )
         })
         .collect()
 }
@@ -80,12 +108,14 @@ fn observes_existing_and_nested_absent_outputs_in_canonical_order() {
     let artifacts = artifacts(&["z-existing.yaml", "nested/a-new.yaml"]);
     let outputs = artifacts.outputs().collect::<Vec<_>>();
     let declarations = vec![
-        PublicationDestination::under_root(
+        destination_under_root(
+            outputs[0].slot(),
             outputs[0].name(),
             directory.path(),
             DestinationExpectation::Observe,
         ),
-        PublicationDestination::under_root(
+        destination_under_root(
+            outputs[1].slot(),
             outputs[1].name(),
             directory.path(),
             DestinationExpectation::Observe,
@@ -96,9 +126,17 @@ fn observes_existing_and_nested_absent_outputs_in_canonical_order() {
         DestinationProofSet::observe(&artifacts, &declarations, &mut AssetLoadBudget::default())
             .unwrap();
 
-    assert_eq!(proof.bindings()[0].output_name(), "nested/a-new.yaml");
+    assert!(
+        proof.bindings()[0]
+            .target()
+            .ends_with(Path::new("nested/a-new.yaml"))
+    );
     assert_eq!(proof.bindings()[0].expected(), DestinationState::Absent);
-    assert_eq!(proof.bindings()[1].output_name(), "z-existing.yaml");
+    assert!(
+        proof.bindings()[1]
+            .target()
+            .ends_with(Path::new("z-existing.yaml"))
+    );
     assert_eq!(
         proof.bindings()[1].expected(),
         DestinationState::Existing(SourceFingerprint::from_bytes(
@@ -166,12 +204,14 @@ fn rejects_duplicate_targets_and_non_bijective_output_mappings() {
     let outputs = artifacts.outputs().collect::<Vec<_>>();
     let shared_target = directory.path().join("shared.yaml");
     let duplicates = vec![
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[0].slot(),
             outputs[0].name(),
             &shared_target,
             DestinationExpectation::Absent,
         ),
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[1].slot(),
             outputs[1].name(),
             &shared_target,
             DestinationExpectation::Absent,
@@ -185,7 +225,8 @@ fn rejects_duplicate_targets_and_non_bijective_output_mappings() {
         })
     ));
 
-    let missing = [PublicationDestination::under_root(
+    let missing = [destination_under_root(
+        outputs[0].slot(),
         outputs[0].name(),
         directory.path(),
         DestinationExpectation::Observe,
@@ -200,12 +241,14 @@ fn rejects_duplicate_targets_and_non_bijective_output_mappings() {
 
     let unknown_name = LogicalArtifactName::new("unknown.yaml").unwrap();
     let wrong = vec![
-        PublicationDestination::under_root(
+        destination_under_root(
+            outputs[0].slot(),
             &unknown_name,
             directory.path(),
             DestinationExpectation::Observe,
         ),
-        PublicationDestination::under_root(
+        destination_under_root(
+            outputs[0].slot(),
             outputs[0].name(),
             directory.path(),
             DestinationExpectation::Observe,
@@ -217,6 +260,29 @@ fn rejects_duplicate_targets_and_non_bijective_output_mappings() {
             output: 1,
             destination: 0,
         })
+    ));
+}
+
+#[test]
+fn rejects_a_foreign_output_capability_before_observing_the_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let prepared = artifacts(&["a.yaml"]);
+    let foreign = artifacts(&["a.yaml"]);
+    let output = prepared.outputs().next().unwrap();
+    let foreign_output = foreign.outputs().next().unwrap();
+    let target = directory.path().join("a.yaml");
+    fs::create_dir(&target).unwrap();
+    let declarations = [PublicationDestination::exact(
+        destination_source(),
+        foreign_output.slot(),
+        output.name(),
+        &target,
+        DestinationExpectation::Absent,
+    )];
+
+    assert!(matches!(
+        DestinationProofSet::observe(&prepared, &declarations, &mut AssetLoadBudget::default(),),
+        Err(DestinationProofError::OutputAuthorityMismatch { output: 0 })
     ));
 }
 
@@ -233,12 +299,14 @@ fn rejects_targets_that_alias_under_portable_filesystem_rules() {
         let first = directory.path().join(first_name);
         let second = directory.path().join(second_name);
         let declarations = [
-            PublicationDestination::exact(
+            exact_destination(
+                outputs[0].slot(),
                 outputs[0].name(),
                 &first,
                 DestinationExpectation::Absent,
             ),
-            PublicationDestination::exact(
+            exact_destination(
+                outputs[1].slot(),
                 outputs[1].name(),
                 &second,
                 DestinationExpectation::Absent,
@@ -268,17 +336,20 @@ fn distinguishes_destination_declaration_indices_from_canonical_output_ordinals(
     let middle_target = directory.path().join("middle.yaml");
 
     let duplicate_outputs = vec![
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[0].slot(),
             outputs[0].name(),
             &shared_target,
             DestinationExpectation::Absent,
         ),
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[1].slot(),
             outputs[1].name(),
             &middle_target,
             DestinationExpectation::Absent,
         ),
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[0].slot(),
             outputs[0].name(),
             &middle_target,
             DestinationExpectation::Absent,
@@ -297,17 +368,20 @@ fn distinguishes_destination_declaration_indices_from_canonical_output_ordinals(
     ));
 
     let duplicate_targets = vec![
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[0].slot(),
             outputs[0].name(),
             &shared_target,
             DestinationExpectation::Absent,
         ),
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[2].slot(),
             outputs[2].name(),
             &middle_target,
             DestinationExpectation::Absent,
         ),
-        PublicationDestination::exact(
+        exact_destination(
+            outputs[1].slot(),
             outputs[1].name(),
             &shared_target,
             DestinationExpectation::Absent,
@@ -336,8 +410,18 @@ fn revalidation_uses_canonical_output_ordinals_after_scrambled_declarations() {
     let artifacts = artifacts(&["z.yaml", "a.yaml"]);
     let outputs = artifacts.outputs().collect::<Vec<_>>();
     let declarations = vec![
-        PublicationDestination::exact(outputs[0].name(), &z_path, DestinationExpectation::Observe),
-        PublicationDestination::exact(outputs[1].name(), &a_path, DestinationExpectation::Observe),
+        exact_destination(
+            outputs[0].slot(),
+            outputs[0].name(),
+            &z_path,
+            DestinationExpectation::Observe,
+        ),
+        exact_destination(
+            outputs[1].slot(),
+            outputs[1].name(),
+            &a_path,
+            DestinationExpectation::Observe,
+        ),
     ];
     let proof =
         DestinationProofSet::observe(&artifacts, &declarations, &mut AssetLoadBudget::default())

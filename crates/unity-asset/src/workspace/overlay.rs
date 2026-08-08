@@ -279,31 +279,6 @@ impl PreparedStateCore {
             )
             .into());
         }
-        let comparisons = output_count
-            .checked_mul(source_bindings.len())
-            .and_then(|count| u64::try_from(count).ok())
-            .ok_or_else(|| {
-                WorkspaceError::operation(
-                    "prepared output ownership validation",
-                    std::io::Error::other("prepared output comparison count overflowed"),
-                )
-            })?;
-        budget
-            .consume_members(comparisons)
-            .map_err(WorkspaceError::from)?;
-        for output in artifacts.outputs() {
-            let owners = source_bindings
-                .iter()
-                .filter(|binding| binding.publication_root && binding.artifact == output.handle())
-                .take(2)
-                .count();
-            if owners != 1 {
-                return Err(invalid_prepared_state(
-                    "every prepared artifact output must belong to exactly one publication root",
-                )
-                .into());
-            }
-        }
 
         for (source, _) in base.state().catalog().iter() {
             if !catalog.contains(source) {

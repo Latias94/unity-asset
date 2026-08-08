@@ -5,9 +5,9 @@ use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
-use unity_asset_core::{AssetLoadBudget, BudgetError, SourceFingerprint, SourceKind};
+use unity_asset_core::{AssetLoadBudget, BudgetError, SourceFingerprint, SourceId, SourceKind};
 use unity_asset_write::artifact::{
-    LogicalArtifactName, PreparedArtifact, PreparedArtifactFormat, PreparedArtifactSet,
+    LogicalArtifactName, OutputSlot, PreparedArtifact, PreparedArtifactFormat, PreparedArtifactSet,
 };
 
 use super::super::portable_path::{PortablePathError, native_key};
@@ -42,9 +42,16 @@ enum DestinationLocation<'path> {
     UnderRoot(&'path Path),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PublicationAuthority {
+    source: SourceId,
+    output: OutputSlot,
+}
+
 /// One caller-declared output-to-filesystem binding.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PublicationDestination<'path> {
+    authority: PublicationAuthority,
     output: &'path LogicalArtifactName,
     location: DestinationLocation<'path>,
     expectation: DestinationExpectation,
@@ -52,24 +59,46 @@ pub(super) struct PublicationDestination<'path> {
 
 impl<'path> PublicationDestination<'path> {
     pub(super) const fn exact(
+        source: SourceId,
+        output_slot: OutputSlot,
         output: &'path LogicalArtifactName,
         target: &'path Path,
         expectation: DestinationExpectation,
     ) -> Self {
         Self {
+            authority: PublicationAuthority {
+                source,
+                output: output_slot,
+            },
             output,
             location: DestinationLocation::Exact(target),
             expectation,
         }
     }
 
+    #[must_use]
+    pub(super) const fn source(self) -> SourceId {
+        self.authority.source
+    }
+
+    #[must_use]
+    pub(super) const fn output_name(self) -> &'path LogicalArtifactName {
+        self.output
+    }
+
     #[cfg(test)]
     pub(super) const fn under_root(
+        source: SourceId,
+        output_slot: OutputSlot,
         output: &'path LogicalArtifactName,
         root: &'path Path,
         expectation: DestinationExpectation,
     ) -> Self {
         Self {
+            authority: PublicationAuthority {
+                source,
+                output: output_slot,
+            },
             output,
             location: DestinationLocation::UnderRoot(root),
             expectation,
@@ -100,6 +129,7 @@ impl DestinationProofSet {
         let mut outputs = budgeted_vec::<OutputView<'_>>(count, budget)?;
         for output in artifacts.outputs() {
             outputs.push(OutputView {
+                slot: output.slot(),
                 name: output.name(),
                 artifact: output.artifact(),
             });
@@ -185,11 +215,11 @@ impl DestinationProofSet {
     }
 
     #[must_use]
-    pub(crate) fn bindings(&self) -> &[DestinationProof] {
+    pub(super) fn bindings(&self) -> &[DestinationProof] {
         &self.bindings
     }
 
-    pub(crate) fn revalidate(
+    pub(super) fn revalidate(
         &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), DestinationProofError> {
@@ -202,15 +232,20 @@ impl DestinationProofSet {
 
 #[derive(Debug)]
 pub(crate) struct DestinationProof {
-    output_name: String,
+    authority: PublicationAuthority,
     parent: VerifiedPhysicalDirectoryBinding,
     evidence: DestinationEvidence,
 }
 
 impl DestinationProof {
     #[must_use]
-    pub(crate) fn output_name(&self) -> &str {
-        &self.output_name
+    pub(super) const fn source(&self) -> SourceId {
+        self.authority.source
+    }
+
+    #[must_use]
+    pub(super) const fn output(&self) -> OutputSlot {
+        self.authority.output
     }
 
     #[must_use]
@@ -249,7 +284,7 @@ impl DestinationProof {
         self.parent.path()
     }
 
-    fn revalidate(
+    pub(super) fn revalidate(
         &self,
         output: usize,
         budget: &mut AssetLoadBudget,
@@ -357,6 +392,7 @@ impl AbsentDestinationProof {
 
 #[derive(Clone, Copy)]
 struct OutputView<'artifact> {
+    slot: OutputSlot,
     name: &'artifact LogicalArtifactName,
     artifact: &'artifact PreparedArtifact,
 }
@@ -390,6 +426,9 @@ fn observe_destination(
     destination: PublicationDestination<'_>,
     budget: &mut AssetLoadBudget,
 ) -> Result<DestinationProof, DestinationProofError> {
+    if destination.authority.output != prepared.slot {
+        return Err(DestinationProofError::OutputAuthorityMismatch { output });
+    }
     let source_kind = artifact_source_kind(prepared.artifact)?;
     match destination.location {
         DestinationLocation::Exact(target) => {
@@ -399,7 +438,7 @@ fn observe_destination(
             let target = budgeted_path_copy(target, budget)?;
             observe_path(
                 output,
-                prepared.name,
+                destination.authority,
                 &target,
                 None,
                 destination.expectation,
@@ -415,7 +454,7 @@ fn observe_destination(
                 budgeted_path_join(root.path(), Path::new(prepared.name.as_str()), budget)?;
             let proof = observe_path(
                 output,
-                prepared.name,
+                destination.authority,
                 &target,
                 Some(root.path()),
                 destination.expectation,
@@ -431,7 +470,7 @@ fn observe_destination(
 
 fn observe_path(
     output: usize,
-    output_name: &LogicalArtifactName,
+    authority: PublicationAuthority,
     requested: &Path,
     containment_root: Option<&Path>,
     expectation: DestinationExpectation,
@@ -529,7 +568,7 @@ fn observe_path(
         }
     };
     Ok(DestinationProof {
-        output_name: budgeted_string(output_name.as_str(), budget)?,
+        authority,
         parent,
         evidence,
     })
@@ -686,24 +725,6 @@ fn budgeted_vec<T>(
     Ok(values)
 }
 
-fn budgeted_string(
-    value: &str,
-    budget: &mut AssetLoadBudget,
-) -> Result<String, DestinationProofError> {
-    let requested = checked_usize_to_u64(value.len())?;
-    budget.check_bytes(requested)?;
-    let mut copy = String::new();
-    copy.try_reserve_exact(value.len())
-        .map_err(|error| DestinationProofError::Allocation {
-            resource: "destination output name",
-            requested: value.len(),
-            message: error.to_string(),
-        })?;
-    copy.push_str(value);
-    budget.consume_bytes(checked_usize_to_u64(copy.capacity())?)?;
-    Ok(copy)
-}
-
 fn budgeted_path_copy(
     value: &Path,
     budget: &mut AssetLoadBudget,
@@ -820,6 +841,8 @@ pub(crate) enum DestinationProofError {
     },
     #[error("prepared output {output} does not match destination declaration {destination}")]
     OutputNameMismatch { output: usize, destination: usize },
+    #[error("prepared output {output} was bound with a foreign output capability")]
+    OutputAuthorityMismatch { output: usize },
     #[error("prepared outputs {first_output} and {second_output} resolve to the same destination")]
     DuplicateTarget {
         first_output: usize,

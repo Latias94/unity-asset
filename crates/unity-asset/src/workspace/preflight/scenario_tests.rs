@@ -20,16 +20,22 @@ use unity_asset_write::bundle::{BundleArtifactEntry, BundleWriter};
 use zip::CompressionMethod;
 use zip::write::FileOptions;
 
+use super::destination::{DestinationExpectation, DestinationProofSet, PublicationDestination};
 use super::runner::PrepareCheckpoint;
-use super::{PrepareFailureReport, PrepareOptions, PrepareReport, PreparedChange};
+use super::{
+    PrepareFailureReport, PrepareOptions, PrepareReport, PreparedChange, PreparedLogicalChanges,
+    PreparedPublicationError, PreparedPublicationSet,
+};
 use crate::reference::ReferenceFact;
 use crate::workspace::{
-    AssetWorkspace, FieldGuard, GenericMutation, MutationPlan, MutationValue, PlanPayload,
-    SourceExpectation, SourceOpenRequest, WorkspaceLookup, WorkspaceOptions, WorkspaceView,
+    AssetWorkspace, CommitError, FieldGuard, GenericMutation, MutationPlan, MutationValue,
+    PlanPayload, PublicationTarget, SourceExpectation, SourceOpenRequest, WorkspaceLookup,
+    WorkspaceOptions, WorkspaceView,
 };
 use crate::{
-    AssetLoadBudget, DigestV1, FieldPath, ObjectAddress, SourceAlias, SourceFingerprint, SourceId,
-    SourceKind, SourceLocator, UnityClass, UnityValue, WorkspaceId,
+    AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1, FieldPath, ObjectAddress, ObjectId,
+    SourceAlias, SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass, UnityValue,
+    WorkspaceId,
 };
 
 const TARGET_ALIAS: &str = "target.prefab";
@@ -141,6 +147,56 @@ fn artifact_output_bytes(prepared: &PreparedChange) -> Vec<u8> {
     let mut bytes = Vec::new();
     output.artifact().stream_verified_to(&mut bytes).unwrap();
     bytes
+}
+
+fn prepared_resource_change() -> (tempfile::TempDir, AssetWorkspace, PreparedChange) {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(RESOURCE_ALIAS);
+    fs::write(&path, RESOURCE_YAML).unwrap();
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_source(
+            SourceOpenRequest::new(&path, SourceAlias::new(RESOURCE_ALIAS).unwrap())
+                .with_kind_hint(SourceKind::Yaml),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let prepared = workspace
+        .prepare(
+            resource_plan(
+                &workspace,
+                SourceLocator::path(RESOURCE_ALIAS).unwrap(),
+                RESOURCE_YAML.as_bytes(),
+                b"replacement payload",
+            ),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    (directory, workspace, prepared)
+}
+
+fn observe_prepared_destinations(prepared: &PreparedChange) -> DestinationProofSet {
+    let destinations = prepared
+        .publications()
+        .iter()
+        .map(|publication| {
+            let output = prepared.artifacts().output(publication.output()).unwrap();
+            PublicationDestination::exact(
+                publication.source(),
+                publication.output(),
+                output.name(),
+                publication.target(),
+                DestinationExpectation::Observe,
+            )
+        })
+        .collect::<Vec<_>>();
+    DestinationProofSet::observe(
+        prepared.artifacts(),
+        &destinations,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap()
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -371,6 +427,149 @@ fn assert_prepared_resource(
 }
 
 #[test]
+fn prepared_publication_source_index_is_exactly_budgeted() {
+    let (_directory, _workspace, prepared) = prepared_resource_change();
+    let mut probe = AssetLoadBudget::default();
+    PreparedPublicationSet::seal(
+        observe_prepared_destinations(&prepared),
+        prepared.state().as_ref(),
+        &mut probe,
+    )
+    .unwrap();
+    let usage = probe.usage();
+    assert!(usage.bytes > 0);
+    assert!(usage.entries > 0);
+    assert!(usage.members > 0);
+
+    let limits = AssetLoadLimits {
+        max_bytes: usage.bytes,
+        max_entries: usage.entries,
+        max_members: usage.members,
+        ..AssetLoadLimits::default()
+    };
+    let mut exact = AssetLoadBudget::new(limits).unwrap();
+    PreparedPublicationSet::seal(
+        observe_prepared_destinations(&prepared),
+        prepared.state().as_ref(),
+        &mut exact,
+    )
+    .unwrap();
+    assert_eq!(exact.usage(), usage);
+
+    let mut byte_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: usage.bytes - 1,
+        ..limits
+    })
+    .unwrap();
+    assert!(matches!(
+        PreparedPublicationSet::seal(
+            observe_prepared_destinations(&prepared),
+            prepared.state().as_ref(),
+            &mut byte_short,
+        ),
+        Err(PreparedPublicationError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
+    ));
+
+    let mut entry_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_entries: usage.entries - 1,
+        ..limits
+    })
+    .unwrap();
+    assert!(matches!(
+        PreparedPublicationSet::seal(
+            observe_prepared_destinations(&prepared),
+            prepared.state().as_ref(),
+            &mut entry_short,
+        ),
+        Err(PreparedPublicationError::Budget(BudgetError::Exceeded {
+            resource: "entries",
+            ..
+        }))
+    ));
+
+    let mut member_short = AssetLoadBudget::new(AssetLoadLimits {
+        max_members: usage.members - 1,
+        ..limits
+    })
+    .unwrap();
+    assert!(matches!(
+        PreparedPublicationSet::seal(
+            observe_prepared_destinations(&prepared),
+            prepared.state().as_ref(),
+            &mut member_short,
+        ),
+        Err(PreparedPublicationError::Budget(BudgetError::Exceeded {
+            resource: "members",
+            ..
+        }))
+    ));
+    assert_eq!(member_short.usage(), Default::default());
+}
+
+#[test]
+fn prepared_publication_set_rejects_swapped_source_authority() {
+    let (_directory, _workspace, prepared) = prepared_resource_change();
+    let publications = prepared.publications().iter().collect::<Vec<_>>();
+    assert_eq!(publications.len(), 2);
+    let destinations = publications
+        .iter()
+        .enumerate()
+        .map(|(ordinal, publication)| {
+            let output = prepared.artifacts().output(publication.output()).unwrap();
+            PublicationDestination::exact(
+                publications[1 - ordinal].source(),
+                publication.output(),
+                output.name(),
+                publication.target(),
+                DestinationExpectation::Observe,
+            )
+        })
+        .collect::<Vec<_>>();
+    let proofs = DestinationProofSet::observe(
+        prepared.artifacts(),
+        &destinations,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        PreparedPublicationSet::seal(
+            proofs,
+            prepared.state().as_ref(),
+            &mut AssetLoadBudget::default(),
+        ),
+        Err(PreparedPublicationError::SourceBindingMismatch { output: 0, .. })
+    ));
+}
+
+#[test]
+fn prepared_logical_changes_own_canonicalization_and_changed_source_projection() {
+    let workspace = WorkspaceId::from_u128(0x1c0).unwrap();
+    let first = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
+    let second = SourceId::new(workspace, SourceKind::Yaml, 2).unwrap();
+    let first_object = ObjectId::yaml_document(first, 1).unwrap();
+    let second_object = ObjectId::yaml_document(second, 0).unwrap();
+
+    let changes = PreparedLogicalChanges::from_actual_sources_and_touched_objects(
+        vec![second, first, first],
+        vec![second_object.clone(), first_object.clone(), first_object],
+    );
+    assert_eq!(changes.sources(), &[first, second]);
+    assert_eq!(
+        changes.objects(),
+        &[ObjectId::yaml_document(first, 1).unwrap(), second_object]
+    );
+
+    let outside = ObjectId::yaml_document(second, 1).unwrap();
+    let projected =
+        PreparedLogicalChanges::from_actual_sources_and_touched_objects(vec![first], vec![outside]);
+    assert!(projected.objects().is_empty());
+}
+
+#[test]
 fn standalone_resource_replace_publishes_a_companion_and_reparses_it() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join(RESOURCE_ALIAS);
@@ -401,6 +600,32 @@ fn standalone_resource_replace_publishes_a_companion_and_reparses_it() {
 
     let sidecar_name = assert_prepared_resource(&prepared, locator, payload, parent, true);
     assert_eq!(prepared.report().artifacts().outputs(), 2);
+    assert_eq!(prepared.publications().len(), 2);
+    assert!(
+        prepared
+            .publications()
+            .iter()
+            .map(|publication| {
+                prepared
+                    .artifacts()
+                    .output(publication.output())
+                    .unwrap()
+                    .name()
+            })
+            .is_sorted(),
+        "prepared publication authority must retain one deterministic logical-name order"
+    );
+    for publication in prepared.publications().iter() {
+        let artifact = prepared.artifacts().output(publication.output()).unwrap();
+        let source = prepared
+            .report()
+            .sources()
+            .iter()
+            .find(|report| report.source_id() == publication.source())
+            .expect("publication authority source must have a prepared report");
+        assert!(source.publication_root());
+        assert_eq!(source.artifact_digest(), artifact.artifact().digest());
+    }
     let sidecar_output = prepared
         .artifacts()
         .outputs()
@@ -412,6 +637,70 @@ fn standalone_resource_replace_publishes_a_companion_and_reparses_it() {
         .stream_verified_to(&mut sidecar_bytes)
         .unwrap();
     assert_eq!(sidecar_bytes, payload);
+}
+
+#[test]
+fn commit_rejects_a_companion_that_appears_after_prepare() {
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join(RESOURCE_ALIAS);
+    fs::write(&source_path, RESOURCE_YAML).unwrap();
+    let mut workspace = AssetWorkspace::new().unwrap();
+    let parent = workspace
+        .load_source(
+            SourceOpenRequest::new(&source_path, SourceAlias::new(RESOURCE_ALIAS).unwrap())
+                .with_kind_hint(SourceKind::Yaml),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let locator = SourceLocator::path(RESOURCE_ALIAS).unwrap();
+    let payload = b"standalone replacement payload";
+    let prepared = workspace
+        .prepare(
+            resource_plan(
+                &workspace,
+                locator.clone(),
+                RESOURCE_YAML.as_bytes(),
+                payload,
+            ),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let base_revision = prepared.report().base_revision();
+    let source_before = fs::read(&source_path).unwrap();
+    let sidecar_name = assert_prepared_resource(&prepared, locator, payload, parent, true);
+    let output = prepared
+        .publications()
+        .iter()
+        .position(|publication| {
+            prepared
+                .artifacts()
+                .output(publication.output())
+                .is_ok_and(|output| output.name().as_str() == sidecar_name)
+        })
+        .expect("companion must own a canonical publication ordinal");
+    let sidecar_path = directory.path().join(&sidecar_name);
+    let external = b"external companion";
+    fs::write(&sidecar_path, external).unwrap();
+
+    let error = workspace
+        .commit(
+            prepared,
+            PublicationTarget::in_place(directory.path()).unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        CommitError::DestinationConflict {
+            output: actual,
+            ..
+        } if actual == output
+    ));
+    assert_eq!(workspace.revision(), base_revision);
+    assert_eq!(fs::read(source_path).unwrap(), source_before);
+    assert_eq!(fs::read(sidecar_path).unwrap(), external);
 }
 
 #[test]

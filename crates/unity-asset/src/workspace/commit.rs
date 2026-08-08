@@ -18,6 +18,7 @@ use unity_asset_core::{
 use unity_asset_write::artifact::{ArtifactHandle, LogicalArtifactName};
 
 use super::portable_path::{PortablePathError, slash_key};
+use super::preflight::PreparedInputProofError;
 use super::preflight::destination::{DestinationProofError, DestinationState};
 use super::preflight::source_proof::PhysicalDependencyProofError;
 use super::source_catalog::CatalogError;
@@ -709,84 +710,32 @@ fn preflight_commit(
         .state()
         .installation_for_catalog(core.catalog())
         .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
-    let publication_root_count = core
-        .source_bindings()
-        .iter()
-        .filter(|binding| binding.is_publication_root())
-        .count();
-    let mut publication_roots =
-        budgeted_vec(publication_root_count, "commit publication roots", budget)?;
-    for binding in core
-        .source_bindings()
-        .iter()
-        .filter(|binding| binding.is_publication_root())
-    {
-        publication_roots.push(binding);
-    }
-    publication_roots.sort_unstable_by_key(|binding| binding.artifact().ordinal());
-    if publication_roots
-        .windows(2)
-        .any(|pair| pair[0].artifact() == pair[1].artifact())
-    {
-        return Err(CommitPreflightError::Ownership(
-            "two publication roots claim the same artifact".to_owned(),
-        ));
-    }
-
-    let proofs = prepared.destination_proofs().bindings();
-    if proofs.len() != prepared.artifacts().len()
-        || publication_roots.len() != prepared.artifacts().len()
-    {
-        return Err(CommitPreflightError::Ownership(
-            "artifact, source, and destination counts disagree".to_owned(),
-        ));
-    }
     let mut publications = budgeted_vec(
-        prepared.artifacts().len(),
+        prepared.publications().len(),
         "commit publication bindings",
         budget,
     )?;
-    for output in prepared.artifacts().outputs() {
-        let binding_index = publication_roots
-            .binary_search_by_key(&output.handle().ordinal(), |binding| {
-                binding.artifact().ordinal()
-            })
-            .map_err(|_| {
-                CommitPreflightError::Ownership(format!(
-                    "output {} has no publication source",
-                    output.name()
-                ))
-            })?;
-        let binding = publication_roots[binding_index];
-        if binding.artifact() != output.handle() {
-            return Err(CommitPreflightError::Ownership(
-                "publication source belongs to another artifact graph".to_owned(),
-            ));
-        }
-        let proof_index = proofs
-            .binary_search_by(|proof| proof.output_name().cmp(output.name().as_str()))
-            .map_err(|_| {
-                CommitPreflightError::Ownership(format!(
-                    "output {} has no destination proof",
-                    output.name()
-                ))
-            })?;
-        let proof = &proofs[proof_index];
-        let relative_target = relative_target(&target.root, proof.target(), budget)?;
+    for (ordinal, binding) in prepared.publications().iter().enumerate() {
+        let output = prepared
+            .artifacts()
+            .output(binding.output())
+            .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
+        let artifact = output.artifact();
+        let relative_target = relative_target(&target.root, binding.target(), budget)?;
         let logical_name =
             budgeted_string_copy(output.name().as_str(), "commit logical name", budget)?;
-        let target_path = budgeted_path_copy(proof.target(), "commit target path", budget)?;
+        let target_path = budgeted_path_copy(binding.target(), "commit target path", budget)?;
         let filesystem_anchor = budgeted_path_copy(
-            proof.filesystem_anchor(),
+            binding.filesystem_anchor(),
             "commit filesystem anchor",
             budget,
         )?;
-        let expected_identity = proof
+        let expected_identity = binding
             .existing_file_identity()
             .map(FileIdentity::from_physical);
         let destination_parent_identity =
-            DirectoryIdentity::from_physical(proof.destination_parent_identity());
-        let ordinal = u32::try_from(publications.len()).map_err(|_| {
+            DirectoryIdentity::from_physical(binding.destination_parent_identity());
+        let ordinal = u32::try_from(ordinal).map_err(|_| {
             CommitPreflightError::Budget(BudgetError::ArithmeticOverflow {
                 resource: "commit publication ordinal",
             })
@@ -800,40 +749,27 @@ fn preflight_commit(
             relative_target,
             filesystem_anchor,
             destination_parent_identity,
-            expected: proof.expected(),
+            expected: binding.expected(),
             expected_identity,
             staged_identity: None,
-            digest: output.artifact().digest(),
-            bytes: output.artifact().len(),
+            digest: artifact.digest(),
+            bytes: artifact.len(),
         });
     }
-    publications.sort_unstable_by(|left, right| left.logical_name.cmp(&right.logical_name));
-    for (ordinal, publication) in publications.iter_mut().enumerate() {
-        publication.ordinal = u32::try_from(ordinal).map_err(|_| {
-            CommitPreflightError::Budget(BudgetError::ArithmeticOverflow {
-                resource: "commit publication ordinal",
-            })
-        })?;
-    }
 
-    let mut changed_sources =
-        budgeted_vec(report.sources().len(), "commit changed sources", budget)?;
-    for source in report.sources() {
-        if source.base_fingerprint() != Some(source.prepared_fingerprint()) {
-            changed_sources.push(source.source_id());
-        }
-    }
-    changed_sources.sort_unstable();
-    changed_sources.dedup();
+    let logical_changes = prepared.logical_changes();
+    let mut changed_sources = budgeted_vec(
+        logical_changes.sources().len(),
+        "commit changed sources",
+        budget,
+    )?;
+    changed_sources.extend_from_slice(logical_changes.sources());
     let mut changed_objects = budgeted_vec(
-        prepared.changed_objects().len(),
+        logical_changes.objects().len(),
         "commit changed objects",
         budget,
     )?;
-    for object in prepared.changed_objects() {
-        if changed_sources.binary_search(&object.source()).is_err() {
-            continue;
-        }
+    for object in logical_changes.objects() {
         let retained = usize_to_u64(
             object.retained_clone_bytes(),
             "commit changed object identity",
@@ -844,7 +780,7 @@ fn preflight_commit(
         changed_objects.push(object);
     }
     let identity_remaps = Vec::new();
-    let recovery_baseline = plan_recovery_baseline(prepared, &publications, budget)?;
+    let recovery_baseline = plan_recovery_baseline(prepared, budget)?;
     let root = target
         .root
         .to_str()
@@ -1229,13 +1165,8 @@ impl AssetWorkspace {
             });
         }
         prepared
-            .source_proofs()
-            .revalidate(budget)
-            .map_err(map_source_proof_error)?;
-        prepared
-            .destination_proofs()
-            .revalidate(budget)
-            .map_err(map_destination_proof_error)?;
+            .revalidate_publication_inputs(budget)
+            .map_err(map_prepared_input_proof_error)?;
         let preflight = preflight_commit(prepared, target, budget).map_err(map_preflight_error)?;
         let CommitPreflight {
             mut publications,
@@ -1504,15 +1435,8 @@ impl AssetWorkspace {
         let directory_identities = directories.identities.clone();
         drop(directories);
         let final_validation = prepared
-            .source_proofs()
-            .revalidate(budget)
-            .map_err(map_source_proof_error)
-            .and_then(|()| {
-                prepared
-                    .destination_proofs()
-                    .revalidate(budget)
-                    .map_err(map_destination_proof_error)
-            });
+            .revalidate_publication_inputs(budget)
+            .map_err(map_prepared_input_proof_error);
         if let Err(error) = final_validation {
             return Err(cleanup_prejournal_error(
                 &layout,
@@ -2093,7 +2017,6 @@ fn map_recovery_baseline_path_error(error: CommitPreflightError) -> RecoveryBase
 
 fn plan_recovery_baseline(
     prepared: &PreparedChange,
-    publications: &[PreparedPublication],
     budget: &mut AssetLoadBudget,
 ) -> Result<JournalBaseline, CommitPreflightError> {
     let core = prepared.state().core();
@@ -2103,16 +2026,20 @@ fn plan_recovery_baseline(
     let mut sources = budgeted_vec(bindings.len(), "recovery baseline sources", budget)?;
     for (index, binding) in bindings.iter().enumerate() {
         let image = if binding.is_publication_root() {
-            let publication = publications
-                .iter()
-                .find(|publication| publication.artifact == binding.artifact())
+            let ordinal = prepared
+                .publications()
+                .ordinal_for_source(binding.source())
                 .ok_or_else(|| {
                     CommitPreflightError::Ownership(
                         "publication root has no output ordinal".to_owned(),
                     )
                 })?;
             JournalBaselineImage::Published {
-                artifact: publication.ordinal,
+                artifact: u32::try_from(ordinal).map_err(|_| {
+                    CommitPreflightError::Budget(BudgetError::ArithmeticOverflow {
+                        resource: "recovery published artifact ordinal",
+                    })
+                })?,
             }
         } else {
             let artifact = prepared
@@ -2871,6 +2798,13 @@ fn validate_publication_hardlinks(
         }
     }
     Ok(())
+}
+
+fn map_prepared_input_proof_error(error: PreparedInputProofError) -> PreparePublicationError {
+    match error {
+        PreparedInputProofError::Source(error) => map_source_proof_error(*error),
+        PreparedInputProofError::Destination(error) => map_destination_proof_error(error),
+    }
 }
 
 fn map_source_proof_error(error: PhysicalDependencyProofError) -> PreparePublicationError {
