@@ -11,10 +11,93 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::ffi::OsStr;
 
+use serde::{Deserialize, Serialize};
 use unity_asset_core::{DigestBuildError, DigestV1, DigestV1Builder};
 use unity_asset_search_protocol::{MAX_PORTABLE_PATH_BYTES, ProjectId};
 
-const PROJECT_PATH_IDENTITY_DOMAIN: &[u8] = b"unity-asset:project-path:v1\0";
+const PROJECT_PATH_IDENTITY_DOMAIN: &[u8] = b"unity-asset:project-path:v2\0";
+
+/// Equality semantics used to derive a persisted project-path identity.
+///
+/// This value is part of the identity contract. An index produced with one path model must never
+/// silently compare its persisted keys with paths produced by another model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPathSemantics {
+    UnixExactBytesV1,
+    WindowsOrdinalIgnoreCaseV1,
+}
+
+impl ProjectPathSemantics {
+    #[cfg(not(windows))]
+    pub const CURRENT: Self = Self::UnixExactBytesV1;
+    #[cfg(windows)]
+    pub const CURRENT: Self = Self::WindowsOrdinalIgnoreCaseV1;
+
+    const fn digest_tag(self) -> &'static [u8] {
+        match self {
+            Self::UnixExactBytesV1 => b"unix-exact-bytes-v1\0",
+            Self::WindowsOrdinalIgnoreCaseV1 => b"windows-ordinal-ignore-case-v1\0",
+        }
+    }
+}
+
+/// Stable authority for one path inside a project coordinate space.
+///
+/// Display spelling is deliberately absent. On Windows, case-only renames retain this identity;
+/// on Unix, byte-distinct spellings remain distinct identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectPathIdentity {
+    project_id: ProjectId,
+    semantics: ProjectPathSemantics,
+    digest: DigestV1,
+}
+
+impl ProjectPathIdentity {
+    #[must_use]
+    pub const fn project_id(self) -> ProjectId {
+        self.project_id
+    }
+
+    #[must_use]
+    pub const fn semantics(self) -> ProjectPathSemantics {
+        self.semantics
+    }
+
+    #[must_use]
+    pub const fn digest(self) -> DigestV1 {
+        self.digest
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; DigestV1::BYTE_LEN] {
+        self.digest.as_bytes()
+    }
+
+    /// Verifies that a persisted display spelling still denotes this identity on the current
+    /// platform path model.
+    pub(crate) fn validate_relative_path(
+        self,
+        relative_path: &str,
+    ) -> Result<(), ProjectPathError> {
+        if self.semantics != ProjectPathSemantics::CURRENT {
+            return Err(ProjectPathError::UnsupportedSemantics {
+                expected: ProjectPathSemantics::CURRENT,
+                actual: self.semantics,
+            });
+        }
+        let actual = ProjectPath::new(self.project_id, PathBuf::from(relative_path))?.identity();
+        if actual != self {
+            return Err(ProjectPathError::IdentityMismatch {
+                path: PathBuf::from(relative_path),
+                expected: Box::new(self),
+                actual: Box::new(actual),
+            });
+        }
+        Ok(())
+    }
+}
 
 /// Lexical coordinate system for one already-verified project root.
 ///
@@ -45,6 +128,25 @@ impl ProjectPathSpace {
     #[must_use]
     pub fn project_id(&self) -> ProjectId {
         self.inner.project_id
+    }
+
+    /// Rebinds a persisted path identity to this project coordinate space.
+    ///
+    /// A persisted identity cannot prove its own project ownership: its digest is derived from the
+    /// embedded project ID. Callers reopening durable state must validate against the currently
+    /// authorized project before accepting the display spelling.
+    pub fn validate_identity(
+        &self,
+        identity: ProjectPathIdentity,
+        relative_path: &str,
+    ) -> Result<(), ProjectPathError> {
+        if identity.project_id() != self.project_id() {
+            return Err(ProjectPathError::DifferentProject {
+                expected: self.project_id(),
+                actual: identity.project_id(),
+            });
+        }
+        identity.validate_relative_path(relative_path)
     }
 
     #[must_use]
@@ -115,7 +217,7 @@ pub struct ProjectPath {
     project_id: ProjectId,
     relative: PathBuf,
     key: ProjectPathKey,
-    identity: DigestV1,
+    identity: ProjectPathIdentity,
 }
 
 impl ProjectPath {
@@ -147,7 +249,7 @@ impl ProjectPath {
     }
 
     #[must_use]
-    pub const fn identity(&self) -> DigestV1 {
+    pub const fn identity(&self) -> ProjectPathIdentity {
         self.identity
     }
 
@@ -278,6 +380,15 @@ pub enum ProjectPathError {
         expected: ProjectId,
         actual: ProjectId,
     },
+    UnsupportedSemantics {
+        expected: ProjectPathSemantics,
+        actual: ProjectPathSemantics,
+    },
+    IdentityMismatch {
+        path: PathBuf,
+        expected: Box<ProjectPathIdentity>,
+        actual: Box<ProjectPathIdentity>,
+    },
     SizeOverflow {
         resource: &'static str,
     },
@@ -320,6 +431,19 @@ impl fmt::Display for ProjectPathError {
             Self::DifferentProject { expected, actual } => write!(
                 formatter,
                 "project path belongs to {actual}, but this path space belongs to {expected}"
+            ),
+            Self::UnsupportedSemantics { expected, actual } => write!(
+                formatter,
+                "project path uses {actual:?} semantics, but this runtime requires {expected:?}"
+            ),
+            Self::IdentityMismatch {
+                path,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "project path {} has identity {actual:?}, not persisted identity {expected:?}",
+                path.display()
             ),
             Self::SizeOverflow { resource } => {
                 write!(formatter, "project path {resource} size overflow")
@@ -413,10 +537,13 @@ impl ProjectPathKey {
 fn project_path_identity(
     project_id: ProjectId,
     key: &ProjectPathKey,
-) -> Result<DigestV1, ProjectPathError> {
+) -> Result<ProjectPathIdentity, ProjectPathError> {
+    let semantics = ProjectPathSemantics::CURRENT;
+    let semantics_tag = semantics.digest_tag();
     let key_bytes = key.encoded_bytes()?;
     let declared_length = u64::try_from(PROJECT_PATH_IDENTITY_DOMAIN.len())
         .ok()
+        .and_then(|length| length.checked_add(semantics_tag.len() as u64))
         .and_then(|length| length.checked_add(project_id.as_bytes().len() as u64))
         .and_then(|length| length.checked_add(key_bytes))
         .ok_or(ProjectPathError::SizeOverflow {
@@ -424,9 +551,14 @@ fn project_path_identity(
         })?;
     let mut digest = DigestV1Builder::new(declared_length);
     digest.update(PROJECT_PATH_IDENTITY_DOMAIN)?;
+    digest.update(semantics_tag)?;
     digest.update(project_id.as_bytes())?;
     key.update_digest(&mut digest)?;
-    Ok(digest.finalize()?)
+    Ok(ProjectPathIdentity {
+        project_id,
+        semantics,
+        digest: digest.finalize()?,
+    })
 }
 
 fn normalize_relative_path(
@@ -866,6 +998,33 @@ mod tests {
         assert!(matches!(
             paths.insert(foreign),
             Err(ProjectPathError::DifferentProject { .. })
+        ));
+    }
+
+    #[test]
+    fn persisted_identity_must_rebind_to_the_current_project() {
+        let current = space();
+        let relative_path = "Assets/Hero.prefab";
+        let identity = current
+            .resolve(Path::new(relative_path))
+            .unwrap()
+            .unwrap()
+            .identity();
+
+        current.validate_identity(identity, relative_path).unwrap();
+
+        assert!(matches!(
+            current.validate_identity(identity, "Assets/Villain.prefab"),
+            Err(ProjectPathError::IdentityMismatch { .. })
+        ));
+
+        let foreign = ProjectPathSpace::new(current.root().to_path_buf(), project_id(2)).unwrap();
+        assert!(matches!(
+            foreign.validate_identity(identity, relative_path),
+            Err(ProjectPathError::DifferentProject {
+                expected,
+                actual,
+            }) if expected == project_id(2) && actual == project_id(1)
         ));
     }
 

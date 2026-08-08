@@ -17,10 +17,10 @@ use crate::analysis::ReferenceProjectionFact;
 use crate::anchored_fs::{AnchoredFsError as SecureReadError, RegularFile, RegularFileRange};
 use crate::projection::ReferenceDocument;
 
-pub(crate) const REFERENCE_PAYLOAD_FILE: &str = "reference-payload-v3.jsonl";
+pub(crate) const REFERENCE_PAYLOAD_FILE: &str = "reference-payload-v4.jsonl";
 pub(crate) const MAX_REFERENCE_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const MAX_REFERENCE_PAYLOAD_BYTES_U64: u64 = 4 * 1024 * 1024;
-const REFERENCE_PAYLOAD_CONTRACT_VERSION: u16 = 3;
+const REFERENCE_PAYLOAD_CONTRACT_VERSION: u16 = 4;
 const REFERENCE_PAYLOAD_JSON_MAX_DEPTH: u32 = 40;
 const REFERENCE_PAYLOAD_JSON_MAX_VALUES: u64 = 128 * 1024;
 // The fixed materialization reserve covers the current payload envelope and parser scratch. The

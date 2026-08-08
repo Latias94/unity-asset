@@ -5,9 +5,9 @@ use super::source_state::{SOURCE_STATE_CONTRACT_VERSION, SOURCE_STATE_LOGICAL_ID
 use super::{
     GenerationActivationEvidence, GenerationBuild, GenerationFailpoint,
     GenerationPublishWarningKind, GenerationStartupDisposition, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions, IndexRebuildReason, TransactionReceiptWindow,
-    activation_file_name, activation_staging_file_name, quarantine_directory_name,
-    staging_directory_name,
+    GenerationStoreError, GenerationStoreOptions, IndexRebuildReason, SOURCE_STATE_FILE,
+    TransactionReceiptWindow, activation_file_name, activation_staging_file_name,
+    quarantine_directory_name, staging_directory_name,
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
@@ -74,6 +74,21 @@ fn open_store_with_startup_disposition(
     )
 }
 
+fn open_store_with_startup_failpoint(
+    root: impl AsRef<Path>,
+    options: GenerationStoreOptions,
+    failpoint: GenerationFailpoint,
+) -> Result<super::OpenedGenerationStore, GenerationStoreError> {
+    let root = super::initialize_root(root.as_ref())?;
+    GenerationStore::open_at_root(
+        root,
+        super::GenerationStoreRootAuthority::Fixture,
+        options,
+        &mut AssetLoadBudget::default(),
+        Some(failpoint),
+    )
+}
+
 fn write_activation_record(
     root: &Path,
     ordinal: u64,
@@ -105,6 +120,34 @@ fn write_activation_record(
         .join(activation_file_name(ordinal));
     fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
     (generation, path)
+}
+
+fn assert_rebuild_required(
+    disposition: GenerationStartupDisposition,
+    reason: IndexRebuildReason,
+    activation_ordinal: u64,
+    generation: SearchGenerationId,
+) {
+    let GenerationStartupDisposition::RebuildRequired(required) = disposition else {
+        panic!("expected a rebuild-required startup disposition");
+    };
+    let expected_revision = revision(&format!("revision-{activation_ordinal}"));
+    assert_eq!(required.reason, reason);
+    assert_eq!(required.activation_ordinal, activation_ordinal);
+    assert_eq!(required.generation, generation);
+    assert_eq!(
+        required.bootstrap.workspace(),
+        WorkspaceId::from_u128(0x9001).unwrap()
+    );
+    assert_eq!(required.bootstrap.actual_revision(), expected_revision);
+    assert_eq!(required.bootstrap.desired_revision(), expected_revision);
+    assert!(
+        required
+            .bootstrap
+            .transaction_receipts()
+            .as_slice()
+            .is_empty()
+    );
 }
 
 fn budget_for_usage(usage: AssetLoadUsage, max_bytes: u64) -> AssetLoadBudget {
@@ -208,7 +251,7 @@ fn write_artifacts_for_workspace(build: &GenerationBuild, label: &str, workspace
     )
     .unwrap();
     fs::write(
-        build.source_state_directory().join("source-state-v3.json"),
+        build.source_state_directory().join(SOURCE_STATE_FILE),
         source_state_payload_for_workspace(label, workspace).0,
     )
     .unwrap();
@@ -449,7 +492,7 @@ fn corrupt_historical_head_does_not_hide_a_valid_latest_head() {
 }
 
 #[test]
-fn obsolete_activation_contracts_require_rebuild_and_retire_the_cache_authority() {
+fn obsolete_activation_contracts_remain_as_durable_rebuild_heads() {
     for contract_version in [
         super::LEGACY_ACTIVATION_CONTRACT_VERSION,
         super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
@@ -457,7 +500,8 @@ fn obsolete_activation_contracts_require_rebuild_and_retire_the_cache_authority(
         let temporary = TempDir::new().unwrap();
         let options = GenerationStoreOptions::default();
         drop(open_store(temporary.path(), options).unwrap());
-        let (generation, _) = write_activation_record(temporary.path(), 1, contract_version, None);
+        let (generation, activation_path) =
+            write_activation_record(temporary.path(), 1, contract_version, None);
         let obsolete_generation =
             temporary
                 .path()
@@ -471,26 +515,126 @@ fn obsolete_activation_contracts_require_rebuild_and_retire_the_cache_authority(
 
         let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
         let (store, recovery, disposition) = opened.into_parts();
-        assert_eq!(recovery.unwrap().removed_entries(), 2);
+        assert_eq!(recovery.unwrap().removed_entries(), 1);
         assert_eq!(store.active(), None);
-        assert_eq!(
+        assert_rebuild_required(
             disposition,
-            GenerationStartupDisposition::RebuildRequired(super::IndexRebuildRequired {
-                reason: IndexRebuildReason::ObsoleteActivationContract {
-                    actual: contract_version,
-                },
-                activation_ordinal: 1,
-                generation,
-            })
+            IndexRebuildReason::ObsoleteActivationContract {
+                actual: contract_version,
+            },
+            1,
+            generation,
         );
         assert!(!obsolete_generation.exists());
         assert_eq!(
             fs::read_dir(temporary.path().join(super::ACTIVATIONS_DIRECTORY))
                 .unwrap()
                 .count(),
-            0
+            1
         );
+        assert!(activation_path.is_file());
     }
+}
+
+#[test]
+fn activation_v2_preserves_a_distinct_desired_revision_in_the_rebuild_bootstrap() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    drop(open_store(temporary.path(), options).unwrap());
+    let (generation, activation_path) = write_activation_record(
+        temporary.path(),
+        1,
+        super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+        None,
+    );
+    let desired = revision("desired-after-rebuild");
+    let mut activation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+    activation["desired_revision"] = serde_json::to_value(desired).unwrap();
+    fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (_, recovery, disposition) = opened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    let GenerationStartupDisposition::RebuildRequired(required) = disposition else {
+        panic!("expected a rebuild-required startup disposition");
+    };
+    assert_eq!(required.generation, generation);
+    assert_eq!(required.bootstrap.actual_revision(), revision("revision-1"));
+    assert_eq!(required.bootstrap.desired_revision(), desired);
+}
+
+#[test]
+fn obsolete_activation_contracts_require_exact_wire_before_rebuild() {
+    let cases = [
+        (
+            super::LEGACY_ACTIVATION_CONTRACT_VERSION,
+            "desired_revision",
+            Some(serde_json::to_value(revision("unexpected-desired")).unwrap()),
+        ),
+        (
+            super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+            "desired_revision",
+            None,
+        ),
+        (
+            super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+            "desired_revision",
+            Some(serde_json::Value::Null),
+        ),
+    ];
+
+    for (contract_version, field, replacement) in cases {
+        let temporary = TempDir::new().unwrap();
+        let options = GenerationStoreOptions::default();
+        drop(open_store(temporary.path(), options).unwrap());
+        let (_, activation_path) =
+            write_activation_record(temporary.path(), 1, contract_version, None);
+        let mut activation: serde_json::Value =
+            serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+        match replacement {
+            Some(value) => activation[field] = value,
+            None => {
+                activation.as_object_mut().unwrap().remove(field);
+            }
+        }
+        fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+        let error = open_store_with_startup_disposition(temporary.path(), options).unwrap_err();
+        assert!(matches!(
+            error,
+            GenerationStoreError::InvalidGenerationHead { .. }
+        ));
+        assert!(activation_path.is_file());
+    }
+}
+
+#[test]
+fn obsolete_activation_filename_ordinal_must_match_the_wire_record() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    drop(open_store(temporary.path(), options).unwrap());
+    let (_, activation_path) = write_activation_record(
+        temporary.path(),
+        1,
+        super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+        None,
+    );
+    let mut activation: serde_json::Value =
+        serde_json::from_slice(&fs::read(&activation_path).unwrap()).unwrap();
+    activation["ordinal"] = serde_json::json!(2);
+    fs::write(&activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+
+    let error = open_store_with_startup_disposition(temporary.path(), options).unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationOrdinalMismatch {
+            expected: 1,
+            actual: 2,
+            ..
+        }
+    ));
+    assert!(activation_path.is_file());
 }
 
 #[test]
@@ -516,15 +660,13 @@ fn storage_v1_activation_requires_rebuild_without_parsing_legacy_generation_byte
 
     let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
     let (store, recovery, disposition) = opened.into_parts();
-    assert_eq!(recovery.unwrap().removed_entries(), 2);
+    assert_eq!(recovery.unwrap().removed_entries(), 1);
     assert_eq!(store.active(), None);
-    assert_eq!(
+    assert_rebuild_required(
         disposition,
-        GenerationStartupDisposition::RebuildRequired(super::IndexRebuildRequired {
-            reason: IndexRebuildReason::ObsoleteGenerationStorage { actual: 1 },
-            activation_ordinal: 1,
-            generation,
-        })
+        IndexRebuildReason::ObsoleteGenerationStorage { actual: 1 },
+        1,
+        generation,
     );
     assert!(!obsolete_generation.exists());
 }
@@ -653,6 +795,38 @@ fn dropped_builds_and_reopened_stores_recover_owned_staging() {
 }
 
 #[test]
+fn failed_startup_cleanup_advances_past_abandoned_build_ordinals() {
+    let temporary = TempDir::new().unwrap();
+    drop(open_store(temporary.path(), GenerationStoreOptions::default()).unwrap());
+    let abandoned = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(staging_directory_name(99));
+    fs::create_dir(&abandoned).unwrap();
+
+    let opened = open_store_with_startup_failpoint(
+        temporary.path(),
+        GenerationStoreOptions::default(),
+        GenerationFailpoint::StartupStagingCleanup,
+    )
+    .unwrap();
+    let (mut store, recovery, disposition) = opened.into_parts();
+    assert!(matches!(
+        recovery,
+        Err(GenerationStoreError::InjectedFailure {
+            checkpoint: GenerationFailpoint::StartupStagingCleanup
+        })
+    ));
+    assert_eq!(disposition, GenerationStartupDisposition::Ready);
+
+    let build = store.begin().unwrap();
+    assert_eq!(
+        build.directory().file_name().unwrap(),
+        staging_directory_name(100).as_str()
+    );
+}
+
+#[test]
 fn reconciliation_removes_only_abandoned_staging_and_preserves_the_active_generation() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
@@ -768,8 +942,8 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         Some(first.generation_id())
     );
     let directory_name = first.generation_id().directory_name();
-    let encoded = directory_name.strip_prefix("generation-v2-").unwrap();
-    let uppercase_alias = format!("generation-v2-{}", encoded.to_ascii_uppercase());
+    let encoded = directory_name.strip_prefix("generation-v3-").unwrap();
+    let uppercase_alias = format!("generation-v3-{}", encoded.to_ascii_uppercase());
     assert_eq!(
         SearchGenerationId::from_directory_name(&uppercase_alias),
         None
@@ -1348,6 +1522,43 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
 }
 
 #[test]
+fn repeated_activation_cleanup_failure_rejects_the_multiply_linked_head() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let mut build = store.begin().unwrap();
+    write_artifacts(&build, "cleanup-retry-failure");
+    let manifest = manifest_for(&store, &build, "cleanup-retry-failure", None);
+    let report = store
+        .prepare_publish_with_failpoint(
+            &mut build,
+            manifest,
+            GenerationFailpoint::ActivationCleanup,
+        )
+        .unwrap()
+        .activate()
+        .unwrap();
+    let abandoned_staging_activation =
+        activation_staging_file_name(report.active.activation_ordinal());
+
+    drop(build);
+    drop(store);
+    let error = open_store_with_startup_failpoint(
+        temporary.path(),
+        options,
+        GenerationFailpoint::StartupStagingCleanup,
+    )
+    .unwrap_err();
+    let GenerationStoreError::PersistedIdentityChanged { path } = error else {
+        panic!("unexpected multiply-linked activation error: {error:?}");
+    };
+    assert_eq!(
+        path.file_name(),
+        Some(abandoned_staging_activation.as_ref())
+    );
+}
+
+#[test]
 fn prepared_generation_is_readable_before_activation_and_reusable_if_dropped() {
     let temporary = TempDir::new().unwrap();
     let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
@@ -1506,42 +1717,170 @@ fn newest_obsolete_activation_never_falls_back_to_an_older_current_generation() 
     let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
     let (store, recovery, disposition) = opened.into_parts();
     assert_eq!(store.active(), None);
-    assert_eq!(recovery.unwrap().removed_entries(), 2);
-    assert_eq!(
+    assert_eq!(recovery.unwrap().removed_entries(), 1);
+    assert_rebuild_required(
         disposition,
-        GenerationStartupDisposition::RebuildRequired(super::IndexRebuildRequired {
-            reason: IndexRebuildReason::ObsoleteGenerationStorage { actual: 1 },
-            activation_ordinal: 2,
-            generation: obsolete,
-        })
+        IndexRebuildReason::ObsoleteGenerationStorage { actual: 1 },
+        2,
+        obsolete,
     );
     assert!(!current_directory.exists());
 }
 
 #[test]
-fn interrupted_obsolete_retirement_finishes_before_the_store_reopens() {
+fn obsolete_activation_bootstrap_survives_reopen_until_current_activation_commits() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions::default();
-    let mut store = open_store(temporary.path(), options).unwrap();
-    let current = publish_generation(&mut store, "current", None);
-    let activation_ordinal = store.active().unwrap().activation_ordinal();
-    let current_directory = store.generation_directory(current);
-    drop(store);
-
-    let activations = temporary.path().join(super::ACTIVATIONS_DIRECTORY);
-    let retired = temporary.path().join(super::STAGING_DIRECTORY).join(
-        super::obsolete_activation_directory_name(activation_ordinal),
+    drop(open_store(temporary.path(), options).unwrap());
+    let (obsolete, obsolete_activation) = write_activation_record(
+        temporary.path(),
+        1,
+        super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+        None,
     );
-    fs::rename(&activations, &retired).unwrap();
-    fs::create_dir(&activations).unwrap();
 
     let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
     let (store, recovery, disposition) = opened.into_parts();
     assert_eq!(store.active(), None);
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    assert_rebuild_required(
+        disposition,
+        IndexRebuildReason::ObsoleteActivationContract { actual: 2 },
+        1,
+        obsolete,
+    );
+    assert!(obsolete_activation.is_file());
+    drop(store);
+
+    let reopened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (mut store, recovery, disposition) = reopened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    assert_rebuild_required(
+        disposition,
+        IndexRebuildReason::ObsoleteActivationContract { actual: 2 },
+        1,
+        obsolete,
+    );
+    assert!(obsolete_activation.is_file());
+
+    let rebuilt = publish_generation(&mut store, "rebuilt", None);
+
+    assert!(!obsolete_activation.exists());
+    assert_eq!(
+        fs::read_dir(temporary.path().join(super::ACTIVATIONS_DIRECTORY))
+            .unwrap()
+            .count(),
+        1
+    );
+    drop(store);
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), rebuilt);
+}
+
+#[test]
+fn activation_sync_failure_preserves_obsolete_bootstrap_if_the_new_head_is_lost() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    drop(open_store(temporary.path(), options).unwrap());
+    let (obsolete, obsolete_activation) = write_activation_record(
+        temporary.path(),
+        1,
+        super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+        None,
+    );
+
+    let activations = temporary.path().join(super::ACTIVATIONS_DIRECTORY);
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (mut store, recovery, disposition) = opened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    assert_rebuild_required(
+        disposition,
+        IndexRebuildReason::ObsoleteActivationContract { actual: 2 },
+        1,
+        obsolete,
+    );
+
+    let mut build = store.begin().unwrap();
+    write_artifacts(&build, "rebuilt-unsynced");
+    let manifest = manifest_for(&store, &build, "rebuilt-unsynced", None);
+    let report = store
+        .prepare_publish_with_failpoint(
+            &mut build,
+            manifest,
+            GenerationFailpoint::ActivationDirectorySync,
+        )
+        .unwrap()
+        .activate()
+        .unwrap();
+    let new_activation = activations.join(activation_file_name(report.active.activation_ordinal()));
+    assert!(report.warnings.iter().any(|warning| {
+        warning.kind() == GenerationPublishWarningKind::PostCommitDurability
+            && warning.message().contains("ActivationDirectorySync")
+    }));
+    assert!(obsolete_activation.is_file());
+    assert!(new_activation.is_file());
+
+    drop(build);
+    drop(store);
+    // Simulate a system crash losing the directory entry whose sync was not confirmed.
+    fs::remove_file(&new_activation).unwrap();
+
+    let reopened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (store, recovery, disposition) = reopened.into_parts();
+    assert_eq!(store.active(), None);
+    assert_eq!(recovery.unwrap().removed_entries(), 1);
+    assert_rebuild_required(
+        disposition,
+        IndexRebuildReason::ObsoleteActivationContract { actual: 2 },
+        1,
+        obsolete,
+    );
+    assert!(obsolete_activation.is_file());
+}
+
+#[test]
+fn surviving_newer_current_head_supersedes_an_obsolete_bootstrap() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    drop(open_store(temporary.path(), options).unwrap());
+    let (_, obsolete_activation) = write_activation_record(
+        temporary.path(),
+        1,
+        super::REVISIONED_ACTIVATION_CONTRACT_VERSION,
+        None,
+    );
+
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (mut store, recovery, disposition) = opened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    assert!(matches!(
+        disposition,
+        GenerationStartupDisposition::RebuildRequired(_)
+    ));
+
+    let mut build = store.begin().unwrap();
+    write_artifacts(&build, "rebuilt-unsynced");
+    let manifest = manifest_for(&store, &build, "rebuilt-unsynced", None);
+    let report = store
+        .prepare_publish_with_failpoint(
+            &mut build,
+            manifest,
+            GenerationFailpoint::ActivationDirectorySync,
+        )
+        .unwrap()
+        .activate()
+        .unwrap();
+    let rebuilt = report.active.generation();
+    assert!(obsolete_activation.is_file());
+
+    drop(build);
+    drop(store);
+    let reopened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (store, recovery, disposition) = reopened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
     assert_eq!(disposition, GenerationStartupDisposition::Ready);
-    assert_eq!(recovery.unwrap().removed_entries(), 2);
-    assert!(!retired.exists());
-    assert!(!current_directory.exists());
+    assert_eq!(store.active().unwrap().generation(), rebuilt);
 }
 
 #[test]

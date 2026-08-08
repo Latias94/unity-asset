@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unity_asset_core::{
     AssetLoadBudget, BudgetedJsonError, ChangeSet, Diagnostic, DigestBuildError, DigestV1,
-    DigestV1Builder, ObjectAddress, TransactionId, WorkspaceId, WorkspaceRevision,
+    DigestV1Builder, ObjectAddress, SourceId, TransactionId, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_search_protocol::MAX_PORTABLE_PATH_BYTES;
 
@@ -19,12 +19,14 @@ use crate::analysis::{
     WorkspaceObjectFact,
 };
 use crate::generation::{ArtifactTreeEvidence, SearchGenerationManifestV1};
+use crate::path_semantics::{ProjectPathError, ProjectPathSpace};
 use crate::semantics::AnalysisCacheIdentityV1;
 #[cfg(test)]
 use crate::semantics::SearchSemantics;
+use crate::source_coordinate::IndexedSourceCoordinate;
 
-pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 3;
-pub(super) const SOURCE_STATE_LOGICAL_IDENTITY_VERSION: u16 = 2;
+pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 4;
+pub(super) const SOURCE_STATE_LOGICAL_IDENTITY_VERSION: u16 = 3;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
 const MAX_TRANSACTION_RECEIPTS: usize = 4_096;
@@ -400,6 +402,7 @@ impl<'de> Deserialize<'de> for TransactionReceiptWindow {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SourceScanHint {
+    pub(crate) coordinate: IndexedSourceCoordinate,
     pub(crate) relative_path: String,
     pub(crate) source_length: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -411,7 +414,9 @@ pub(crate) struct SourceScanHint {
 }
 
 impl SourceScanHint {
+    #[cfg(test)]
     pub(crate) fn new(
+        coordinate: IndexedSourceCoordinate,
         relative_path: String,
         source_length: u64,
         source_modified_unix_ms: Option<u64>,
@@ -419,7 +424,9 @@ impl SourceScanHint {
         metadata_modified_unix_ms: Option<u64>,
     ) -> Result<Self, SourceStateError> {
         validate_source_state_relative_path(&relative_path, MAX_SOURCE_STATE_RELATIVE_PATH_BYTES)?;
+        validate_coordinate_display(coordinate, &relative_path)?;
         Ok(Self {
+            coordinate,
             relative_path,
             source_length,
             source_modified_unix_ms,
@@ -491,31 +498,64 @@ impl SourceStateSnapshot {
         for analysis in &mut assets {
             normalize_asset_analysis(analysis);
         }
-        scan_hints.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-        reject_duplicate_source_state_paths(
+        scan_hints.sort_unstable_by(|left, right| {
+            left.coordinate
+                .cmp(&right.coordinate)
+                .then_with(|| left.relative_path.cmp(&right.relative_path))
+        });
+        reject_duplicate_source_state_identities(
             "scan hints",
-            scan_hints.iter().map(|hint| hint.relative_path.as_str()),
+            scan_hints.iter().map(|hint| hint.coordinate),
         )?;
         assets.sort_unstable_by(|left, right| {
-            left.source.relative_path.cmp(&right.source.relative_path)
+            left.source
+                .coordinate
+                .cmp(&right.source.coordinate)
+                .then_with(|| left.source.relative_path.cmp(&right.source.relative_path))
         });
-        reject_duplicate_source_state_paths(
+        reject_duplicate_source_state_identities(
             "assets",
-            assets
-                .iter()
-                .map(|analysis| analysis.source.relative_path.as_str()),
+            assets.iter().map(|analysis| analysis.source.coordinate),
         )?;
-        for hint in &scan_hints {
-            validate_source_state_relative_path(
-                &hint.relative_path,
-                MAX_SOURCE_STATE_RELATIVE_PATH_BYTES,
-            )?;
-        }
         for analysis in &assets {
             validate_source_state_relative_path(
                 &analysis.source.relative_path,
                 MAX_SOURCE_STATE_RELATIVE_PATH_BYTES,
             )?;
+            validate_coordinate_display(
+                analysis.source.coordinate,
+                &analysis.source.relative_path,
+            )?;
+            if let IndexedSourceCoordinate::Workspace { source } = analysis.source.coordinate
+                && analysis.source.workspace_source != Some(source)
+            {
+                return Err(SourceStateError::WorkspaceCoordinateMismatch {
+                    coordinate: source,
+                    analysis_source: analysis.source.workspace_source,
+                });
+            }
+        }
+        let mut asset_index = 0;
+        for hint in &scan_hints {
+            while assets
+                .get(asset_index)
+                .is_some_and(|analysis| analysis.source.coordinate < hint.coordinate)
+            {
+                asset_index += 1;
+            }
+            let Some(analysis) = assets
+                .get(asset_index)
+                .filter(|analysis| analysis.source.coordinate == hint.coordinate)
+            else {
+                return Err(SourceStateError::OrphanScanHint {
+                    coordinate: hint.coordinate,
+                });
+            };
+            if analysis.source.relative_path != hint.relative_path {
+                return Err(SourceStateError::ScanHintDisplayMismatch {
+                    coordinate: hint.coordinate,
+                });
+            }
         }
 
         let logical_digest =
@@ -555,9 +595,8 @@ impl SourceStateSnapshot {
     #[cfg(test)]
     pub(crate) fn scan_hint(&self, relative_path: &str) -> Option<&SourceScanHint> {
         self.scan_hints
-            .binary_search_by(|hint| hint.relative_path.as_str().cmp(relative_path))
-            .ok()
-            .and_then(|index| self.scan_hints.get(index))
+            .iter()
+            .find(|hint| hint.relative_path == relative_path)
     }
 
     #[must_use]
@@ -569,14 +608,36 @@ impl SourceStateSnapshot {
     #[cfg(test)]
     pub(crate) fn analysis(&self, relative_path: &str) -> Option<&AssetAnalysis> {
         self.assets
-            .binary_search_by(|analysis| analysis.source.relative_path.as_str().cmp(relative_path))
-            .ok()
-            .and_then(|index| self.assets.get(index))
+            .iter()
+            .find(|analysis| analysis.source.relative_path == relative_path)
     }
 
     #[must_use]
     pub(crate) const fn logical_digest(&self) -> DigestV1 {
         self.logical_digest
+    }
+
+    /// Binds every persisted project coordinate to the currently authorized project.
+    ///
+    /// This validation is intentionally separate from deserialization because a source-state file
+    /// cannot derive the current project authority from its own bytes.
+    pub(crate) fn validate_project_path_space(
+        &self,
+        path_space: &ProjectPathSpace,
+    ) -> Result<(), SourceStateError> {
+        for analysis in &self.assets {
+            if let IndexedSourceCoordinate::Project { path } = analysis.source.coordinate
+                && path.project_id() != path_space.project_id()
+            {
+                return Err(SourceStateError::ProjectPath(
+                    ProjectPathError::DifferentProject {
+                        expected: path_space.project_id(),
+                        actual: path.project_id(),
+                    },
+                ));
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -836,15 +897,10 @@ fn ensure_source_state_canonical_order(
     scan_hints: &[SourceScanHint],
     assets: &[AssetAnalysis],
 ) -> Result<(), SourceStateError> {
-    ensure_strictly_sorted_paths(
-        "scan hints",
-        scan_hints.iter().map(|hint| hint.relative_path.as_str()),
-    )?;
-    ensure_strictly_sorted_paths(
+    ensure_strictly_sorted_identities("scan hints", scan_hints.iter().map(|hint| hint.coordinate))?;
+    ensure_strictly_sorted_identities(
         "assets",
-        assets
-            .iter()
-            .map(|analysis| analysis.source.relative_path.as_str()),
+        assets.iter().map(|analysis| analysis.source.coordinate),
     )
 }
 
@@ -907,33 +963,30 @@ fn is_strictly_sorted<T: Ord>(values: &[T]) -> bool {
     values.windows(2).all(|pair| pair[0] < pair[1])
 }
 
-fn ensure_strictly_sorted_paths<'path>(
+fn ensure_strictly_sorted_identities<T: Copy + Ord>(
     collection: &'static str,
-    paths: impl IntoIterator<Item = &'path str>,
+    identities: impl IntoIterator<Item = T>,
 ) -> Result<(), SourceStateError> {
     let mut previous = None;
-    for path in paths {
-        if matches!(previous, Some(previous) if previous >= path) {
+    for identity in identities {
+        if matches!(previous, Some(previous) if previous >= identity) {
             return Err(SourceStateError::NonCanonicalOrder { collection });
         }
-        previous = Some(path);
+        previous = Some(identity);
     }
     Ok(())
 }
 
-fn reject_duplicate_source_state_paths<'path>(
+fn reject_duplicate_source_state_identities<T: Copy + Eq>(
     collection: &'static str,
-    paths: impl IntoIterator<Item = &'path str>,
+    identities: impl IntoIterator<Item = T>,
 ) -> Result<(), SourceStateError> {
     let mut previous = None;
-    for path in paths {
-        if previous == Some(path) {
-            return Err(SourceStateError::DuplicateRelativePath {
-                collection,
-                relative_path: path.to_owned(),
-            });
+    for identity in identities {
+        if previous == Some(identity) {
+            return Err(SourceStateError::DuplicateIdentity { collection });
         }
-        previous = Some(path);
+        previous = Some(identity);
     }
     Ok(())
 }
@@ -971,6 +1024,17 @@ fn validate_source_state_relative_path(
             relative_path: relative_path.to_owned(),
             maximum_bytes,
         });
+    }
+    Ok(())
+}
+
+fn validate_coordinate_display(
+    coordinate: IndexedSourceCoordinate,
+    relative_path: &str,
+) -> Result<(), SourceStateError> {
+    if let IndexedSourceCoordinate::Project { path } = coordinate {
+        path.validate_relative_path(relative_path)
+            .map_err(SourceStateError::ProjectPath)?;
     }
     Ok(())
 }
@@ -1344,9 +1408,19 @@ pub(crate) enum SourceStateError {
     NonCanonicalAnalysis {
         relative_path: String,
     },
-    DuplicateRelativePath {
+    DuplicateIdentity {
         collection: &'static str,
-        relative_path: String,
+    },
+    ProjectPath(ProjectPathError),
+    WorkspaceCoordinateMismatch {
+        coordinate: SourceId,
+        analysis_source: Option<SourceId>,
+    },
+    OrphanScanHint {
+        coordinate: IndexedSourceCoordinate,
+    },
+    ScanHintDisplayMismatch {
+        coordinate: IndexedSourceCoordinate,
     },
     InvalidRelativePath {
         relative_path: String,
@@ -1462,12 +1536,25 @@ impl fmt::Display for SourceStateError {
                 formatter,
                 "source state analysis for {relative_path} is not canonical"
             ),
-            Self::DuplicateRelativePath {
-                collection,
-                relative_path,
+            Self::DuplicateIdentity { collection } => write!(
+                formatter,
+                "source state {collection} contain a duplicate source identity"
+            ),
+            Self::ProjectPath(error) => fmt::Display::fmt(error, formatter),
+            Self::WorkspaceCoordinateMismatch {
+                coordinate,
+                analysis_source,
             } => write!(
                 formatter,
-                "source state {collection} contain duplicate path {relative_path}"
+                "workspace source coordinate {coordinate:?} does not match analyzed source {analysis_source:?}"
+            ),
+            Self::OrphanScanHint { coordinate } => write!(
+                formatter,
+                "source state scan hint {coordinate:?} has no matching analyzed source"
+            ),
+            Self::ScanHintDisplayMismatch { coordinate } => write!(
+                formatter,
+                "source state scan hint {coordinate:?} does not use its analyzed source display path"
             ),
             Self::InvalidRelativePath {
                 relative_path,
@@ -1535,6 +1622,7 @@ impl Error for SourceStateError {
             Self::Budget(error) => Some(error),
             Self::Json(error) => Some(error),
             Self::Digest(error) => Some(error),
+            Self::ProjectPath(error) => Some(error),
             Self::AllocationFailed { source, .. } => Some(source),
             _ => None,
         }
@@ -1543,11 +1631,14 @@ impl Error for SourceStateError {
 
 #[cfg(test)]
 mod source_state_tests {
+    use std::path::PathBuf;
+
     use tempfile::TempDir;
     use unity_asset_core::{
         AssetLoadLimits, DigestV1, ObjectAddress, SourceId, SourceKind, SourceLocator,
     };
     use unity_asset_search_core::SearchKind;
+    use unity_asset_search_protocol::ProjectId;
 
     use super::super::*;
     use super::*;
@@ -1560,14 +1651,53 @@ mod source_state_tests {
         SearchGenerationIdentityV1, SearchGenerationManifestV1,
     };
     use crate::semantics::SearchSemantics;
+    use crate::{ProjectPathSpace, source_coordinate::IndexedSourceCoordinate};
 
     fn digest(label: &str) -> DigestV1 {
         DigestV1::hash_bytes(label.as_bytes())
     }
 
+    fn coordinate(relative_path: &str) -> IndexedSourceCoordinate {
+        coordinate_in(relative_path, 7)
+    }
+
+    fn coordinate_in(relative_path: &str, project_seed: u8) -> IndexedSourceCoordinate {
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\Project");
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/Project");
+        let space = ProjectPathSpace::new(root, ProjectId::from_bytes([project_seed; 32])).unwrap();
+        IndexedSourceCoordinate::project(
+            space
+                .resolve(PathBuf::from(relative_path).as_path())
+                .unwrap()
+                .unwrap()
+                .identity(),
+        )
+    }
+
+    fn scan_hint(
+        relative_path: &str,
+        source_length: u64,
+        source_modified_unix_ms: Option<u64>,
+        metadata_length: Option<u64>,
+        metadata_modified_unix_ms: Option<u64>,
+    ) -> SourceScanHint {
+        SourceScanHint::new(
+            coordinate(relative_path),
+            relative_path.to_owned(),
+            source_length,
+            source_modified_unix_ms,
+            metadata_length,
+            metadata_modified_unix_ms,
+        )
+        .unwrap()
+    }
+
     fn analysis(relative_path: &str) -> AssetAnalysis {
         AssetAnalysis::new(
             AnalyzedSource {
+                coordinate: coordinate(relative_path),
                 relative_path: relative_path.to_owned(),
                 content_digest: digest(relative_path),
                 length: relative_path.len() as u64,
@@ -1609,9 +1739,8 @@ mod source_state_tests {
             workspace,
             revision,
             vec![
-                SourceScanHint::new("Assets/B.asset".to_owned(), 20, None, Some(10), None).unwrap(),
-                SourceScanHint::new("Assets/A.asset".to_owned(), 10, Some(100), None, None)
-                    .unwrap(),
+                scan_hint("Assets/B.asset", 20, None, Some(10), None),
+                scan_hint("Assets/A.asset", 10, Some(100), None, None),
             ],
             vec![analysis("Assets/B.asset"), analysis("Assets/A.asset")],
         )
@@ -1624,8 +1753,18 @@ mod source_state_tests {
         let revision = WorkspaceRevision::new(digest("revision"));
         let snapshot = source_state(workspace, revision);
 
-        assert_eq!(snapshot.scan_hints()[0].relative_path, "Assets/A.asset");
-        assert_eq!(snapshot.assets()[0].source.relative_path, "Assets/A.asset");
+        assert!(
+            snapshot
+                .scan_hints()
+                .windows(2)
+                .all(|pair| pair[0].coordinate < pair[1].coordinate)
+        );
+        assert!(
+            snapshot
+                .assets()
+                .windows(2)
+                .all(|pair| pair[0].source.coordinate < pair[1].source.coordinate)
+        );
         assert!(snapshot.scan_hint("Assets/B.asset").is_some());
         assert!(snapshot.analysis("Assets/B.asset").is_some());
 
@@ -1633,10 +1772,8 @@ mod source_state_tests {
             workspace,
             revision,
             vec![
-                SourceScanHint::new("Assets/A.asset".to_owned(), 10, Some(999), None, None)
-                    .unwrap(),
-                SourceScanHint::new("Assets/B.asset".to_owned(), 20, Some(999), Some(10), None)
-                    .unwrap(),
+                scan_hint("Assets/A.asset", 10, Some(999), None, None),
+                scan_hint("Assets/B.asset", 20, Some(999), Some(10), None),
             ],
             snapshot.assets().to_vec(),
         )
@@ -1663,6 +1800,62 @@ mod source_state_tests {
             unsupported["contract_version"] = serde_json::json!(unsupported_version);
             assert!(serde_json::from_value::<SourceStateSnapshot>(unsupported).is_err());
         }
+    }
+
+    #[test]
+    fn source_state_rejects_scan_hint_display_spelling_that_differs_from_its_asset() {
+        let workspace = WorkspaceId::from_u128(0x51_01).unwrap();
+        let revision = WorkspaceRevision::new(digest("revision"));
+        let source = SourceId::new(workspace, SourceKind::SerializedFile, 1).unwrap();
+        let coordinate = IndexedSourceCoordinate::workspace(source);
+        let hint = SourceScanHint::new(
+            coordinate,
+            "Assets/Hero.prefab".to_owned(),
+            10,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut analyzed = analysis("Assets/Hero.prefab");
+        analyzed.source.coordinate = coordinate;
+        analyzed.source.workspace_source = Some(source);
+        analyzed.source.relative_path = "Packages/Hero.prefab".to_owned();
+
+        assert!(matches!(
+            SourceStateSnapshot::new(workspace, revision, vec![hint], vec![analyzed]),
+            Err(SourceStateError::ScanHintDisplayMismatch { coordinate: actual })
+                if actual == coordinate
+        ));
+    }
+
+    #[test]
+    fn source_state_project_coordinates_rebind_to_current_project_without_scan_hints() {
+        let workspace = WorkspaceId::from_u128(0x52).unwrap();
+        let revision = WorkspaceRevision::new(digest("revision"));
+        let snapshot = SourceStateSnapshot::new(
+            workspace,
+            revision,
+            Vec::new(),
+            vec![analysis("Assets/A.asset")],
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\Project");
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/Project");
+        let current = ProjectPathSpace::new(root.clone(), ProjectId::from_bytes([7; 32])).unwrap();
+        snapshot.validate_project_path_space(&current).unwrap();
+
+        let foreign = ProjectPathSpace::new(root, ProjectId::from_bytes([8; 32])).unwrap();
+        assert!(matches!(
+            snapshot.validate_project_path_space(&foreign),
+            Err(SourceStateError::ProjectPath(
+                ProjectPathError::DifferentProject { expected, actual }
+            )) if expected == ProjectId::from_bytes([8; 32])
+                && actual == ProjectId::from_bytes([7; 32])
+        ));
     }
 
     #[test]

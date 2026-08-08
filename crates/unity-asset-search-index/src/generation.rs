@@ -7,9 +7,9 @@ use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use crate::ProjectPathSet;
 use crate::semantics::SearchSemantics;
 
-pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 2;
-const GENERATION_DIRECTORY_PREFIX: &str = "generation-v2-";
-const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v2\0";
+pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 3;
+const GENERATION_DIRECTORY_PREFIX: &str = "generation-v3-";
+const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v3\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

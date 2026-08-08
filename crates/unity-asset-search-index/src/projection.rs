@@ -426,12 +426,7 @@ fn project_search_document(
     }
 
     Ok(SearchDocument {
-        stable_id: stable_id_budgeted(
-            asset.source.guid.as_deref(),
-            &asset.source.relative_path,
-            None,
-            budget,
-        )?,
+        stable_id: source_stable_id(asset.source.coordinate, budget)?,
         guid: clone_optional_string(asset.source.guid.as_deref(), "search document GUID", budget)?,
         path: clone_string(&asset.source.relative_path, "search document path", budget)?,
         path_terms: clone_string(
@@ -554,11 +549,7 @@ fn project_reference_document(
         reserve_retained_vec(outgoing_capacity, "reference outgoing keys", budget)?;
     outgoing_keys.push(reference_object_key_budgeted(&fact.source_object, budget)?);
     if let Some(file_id) = source_file_id {
-        outgoing_keys.push(source_file_key(
-            &asset.source.relative_path,
-            file_id,
-            budget,
-        )?);
+        outgoing_keys.push(source_file_key(asset.source.coordinate, file_id, budget)?);
     }
     if let Some(guid) = asset.source.guid.as_deref() {
         outgoing_keys.push(reference_guid_key_budgeted(guid, None, budget)?);
@@ -596,15 +587,16 @@ fn reference_stable_id(
 ) -> Result<String, ProjectionError> {
     let digest = streaming_json_digest(
         &(
-            &asset.source.relative_path,
-            &fact.source_object,
+            asset.source.coordinate,
+            fact.source_object.source_locator().members(),
+            fact.source_object.binary_path_id(),
+            fact.source_object.yaml_selector(),
             &fact.field_path,
-            &fact.raw_target,
             ordinal,
         ),
         "reference stable ID",
     )?;
-    digest_key("reference-v3:", digest, "reference stable ID", budget)
+    digest_key("reference-v4:", digest, "reference stable ID", budget)
 }
 
 fn append_raw_target_keys(
@@ -717,44 +709,12 @@ fn reference_guid_key_budgeted(
     Ok(key)
 }
 
-fn stable_id_budgeted(
-    guid: Option<&str>,
-    path: &str,
-    file_id: Option<i64>,
+fn source_stable_id(
+    coordinate: crate::source_coordinate::IndexedSourceCoordinate,
     budget: &mut AssetLoadBudget,
 ) -> Result<String, ProjectionError> {
-    let guid_hex_len = guid.map_or(0, |guid| {
-        guid.bytes().filter(|byte| byte.is_ascii_hexdigit()).count()
-    });
-    let (prefix, identity_len) = if guid_hex_len == 0 {
-        ("path:", path.len())
-    } else {
-        ("guid:", guid_hex_len)
-    };
-    let suffix_len = file_id.map_or(0, |file_id| 1 + decimal_i64_len(file_id));
-    let capacity = prefix
-        .len()
-        .checked_add(identity_len)
-        .and_then(|length| length.checked_add(suffix_len))
-        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
-    let mut stable = reserve_string(capacity, "search stable ID", budget)?;
-    stable.push_str(prefix);
-    if prefix == "guid:" {
-        if let Some(guid) = guid {
-            for byte in guid.bytes() {
-                if byte.is_ascii_hexdigit() {
-                    stable.push(char::from(byte.to_ascii_lowercase()));
-                }
-            }
-        }
-    } else {
-        stable.push_str(path);
-    }
-    if let Some(file_id) = file_id {
-        stable.push('#');
-        push_i64_decimal(&mut stable, file_id);
-    }
-    Ok(stable)
+    let digest = streaming_json_digest(&coordinate, "search stable ID")?;
+    digest_key("source-v2:", digest, "search stable ID", budget)
 }
 
 fn container_stable_id(
@@ -764,15 +724,14 @@ fn container_stable_id(
 ) -> Result<String, ProjectionError> {
     let digest = streaming_json_digest(
         &(
-            asset.source.guid.as_deref(),
-            &asset.source.relative_path,
+            asset.source.coordinate,
             &entry.asset_path,
             entry.file_id,
             entry.path_id,
         ),
         "container stable ID",
     )?;
-    digest_key("container-v1:", digest, "container stable ID", budget)
+    digest_key("container-v2:", digest, "container stable ID", budget)
 }
 
 fn incoming_key_capacity(fact: &ReferenceProjectionFact) -> Result<usize, ProjectionError> {
@@ -1225,21 +1184,17 @@ fn push_hex(destination: &mut String, bytes: &[u8]) {
 }
 
 fn source_file_key(
-    path: &str,
+    coordinate: crate::source_coordinate::IndexedSourceCoordinate,
     file_id: i64,
     budget: &mut AssetLoadBudget,
 ) -> Result<String, ProjectionError> {
-    let capacity = "source-file:"
-        .len()
-        .checked_add(path.len())
-        .and_then(|length| length.checked_add(1 + decimal_i64_len(file_id)))
-        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
-    let mut key = reserve_string(capacity, "source file reference key", budget)?;
-    key.push_str("source-file:");
-    key.push_str(path);
-    key.push(':');
-    push_i64_decimal(&mut key, file_id);
-    Ok(key)
+    let digest = streaming_json_digest(&(coordinate, file_id), "source file reference key")?;
+    digest_key(
+        "source-file-v2:",
+        digest,
+        "source file reference key",
+        budget,
+    )
 }
 
 fn binary_path_key(path_id: i64, budget: &mut AssetLoadBudget) -> Result<String, ProjectionError> {
@@ -1422,9 +1377,29 @@ mod tests {
         YamlFileId,
     };
 
+    fn test_coordinate(path: &str) -> crate::source_coordinate::IndexedSourceCoordinate {
+        #[cfg(windows)]
+        let root = std::path::PathBuf::from(r"C:\Project");
+        #[cfg(not(windows))]
+        let root = std::path::PathBuf::from("/Project");
+        let space = crate::ProjectPathSpace::new(
+            root,
+            unity_asset_search_protocol::ProjectId::from_bytes([11; 32]),
+        )
+        .unwrap();
+        crate::source_coordinate::IndexedSourceCoordinate::project(
+            space
+                .resolve(std::path::Path::new(path))
+                .unwrap()
+                .unwrap()
+                .identity(),
+        )
+    }
+
     fn analyzed_asset(search: SearchFacts) -> AssetAnalysis {
         AssetAnalysis::new(
             AnalyzedSource {
+                coordinate: test_coordinate("Assets/Player.prefab"),
                 relative_path: "Assets/Player.prefab".to_owned(),
                 content_digest: DigestV1::hash_bytes(b"player"),
                 length: 6,
@@ -1473,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn identical_container_entries_from_different_bundles_have_distinct_ids() {
+    fn identical_container_entries_from_different_sources_have_distinct_ids() {
         let entry = ContainerEntryFact {
             asset_path: "Assets/Shared.prefab".to_owned(),
             file_id: -3,
@@ -1481,6 +1456,7 @@ mod tests {
         };
         let first = analyzed_asset(SearchFacts::default());
         let mut second = first.clone();
+        second.source.coordinate = test_coordinate("Bundles/Other.bundle");
         second.source.relative_path = "Bundles/Other.bundle".to_owned();
         second.source.guid = Some("other-bundle-guid".to_owned());
         let mut budget = AssetLoadBudget::default();
@@ -1492,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_container_identity_preserves_the_existing_json_digest_domain() {
+    fn streaming_container_identity_uses_the_v2_coordinate_domain() {
         let entry = ContainerEntryFact {
             asset_path: "Assets/Shared.prefab".to_owned(),
             file_id: -3,
@@ -1500,15 +1476,14 @@ mod tests {
         };
         let asset = analyzed_asset(SearchFacts::default());
         let identity = serde_json::to_vec(&(
-            asset.source.guid.as_deref(),
-            &asset.source.relative_path,
+            asset.source.coordinate,
             &entry.asset_path,
             entry.file_id,
             entry.path_id,
         ))
         .unwrap();
         let expected = format!(
-            "container-v1:{}",
+            "container-v2:{}",
             hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
         );
         let mut budget = AssetLoadBudget::default();
@@ -1520,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_reference_identity_uses_the_v3_prefix_and_exact_json_digest() {
+    fn streaming_reference_identity_uses_the_v4_source_local_domain() {
         let asset = analyzed_asset(SearchFacts::default());
         let source_object = ObjectAddress::binary_direct(
             SourceLocator::path(asset.source.relative_path.clone()).unwrap(),
@@ -1542,15 +1517,16 @@ mod tests {
         };
         let ordinal = 7;
         let identity = serde_json::to_vec(&(
-            &asset.source.relative_path,
-            &fact.source_object,
+            asset.source.coordinate,
+            fact.source_object.source_locator().members(),
+            fact.source_object.binary_path_id(),
+            fact.source_object.yaml_selector(),
             &fact.field_path,
-            &fact.raw_target,
             ordinal,
         ))
         .unwrap();
         let expected = format!(
-            "reference-v3:{}",
+            "reference-v4:{}",
             hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
         );
         let mut budget = AssetLoadBudget::default();
@@ -1610,7 +1586,7 @@ mod tests {
             document
                 .outgoing_keys
                 .iter()
-                .all(|key| !key.starts_with("source-file:"))
+                .all(|key| !key.starts_with("source-file-v2:"))
         );
     }
 
@@ -1623,11 +1599,17 @@ mod tests {
             (0, "0"),
         ];
         let mut budget = AssetLoadBudget::default();
+        let coordinate = test_coordinate("Assets/Player.prefab");
 
         for (value, decimal) in cases {
+            let identity = serde_json::to_vec(&(coordinate, value)).unwrap();
+            let expected_source_file = format!(
+                "source-file-v2:{}",
+                hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
+            );
             assert_eq!(
-                source_file_key("Assets/Player.prefab", value, &mut budget).unwrap(),
-                format!("source-file:Assets/Player.prefab:{decimal}")
+                source_file_key(coordinate, value, &mut budget).unwrap(),
+                expected_source_file
             );
             assert_eq!(
                 binary_path_key(value, &mut budget).unwrap(),
@@ -1645,45 +1627,47 @@ mod tests {
     }
 
     #[test]
-    fn stable_id_filters_guid_spelling_and_falls_back_when_no_hex_remains() {
+    fn source_stable_id_is_derived_only_from_the_typed_coordinate() {
+        let mut budget = AssetLoadBudget::default();
+        let coordinate = test_coordinate("Assets/Fallback.prefab");
+        let identity = serde_json::to_vec(&coordinate).unwrap();
+        let expected = format!(
+            "source-v2:{}",
+            hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
+        );
+
+        assert_eq!(source_stable_id(coordinate, &mut budget).unwrap(), expected);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn source_stable_id_survives_a_windows_case_only_rename() {
+        let original = test_coordinate("Assets/Fallback.prefab");
+        let renamed = test_coordinate("assets/FALLBACK.prefab");
         let mut budget = AssetLoadBudget::default();
 
+        assert_eq!(original, renamed);
         assert_eq!(
-            stable_id_budgeted(
-                Some("AA-BB_cc:00 / zz"),
-                "Assets/Fallback.prefab",
-                Some(-7),
-                &mut budget,
-            )
-            .unwrap(),
-            "guid:aabbcc00#-7"
-        );
-        assert_eq!(
-            stable_id_budgeted(
-                Some(" \t-_:/\r\n"),
-                "Assets/Fallback.prefab",
-                None,
-                &mut budget,
-            )
-            .unwrap(),
-            "path:Assets/Fallback.prefab"
+            source_stable_id(original, &mut budget).unwrap(),
+            source_stable_id(renamed, &mut budget).unwrap()
         );
     }
 
     #[test]
-    fn stable_id_budget_uses_the_filtered_guid_layout() {
-        let guid = "AA-BB_cc:00 / zz";
-        let expected = "guid:aabbcc00#-7";
+    fn source_stable_id_budget_uses_the_exact_digest_layout() {
+        let coordinate = test_coordinate("Assets/Fallback.prefab");
+        let identity = serde_json::to_vec(&coordinate).unwrap();
+        let expected = format!(
+            "source-v2:{}",
+            hex::encode(DigestV1::hash_bytes(&identity).as_bytes())
+        );
         let mut exact = AssetLoadBudget::new(AssetLoadLimits {
             max_bytes: u64::try_from(expected.len()).unwrap(),
             ..AssetLoadLimits::default()
         })
         .unwrap();
 
-        assert_eq!(
-            stable_id_budgeted(Some(guid), "Assets/Fallback.prefab", Some(-7), &mut exact).unwrap(),
-            expected
-        );
+        assert_eq!(source_stable_id(coordinate, &mut exact).unwrap(), expected);
         assert_eq!(exact.usage().bytes, u64::try_from(expected.len()).unwrap());
 
         let mut short = AssetLoadBudget::new(AssetLoadLimits {
@@ -1692,12 +1676,7 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(
-            stable_id_budgeted(
-                Some(guid),
-                "Assets/Fallback.prefab",
-                Some(-7),
-                &mut short,
-            ),
+            source_stable_id(coordinate, &mut short),
             Err(ProjectionError::Budget(BudgetError::Exceeded {
                 resource: "bytes",
                 limit,
@@ -1826,6 +1805,7 @@ mod tests {
         .unwrap();
         let asset = AssetAnalysis::new(
             AnalyzedSource {
+                coordinate: test_coordinate("Assets/Budget.prefab"),
                 relative_path: "Assets/Budget.prefab".to_owned(),
                 content_digest: DigestV1::hash_bytes(b"budget"),
                 length: 6,

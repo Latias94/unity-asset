@@ -144,6 +144,13 @@ impl ProjectFixture {
     }
 }
 
+#[cfg(windows)]
+fn rename_case_only(original: &Path, renamed: &Path) {
+    let temporary = original.with_file_name("__unity_asset_case_rename__.tmp");
+    fs::rename(original, &temporary).unwrap();
+    fs::rename(&temporary, renamed).unwrap();
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct LocationFact {
     path: String,
@@ -685,6 +692,156 @@ fn full_reconcile_and_changed_paths_converge_on_public_generation_facts() {
 
     assert_eq!(full, reconcile);
     assert_eq!(full, changed);
+}
+
+#[cfg(windows)]
+#[test]
+fn case_only_rename_preserves_one_source_and_stable_projection_identities() {
+    let fixture = ProjectFixture::new(ProjectVersion::Final);
+    let index = open_index(&fixture);
+    let baseline = published_stamp(&index, &reindex(&index, FilesystemReindexIntent::full()));
+    let baseline_search = capture_search(&index, &baseline, "FinalHero");
+    let baseline_references = capture_references(
+        &index,
+        &baseline,
+        ReferenceRequest::incoming_guid(SCRIPT_GUID, None, 20),
+    );
+    assert_eq!(baseline_search.hits.len(), 1);
+    assert_eq!(baseline_references.hits.len(), 1);
+
+    let renamed_hero = fixture.hero_path.with_file_name("hero.prefab");
+    let original_meta = fixture.hero_path.with_extension("prefab.meta");
+    let renamed_meta = renamed_hero.with_extension("prefab.meta");
+    rename_case_only(&fixture.hero_path, &renamed_hero);
+    rename_case_only(&original_meta, &renamed_meta);
+
+    let renamed_relative = PathBuf::from("Assets/Characters/hero.prefab");
+    let changed_paths = index
+        .paths()
+        .project_path_space()
+        .resolve_set([renamed_relative.clone()])
+        .unwrap();
+    let changed = published_stamp(
+        &index,
+        &reindex(
+            &index,
+            FilesystemReindexIntent::changed_paths(changed_paths),
+        ),
+    );
+    let changed_search = capture_search(&index, &changed, "FinalHero");
+    let changed_references = capture_references(
+        &index,
+        &changed,
+        ReferenceRequest::incoming_guid(SCRIPT_GUID, None, 20),
+    );
+
+    assert_eq!(changed_search.hits.len(), 1);
+    assert_eq!(changed_search.hits[0].path, "Assets/Characters/hero.prefab");
+    assert_eq!(
+        changed_search.hits[0].stable_id,
+        baseline_search.hits[0].stable_id
+    );
+    assert_eq!(changed_references.hits.len(), 1);
+    assert_eq!(
+        changed_references.hits[0].source_path,
+        "Assets/Characters/hero.prefab"
+    );
+    assert_eq!(
+        changed_references.hits[0].stable_id,
+        baseline_references.hits[0].stable_id
+    );
+    assert_eq!(index.status().unwrap().indexed_assets, 2);
+
+    let upper_hero = renamed_hero.with_file_name("HERO.prefab");
+    let upper_meta = upper_hero.with_extension("prefab.meta");
+    rename_case_only(&renamed_hero, &upper_hero);
+    rename_case_only(&renamed_meta, &upper_meta);
+    let full = published_stamp(&index, &reindex(&index, FilesystemReindexIntent::full()));
+    let full_search = capture_search(&index, &full, "FinalHero");
+    let full_references = capture_references(
+        &index,
+        &full,
+        ReferenceRequest::incoming_guid(SCRIPT_GUID, None, 20),
+    );
+
+    assert_eq!(full_search.hits.len(), 1);
+    assert_eq!(full_search.hits[0].path, "Assets/Characters/HERO.prefab");
+    assert_eq!(
+        full_search.hits[0].stable_id,
+        baseline_search.hits[0].stable_id
+    );
+    assert_eq!(full_references.hits.len(), 1);
+    assert_eq!(
+        full_references.hits[0].source_path,
+        "Assets/Characters/HERO.prefab"
+    );
+    assert_eq!(
+        full_references.hits[0].stable_id,
+        baseline_references.hits[0].stable_id
+    );
+    assert_eq!(index.status().unwrap().indexed_assets, 2);
+
+    rename_case_only(&upper_hero, &fixture.hero_path);
+    rename_case_only(&upper_meta, &original_meta);
+    let reconcile = published_stamp(
+        &index,
+        &reindex(&index, FilesystemReindexIntent::reconcile()),
+    );
+    let reconcile_search = capture_search(&index, &reconcile, "FinalHero");
+    let reconcile_references = capture_references(
+        &index,
+        &reconcile,
+        ReferenceRequest::incoming_guid(SCRIPT_GUID, None, 20),
+    );
+
+    assert_eq!(reconcile_search.hits.len(), 1);
+    assert_eq!(
+        reconcile_search.hits[0].path,
+        "Assets/Characters/Hero.prefab"
+    );
+    assert_eq!(
+        reconcile_search.hits[0].stable_id,
+        baseline_search.hits[0].stable_id
+    );
+    assert_eq!(reconcile_references.hits.len(), 1);
+    assert_eq!(
+        reconcile_references.hits[0].source_path,
+        "Assets/Characters/Hero.prefab"
+    );
+    assert_eq!(
+        reconcile_references.hits[0].stable_id,
+        baseline_references.hits[0].stable_id
+    );
+    assert_eq!(index.status().unwrap().indexed_assets, 2);
+
+    let paths = fixture.index_paths();
+    drop(index);
+    let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+    reindex(&reopened, FilesystemReindexIntent::reconcile());
+    let reconciled = reopened
+        .status()
+        .unwrap()
+        .generation
+        .active
+        .expect("reconciliation keeps one active generation");
+    let reconciled_search = capture_search(&reopened, &reconciled, "FinalHero");
+    let reconciled_references = capture_references(
+        &reopened,
+        &reconciled,
+        ReferenceRequest::incoming_guid(SCRIPT_GUID, None, 20),
+    );
+
+    assert_eq!(reconciled_search.hits.len(), 1);
+    assert_eq!(
+        reconciled_search.hits[0].stable_id,
+        baseline_search.hits[0].stable_id
+    );
+    assert_eq!(reconciled_references.hits.len(), 1);
+    assert_eq!(
+        reconciled_references.hits[0].stable_id,
+        baseline_references.hits[0].stable_id
+    );
+    assert_eq!(reopened.status().unwrap().indexed_assets, 2);
 }
 
 #[test]

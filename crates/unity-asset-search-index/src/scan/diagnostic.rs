@@ -19,6 +19,7 @@ pub(crate) enum PathRejection {
     Excluded,
     Symlink,
     UnsupportedFileType,
+    UnsupportedCaseSensitiveDirectory,
     NonUtf8RelativePath,
 }
 

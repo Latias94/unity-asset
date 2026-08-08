@@ -47,8 +47,8 @@ const PATH_CATALOG_FILE: &str = "unity-asset-path-catalog-v1.bin";
 const PATH_CATALOG_MAGIC: &[u8] = b"unity-asset:path-catalog:v1\0";
 const SEARCH_SCHEMA_CONTRACT: &str = "unity-asset.search-projection";
 const REFERENCE_SCHEMA_CONTRACT: &str = "unity-asset.reference-projection";
-pub(crate) const SEARCH_SCHEMA_VERSION: u16 = 1;
-pub(crate) const REFERENCE_SCHEMA_VERSION: u16 = 4;
+pub(crate) const SEARCH_SCHEMA_VERSION: u16 = 2;
+pub(crate) const REFERENCE_SCHEMA_VERSION: u16 = 5;
 const MAX_SCHEMA_MARKER_BYTES: u64 = 16 * 1024;
 // The fixed reserve covers one maximum-sized contract string, its typed copy, and Serde scratch.
 const SCHEMA_MARKER_JSON_RESOURCES: ContractJsonResourceModel =
@@ -61,8 +61,8 @@ const SCHEMA_MARKER_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
     3,
     SCHEMA_MARKER_JSON_RESOURCES,
 );
-const SEARCH_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:search-projection:v1\0";
-const REFERENCE_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:reference-projection:v3\0";
+const SEARCH_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:search-projection:v2\0";
+const REFERENCE_LOGICAL_DOMAIN: &[u8] = b"unity-asset:search-generation:reference-projection:v4\0";
 const MIN_WRITER_MEMORY_PER_THREAD: usize = 15_000_000;
 const MAX_WRITER_MEMORY_PER_THREAD: usize = u32::MAX as usize - 1_000_000;
 const MAX_WRITER_THREADS: usize = 8;

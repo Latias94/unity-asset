@@ -132,6 +132,17 @@ impl ProjectRootAuthority {
         rebound.ensure_object(self.inner.object_identity)?;
         Ok(rebound)
     }
+
+    /// Proves that a project-relative leaf remains below the retained project namespace.
+    ///
+    /// The leaf itself may no longer exist because workspace backing is immutable and can outlive
+    /// its physical origin. Both binding checks are required: descendant validation must not turn
+    /// the retained handle into authority for a replacement now named by the project-root path.
+    pub(crate) fn validate_parent_lookup(&self, relative: &Path) -> Result<(), AnchoredFsError> {
+        self.validate_binding()?;
+        self.inner.directory.validate_parent_lookup(relative)?;
+        self.validate_binding()
+    }
 }
 
 impl std::fmt::Debug for ProjectRootAuthority {
@@ -172,6 +183,36 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn construction_rejects_a_case_sensitive_project_root_when_supported() {
+        let temporary = tempfile::tempdir().unwrap();
+        let project = temporary.path().join("project");
+        fs::create_dir(&project).unwrap();
+        if let Err(error) =
+            crate::anchored_fs::try_enable_case_sensitive_directory_for_test(&project)
+        {
+            if crate::anchored_fs::case_sensitivity_test_is_unsupported(&error) {
+                eprintln!(
+                    "skipping per-directory case-sensitivity project-root test for {}: {error}",
+                    project.display()
+                );
+                return;
+            }
+            panic!(
+                "unexpected failure enabling per-directory case sensitivity for {}: {error}",
+                project.display()
+            );
+        }
+
+        let error = ProjectRootAuthority::open(project).unwrap_err();
+
+        assert!(matches!(
+            error.downcast_ref::<AnchoredFsError>(),
+            Some(AnchoredFsError::UnsupportedCaseSensitiveDirectory)
+        ));
+    }
 
     #[test]
     fn construction_rejects_a_path_rebound_after_authority_capture() {

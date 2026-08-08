@@ -36,7 +36,7 @@ const ACTIVATIONS_DIRECTORY: &str = "activations";
 const SEARCH_ARTIFACT_DIRECTORY: &str = "search";
 const REFERENCE_ARTIFACT_DIRECTORY: &str = "references";
 const SOURCE_STATE_ARTIFACT_DIRECTORY: &str = "state";
-const SOURCE_STATE_FILE: &str = "source-state-v3.json";
+pub(crate) const SOURCE_STATE_FILE: &str = "source-state-v4.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LEGACY_ACTIVATION_CONTRACT_VERSION: u16 = 1;
 const REVISIONED_ACTIVATION_CONTRACT_VERSION: u16 = 2;
@@ -105,8 +105,7 @@ pub(crate) use source_state::{
 
 const WRITER_LEASE_FILE: &str = ".writer.lock";
 const QUARANTINE_DIRECTORY_PREFIX: &str = "quarantine-";
-const OBSOLETE_ACTIVATION_DIRECTORY_PREFIX: &str = "obsolete-activations-";
-const OBSOLETE_GENERATION_DIRECTORY_PREFIX: &str = "generation-v1-";
+const OBSOLETE_GENERATION_DIRECTORY_PREFIXES: [&str; 2] = ["generation-v1-", "generation-v2-"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GenerationStoreOptions {
@@ -300,6 +299,11 @@ enum ActivationStagingState {
     Armed,
     Committed,
     Relinquished,
+}
+
+struct ActivationWriteOutcome {
+    warnings: Vec<GenerationPublishWarning>,
+    directory_synced: bool,
 }
 
 /// Owns one activation staging file from creation through commit or explicit cleanup.
@@ -1143,11 +1147,49 @@ fn merge_recovery_results(
 
 /// Typed evidence that the authoritative generation belongs to a recognized obsolete cache
 /// contract and must be rebuilt instead of queried or converted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IndexRebuildRequired {
     reason: IndexRebuildReason,
     activation_ordinal: u64,
     generation: SearchGenerationId,
+    bootstrap: GenerationRebuildBootstrap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GenerationRebuildBootstrap {
+    workspace: WorkspaceId,
+    actual_revision: WorkspaceRevision,
+    desired_revision: WorkspaceRevision,
+    transaction_receipts: TransactionReceiptWindow,
+}
+
+impl GenerationRebuildBootstrap {
+    #[must_use]
+    pub(crate) const fn workspace(&self) -> WorkspaceId {
+        self.workspace
+    }
+
+    #[must_use]
+    pub(crate) const fn actual_revision(&self) -> WorkspaceRevision {
+        self.actual_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn desired_revision(&self) -> WorkspaceRevision {
+        self.desired_revision
+    }
+
+    #[must_use]
+    pub(crate) const fn transaction_receipts(&self) -> &TransactionReceiptWindow {
+        &self.transaction_receipts
+    }
+}
+
+impl IndexRebuildRequired {
+    #[must_use]
+    pub(crate) const fn bootstrap(&self) -> &GenerationRebuildBootstrap {
+        &self.bootstrap
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1156,7 +1198,7 @@ pub(crate) enum IndexRebuildReason {
     ObsoleteGenerationStorage { actual: u16 },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GenerationStartupDisposition {
     Ready,
     RebuildRequired(IndexRebuildRequired),
@@ -1164,7 +1206,7 @@ pub(crate) enum GenerationStartupDisposition {
 
 impl GenerationStartupDisposition {
     #[must_use]
-    pub(crate) const fn rebuild_required(self) -> Option<IndexRebuildRequired> {
+    pub(crate) const fn rebuild_required(&self) -> Option<&IndexRebuildRequired> {
         match self {
             Self::Ready => None,
             Self::RebuildRequired(required) => Some(required),
@@ -1174,9 +1216,9 @@ impl GenerationStartupDisposition {
 
 /// A validated generation store paired with the independent startup-maintenance outcome.
 ///
-/// Staging is not authoritative for the active generation. Its cleanup result is therefore
-/// reported separately so callers can keep a validated active generation queryable while
-/// scheduling another bounded reconciliation pass.
+/// Staging is not authoritative for the active generation. Ordinary cleanup failures are reported
+/// separately, but a residue that remains hard-linked to a committed head still violates the
+/// persisted single-link identity contract and fails closed while that head is opened.
 #[derive(Debug)]
 pub(crate) struct OpenedGenerationStore {
     store: GenerationStore,
@@ -1234,8 +1276,9 @@ impl GenerationStore {
     /// The highest head is the sole authority for actual and desired revision state. Corruption in
     /// that head or its immutable generation therefore fails closed instead of silently rolling
     /// freshness back to an older activation. Authoritative directory discovery and validation
-    /// share the caller's ledger; abandoned-staging cleanup uses an independent bounded ledger and
-    /// is returned as maintenance evidence rather than invalidating a verified active generation.
+    /// share the caller's ledger; abandoned-staging cleanup uses an independent bounded ledger.
+    /// Cleanup failures remain maintenance evidence unless the residue violates a committed
+    /// head's persisted identity contract.
     pub(crate) fn open_private(
         private_root: PrivateIndexRootV1,
         options: GenerationStoreOptions,
@@ -1310,6 +1353,17 @@ impl GenerationStore {
         let generations = ensure_managed_directory(&root, GENERATIONS_DIRECTORY)?;
         let staging = ensure_managed_directory(&root, STAGING_DIRECTORY)?;
         let activations = ensure_managed_directory(&root, ACTIVATIONS_DIRECTORY)?;
+        // Staging is recovery input, not persisted authority. Remove crash residue before opening
+        // committed heads because an activation residue may still be the second hard link of an
+        // already-committed head. Obsolete activation heads remain append-only in `activations`
+        // until a newer current head is durably committed.
+        let mut recovery_budget = AssetLoadBudget::default();
+        let mut staging_recovery = recover_owned_staging(
+            &staging,
+            &mut recovery_budget,
+            #[cfg(test)]
+            startup_recovery_failpoint,
+        );
         let opened_generations =
             SecureReadDirectory::open(&generations, OpenPolicy::PersistedState).map_err(
                 |source| {
@@ -1322,28 +1376,13 @@ impl GenerationStore {
                     persisted_read_error("open activations directory", activations.clone(), source)
                 },
             )?;
-        let mut recovery_budget = AssetLoadBudget::default();
-        let mut staging_recovery = recover_owned_staging(
-            &staging,
-            &generations,
-            true,
-            &mut recovery_budget,
-            #[cfg(test)]
-            startup_recovery_failpoint,
-        );
         let opened_staging = SecureReadDirectory::open(&staging, OpenPolicy::PersistedState)
             .map_err(|source| {
                 persisted_read_error("open staging directory", staging.clone(), source)
             })?;
-
         let next_staging_ordinal = next_staging_ordinal(&staging, &opened_staging, budget)?;
-        let activation_snapshot = activation_candidates_for_open(
-            &activations,
-            &opened_activations,
-            &staging,
-            &opened_staging,
-            budget,
-        )?;
+        let activation_snapshot =
+            activation_candidates_for_open(&activations, &opened_activations, budget)?;
         let selected = select_active_generation(
             &activations,
             &generations,
@@ -1360,19 +1399,7 @@ impl GenerationStore {
         let (active, startup_disposition) = match selected {
             Ok(active) => (active, GenerationStartupDisposition::Ready),
             Err(GenerationStoreError::IndexRebuildRequired(required)) => {
-                root_authority.revalidate(
-                    "revalidate private index root before retiring obsolete activations",
-                )?;
-                retire_obsolete_activation_authority(&root, &activations, &staging, required)?;
-                let retired_recovery = recover_owned_staging(
-                    &staging,
-                    &generations,
-                    true,
-                    &mut recovery_budget,
-                    #[cfg(test)]
-                    startup_recovery_failpoint,
-                );
-                staging_recovery = merge_recovery_results(staging_recovery, retired_recovery);
+                let required = *required;
                 (
                     None,
                     GenerationStartupDisposition::RebuildRequired(required),
@@ -1426,14 +1453,16 @@ impl GenerationStore {
         if self.live_build.is_held() {
             return Err(GenerationStoreError::BuildAlreadyActive);
         }
-        recover_owned_staging(
+        self.revalidate_private_root(
+            "revalidate private index root before durable staging reconciliation",
+        )?;
+        let report = recover_owned_staging(
             &self.staging,
-            &self.generations,
-            self.active.is_none(),
             budget,
             #[cfg(test)]
             None,
-        )
+        )?;
+        Ok(report)
     }
 
     /// Appends a durable head for the current immutable generation before derived work starts.
@@ -1938,19 +1967,24 @@ impl GenerationStore {
             transaction_receipts: snapshot.transaction_receipts().clone(),
         };
         self.revalidate_private_root("revalidate private index root before writing activation")?;
-        warnings.extend(self.write_activation(&record, failpoint, budget)?);
+        let activation = self.write_activation(&record, failpoint, budget)?;
+        warnings.extend(activation.warnings);
 
         self.active = Some(snapshot.clone());
 
         // Retention is post-commit maintenance. A security violation cannot turn this committed
         // activation into a failed publication; reopening rescans managed directories without
         // following links and fails closed if the unsafe entry remains.
-        let mut maintenance_budget = AssetLoadBudget::default();
-        if let Err(error) = self.prune_retention(&mut maintenance_budget) {
-            warnings.push(GenerationPublishWarning::new(
-                GenerationPublishWarningKind::Retention,
-                error.to_string(),
-            ));
+        // If activation-directory durability was not confirmed, the previous head remains the
+        // only crash-stable bootstrap and must not be pruned.
+        if activation.directory_synced {
+            let mut maintenance_budget = AssetLoadBudget::default();
+            if let Err(error) = self.prune_retention(&mut maintenance_budget) {
+                warnings.push(GenerationPublishWarning::new(
+                    GenerationPublishWarningKind::Retention,
+                    error.to_string(),
+                ));
+            }
         }
         Ok(GenerationPublishReport {
             active: snapshot,
@@ -2024,7 +2058,7 @@ impl GenerationStore {
         record: &GenerationHeadRecord,
         failpoint: Option<GenerationFailpoint>,
         budget: &mut AssetLoadBudget,
-    ) -> Result<Vec<GenerationPublishWarning>, GenerationStoreError> {
+    ) -> Result<ActivationWriteOutcome, GenerationStoreError> {
         let temporary_path = self
             .staging
             .join(activation_staging_file_name(record.ordinal));
@@ -2038,14 +2072,19 @@ impl GenerationStore {
         // immediately after it becomes visible. Every later failure is reported as evidence rather
         // than returning an error that would disagree with the persisted active generation.
         let mut warnings = Vec::new();
-        if let Err(error) = inject_failure(failpoint, GenerationFailpoint::ActivationDirectorySync)
-            .and_then(|()| sync_directory(&self.activations))
-        {
-            warnings.push(GenerationPublishWarning::new(
-                GenerationPublishWarningKind::PostCommitDurability,
-                error.to_string(),
-            ));
-        }
+        let directory_synced =
+            match inject_failure(failpoint, GenerationFailpoint::ActivationDirectorySync)
+                .and_then(|()| sync_directory(&self.activations))
+            {
+                Ok(()) => true,
+                Err(error) => {
+                    warnings.push(GenerationPublishWarning::new(
+                        GenerationPublishWarningKind::PostCommitDurability,
+                        error.to_string(),
+                    ));
+                    false
+                }
+            };
 
         if let Err(error) = inject_failure(failpoint, GenerationFailpoint::ActivationCleanup)
             .and_then(|()| staging.cleanup_after_commit())
@@ -2056,7 +2095,10 @@ impl GenerationStore {
                 error.to_string(),
             ));
         }
-        Ok(warnings)
+        Ok(ActivationWriteOutcome {
+            warnings,
+            directory_synced,
+        })
     }
 
     fn retained_historical_snapshots(
@@ -2086,17 +2128,8 @@ impl GenerationStore {
                     )
                 },
             )?;
-        let opened_staging = SecureReadDirectory::open(&self.staging, OpenPolicy::PersistedState)
-            .map_err(|source| {
-            persisted_read_error("open staging directory", self.staging.clone(), source)
-        })?;
-        let mut activation_snapshot = activation_candidates_for_open(
-            &self.activations,
-            &opened_activations,
-            &self.staging,
-            &opened_staging,
-            budget,
-        )?;
+        let mut activation_snapshot =
+            activation_candidates_for_open(&self.activations, &opened_activations, budget)?;
         let mut candidates = std::mem::take(&mut activation_snapshot.candidates);
         candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.ordinal));
 
@@ -2541,8 +2574,6 @@ fn revalidate_opened_directory_snapshot(
 
 fn recover_owned_staging(
     staging: &Path,
-    generations: &Path,
-    allow_obsolete_retirement: bool,
     budget: &mut AssetLoadBudget,
     #[cfg(test)] failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
@@ -2585,31 +2616,6 @@ fn recover_owned_staging(
                     })?;
             return Ok(());
         }
-        if parse_obsolete_activation_directory_name(name).is_some() {
-            if !metadata.is_dir() {
-                return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
-            }
-            if !allow_obsolete_retirement {
-                return Err(
-                    GenerationStoreError::ObsoleteRetirementConflictsWithActiveGeneration {
-                        path: entry.path,
-                    },
-                );
-            }
-            #[cfg(test)]
-            inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
-            let generation_recovery =
-                recover_unreferenced_generation_directories(generations, true, budget)?;
-            remove_tree_no_follow(&entry.path, budget)?;
-            changed = true;
-            removed_entries = removed_entries
-                .checked_add(generation_recovery.removed_entries)
-                .and_then(|removed| removed.checked_add(1))
-                .ok_or(GenerationStoreError::SizeOverflow {
-                    resource: "recovered staging entries",
-                })?;
-            return Ok(());
-        }
         if parse_activation_staging_file_name(name).is_some() {
             if !metadata.is_file() {
                 return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
@@ -2639,38 +2645,30 @@ fn recover_owned_staging(
     Ok(GenerationStagingRecoveryReport { removed_entries })
 }
 
-fn retire_obsolete_activation_authority(
-    root: &Path,
-    activations: &Path,
+fn next_staging_ordinal(
     staging: &Path,
-    required: IndexRebuildRequired,
-) -> Result<(), GenerationStoreError> {
-    let retired = staging.join(obsolete_activation_directory_name(
-        required.activation_ordinal,
-    ));
-    match fs::symlink_metadata(&retired) {
-        Ok(_) => return Err(GenerationStoreError::QuarantineCollision { path: retired }),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {}
-        Err(source) => {
-            return Err(GenerationStoreError::io(
-                "inspect obsolete activation retirement path",
-                retired,
-                source,
-            ));
+    opened_staging: &SecureReadDirectory,
+    budget: &mut AssetLoadBudget,
+) -> Result<u64, GenerationStoreError> {
+    let mut maximum = 0_u64;
+    visit_opened_directory_entries_budgeted(staging, opened_staging, budget, |entry, _budget| {
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
+        };
+        let Some(ordinal) = parse_staging_directory_name(name) else {
+            return Ok(());
+        };
+        if entry.kind != OpenedDirectoryEntryKind::Directory {
+            return Err(GenerationStoreError::UnsupportedFileType {
+                path: entry.display_path,
+            });
         }
-    }
-
-    fs::rename(activations, &retired).map_err(|source| {
-        GenerationStoreError::io(
-            "retire obsolete activation authority",
-            activations.to_path_buf(),
-            source,
-        )
+        maximum = maximum.max(ordinal);
+        Ok(())
     })?;
-    sync_directory(root)?;
-    sync_directory(staging)?;
-    ensure_managed_directory(root, ACTIVATIONS_DIRECTORY)?;
-    sync_directory(root)
+    maximum
+        .checked_add(1)
+        .ok_or(GenerationStoreError::OrdinalOverflow)
 }
 
 fn recover_unreferenced_generation_directories(
@@ -2710,36 +2708,9 @@ fn recover_unreferenced_generation_directories(
     Ok(GenerationStagingRecoveryReport { removed_entries })
 }
 
-fn next_staging_ordinal(
-    staging: &Path,
-    opened_staging: &SecureReadDirectory,
-    budget: &mut AssetLoadBudget,
-) -> Result<u64, GenerationStoreError> {
-    let mut maximum = 0_u64;
-    visit_opened_directory_entries_budgeted(staging, opened_staging, budget, |entry, _budget| {
-        let Some(name) = entry.file_name.to_str() else {
-            return Ok(());
-        };
-        if let Some(ordinal) = parse_staging_directory_name(name) {
-            if entry.kind != OpenedDirectoryEntryKind::Directory {
-                return Err(GenerationStoreError::UnsupportedFileType {
-                    path: entry.display_path,
-                });
-            }
-            maximum = maximum.max(ordinal);
-        }
-        Ok(())
-    })?;
-    maximum
-        .checked_add(1)
-        .ok_or(GenerationStoreError::OrdinalOverflow)
-}
-
 fn activation_candidates_for_open(
     activations: &Path,
     opened_activations: &SecureReadDirectory,
-    staging: &Path,
-    opened_staging: &SecureReadDirectory,
     budget: &mut AssetLoadBudget,
 ) -> Result<ActivationDirectorySnapshot, GenerationStoreError> {
     let directory_identity = opened_activations.stable_identity().map_err(|source| {
@@ -2779,20 +2750,6 @@ fn activation_candidates_for_open(
             )
         },
     )?;
-    visit_opened_directory_entries_budgeted(staging, opened_staging, budget, |entry, _budget| {
-        let Some(name) = entry.file_name.to_str() else {
-            return Ok(());
-        };
-        if let Some(ordinal) = parse_activation_staging_file_name(name) {
-            if entry.kind != OpenedDirectoryEntryKind::Regular {
-                return Err(GenerationStoreError::UnsupportedFileType {
-                    path: entry.display_path,
-                });
-            }
-            maximum = maximum.max(ordinal);
-        }
-        Ok(())
-    })?;
     candidates.sort_unstable_by_key(|candidate| candidate.ordinal);
     let next = maximum
         .checked_add(1)
@@ -2961,7 +2918,28 @@ fn read_activation_record(
         path: path.to_path_buf(),
         source,
     })?;
-    let record = decode_generation_head_record(wire, path)?;
+    let record = match decode_generation_head_record(wire, path) {
+        Ok(record) => record,
+        Err(GenerationStoreError::IndexRebuildRequired(required)) => {
+            if required.activation_ordinal != expected_ordinal {
+                return Err(GenerationStoreError::ActivationOrdinalMismatch {
+                    path: path.to_path_buf(),
+                    expected: expected_ordinal,
+                    actual: required.activation_ordinal,
+                });
+            }
+            required
+                .bootstrap
+                .transaction_receipts
+                .validate_for_workspace(required.bootstrap.workspace)
+                .map_err(|source| GenerationStoreError::ActivationProvenance {
+                    path: path.to_path_buf(),
+                    source: Box::new(source),
+                })?;
+            return Err(GenerationStoreError::IndexRebuildRequired(required));
+        }
+        Err(error) => return Err(error),
+    };
     if record.ordinal != expected_ordinal {
         return Err(GenerationStoreError::ActivationOrdinalMismatch {
             path: path.to_path_buf(),
@@ -3001,16 +2979,80 @@ fn decode_generation_head_record(
     };
 
     let (desired_revision, parent_generation, transaction_receipts) = match contract_version {
-        LEGACY_ACTIVATION_CONTRACT_VERSION | REVISIONED_ACTIVATION_CONTRACT_VERSION => {
-            return Err(GenerationStoreError::IndexRebuildRequired(
+        LEGACY_ACTIVATION_CONTRACT_VERSION => {
+            require_wire_missing(
+                generation_storage_contract,
+                &invalid,
+                "activation v1 must not declare a generation storage contract",
+            )?;
+            require_wire_missing(
+                desired_revision,
+                &invalid,
+                "activation v1 must not declare a desired revision",
+            )?;
+            require_wire_missing(
+                parent_generation,
+                &invalid,
+                "activation v1 must not declare a parent generation",
+            )?;
+            require_wire_missing(
+                transaction_receipts,
+                &invalid,
+                "activation v1 must not declare transaction receipts",
+            )?;
+            return Err(GenerationStoreError::IndexRebuildRequired(Box::new(
                 IndexRebuildRequired {
                     reason: IndexRebuildReason::ObsoleteActivationContract {
                         actual: contract_version,
                     },
                     activation_ordinal: ordinal,
                     generation,
+                    bootstrap: GenerationRebuildBootstrap {
+                        workspace,
+                        actual_revision: revision,
+                        desired_revision: revision,
+                        transaction_receipts: TransactionReceiptWindow::empty(),
+                    },
                 },
-            ));
+            )));
+        }
+        REVISIONED_ACTIVATION_CONTRACT_VERSION => {
+            require_wire_missing(
+                generation_storage_contract,
+                &invalid,
+                "activation v2 must not declare a generation storage contract",
+            )?;
+            let desired_revision = require_wire_value(
+                desired_revision,
+                &invalid,
+                "activation v2 is missing its desired revision",
+                "activation v2 desired revision must not be null",
+            )?;
+            require_wire_missing(
+                parent_generation,
+                &invalid,
+                "activation v2 must not declare a parent generation",
+            )?;
+            require_wire_missing(
+                transaction_receipts,
+                &invalid,
+                "activation v2 must not declare transaction receipts",
+            )?;
+            return Err(GenerationStoreError::IndexRebuildRequired(Box::new(
+                IndexRebuildRequired {
+                    reason: IndexRebuildReason::ObsoleteActivationContract {
+                        actual: contract_version,
+                    },
+                    activation_ordinal: ordinal,
+                    generation,
+                    bootstrap: GenerationRebuildBootstrap {
+                        workspace,
+                        actual_revision: revision,
+                        desired_revision,
+                        transaction_receipts: TransactionReceiptWindow::empty(),
+                    },
+                },
+            )));
         }
         GENERATION_HEAD_CONTRACT_VERSION => {
             let generation_storage_contract = require_wire_value(
@@ -3019,24 +3061,6 @@ fn decode_generation_head_record(
                 "activation v3 is missing its generation storage contract",
                 "activation v3 generation storage contract must not be null",
             )?;
-            if generation_storage_contract == 1 {
-                return Err(GenerationStoreError::IndexRebuildRequired(
-                    IndexRebuildRequired {
-                        reason: IndexRebuildReason::ObsoleteGenerationStorage {
-                            actual: generation_storage_contract,
-                        },
-                        activation_ordinal: ordinal,
-                        generation,
-                    },
-                ));
-            }
-            if generation_storage_contract != SEARCH_GENERATION_STORAGE_CONTRACT_VERSION {
-                return Err(GenerationStoreError::UnsupportedVersion {
-                    artifact: "generation storage",
-                    actual: generation_storage_contract,
-                    expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
-                });
-            }
             let desired_revision = require_wire_value(
                 desired_revision,
                 &invalid,
@@ -3054,6 +3078,32 @@ fn decode_generation_head_record(
                 "activation v3 is missing its transaction receipts",
                 "activation v3 transaction receipts must not be null",
             )?;
+            if (1..SEARCH_GENERATION_STORAGE_CONTRACT_VERSION)
+                .contains(&generation_storage_contract)
+            {
+                return Err(GenerationStoreError::IndexRebuildRequired(Box::new(
+                    IndexRebuildRequired {
+                        reason: IndexRebuildReason::ObsoleteGenerationStorage {
+                            actual: generation_storage_contract,
+                        },
+                        activation_ordinal: ordinal,
+                        generation,
+                        bootstrap: GenerationRebuildBootstrap {
+                            workspace,
+                            actual_revision: revision,
+                            desired_revision,
+                            transaction_receipts,
+                        },
+                    },
+                )));
+            }
+            if generation_storage_contract != SEARCH_GENERATION_STORAGE_CONTRACT_VERSION {
+                return Err(GenerationStoreError::UnsupportedVersion {
+                    artifact: "generation storage",
+                    actual: generation_storage_contract,
+                    expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+                });
+            }
             (
                 Some(desired_revision),
                 parent_generation,
@@ -3105,6 +3155,17 @@ fn optional_non_null_wire_value<T>(
         WirePresence::Missing => Ok(None),
         WirePresence::Present(None) => Err(invalid(null_message)),
         WirePresence::Present(Some(value)) => Ok(Some(value)),
+    }
+}
+
+fn require_wire_missing<T>(
+    presence: WirePresence<T>,
+    invalid: &impl Fn(&'static str) -> GenerationStoreError,
+    present_message: &'static str,
+) -> Result<(), GenerationStoreError> {
+    match presence {
+        WirePresence::Missing => Ok(()),
+        WirePresence::Present(_) => Err(invalid(present_message)),
     }
 }
 
@@ -4430,6 +4491,12 @@ fn persisted_read_error(
         SecureReadError::UnsupportedPlatform => {
             GenerationStoreError::UnsupportedPlatform { operation, path }
         }
+        SecureReadError::UnsupportedCaseSensitiveDirectory => {
+            GenerationStoreError::UnsupportedPlatform {
+                operation: "access per-directory case-sensitive Windows storage",
+                path,
+            }
+        }
         SecureReadError::LinkOrReparse => persisted_link_error(path),
         SecureReadError::NotDirectory => GenerationStoreError::NotDirectory { path },
         SecureReadError::NotRegular => GenerationStoreError::UnsupportedFileType { path },
@@ -4593,17 +4660,10 @@ fn parse_staging_directory_name(value: &str) -> Option<u64> {
     parse_ordinal_component(value, "build-", "")
 }
 
-fn obsolete_activation_directory_name(ordinal: u64) -> String {
-    format!("{OBSOLETE_ACTIVATION_DIRECTORY_PREFIX}{ordinal:020}")
-}
-
-fn parse_obsolete_activation_directory_name(value: &str) -> Option<u64> {
-    parse_ordinal_component(value, OBSOLETE_ACTIVATION_DIRECTORY_PREFIX, "")
-}
-
 fn is_obsolete_generation_directory_name(value: &str) -> bool {
-    value
-        .strip_prefix(OBSOLETE_GENERATION_DIRECTORY_PREFIX)
+    OBSOLETE_GENERATION_DIRECTORY_PREFIXES
+        .iter()
+        .find_map(|prefix| value.strip_prefix(prefix))
         .is_some_and(|encoded| {
             encoded.len() == DigestV1::BYTE_LEN * 2
                 && encoded
@@ -4619,7 +4679,7 @@ fn quarantine_directory_name(ordinal: u64, generation: SearchGenerationId) -> St
     )
 }
 
-fn parse_quarantine_directory_name(value: &str) -> Option<(u64, SearchGenerationId)> {
+fn parse_quarantine_directory_name(value: &str) -> Option<u64> {
     let encoded = value.strip_prefix(QUARANTINE_DIRECTORY_PREFIX)?;
     let ordinal = encoded.get(..ACTIVATION_FILE_DIGITS)?;
     if encoded.as_bytes().get(ACTIVATION_FILE_DIGITS) != Some(&b'-')
@@ -4627,10 +4687,13 @@ fn parse_quarantine_directory_name(value: &str) -> Option<(u64, SearchGeneration
     {
         return None;
     }
-    let generation = SearchGenerationId::from_directory_name(
-        encoded.get(ACTIVATION_FILE_DIGITS.checked_add(1)?..)?,
-    )?;
-    Some((ordinal.parse().ok()?, generation))
+    let generation = encoded.get(ACTIVATION_FILE_DIGITS.checked_add(1)?..)?;
+    if SearchGenerationId::from_directory_name(generation).is_none()
+        && !is_obsolete_generation_directory_name(generation)
+    {
+        return None;
+    }
+    ordinal.parse().ok()
 }
 
 fn activation_file_name(ordinal: u64) -> String {
@@ -4728,7 +4791,7 @@ pub(crate) enum GenerationStoreError {
         actual: u16,
         expected: u16,
     },
-    IndexRebuildRequired(IndexRebuildRequired),
+    IndexRebuildRequired(Box<IndexRebuildRequired>),
     ActivationOrdinalMismatch {
         path: PathBuf,
         expected: u64,
@@ -4772,9 +4835,6 @@ pub(crate) enum GenerationStoreError {
     },
     BuildAlreadyActive,
     ForeignBuild,
-    ObsoleteRetirementConflictsWithActiveGeneration {
-        path: PathBuf,
-    },
     QuarantineCollision {
         path: PathBuf,
     },
@@ -5062,11 +5122,6 @@ impl fmt::Display for GenerationStoreError {
             Self::ForeignBuild => formatter.write_str(
                 "generation build does not belong to this store or has an invalid ordinal path",
             ),
-            Self::ObsoleteRetirementConflictsWithActiveGeneration { path } => write!(
-                formatter,
-                "obsolete activation retirement at {} conflicts with an active generation",
-                path.display()
-            ),
             Self::QuarantineCollision { path } => write!(
                 formatter,
                 "generation quarantine path already exists: {}",
@@ -5115,6 +5170,21 @@ mod reference_generation_tests;
 mod generation_store_tests {
     use super::*;
     use unity_asset_core::AssetLoadLimits;
+
+    #[test]
+    fn quarantine_parser_recognizes_all_rebuildable_generation_contracts() {
+        let digest = "0".repeat(DigestV1::BYTE_LEN * 2);
+        for version in [1, 2, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION] {
+            let name = format!("quarantine-00000000000000000007-generation-v{version}-{digest}");
+            assert_eq!(parse_quarantine_directory_name(&name), Some(7));
+        }
+        assert_eq!(
+            parse_quarantine_directory_name(&format!(
+                "quarantine-00000000000000000007-generation-v4-{digest}"
+            )),
+            None
+        );
+    }
 
     #[test]
     fn anchored_artifact_measurement_honors_the_exact_caller_budget() {
@@ -5280,10 +5350,8 @@ mod generation_store_tests {
         for replace_existing in [false, true] {
             let temporary = tempfile::TempDir::new().unwrap();
             let activations = temporary.path().join("activations");
-            let staging = temporary.path().join("staging");
             let generations = temporary.path().join("generations");
             fs::create_dir(&activations).unwrap();
-            fs::create_dir(&staging).unwrap();
             fs::create_dir(&generations).unwrap();
             let first = activations.join(activation_file_name(1));
             if replace_existing {
@@ -5291,19 +5359,12 @@ mod generation_store_tests {
             }
             let opened_activations =
                 SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).unwrap();
-            let opened_staging =
-                SecureReadDirectory::open(&staging, OpenPolicy::PersistedState).unwrap();
             let opened_generations =
                 SecureReadDirectory::open(&generations, OpenPolicy::PersistedState).unwrap();
             let mut budget = AssetLoadBudget::default();
-            let snapshot = activation_candidates_for_open(
-                &activations,
-                &opened_activations,
-                &staging,
-                &opened_staging,
-                &mut budget,
-            )
-            .unwrap();
+            let snapshot =
+                activation_candidates_for_open(&activations, &opened_activations, &mut budget)
+                    .unwrap();
 
             if replace_existing {
                 fs::remove_file(&first).unwrap();
@@ -5334,22 +5395,16 @@ mod generation_store_tests {
         let temporary = tempfile::TempDir::new().unwrap();
         let activations = temporary.path().join("activations");
         let anchored_activations = temporary.path().join("anchored-activations");
-        let staging = temporary.path().join("staging");
         fs::create_dir(&activations).unwrap();
-        fs::create_dir(&staging).unwrap();
         fs::write(activations.join(activation_file_name(7)), b"{}").unwrap();
         let opened_activations =
             SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).unwrap();
-        let opened_staging =
-            SecureReadDirectory::open(&staging, OpenPolicy::PersistedState).unwrap();
         fs::rename(&activations, &anchored_activations).unwrap();
         fs::create_dir(&activations).unwrap();
 
         let error = activation_candidates_for_open(
             &activations,
             &opened_activations,
-            &staging,
-            &opened_staging,
             &mut AssetLoadBudget::default(),
         )
         .unwrap_err();
@@ -5367,21 +5422,15 @@ mod generation_store_tests {
 
         let temporary = tempfile::TempDir::new().unwrap();
         let activations = temporary.path().join("activations");
-        let staging = temporary.path().join("staging");
         fs::create_dir(&activations).unwrap();
-        fs::create_dir(&staging).unwrap();
         fs::write(temporary.path().join("outside.json"), b"{}").unwrap();
         symlink("../outside.json", activations.join("unknown-link")).unwrap();
         let opened_activations =
             SecureReadDirectory::open(&activations, OpenPolicy::PersistedState).unwrap();
-        let opened_staging =
-            SecureReadDirectory::open(&staging, OpenPolicy::PersistedState).unwrap();
 
         let error = activation_candidates_for_open(
             &activations,
             &opened_activations,
-            &staging,
-            &opened_staging,
             &mut AssetLoadBudget::default(),
         )
         .unwrap_err();

@@ -23,6 +23,15 @@ use unix as platform;
 use unsupported as platform;
 #[cfg(windows)]
 use windows as platform;
+#[cfg(all(test, windows))]
+pub(crate) use windows::try_enable_case_sensitive_directory_for_test;
+
+#[cfg(all(test, windows))]
+pub(crate) fn case_sensitivity_test_is_unsupported(error: &io::Error) -> bool {
+    // Older Windows versions, filesystems without per-directory case sensitivity, and callers
+    // without the required privilege may legitimately reject this test-only setup operation.
+    matches!(error.raw_os_error(), Some(1 | 5 | 50 | 87 | 1_314))
+}
 
 /// A security-relevant failure while opening or validating an anchored path.
 #[derive(Debug)]
@@ -34,6 +43,7 @@ pub(crate) enum AnchoredFsError {
     )]
     UnsupportedPlatform,
     LinkOrReparse,
+    UnsupportedCaseSensitiveDirectory,
     NotDirectory,
     NotRegular,
     IdentityChanged,
@@ -48,6 +58,8 @@ impl std::fmt::Display for AnchoredFsError {
             Self::LinkOrReparse => {
                 formatter.write_str("anchored path contains a symbolic link or reparse point")
             }
+            Self::UnsupportedCaseSensitiveDirectory => formatter
+                .write_str("per-directory case-sensitive Windows directories are unsupported"),
             Self::NotDirectory => formatter.write_str("anchored path is not a directory"),
             Self::NotRegular => formatter.write_str("anchored entry is not a regular file"),
             Self::IdentityChanged => formatter
@@ -62,6 +74,7 @@ impl std::error::Error for AnchoredFsError {
             Self::Io(source) => Some(source),
             Self::UnsupportedPlatform
             | Self::LinkOrReparse
+            | Self::UnsupportedCaseSensitiveDirectory
             | Self::NotDirectory
             | Self::NotRegular
             | Self::IdentityChanged => None,
@@ -223,6 +236,42 @@ impl ReadDirectory {
         }
         Err(invalid_relative_path(
             "anchored relative regular-file path has no leaf",
+        ))
+    }
+
+    /// Validates the anchored lookup semantics for every parent of a relative leaf path.
+    ///
+    /// The leaf is intentionally not opened. Workspace sources can retain authoritative bytes
+    /// after their original file disappears, but a project coordinate is only valid when its
+    /// parent namespace still follows this authority's no-link and case-equivalence contract.
+    pub(crate) fn validate_parent_lookup<P>(&self, relative: &P) -> Result<(), AnchoredFsError>
+    where
+        P: AsRef<OsStr> + ?Sized,
+    {
+        let relative = Path::new(relative.as_ref());
+        let mut components = relative.components().peekable();
+        if components.peek().is_none() {
+            return Err(invalid_relative_path(
+                "anchored relative leaf path is empty",
+            ));
+        }
+
+        let mut current = None;
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(invalid_relative_path(
+                    "anchored relative leaf path contains an escaping component",
+                ));
+            };
+            let parent = current.as_ref().unwrap_or(self);
+            if components.peek().is_none() {
+                parent.stable_identity()?;
+                return Ok(());
+            }
+            current = Some(parent.open_directory(name)?);
+        }
+        Err(invalid_relative_path(
+            "anchored relative leaf path has no leaf",
         ))
     }
 
@@ -533,6 +582,28 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{AnchoredFsError, EntryKindHint, OpenPolicy, ReadDirectory};
+    #[cfg(windows)]
+    use super::{
+        case_sensitivity_test_is_unsupported, try_enable_case_sensitive_directory_for_test,
+    };
+
+    #[cfg(windows)]
+    fn enable_case_sensitivity_or_skip(path: &Path) -> bool {
+        match try_enable_case_sensitive_directory_for_test(path) {
+            Ok(()) => true,
+            Err(error) if case_sensitivity_test_is_unsupported(&error) => {
+                eprintln!(
+                    "skipping per-directory case-sensitivity contract test for {}: {error}",
+                    path.display()
+                );
+                false
+            }
+            Err(error) => panic!(
+                "unexpected failure enabling per-directory case sensitivity for {}: {error}",
+                path.display()
+            ),
+        }
+    }
 
     #[test]
     fn opens_multi_component_descendants_from_the_root_handle() {
@@ -548,6 +619,21 @@ mod tests {
         file.read_exact_at(6, &mut bytes).unwrap();
 
         assert_eq!(&bytes, b"bytes");
+    }
+
+    #[test]
+    fn validates_parent_lookup_without_requiring_the_leaf() {
+        let temporary = tempdir().unwrap();
+        fs::create_dir_all(temporary.path().join("one/two")).unwrap();
+        let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
+
+        root.validate_parent_lookup(Path::new("one/two/missing.asset"))
+            .unwrap();
+
+        let error = root
+            .validate_parent_lookup(Path::new("one/missing/asset.bin"))
+            .unwrap_err();
+        assert!(matches!(error, AnchoredFsError::Io(_)));
     }
 
     #[test]
@@ -569,6 +655,103 @@ mod tests {
         let error = ReadDirectory::open(Path::new("."), OpenPolicy::ProjectSource).unwrap_err();
 
         assert!(matches!(error, AnchoredFsError::Io(_)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ordinary_windows_directories_support_opening_and_enumeration() {
+        let temporary = tempdir().unwrap();
+        fs::create_dir(temporary.path().join("Assets")).unwrap();
+        let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
+
+        root.open_directory(OsStr::new("Assets")).unwrap();
+        let entries = root
+            .entries()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name(), OsStr::new("Assets"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_a_case_sensitive_windows_root_when_supported() {
+        let temporary = tempdir().unwrap();
+        let root = temporary.path().join("project");
+        fs::create_dir(&root).unwrap();
+        if !enable_case_sensitivity_or_skip(&root) {
+            return;
+        }
+
+        let error = ReadDirectory::open(&root, OpenPolicy::ProjectSource).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AnchoredFsError::UnsupportedCaseSensitiveDirectory
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_a_case_sensitive_windows_scan_root_ancestor_when_supported() {
+        let temporary = tempdir().unwrap();
+        let scan_root_ancestor = temporary.path().join("Assets");
+        fs::create_dir(&scan_root_ancestor).unwrap();
+        let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
+        if !enable_case_sensitivity_or_skip(&scan_root_ancestor) {
+            return;
+        }
+        fs::create_dir(scan_root_ancestor.join("Nested")).unwrap();
+
+        let error = root.open_directory(Path::new("Assets/Nested")).unwrap_err();
+
+        assert!(matches!(
+            error,
+            AnchoredFsError::UnsupportedCaseSensitiveDirectory
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rechecks_windows_case_sensitivity_before_enumeration_when_supported() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("Assets");
+        fs::create_dir(&path).unwrap();
+        let directory = ReadDirectory::open(&path, OpenPolicy::ProjectSource).unwrap();
+        if !enable_case_sensitivity_or_skip(&path) {
+            return;
+        }
+
+        let error = directory.entries().unwrap_err();
+
+        assert!(matches!(
+            error,
+            AnchoredFsError::UnsupportedCaseSensitiveDirectory
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rechecks_windows_parent_case_sensitivity_before_opening_a_regular_file_when_supported() {
+        let temporary = tempdir().unwrap();
+        let path = temporary.path().join("Assets");
+        fs::create_dir(&path).unwrap();
+        let directory = ReadDirectory::open(&path, OpenPolicy::ProjectSource).unwrap();
+        if !enable_case_sensitivity_or_skip(&path) {
+            return;
+        }
+        fs::write(path.join("Example.asset"), b"asset").unwrap();
+
+        let error = directory
+            .open_regular(Path::new("Example.asset"))
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            AnchoredFsError::UnsupportedCaseSensitiveDirectory
+        ));
     }
 
     #[test]

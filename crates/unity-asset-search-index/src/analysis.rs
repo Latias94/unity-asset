@@ -5,6 +5,8 @@ use unity_asset_core::{
 };
 use unity_asset_search_core::SearchKind;
 
+use crate::source_coordinate::IndexedSourceCoordinate;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AssetAnalysisBatch {
@@ -27,7 +29,10 @@ impl AssetAnalysisBatch {
         transactions.sort_unstable();
         transactions.dedup();
         assets.sort_unstable_by(|left, right| {
-            left.source.relative_path.cmp(&right.source.relative_path)
+            left.source
+                .coordinate
+                .cmp(&right.source.coordinate)
+                .then_with(|| left.source.relative_path.cmp(&right.source.relative_path))
         });
         Self {
             workspace,
@@ -285,6 +290,7 @@ impl AnalysisTruncation {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AnalyzedSource {
+    pub(crate) coordinate: IndexedSourceCoordinate,
     pub(crate) relative_path: String,
     pub(crate) content_digest: DigestV1,
     pub(crate) length: u64,

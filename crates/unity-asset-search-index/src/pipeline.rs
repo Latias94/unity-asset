@@ -44,9 +44,10 @@ use crate::generation::{
 use crate::generation_store::GenerationFailpoint;
 use crate::generation_store::{
     GenerationActivationEvidence, GenerationBuild, GenerationDiskEstimate,
-    GenerationPublishWarning, GenerationPublishWarningKind, GenerationSnapshot, GenerationStore,
-    GenerationStoreError, GenerationStoreOptions, SourceScanHint, SourceStateError,
-    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
+    GenerationPublishWarning, GenerationPublishWarningKind, GenerationRebuildBootstrap,
+    GenerationSnapshot, GenerationStore, GenerationStoreError, GenerationStoreOptions,
+    SourceScanHint, SourceStateError, SourceStateSnapshot, TransactionReceiptMembership,
+    TransactionReceiptWindow,
 };
 use crate::path_semantics::{ProjectPath, ProjectPathError, compare_portable_paths};
 use crate::projection::{
@@ -59,10 +60,11 @@ use crate::reference_query::{
     ReferenceQueryError, ReferenceQuerySnapshot,
 };
 use crate::scan::{
-    FileHint, PathRejection, ProjectScanner, ReadSource, ScanDiagnostic, ScanError, ScanIntent,
-    ScanMetrics, ScanMode, ScanValidation, SourceHints, SourcePart,
+    FileHint, PathRejection, ProjectScanner, ProjectSourcePath, ReadSource, ScanDiagnostic,
+    ScanError, ScanIntent, ScanMetrics, ScanMode, ScanValidation, SourceHints, SourcePart,
 };
 use crate::semantics::{AnalysisCacheIdentityV1, SearchSemantics};
+use crate::source_coordinate::IndexedSourceCoordinate;
 use crate::store::{ProjectionReaders, ProjectionStore, is_rebuildable_projection_schema_version};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -313,6 +315,7 @@ pub(crate) struct SearchGenerationPipeline {
     workspace_hydrated: bool,
     active_analysis_match: bool,
     active_compatibility_match: bool,
+    rebuild_bootstrap: Option<GenerationRebuildBootstrap>,
     store: GenerationStore,
     source_state: Option<SourceStateSnapshot>,
     active: Option<Arc<ActiveGeneration>>,
@@ -427,6 +430,9 @@ impl SearchGenerationPipeline {
             )?,
         };
         let (store, staging_recovery, startup_disposition) = opened.into_parts();
+        let rebuild_bootstrap = startup_disposition
+            .rebuild_required()
+            .map(|required| required.bootstrap().clone());
         let generation_maintenance = match staging_recovery {
             Ok(report) => GenerationMaintenanceStatus {
                 state: GenerationMaintenanceState::Clean,
@@ -441,7 +447,7 @@ impl SearchGenerationPipeline {
         };
         scanner
             .validate_project_root_binding()
-            .map_err(|error| PipelineError::Scan(error.into()))?;
+            .map_err(|error| PipelineError::Scan(Box::new(error)))?;
         let recovered = store.active().cloned();
         let (active_semantics_match, active_configuration_match, active_source_state_layout_match) =
             recovered.as_ref().map_or((true, true, true), |snapshot| {
@@ -464,6 +470,9 @@ impl SearchGenerationPipeline {
         } else {
             None
         };
+        if let Some(source_state) = source_state.as_ref() {
+            source_state.validate_project_path_space(paths.project_path_space())?;
+        }
         let workspace = source_state
             .as_ref()
             .map(SourceStateSnapshot::workspace)
@@ -471,6 +480,11 @@ impl SearchGenerationPipeline {
                 recovered
                     .as_ref()
                     .map(|snapshot| snapshot.manifest().workspace())
+            })
+            .or_else(|| {
+                rebuild_bootstrap
+                    .as_ref()
+                    .map(GenerationRebuildBootstrap::workspace)
             })
             .map_or_else(AssetWorkspace::new, |workspace| {
                 AssetWorkspace::with_workspace_id(workspace, WorkspaceOptions::lenient())
@@ -540,6 +554,7 @@ impl SearchGenerationPipeline {
             workspace_hydrated: false,
             active_analysis_match,
             active_compatibility_match,
+            rebuild_bootstrap,
             store,
             source_state,
             active,
@@ -790,7 +805,7 @@ impl SearchGenerationPipeline {
             self.clone_previous_assets(budget)?
         };
         let mut workspace = self.workspace.fork_candidate();
-        let known_paths = clone_known_paths(&cached, budget)?;
+        let known_paths = clone_known_paths(self.source_state.as_ref(), budget)?;
         let mut plan = self.scanner.plan(intent, &known_paths, budget).map_err(
             |error| match error {
                 ScanError::Budget(error) => PipelineError::Budget(error),
@@ -799,7 +814,7 @@ impl SearchGenerationPipeline {
                         "changed paths belong to project {actual}, but this index owns {expected}"
                     ))
                 }
-                error => PipelineError::Scan(error.into()),
+                error => PipelineError::Scan(Box::new(error)),
             },
         )?;
         let invalid_changed_path = matches!(plan.mode, ScanMode::ChangedPaths)
@@ -810,7 +825,8 @@ impl SearchGenerationPipeline {
                         reason: PathRejection::InvalidPath
                             | PathRejection::Symlink
                             | PathRejection::UnsupportedFileType
-                            | PathRejection::NonUtf8RelativePath,
+                            | PathRejection::NonUtf8RelativePath
+                            | PathRejection::UnsupportedCaseSensitiveDirectory,
                         ..
                     }
                 )
@@ -823,7 +839,12 @@ impl SearchGenerationPipeline {
         let scan_plan_failed = plan.diagnostics.iter().any(|diagnostic| {
             matches!(
                 diagnostic,
-                ScanDiagnostic::WalkFailed { .. } | ScanDiagnostic::ReadFailed { .. }
+                ScanDiagnostic::WalkFailed { .. }
+                    | ScanDiagnostic::ReadFailed { .. }
+                    | ScanDiagnostic::PathRejected {
+                        reason: PathRejection::UnsupportedCaseSensitiveDirectory,
+                        ..
+                    }
             )
         });
         if scan_plan_failed {
@@ -843,8 +864,9 @@ impl SearchGenerationPipeline {
         for candidate_index in 0..plan.present.len() {
             let outcome = {
                 let candidate = &plan.present[candidate_index];
+                let coordinate = candidate.coordinate();
                 let previous_identity = cached
-                    .get(&candidate.rel_path)
+                    .get(coordinate)
                     .map(|analysis| analysis.source.content_digest);
                 self.scanner
                     .read_source(candidate, previous_identity, budget)
@@ -857,7 +879,7 @@ impl SearchGenerationPipeline {
                 Some(accepted) => accepted,
                 None => {
                     return Err(PipelineError::SourceReadRejected {
-                        relative_path: plan.present[candidate_index].rel_path.clone(),
+                        relative_path: plan.present[candidate_index].relative_path().to_owned(),
                         diagnostics: outcome.diagnostics,
                     });
                 }
@@ -865,62 +887,70 @@ impl SearchGenerationPipeline {
             plan.record_source_proof(accepted.proof, budget)
                 .map_err(|error| match error {
                     ScanError::Budget(error) => PipelineError::Budget(error),
-                    error => PipelineError::Scan(error.into()),
+                    error => PipelineError::Scan(Box::new(error)),
                 })?;
             read_sources.push(ScannedSource {
                 source: accepted.source,
                 diagnostics: outcome.diagnostics,
             });
         }
-        read_sources
-            .sort_unstable_by(|left, right| left.source.rel_path.cmp(&right.source.rel_path));
+        read_sources.sort_unstable_by_key(|scanned| scanned.source.coordinate);
         if read_sources
             .windows(2)
-            .any(|pair| pair[0].source.rel_path == pair[1].source.rel_path)
+            .any(|pair| pair[0].source.coordinate == pair[1].source.coordinate)
         {
             return Err(PipelineError::Invariant(
-                "scanner returned duplicate relative paths",
+                "scanner returned duplicate source coordinates",
             ));
         }
 
         let changed_read_sources = read_sources
             .iter()
             .filter(|scanned| {
-                !scanned.source.unchanged || !cached.contains_key(scanned.source.rel_path.as_str())
+                let source = &scanned.source;
+                !source.unchanged
+                    || cached
+                        .get(source.coordinate)
+                        .is_none_or(|analysis| analysis.source.relative_path != source.rel_path)
             })
             .count();
-        let changed_path_capacity = plan.deleted.len().checked_add(changed_read_sources).ok_or(
-            PipelineError::ArithmeticOverflow("changed source path list"),
+        let changed_source_capacity = plan.deleted.len().checked_add(changed_read_sources).ok_or(
+            PipelineError::ArithmeticOverflow("changed source coordinate list"),
         )?;
-        let mut changed_paths =
-            reserve_retained_vec(changed_path_capacity, "changed source path list", budget)?;
-        changed_paths.extend(plan.deleted.iter().map(String::as_str));
+        let mut changed_sources = reserve_retained_vec(
+            changed_source_capacity,
+            "changed source coordinate list",
+            budget,
+        )?;
+        changed_sources.extend(plan.deleted.iter().map(ProjectSourcePath::coordinate));
         for scanned in &read_sources {
             let source = &scanned.source;
-            if !source.unchanged || !cached.contains_key(&source.rel_path) {
-                changed_paths.push(source.rel_path.as_str());
-            }
-        }
-        changed_paths.sort_unstable();
-        changed_paths.dedup();
-        let mut impact = DependencyImpact::default();
-        for relative_path in &changed_paths {
-            if let Some(analysis) = cached.get(relative_path) {
-                impact.add_analysis_identity(analysis, budget)?;
-            }
-        }
-        for scanned in &read_sources {
-            let source = &scanned.source;
-            if changed_paths
-                .binary_search(&source.rel_path.as_str())
-                .is_ok()
+            if !source.unchanged
+                || cached
+                    .get(source.coordinate)
+                    .is_none_or(|analysis| analysis.source.relative_path != source.rel_path)
             {
+                changed_sources.push(source.coordinate);
+            }
+        }
+        changed_sources.sort_unstable();
+        changed_sources.dedup();
+        let mut impact = DependencyImpact::default();
+        for coordinate in &changed_sources {
+            if let Some(analysis) = cached.get(*coordinate) {
+                impact.add_analysis_identity(analysis, budget)?;
+                impact.add_source_path(&analysis.source.relative_path, budget)?;
+            }
+        }
+        for scanned in &read_sources {
+            let source = &scanned.source;
+            if changed_sources.binary_search(&source.coordinate).is_ok() {
                 impact.add_guid(source.guid.as_deref(), budget)?;
                 impact.add_source_path(source.rel_path.as_str(), budget)?;
             }
         }
-        let changed_evidence_incomplete = changed_paths.iter().any(|relative_path| {
-            cached.get(relative_path).is_some_and(|analysis| {
+        let changed_evidence_incomplete = changed_sources.iter().any(|coordinate| {
+            cached.get(*coordinate).is_some_and(|analysis| {
                 analysis.source.workspace_source.is_some() && !analysis.graph_inputs.complete
             })
         });
@@ -931,16 +961,23 @@ impl SearchGenerationPipeline {
             .iter()
             .filter(|scanned| {
                 let source = &scanned.source;
-                let root_is_loaded = self.workspace_roots.contains_key(&source.rel_path);
-                !was_hydrated || !source.unchanged || !root_is_loaded
+                let root_is_loaded = self.workspace_roots.contains_key(source.coordinate);
+                let spelling_changed = cached
+                    .get(source.coordinate)
+                    .is_some_and(|analysis| analysis.source.relative_path != source.rel_path);
+                !was_hydrated || !source.unchanged || spelling_changed || !root_is_loaded
             })
             .count();
         let mut reloads =
             reserve_retained_vec(reload_count, "filesystem source reload plans", budget)?;
         for (source_index, scanned) in read_sources.iter().enumerate() {
             let source = &scanned.source;
-            let existing_root = self.workspace_roots.get(&source.rel_path).copied();
-            let needs_reload = !was_hydrated || !source.unchanged || existing_root.is_none();
+            let existing_root = self.workspace_roots.get(source.coordinate).copied();
+            let spelling_changed = cached
+                .get(source.coordinate)
+                .is_some_and(|analysis| analysis.source.relative_path != source.rel_path);
+            let needs_reload =
+                !was_hydrated || !source.unchanged || spelling_changed || existing_root.is_none();
             if !needs_reload {
                 continue;
             }
@@ -954,7 +991,7 @@ impl SearchGenerationPipeline {
         let deleted_unloads = plan
             .deleted
             .iter()
-            .filter(|relative_path| self.workspace_roots.contains_key(relative_path))
+            .filter(|path| self.workspace_roots.contains_key(path.coordinate()))
             .count();
         let reload_unloads = reloads
             .iter()
@@ -985,7 +1022,7 @@ impl SearchGenerationPipeline {
         )?;
         for (deleted_index, deleted) in plan.deleted.iter().enumerate() {
             root_updates.push(FilesystemRootUpdate::Delete { deleted_index });
-            if let Some(root) = self.workspace_roots.get(deleted).copied() {
+            if let Some(root) = self.workspace_roots.get(deleted.coordinate()).copied() {
                 admission_batch
                     .try_push(SourceAdmissionOperation::Unload(root), budget)
                     .map_err(PipelineError::from)?;
@@ -1104,12 +1141,12 @@ impl SearchGenerationPipeline {
             }
         }
         root_updates.sort_unstable_by(|left, right| {
-            left.relative_path(&plan.deleted, &read_sources)
-                .cmp(right.relative_path(&plan.deleted, &read_sources))
+            left.coordinate(&plan.deleted, &read_sources)
+                .cmp(&right.coordinate(&plan.deleted, &read_sources))
         });
         if root_updates.windows(2).any(|pair| {
-            pair[0].relative_path(&plan.deleted, &read_sources)
-                == pair[1].relative_path(&plan.deleted, &read_sources)
+            pair[0].coordinate(&plan.deleted, &read_sources)
+                == pair[1].coordinate(&plan.deleted, &read_sources)
         }) {
             return Err(PipelineError::Invariant(
                 "filesystem scan produced duplicate workspace root updates",
@@ -1138,16 +1175,16 @@ impl SearchGenerationPipeline {
         let context = WorkspaceAnalysisContext::build(&snapshot, &graph, budget)?;
         let mut current_sources = snapshot.sources(budget)?;
         current_sources.sort_unstable_by_key(|source| source.id());
-        let changed_root_count = changed_paths
+        let changed_root_count = changed_sources
             .iter()
-            .filter_map(|relative_path| workspace_roots.get(relative_path).copied())
+            .filter_map(|coordinate| workspace_roots.get(*coordinate).copied())
             .count();
         let mut changed_roots =
             reserve_retained_vec(changed_root_count, "changed workspace roots", budget)?;
         changed_roots.extend(
-            changed_paths
+            changed_sources
                 .iter()
-                .filter_map(|relative_path| workspace_roots.get(relative_path).copied()),
+                .filter_map(|coordinate| workspace_roots.get(*coordinate).copied()),
         );
         changed_roots.sort_unstable();
         changed_roots.dedup();
@@ -1165,16 +1202,17 @@ impl SearchGenerationPipeline {
             budget,
         )?;
         let force_full_analysis = discard_cached_analysis
-            || (!changed_paths.is_empty() && (!graph.is_complete() || changed_evidence_incomplete));
+            || (!changed_sources.is_empty()
+                && (!graph.is_complete() || changed_evidence_incomplete));
         let dependency_candidate_assets = cached.len();
         metrics.forced_full_analysis = force_full_analysis;
         metrics.full_dependency_scan =
-            !changed_paths.is_empty() && dependency_candidate_assets != 0;
+            !changed_sources.is_empty() && dependency_candidate_assets != 0;
         metrics.dependency_candidate_assets = saturating_usize_to_u64(dependency_candidate_assets);
-        let affected_path_count = cached
+        let affected_source_count = cached
             .iter()
-            .filter(|(relative_path, analysis)| {
-                if changed_paths.binary_search(relative_path).is_ok()
+            .filter(|(coordinate, analysis)| {
+                if changed_sources.binary_search(coordinate).is_ok()
                     || analysis.source.workspace_source.is_none()
                 {
                     return false;
@@ -1182,36 +1220,27 @@ impl SearchGenerationPipeline {
                 force_full_analysis || !analysis.complete || impact.matches_analysis(analysis)
             })
             .count();
-        for (relative_path, analysis) in cached.iter() {
-            if changed_paths.binary_search(&relative_path).is_err()
+        let mut affected_sources =
+            reserve_retained_vec(affected_source_count, "affected source coordinates", budget)?;
+        for (coordinate, analysis) in cached.iter() {
+            if changed_sources.binary_search(&coordinate).is_err()
                 && analysis.source.workspace_source.is_some()
                 && (force_full_analysis || !analysis.complete || impact.matches_analysis(analysis))
             {
-                charge_retained_string(relative_path, "affected source path", budget)?;
+                affected_sources.push(coordinate);
             }
         }
-        let mut affected_paths =
-            reserve_retained_vec(affected_path_count, "affected source paths", budget)?;
-        for (relative_path, analysis) in cached.iter() {
-            if changed_paths.binary_search(&relative_path).is_err()
-                && analysis.source.workspace_source.is_some()
-                && (force_full_analysis || !analysis.complete || impact.matches_analysis(analysis))
-            {
-                affected_paths.push(clone_precharged_string(
-                    relative_path,
-                    "affected source path",
-                )?);
-            }
-        }
+        affected_sources.sort_unstable();
+        affected_sources.dedup();
         drop(impact);
         for deleted in &plan.deleted {
-            cached.remove(deleted);
+            cached.remove(deleted.coordinate());
         }
-        metrics.dependency_closure_assets = saturating_usize_to_u64(affected_paths.len());
+        metrics.dependency_closure_assets = saturating_usize_to_u64(affected_sources.len());
         let analyzer = AssetAnalyzer::new(AnalyzerLimits::default());
         let replaced_asset_count = read_sources
             .iter()
-            .filter(|scanned| cached.contains_key(&scanned.source.rel_path))
+            .filter(|scanned| cached.contains_key(scanned.source.coordinate))
             .count();
         let retained_asset_count = cached.len().checked_sub(replaced_asset_count).ok_or(
             PipelineError::ArithmeticOverflow("filesystem retained asset count"),
@@ -1225,12 +1254,14 @@ impl SearchGenerationPipeline {
 
         for (source_index, scanned) in read_sources.iter().enumerate() {
             let source = &scanned.source;
-            let relative_path = source.rel_path.as_str();
-            let cached_analysis = cached.take(relative_path);
-            let workspace_root = workspace_roots.get(relative_path).copied();
+            let cached_analysis = cached.take(source.coordinate);
+            let workspace_root = workspace_roots.get(source.coordinate).copied();
             let workspace_input = workspace_root.map(|root| context.asset(root)).transpose()?;
             let analyzed = match cached_analysis {
-                Some(mut cached_analysis) if source.unchanged => {
+                Some(mut cached_analysis)
+                    if source.unchanged
+                        && cached_analysis.source.relative_path == source.rel_path =>
+                {
                     let cached_root_matches =
                         cached_analysis.source.workspace_source == workspace_root;
                     if cached_root_matches && cached_analysis.complete && workspace_input.is_none()
@@ -1248,9 +1279,7 @@ impl SearchGenerationPipeline {
                     if cached_root_matches
                         && cached_analysis.complete
                         && workspace_input.is_some()
-                        && affected_paths
-                            .binary_search_by(|path| path.as_str().cmp(relative_path))
-                            .is_err()
+                        && affected_sources.binary_search(&source.coordinate).is_err()
                     {
                         apply_source_scan_diagnostics(
                             &mut cached_analysis,
@@ -1294,11 +1323,9 @@ impl SearchGenerationPipeline {
             assets.push(analysis);
         }
 
-        for (relative_path, cached_analysis) in cached.into_remaining() {
+        for (coordinate, cached_analysis) in cached.into_remaining() {
             if cached_analysis.source.workspace_source.is_none()
-                || affected_paths
-                    .binary_search_by(|path| path.as_str().cmp(&relative_path))
-                    .is_err()
+                || affected_sources.binary_search(&coordinate).is_err()
             {
                 metrics.reused_assets = metrics.reused_assets.saturating_add(1);
                 assets.push(cached_analysis);
@@ -1322,6 +1349,17 @@ impl SearchGenerationPipeline {
         let transaction_receipts = match self.store.active() {
             Some(active) if active.manifest().workspace() == snapshot.workspace_id() => {
                 active.transaction_receipts().clone()
+            }
+            None if self
+                .rebuild_bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.workspace() == snapshot.workspace_id()) =>
+            {
+                self.rebuild_bootstrap
+                    .as_ref()
+                    .expect("matching rebuild bootstrap disappeared")
+                    .transaction_receipts()
+                    .clone()
             }
             Some(_) | None => TransactionReceiptWindow::empty(),
         };
@@ -1547,12 +1585,12 @@ impl SearchGenerationPipeline {
         let mut assets =
             reserve_retained_vec(final_asset_count, "workspace analysis batch", budget)?;
 
-        for (relative_path, root_id) in roots {
+        for (coordinate, relative_path, root_id) in roots {
             let root = workspace_source(&sources, root_id)
                 .ok_or(PipelineError::UnknownWorkspaceSource(root_id))?;
             let length = view.source_length(root.id())?;
             let cached_analysis = cached
-                .take(&relative_path)
+                .take(coordinate)
                 .or_else(|| cached.take_workspace_root(root.id()));
             let source = workspace_read_source(
                 &self.paths,
@@ -1665,7 +1703,7 @@ impl SearchGenerationPipeline {
                 );
                 self.scanner
                     .validate_scan(validation)
-                    .map_err(|error| PipelineError::Scan(error.into()))?;
+                    .map_err(|error| PipelineError::Scan(Box::new(error)))?;
             }
             self.active_compatibility_match = true;
             self.install_workspace(workspace);
@@ -1756,7 +1794,17 @@ impl SearchGenerationPipeline {
                 .store
                 .active()
                 .filter(|active| active.manifest().revision() == manifest.revision())
-                .map_or(manifest.revision(), GenerationSnapshot::desired_revision);
+                .map(GenerationSnapshot::desired_revision)
+                .or_else(|| {
+                    self.rebuild_bootstrap
+                        .as_ref()
+                        .filter(|bootstrap| {
+                            bootstrap.workspace() == manifest.workspace()
+                                && bootstrap.actual_revision() == manifest.revision()
+                        })
+                        .map(GenerationRebuildBootstrap::desired_revision)
+                })
+                .unwrap_or_else(|| manifest.revision());
             let disk_estimate = self.store.estimate_manifest_publish(&manifest, budget)?;
             Ok((manifest, desired_revision, disk_estimate))
         })();
@@ -1824,7 +1872,7 @@ impl SearchGenerationPipeline {
             );
             self.scanner
                 .validate_scan(validation)
-                .map_err(|error| PipelineError::Scan(error.into()))?;
+                .map_err(|error| PipelineError::Scan(Box::new(error)))?;
         }
         let report = prepared.activate_with_budget(budget)?;
         self.append_pending_publish_warnings(report.warnings);
@@ -1833,6 +1881,7 @@ impl SearchGenerationPipeline {
         self.active = Some(Arc::clone(&active));
         self.active_analysis_match = true;
         self.active_compatibility_match = true;
+        self.rebuild_bootstrap = None;
         self.install_workspace(workspace);
 
         Ok(PipelineBuildOutput {
@@ -1858,19 +1907,24 @@ impl SearchGenerationPipeline {
             });
         };
         for analysis in state.assets() {
-            charge_retained_string(&analysis.source.relative_path, "cached asset path", budget)?;
             charge_cached_analysis_clone(analysis, budget)?;
         }
         let mut entries = reserve_retained_vec(state.assets().len(), "cached asset index", budget)?;
         for analysis in state.assets() {
-            let relative_path =
-                clone_precharged_string(&analysis.source.relative_path, "cached asset path")?;
             entries.push(CachedAsset {
-                relative_path,
+                coordinate: analysis.source.coordinate,
                 analysis: Some(analysis.clone()),
             });
         }
-        entries.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        entries.sort_unstable_by_key(|entry| entry.coordinate);
+        if entries
+            .windows(2)
+            .any(|pair| pair[0].coordinate == pair[1].coordinate)
+        {
+            return Err(PipelineError::Invariant(
+                "cached assets contain duplicate source coordinates",
+            ));
+        }
         let workspace_root_count = entries
             .iter()
             .filter(|entry| {
@@ -1909,7 +1963,7 @@ impl SearchGenerationPipeline {
 
     fn merge_scan_hints(
         &self,
-        deleted: &[String],
+        deleted: &[ProjectSourcePath],
         read_sources: &[ScannedSource],
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<SourceScanHint>, PipelineError> {
@@ -1934,12 +1988,11 @@ impl SearchGenerationPipeline {
                 .map(|(source_index, _)| ScanHintUpdate::Upsert { source_index }),
         );
         updates.sort_unstable_by(|left, right| {
-            left.relative_path(deleted, read_sources)
-                .cmp(right.relative_path(deleted, read_sources))
+            left.coordinate(deleted, read_sources)
+                .cmp(&right.coordinate(deleted, read_sources))
         });
         if updates.windows(2).any(|pair| {
-            pair[0].relative_path(deleted, read_sources)
-                == pair[1].relative_path(deleted, read_sources)
+            pair[0].coordinate(deleted, read_sources) == pair[1].coordinate(deleted, read_sources)
         }) {
             return Err(PipelineError::Invariant(
                 "filesystem scan produced duplicate scan hint updates",
@@ -1949,17 +2002,16 @@ impl SearchGenerationPipeline {
         let mut previous_index = 0;
         let mut final_count = 0_usize;
         for update in &updates {
-            let path = update.relative_path(deleted, read_sources);
+            let coordinate = update.coordinate(deleted, read_sources);
             while previous_index < previous.len()
-                && previous[previous_index].relative_path.as_str() < path
+                && previous[previous_index].coordinate < coordinate
             {
                 final_count = final_count
                     .checked_add(1)
                     .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
                 previous_index += 1;
             }
-            if previous_index < previous.len()
-                && previous[previous_index].relative_path.as_str() == path
+            if previous_index < previous.len() && previous[previous_index].coordinate == coordinate
             {
                 previous_index += 1;
             }
@@ -1976,15 +2028,14 @@ impl SearchGenerationPipeline {
         let mut merged = reserve_retained_vec(final_count, "source scan hints", budget)?;
         previous_index = 0;
         for update in updates {
-            let path = update.relative_path(deleted, read_sources);
+            let coordinate = update.coordinate(deleted, read_sources);
             while previous_index < previous.len()
-                && previous[previous_index].relative_path.as_str() < path
+                && previous[previous_index].coordinate < coordinate
             {
                 push_cloned_scan_hint(&mut merged, &previous[previous_index], budget)?;
                 previous_index += 1;
             }
-            if previous_index < previous.len()
-                && previous[previous_index].relative_path.as_str() == path
+            if previous_index < previous.len() && previous[previous_index].coordinate == coordinate
             {
                 previous_index += 1;
             }
@@ -2011,10 +2062,10 @@ impl SearchGenerationPipeline {
             .source_state
             .as_ref()
             .map_or(&[][..], |state| state.scan_hints());
-        replacements.sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        replacements.sort_unstable_by_key(|hint| hint.coordinate);
         if replacements
             .windows(2)
-            .any(|pair| pair[0].relative_path == pair[1].relative_path)
+            .any(|pair| pair[0].coordinate == pair[1].coordinate)
         {
             return Err(PipelineError::Invariant(
                 "workspace reindex produced duplicate scan hint updates",
@@ -2025,7 +2076,7 @@ impl SearchGenerationPipeline {
         let mut final_count = 0_usize;
         for replacement in &replacements {
             while previous_index < previous.len()
-                && previous[previous_index].relative_path < replacement.relative_path
+                && previous[previous_index].coordinate < replacement.coordinate
             {
                 final_count = final_count
                     .checked_add(1)
@@ -2033,7 +2084,7 @@ impl SearchGenerationPipeline {
                 previous_index += 1;
             }
             if previous_index < previous.len()
-                && previous[previous_index].relative_path == replacement.relative_path
+                && previous[previous_index].coordinate == replacement.coordinate
             {
                 previous_index += 1;
             }
@@ -2049,13 +2100,13 @@ impl SearchGenerationPipeline {
         previous_index = 0;
         for replacement in replacements {
             while previous_index < previous.len()
-                && previous[previous_index].relative_path < replacement.relative_path
+                && previous[previous_index].coordinate < replacement.coordinate
             {
                 push_cloned_scan_hint(&mut merged, &previous[previous_index], budget)?;
                 previous_index += 1;
             }
             if previous_index < previous.len()
-                && previous[previous_index].relative_path == replacement.relative_path
+                && previous[previous_index].coordinate == replacement.coordinate
             {
                 previous_index += 1;
             }
@@ -2178,13 +2229,7 @@ fn retain_scan_hints_for_assets(
 ) {
     scan_hints.retain(|hint| {
         sorted_assets
-            .binary_search_by(|analysis| {
-                analysis
-                    .source
-                    .relative_path
-                    .as_str()
-                    .cmp(hint.relative_path.as_str())
-            })
+            .binary_search_by_key(&hint.coordinate, |analysis| analysis.source.coordinate)
             .is_ok()
     });
 }
@@ -2236,14 +2281,14 @@ enum FilesystemRootUpdate {
 }
 
 impl FilesystemRootUpdate {
-    fn relative_path<'a>(
+    fn coordinate(
         &self,
-        deleted: &'a [String],
-        read_sources: &'a [ScannedSource],
-    ) -> &'a str {
+        deleted: &[ProjectSourcePath],
+        read_sources: &[ScannedSource],
+    ) -> IndexedSourceCoordinate {
         match self {
-            Self::Delete { deleted_index } => &deleted[*deleted_index],
-            Self::Source { source_index, .. } => &read_sources[*source_index].source.rel_path,
+            Self::Delete { deleted_index } => deleted[*deleted_index].coordinate(),
+            Self::Source { source_index, .. } => read_sources[*source_index].source.coordinate,
         }
     }
 
@@ -2273,50 +2318,50 @@ enum ScanHintUpdate {
 }
 
 impl ScanHintUpdate {
-    fn relative_path<'a>(
+    fn coordinate(
         &self,
-        deleted: &'a [String],
-        read_sources: &'a [ScannedSource],
-    ) -> &'a str {
+        deleted: &[ProjectSourcePath],
+        read_sources: &[ScannedSource],
+    ) -> IndexedSourceCoordinate {
         match self {
-            Self::Delete { deleted_index } => &deleted[*deleted_index],
-            Self::Upsert { source_index } => &read_sources[*source_index].source.rel_path,
+            Self::Delete { deleted_index } => deleted[*deleted_index].coordinate(),
+            Self::Upsert { source_index } => read_sources[*source_index].source.coordinate,
         }
     }
 }
 
 #[derive(Default)]
 struct WorkspaceRoots {
-    entries: Vec<(String, SourceId)>,
+    entries: Vec<(IndexedSourceCoordinate, SourceId)>,
 }
 
 impl WorkspaceRoots {
-    fn get(&self, relative_path: &str) -> Option<&SourceId> {
+    fn get(&self, coordinate: IndexedSourceCoordinate) -> Option<&SourceId> {
         let index = self
             .entries
-            .binary_search_by(|(path, _)| path.as_str().cmp(relative_path))
+            .binary_search_by_key(&coordinate, |(candidate, _)| *candidate)
             .ok()?;
         Some(&self.entries[index].1)
     }
 
-    fn contains_key(&self, relative_path: &str) -> bool {
-        self.get(relative_path).is_some()
+    fn contains_key(&self, coordinate: IndexedSourceCoordinate) -> bool {
+        self.get(coordinate).is_some()
     }
 }
 
 fn merge_workspace_roots(
     previous: &WorkspaceRoots,
     updates: &[FilesystemRootUpdate],
-    deleted: &[String],
+    deleted: &[ProjectSourcePath],
     read_sources: &[ScannedSource],
     budget: &mut AssetLoadBudget,
 ) -> Result<WorkspaceRoots, PipelineError> {
     let mut previous_index = 0;
     let mut final_count = 0_usize;
     for update in updates {
-        let path = update.relative_path(deleted, read_sources);
+        let coordinate = update.coordinate(deleted, read_sources);
         while previous_index < previous.entries.len()
-            && previous.entries[previous_index].0.as_str() < path
+            && previous.entries[previous_index].0 < coordinate
         {
             final_count = final_count
                 .checked_add(1)
@@ -2324,7 +2369,7 @@ fn merge_workspace_roots(
             previous_index += 1;
         }
         if previous_index < previous.entries.len()
-            && previous.entries[previous_index].0.as_str() == path
+            && previous.entries[previous_index].0 == coordinate
         {
             previous_index += 1;
         }
@@ -2341,35 +2386,24 @@ fn merge_workspace_roots(
     let mut entries = reserve_retained_vec(final_count, "workspace root index", budget)?;
     previous_index = 0;
     for update in updates {
-        let path = update.relative_path(deleted, read_sources);
+        let coordinate = update.coordinate(deleted, read_sources);
         while previous_index < previous.entries.len()
-            && previous.entries[previous_index].0.as_str() < path
+            && previous.entries[previous_index].0 < coordinate
         {
-            let (previous_path, root) = &previous.entries[previous_index];
-            charge_retained_string(previous_path, "workspace root path clone", budget)?;
-            entries.push((
-                clone_precharged_string(previous_path, "workspace root path clone")?,
-                *root,
-            ));
+            entries.push(previous.entries[previous_index]);
             previous_index += 1;
         }
         if previous_index < previous.entries.len()
-            && previous.entries[previous_index].0.as_str() == path
+            && previous.entries[previous_index].0 == coordinate
         {
             previous_index += 1;
         }
         if let Some(root) = update.replacement() {
-            charge_retained_string(path, "workspace root path", budget)?;
-            entries.push((clone_precharged_string(path, "workspace root path")?, root));
+            entries.push((coordinate, root));
         }
     }
     while previous_index < previous.entries.len() {
-        let (previous_path, root) = &previous.entries[previous_index];
-        charge_retained_string(previous_path, "workspace root path clone", budget)?;
-        entries.push((
-            clone_precharged_string(previous_path, "workspace root path clone")?,
-            *root,
-        ));
+        entries.push(previous.entries[previous_index]);
         previous_index += 1;
     }
     debug_assert_eq!(entries.len(), final_count);
@@ -2377,7 +2411,7 @@ fn merge_workspace_roots(
 }
 
 struct CachedAsset {
-    relative_path: String,
+    coordinate: IndexedSourceCoordinate,
     analysis: Option<AssetAnalysis>,
 }
 
@@ -2394,28 +2428,28 @@ impl CachedAssets {
         }
     }
 
-    fn get(&self, relative_path: &str) -> Option<&AssetAnalysis> {
+    fn get(&self, coordinate: IndexedSourceCoordinate) -> Option<&AssetAnalysis> {
         let index = self
             .entries
-            .binary_search_by(|entry| entry.relative_path.as_str().cmp(relative_path))
+            .binary_search_by_key(&coordinate, |entry| entry.coordinate)
             .ok()?;
         self.entries[index].analysis.as_ref()
     }
 
-    fn contains_key(&self, relative_path: &str) -> bool {
-        self.get(relative_path).is_some()
+    fn contains_key(&self, coordinate: IndexedSourceCoordinate) -> bool {
+        self.get(coordinate).is_some()
     }
 
-    fn take(&mut self, relative_path: &str) -> Option<AssetAnalysis> {
+    fn take(&mut self, coordinate: IndexedSourceCoordinate) -> Option<AssetAnalysis> {
         let index = self
             .entries
-            .binary_search_by(|entry| entry.relative_path.as_str().cmp(relative_path))
+            .binary_search_by_key(&coordinate, |entry| entry.coordinate)
             .ok()?;
         self.entries[index].analysis.take()
     }
 
-    fn remove(&mut self, relative_path: &str) {
-        let _ = self.take(relative_path);
+    fn remove(&mut self, coordinate: IndexedSourceCoordinate) {
+        let _ = self.take(coordinate);
     }
 
     fn take_workspace_root(&mut self, root: SourceId) -> Option<AssetAnalysis> {
@@ -2433,21 +2467,24 @@ impl CachedAssets {
             .filter_map(|entry| entry.analysis.as_ref())
     }
 
-    fn iter(&self) -> impl Iterator<Item = (&str, &AssetAnalysis)> {
+    fn iter(&self) -> impl Iterator<Item = (IndexedSourceCoordinate, &AssetAnalysis)> {
         self.entries.iter().filter_map(|entry| {
             entry
                 .analysis
                 .as_ref()
-                .map(|analysis| (entry.relative_path.as_str(), analysis))
+                .map(|analysis| (entry.coordinate, analysis))
         })
     }
 
-    fn retain(&mut self, mut predicate: impl FnMut(&str, &AssetAnalysis) -> bool) {
+    fn retain(
+        &mut self,
+        mut predicate: impl FnMut(IndexedSourceCoordinate, &AssetAnalysis) -> bool,
+    ) {
         for entry in &mut self.entries {
             let retain = entry
                 .analysis
                 .as_ref()
-                .is_none_or(|analysis| predicate(&entry.relative_path, analysis));
+                .is_none_or(|analysis| predicate(entry.coordinate, analysis));
             if !retain {
                 let _ = entry.analysis.take();
             }
@@ -2458,12 +2495,10 @@ impl CachedAssets {
         self.values().count()
     }
 
-    fn into_remaining(self) -> impl Iterator<Item = (String, AssetAnalysis)> {
-        self.entries.into_iter().filter_map(|entry| {
-            entry
-                .analysis
-                .map(|analysis| (entry.relative_path, analysis))
-        })
+    fn into_remaining(self) -> impl Iterator<Item = (IndexedSourceCoordinate, AssetAnalysis)> {
+        self.entries
+            .into_iter()
+            .filter_map(|entry| entry.analysis.map(|analysis| (entry.coordinate, analysis)))
     }
 }
 
@@ -3063,32 +3098,32 @@ fn reserve_precharged_vec_push<T>(
 }
 
 fn clone_known_paths(
-    cached: &CachedAssets,
+    source_state: Option<&SourceStateSnapshot>,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<String>, PipelineError> {
-    let mut known_paths = reserve_retained_vec(cached.len(), "known source path index", budget)?;
-    for (path, _) in cached.iter() {
-        charge_retained_string(path, "known source path", budget)?;
-        let owned = clone_precharged_string(path, "known source path")?;
-        known_paths.push(owned);
-    }
-    if !known_paths
-        .windows(2)
-        .all(|pair| pair[0].as_str() < pair[1].as_str())
-    {
-        return Err(PipelineError::Invariant(
-            "cached source paths were not uniquely sorted",
+) -> Result<Vec<ProjectSourcePath>, PipelineError> {
+    let assets = source_state.map_or(&[][..], SourceStateSnapshot::assets);
+    let project_path_count = assets
+        .iter()
+        .filter(|analysis| analysis.source.coordinate.project_path().is_some())
+        .count();
+    let mut known_paths =
+        reserve_retained_vec(project_path_count, "known source path index", budget)?;
+    for analysis in assets {
+        let Some(identity) = analysis.source.coordinate.project_path() else {
+            continue;
+        };
+        charge_retained_string(&analysis.source.relative_path, "known source path", budget)?;
+        let relative_path =
+            clone_precharged_string(&analysis.source.relative_path, "known source path")?;
+        known_paths.push(ProjectSourcePath::from_validated_parts(
+            identity,
+            relative_path,
         ));
     }
-    known_paths.sort_unstable_by(|left, right| compare_portable_paths(left, right));
-    if known_paths
-        .windows(2)
-        .any(|pair| compare_portable_paths(&pair[0], &pair[1]) == std::cmp::Ordering::Equal)
-    {
-        return Err(PipelineError::Invariant(
-            "cached source paths were not unique under platform path semantics",
-        ));
-    }
+    known_paths.sort_unstable_by(|left, right| {
+        compare_portable_paths(left.relative_path(), right.relative_path())
+            .then_with(|| left.identity().cmp(&right.identity()))
+    });
     Ok(known_paths)
 }
 
@@ -3096,7 +3131,7 @@ fn workspace_root_paths(
     paths: &IndexPaths,
     sources: &[WorkspaceSource],
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<(String, SourceId)>, PipelineError> {
+) -> Result<Vec<(IndexedSourceCoordinate, String, SourceId)>, PipelineError> {
     let root_count = sources
         .iter()
         .filter(|source| source.parent().is_none())
@@ -3113,31 +3148,33 @@ fn workspace_root_paths(
     }
     let mut by_path = reserve_retained_vec(root_count, "workspace root paths", budget)?;
     for root in sources.iter().filter(|source| source.parent().is_none()) {
-        let relative_path = match workspace_root_project_path(paths, root)? {
-            Some(relative) => portable_relative_path_precharged(relative.as_relative_path())?,
-            None => clone_precharged_string(
-                root.locator().root_alias().as_str(),
-                "workspace root path",
-            )?,
+        let (coordinate, relative_path) = match workspace_root_project_path(paths, root)? {
+            Some(relative) => (
+                IndexedSourceCoordinate::project(relative.identity()),
+                portable_relative_path_precharged(relative.as_relative_path())?,
+            ),
+            None => (
+                IndexedSourceCoordinate::workspace(root.id()),
+                clone_precharged_string(
+                    root.locator().root_alias().as_str(),
+                    "workspace root path",
+                )?,
+            ),
         };
-        by_path.push((relative_path, root.id()));
+        by_path.push((coordinate, relative_path, root.id()));
     }
     sort_workspace_root_paths(&mut by_path)?;
     Ok(by_path)
 }
 
-fn sort_workspace_root_paths(by_path: &mut Vec<(String, SourceId)>) -> Result<(), PipelineError> {
-    by_path.sort_unstable_by(|left, right| {
-        compare_portable_paths(&left.0, &right.0)
-            .then_with(|| left.0.cmp(&right.0))
-            .then_with(|| left.1.cmp(&right.1))
-    });
+fn sort_workspace_root_paths(
+    by_path: &mut Vec<(IndexedSourceCoordinate, String, SourceId)>,
+) -> Result<(), PipelineError> {
+    by_path.sort_unstable_by_key(|(coordinate, _, source)| (*coordinate, *source));
     for index in 1..by_path.len() {
-        if compare_portable_paths(&by_path[index - 1].0, &by_path[index].0)
-            == std::cmp::Ordering::Equal
-        {
-            let (relative_path, second) = by_path.remove(index);
-            let first = by_path[index - 1].1;
+        if by_path[index - 1].0 == by_path[index].0 {
+            let (_, relative_path, second) = by_path.remove(index);
+            let first = by_path[index - 1].2;
             return Err(PipelineError::RelativePathCollision {
                 relative_path,
                 first,
@@ -3156,7 +3193,16 @@ fn workspace_root_project_path(
         return Ok(None);
     };
     match paths.project_path_space().resolve(origin) {
-        Ok(relative) => Ok(relative),
+        Ok(Some(relative)) => {
+            paths
+                .project_authority()
+                .validate_parent_lookup(relative.as_relative_path())
+                .map_err(|source| {
+                    PipelineError::Scan(Box::new(ScanError::TraversalRead { source }))
+                })?;
+            Ok(Some(relative))
+        }
+        Ok(None) => Ok(None),
         Err(ProjectPathError::OutsideProject { .. }) => Ok(None),
         Err(error) => Err(PipelineError::Configuration(anyhow::Error::new(error))),
     }
@@ -3238,6 +3284,10 @@ fn workspace_read_source(
     guid: Option<&str>,
     budget: &mut AssetLoadBudget,
 ) -> Result<ReadSource, PipelineError> {
+    let coordinate = match workspace_root_project_path(paths, source)? {
+        Some(path) => IndexedSourceCoordinate::project(path.identity()),
+        None => IndexedSourceCoordinate::workspace(source.id()),
+    };
     let name = Path::new(relative_path.as_ref())
         .file_name()
         .and_then(|name| name.to_str())
@@ -3318,6 +3368,7 @@ fn workspace_read_source(
         Cow::Owned(relative_path) => relative_path,
     };
     Ok(ReadSource {
+        coordinate,
         rel_path: relative_path,
         abs_path,
         name,
@@ -3375,14 +3426,14 @@ fn cached_workspace_read_source(
 }
 
 fn source_scan_hint_precharged(source: &ReadSource) -> Result<SourceScanHint, PipelineError> {
-    SourceScanHint::new(
-        clone_precharged_string(&source.rel_path, "source scan hint path")?,
-        source.hints.asset.size,
-        source.hints.asset.mtime_ms,
-        source.hints.meta.map(|hint| hint.size),
-        source.hints.meta.and_then(|hint| hint.mtime_ms),
-    )
-    .map_err(PipelineError::from)
+    Ok(SourceScanHint {
+        coordinate: source.coordinate,
+        relative_path: clone_precharged_string(&source.rel_path, "source scan hint path")?,
+        source_length: source.hints.asset.size,
+        source_modified_unix_ms: source.hints.asset.mtime_ms,
+        metadata_length: source.hints.meta.map(|hint| hint.size),
+        metadata_modified_unix_ms: source.hints.meta.and_then(|hint| hint.mtime_ms),
+    })
 }
 
 fn push_cloned_scan_hint(
@@ -3391,13 +3442,14 @@ fn push_cloned_scan_hint(
     budget: &mut AssetLoadBudget,
 ) -> Result<(), PipelineError> {
     charge_retained_string(&hint.relative_path, "source scan hint path clone", budget)?;
-    hints.push(SourceScanHint::new(
-        clone_precharged_string(&hint.relative_path, "source scan hint path clone")?,
-        hint.source_length,
-        hint.source_modified_unix_ms,
-        hint.metadata_length,
-        hint.metadata_modified_unix_ms,
-    )?);
+    hints.push(SourceScanHint {
+        coordinate: hint.coordinate,
+        relative_path: clone_precharged_string(&hint.relative_path, "source scan hint path clone")?,
+        source_length: hint.source_length,
+        source_modified_unix_ms: hint.source_modified_unix_ms,
+        metadata_length: hint.metadata_length,
+        metadata_modified_unix_ms: hint.metadata_modified_unix_ms,
+    });
     Ok(())
 }
 
@@ -3726,6 +3778,18 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+fn scan_diagnostics_are_retryable(diagnostics: &[ScanDiagnostic]) -> bool {
+    !diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic,
+            ScanDiagnostic::PathRejected {
+                reason: PathRejection::UnsupportedCaseSensitiveDirectory,
+                ..
+            }
+        )
+    })
+}
+
 #[derive(Debug)]
 pub(crate) enum PipelineError {
     FilesystemReindexRequired,
@@ -3778,7 +3842,7 @@ pub(crate) enum PipelineError {
     ArithmeticOverflow(&'static str),
     Invariant(&'static str),
     Configuration(anyhow::Error),
-    Scan(anyhow::Error),
+    Scan(Box<ScanError>),
     Query(anyhow::Error),
     Projection(anyhow::Error),
     Budget(BudgetError),
@@ -3851,7 +3915,11 @@ impl PipelineError {
                 primary.retryable() || cleanup.is_retryable()
             }
             Self::FilesystemReindexRequired => true,
-            Self::ScanPlanRejected { .. } | Self::SourceReadRejected { .. } | Self::Scan(_) => true,
+            Self::ScanPlanRejected { diagnostics }
+            | Self::SourceReadRejected { diagnostics, .. } => {
+                scan_diagnostics_are_retryable(diagnostics)
+            }
+            Self::Scan(error) => error.retryable(),
             Self::SourceAdmission(error) => matches!(
                 error.category(),
                 SourceAdmissionErrorCategory::Io | SourceAdmissionErrorCategory::SourceChanged
@@ -3982,9 +4050,9 @@ impl fmt::Display for PipelineError {
             }
             Self::Invariant(message) => write!(formatter, "pipeline invariant failed: {message}"),
             Self::Configuration(error)
-            | Self::Scan(error)
             | Self::Query(error)
             | Self::Projection(error) => fmt::Display::fmt(error, formatter),
+            Self::Scan(error) => fmt::Display::fmt(error, formatter),
             Self::Budget(error) => fmt::Display::fmt(error, formatter),
             Self::Contract(error) => fmt::Display::fmt(error, formatter),
             Self::Diagnostic(error) => fmt::Display::fmt(error, formatter),
@@ -4007,10 +4075,10 @@ impl fmt::Display for PipelineError {
 impl StdError for PipelineError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match self {
-            Self::Configuration(error)
-            | Self::Scan(error)
-            | Self::Query(error)
-            | Self::Projection(error) => Some(error.as_ref()),
+            Self::Configuration(error) | Self::Query(error) | Self::Projection(error) => {
+                Some(error.as_ref())
+            }
+            Self::Scan(error) => Some(error.as_ref()),
             Self::Budget(error) => Some(error),
             Self::Contract(error) => Some(error),
             Self::Diagnostic(error) => Some(error),
@@ -4140,12 +4208,55 @@ impl From<serde_json::Error> for PipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ProjectPathSpace;
     use crate::analysis::{AnalyzedSource, SearchFacts};
+    use crate::anchored_fs::AnchoredFsError;
+    use crate::scan::ScanReadLimits;
     use unity_asset::{AssetLoadLimits, BudgetedSourceBytes, SourceKind};
+    use unity_asset_search_protocol::ProjectId;
+
+    fn test_coordinate(path: &str) -> IndexedSourceCoordinate {
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\Project");
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/Project");
+        let space = ProjectPathSpace::new(root, ProjectId::from_bytes([9; 32])).unwrap();
+        IndexedSourceCoordinate::project(
+            space.resolve(Path::new(path)).unwrap().unwrap().identity(),
+        )
+    }
+
+    fn write_obsolete_v2_activation(
+        paths: &IndexPaths,
+        workspace: WorkspaceId,
+        actual_revision: WorkspaceRevision,
+        desired_revision: WorkspaceRevision,
+    ) {
+        let activation = serde_json::json!({
+            "contract_version": 2,
+            "ordinal": 1,
+            "generation": crate::generation::SearchGenerationId::new(DigestV1::hash_bytes(
+                b"obsolete-v2-generation",
+            )),
+            "manifest_digest": DigestV1::hash_bytes(b"obsolete-v2-manifest"),
+            "workspace": workspace,
+            "revision": actual_revision,
+            "desired_revision": desired_revision,
+        });
+        std::fs::write(
+            paths
+                .index_root()
+                .join("activations")
+                .join("00000000000000000001.json"),
+            serde_json::to_vec(&activation).unwrap(),
+        )
+        .unwrap();
+    }
 
     fn tier_zero_analysis(path: &str) -> AssetAnalysis {
         AssetAnalysis::new(
             AnalyzedSource {
+                coordinate: test_coordinate(path),
                 relative_path: path.to_owned(),
                 content_digest: DigestV1::hash_bytes(path.as_bytes()),
                 length: 32,
@@ -4165,26 +4276,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn workspace_root_collision_uses_windows_project_path_equivalence() {
+    fn logical_workspace_roots_do_not_inherit_windows_path_equivalence() {
         let workspace = WorkspaceId::from_u128(1).unwrap();
         let first = SourceId::new(workspace, SourceKind::Yaml, 1).unwrap();
         let second = SourceId::new(workspace, SourceKind::Yaml, 2).unwrap();
         let mut roots = vec![
-            ("Assets/Hero".to_owned(), first),
-            ("assets/HERO".to_owned(), second),
+            (
+                IndexedSourceCoordinate::workspace(first),
+                "Assets/Hero".to_owned(),
+                first,
+            ),
+            (
+                IndexedSourceCoordinate::workspace(second),
+                "assets/HERO".to_owned(),
+                second,
+            ),
         ];
 
-        let error = sort_workspace_root_paths(&mut roots).unwrap_err();
+        sort_workspace_root_paths(&mut roots).unwrap();
 
-        assert!(matches!(
-            error,
-            PipelineError::RelativePathCollision {
-                first: actual_first,
-                second: actual_second,
-                ..
-            } if [actual_first, actual_second].contains(&first)
-                && [actual_first, actual_second].contains(&second)
-        ));
+        assert_eq!(roots.len(), 2);
+        assert_ne!(roots[0].0, roots[1].0);
     }
 
     #[test]
@@ -4193,6 +4305,7 @@ mod tests {
         let bytes =
             BudgetedSourceBytes::from_vec(b"%YAML 1.1\n".to_vec(), &mut source_budget).unwrap();
         let source = ReadSource {
+            coordinate: test_coordinate("Assets/Unknown.data"),
             rel_path: "Assets/Unknown.data".to_owned(),
             abs_path: PathBuf::from("Assets/Unknown.data"),
             name: "Unknown.data".to_owned(),
@@ -4289,6 +4402,23 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_case_sensitive_directories_are_not_retryable() {
+        let scan_error = PipelineError::Scan(Box::new(ScanError::TraversalRead {
+            source: AnchoredFsError::UnsupportedCaseSensitiveDirectory,
+        }));
+        let diagnostic_error = PipelineError::SourceReadRejected {
+            relative_path: "Assets/CaseSensitive.asset".to_owned(),
+            diagnostics: vec![ScanDiagnostic::PathRejected {
+                path: PathBuf::from("Assets/CaseSensitive.asset"),
+                reason: PathRejection::UnsupportedCaseSensitiveDirectory,
+            }],
+        };
+
+        assert!(!scan_error.retryable());
+        assert!(!diagnostic_error.retryable());
+    }
+
+    #[test]
     fn workspace_reindex_discards_scan_hints_for_removed_assets() {
         let assets = [
             tier_zero_analysis("Assets/A.asset"),
@@ -4296,7 +4426,10 @@ mod tests {
         ];
         let mut scan_hints = ["Assets/A.asset", "Assets/B.asset", "Assets/C.asset"]
             .into_iter()
-            .map(|path| SourceScanHint::new(path.to_owned(), 32, None, None, None).unwrap())
+            .map(|path| {
+                SourceScanHint::new(test_coordinate(path), path.to_owned(), 32, None, None, None)
+                    .unwrap()
+            })
             .collect();
 
         retain_scan_hints_for_assets(&mut scan_hints, &assets);
@@ -4308,6 +4441,57 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Assets/A.asset", "Assets/C.asset"]
         );
+    }
+
+    #[test]
+    fn filesystem_reindex_deletes_project_assets_without_scan_hints() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let coordinate = IndexedSourceCoordinate::project(
+            paths
+                .project_path_space()
+                .resolve(Path::new("Assets/Removed.asset"))
+                .unwrap()
+                .unwrap()
+                .identity(),
+        );
+        let mut analysis = tier_zero_analysis("Assets/Removed.asset");
+        analysis.source.coordinate = coordinate;
+        let state = SourceStateSnapshot::new(
+            WorkspaceId::from_u128(1).unwrap(),
+            WorkspaceRevision::new(DigestV1::hash_bytes(b"revision")),
+            Vec::new(),
+            vec![analysis],
+        )
+        .unwrap();
+        let known = clone_known_paths(Some(&state), &mut AssetLoadBudget::default()).unwrap();
+        let scanner = ProjectScanner::new(
+            &paths,
+            SearchIndexOptions::default(),
+            ScanReadLimits::default(),
+        )
+        .unwrap();
+
+        for intent in [ScanIntent::Full, ScanIntent::Reconcile] {
+            let plan = scanner
+                .plan(intent, &known, &mut AssetLoadBudget::default())
+                .unwrap();
+
+            assert!(plan.present.is_empty());
+            assert_eq!(plan.deleted.len(), 1);
+            assert_eq!(plan.deleted[0].relative_path(), "Assets/Removed.asset");
+            assert_eq!(
+                plan.deleted[0].identity(),
+                coordinate.project_path().unwrap()
+            );
+        }
     }
 
     #[test]
@@ -4555,6 +4739,214 @@ mod tests {
         let active = rebuilt.active.unwrap();
         assert_ne!(active.snapshot.generation(), old_generation);
         assert!(active.stamp.semantics_current);
+    }
+
+    #[test]
+    fn obsolete_v2_activation_rebuild_preserves_workspace_transaction_continuity() {
+        const SOURCE: &[u8] = b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Bootstrap\n";
+
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId::from_u128(0x9002).unwrap();
+        let empty_workspace =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::lenient()).unwrap();
+        let empty_revision = empty_workspace.revision();
+
+        let source_path = temporary.path().join("external.prefab");
+        std::fs::write(&source_path, SOURCE).unwrap();
+        let mut target_workspace =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::lenient()).unwrap();
+        let mut workspace_budget = AssetLoadBudget::default();
+        let source = target_workspace
+            .load_source_bytes(
+                SourceOpenRequest::new(
+                    source_path,
+                    SourceAlias::new("external.prefab".to_owned()).unwrap(),
+                )
+                .with_kind_hint(SourceKind::Yaml),
+                Arc::<[u8]>::from(SOURCE),
+                &mut workspace_budget,
+            )
+            .unwrap();
+        let target_revision = target_workspace.revision();
+        let transaction = TransactionId::new(DigestV1::hash_bytes(b"bootstrap-change"));
+        let changes = ChangeSet::new(
+            transaction,
+            workspace_id,
+            empty_revision,
+            target_revision,
+            vec![source],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        drop(
+            SearchGenerationPipeline::open(
+                paths.clone(),
+                SearchIndexOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        write_obsolete_v2_activation(&paths, workspace_id, empty_revision, target_revision);
+
+        let obsolete_activation = paths
+            .index_root()
+            .join("activations")
+            .join("00000000000000000001.json");
+        let mut interrupted = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(interrupted.workspace.workspace_id(), workspace_id);
+        assert!(interrupted.active.is_none());
+        assert!(interrupted.rebuild_bootstrap.is_some());
+        assert!(obsolete_activation.is_file());
+        assert!(matches!(
+            interrupted.reindex_workspace(
+                changes.clone(),
+                &target_workspace.snapshot(),
+                &mut AssetLoadBudget::default(),
+            ),
+            Err(PipelineError::FilesystemReindexRequired)
+        ));
+        drop(interrupted);
+
+        let mut reopened = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let bootstrap = reopened.rebuild_bootstrap.as_ref().unwrap();
+        assert_eq!(bootstrap.workspace(), workspace_id);
+        assert_eq!(bootstrap.actual_revision(), empty_revision);
+        assert_eq!(bootstrap.desired_revision(), target_revision);
+        assert!(obsolete_activation.is_file());
+
+        let rebuilt = reopened
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.disposition, PipelineBuildDisposition::Published);
+        let rebuilt = rebuilt.active.unwrap();
+        assert_eq!(rebuilt.snapshot.manifest().workspace(), workspace_id);
+        assert_eq!(rebuilt.snapshot.manifest().revision(), empty_revision);
+        assert_eq!(rebuilt.snapshot.desired_revision(), target_revision);
+        assert!(!obsolete_activation.exists());
+        assert!(reopened.rebuild_bootstrap.is_none());
+
+        let applied = reopened
+            .reindex_workspace(
+                changes,
+                &target_workspace.snapshot(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(applied.disposition, PipelineBuildDisposition::Published);
+        let active = applied.active.unwrap();
+        assert_eq!(active.snapshot.manifest().workspace(), workspace_id);
+        assert_eq!(active.snapshot.manifest().revision(), target_revision);
+        assert_eq!(active.snapshot.desired_revision(), target_revision);
+        assert_eq!(
+            reopened
+                .store
+                .active()
+                .unwrap()
+                .transaction_receipts()
+                .ids()
+                .collect::<Vec<_>>(),
+            [transaction]
+        );
+    }
+
+    #[test]
+    fn obsolete_v2_desired_revision_is_discarded_when_rebuilt_content_changed() {
+        const SOURCE: &[u8] = b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Changed\n";
+
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root.clone(),
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let workspace_id = WorkspaceId::from_u128(0x9003).unwrap();
+        let empty_workspace =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::lenient()).unwrap();
+        let obsolete_actual = empty_workspace.revision();
+        let obsolete_desired = WorkspaceRevision::new(DigestV1::hash_bytes(b"obsolete-desired"));
+
+        drop(
+            SearchGenerationPipeline::open(
+                paths.clone(),
+                SearchIndexOptions::default(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap(),
+        );
+        write_obsolete_v2_activation(&paths, workspace_id, obsolete_actual, obsolete_desired);
+        std::fs::write(project_root.join("Assets/Changed.prefab"), SOURCE).unwrap();
+
+        let mut pipeline = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let rebuilt = pipeline
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let active = rebuilt.active.unwrap();
+        let rebuilt_revision = active.snapshot.manifest().revision();
+        assert_ne!(rebuilt_revision, obsolete_actual);
+        assert_eq!(active.snapshot.desired_revision(), rebuilt_revision);
+        assert_ne!(active.snapshot.desired_revision(), obsolete_desired);
+
+        let stale_change = ChangeSet::new(
+            TransactionId::new(DigestV1::hash_bytes(b"stale-bootstrap-change")),
+            workspace_id,
+            obsolete_actual,
+            obsolete_desired,
+            vec![SourceId::new(workspace_id, SourceKind::Yaml, 1).unwrap()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let error = pipeline
+            .reindex_workspace(
+                stale_change,
+                &empty_workspace.snapshot(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::RevisionBarrierMismatch {
+                indexed,
+                change_from,
+                change_to,
+            } if indexed == rebuilt_revision
+                && change_from == obsolete_actual
+                && change_to == obsolete_desired
+        ));
     }
 
     #[test]

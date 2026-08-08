@@ -16,7 +16,7 @@ use unity_asset_core::{
 use unity_asset_search_core::SearchKind;
 use unity_asset_search_protocol::ProjectId;
 
-use super::candidate::{FileHint, ReadSource, ScanCandidate, SourceHints};
+use super::candidate::{FileHint, ProjectSourcePath, ReadSource, ScanCandidate, SourceHints};
 use super::diagnostic::{PathRejection, ScanDiagnostic, SourcePart};
 use super::ledger::{ScanEntryKind, ScanLedger, ScanLimitError, ScanLimitResource};
 use super::policy::{
@@ -30,7 +30,8 @@ use crate::anchored_fs::{
     StableDirectoryIdentity, StableDirectoryObjectIdentity, StableFileIdentity,
 };
 use crate::path_semantics::{
-    compare_portable_paths, is_portable_component, strip_prefix as strip_project_root,
+    ProjectPathError, compare_portable_paths, is_portable_component,
+    strip_prefix as strip_project_root,
 };
 #[cfg(windows)]
 use crate::path_semantics::{
@@ -103,7 +104,7 @@ impl ScanMetrics {
 pub(crate) struct ScanPlan {
     pub(crate) mode: ScanMode,
     pub(crate) present: Vec<ScanCandidate>,
-    pub(crate) deleted: Vec<String>,
+    pub(crate) deleted: Vec<ProjectSourcePath>,
     pub(crate) diagnostics: Vec<ScanDiagnostic>,
     pub(crate) metrics: ScanMetrics,
     validation: ScanValidation,
@@ -166,6 +167,20 @@ pub(crate) enum ScanError {
         expected: ProjectId,
         actual: ProjectId,
     },
+    ProjectPath(ProjectPathError),
+}
+
+impl ScanError {
+    pub(crate) fn retryable(&self) -> bool {
+        !matches!(
+            self,
+            Self::PolicyRead {
+                source: AnchoredFsError::UnsupportedCaseSensitiveDirectory,
+            } | Self::TraversalRead {
+                source: AnchoredFsError::UnsupportedCaseSensitiveDirectory,
+            }
+        )
+    }
 }
 
 impl fmt::Display for ScanError {
@@ -214,6 +229,7 @@ impl fmt::Display for ScanError {
                 formatter,
                 "changed paths belong to project {actual}, but this scanner owns {expected}"
             ),
+            Self::ProjectPath(error) => fmt::Display::fmt(error, formatter),
         }
     }
 }
@@ -226,6 +242,7 @@ impl StdError for ScanError {
             Self::Policy(error) => Some(error),
             Self::PolicyRead { source } => Some(source),
             Self::TraversalRead { source } => Some(source),
+            Self::ProjectPath(error) => Some(error),
             Self::PolicyChangedDuringScan
             | Self::TraversalChangedDuringScan
             | Self::SourceChangedDuringScan
@@ -381,10 +398,23 @@ impl ProjectScanner {
         self.project.directory()
     }
 
+    fn project_source_path(
+        &self,
+        relative_path: String,
+    ) -> std::result::Result<ProjectSourcePath, ScanError> {
+        let path = self
+            .project
+            .path_space()
+            .resolve(Path::new(&relative_path))
+            .map_err(ScanError::ProjectPath)?
+            .ok_or(ScanError::TraversalChangedDuringScan)?;
+        Ok(ProjectSourcePath::from_project_path(&path, relative_path))
+    }
+
     pub(crate) fn plan(
         &self,
         intent: ScanIntent,
-        known_rel_paths: &[String],
+        known_rel_paths: &[ProjectSourcePath],
         budget: &mut AssetLoadBudget,
     ) -> std::result::Result<ScanPlan, ScanError> {
         self.validate_project_root_binding()?;
@@ -408,7 +438,6 @@ impl ProjectScanner {
             budget,
             "scan directory proof list",
         )?;
-        self.diagnose_known_paths(known_rel_paths, &mut diagnostics, &mut ledger, budget)?;
         let (mode, mut present, mut deleted, absence_proofs) = match intent {
             ScanIntent::Full => {
                 let mut present = self.discover_full(
@@ -469,8 +498,12 @@ impl ProjectScanner {
         diagnostics.sort_unstable_by(compare_scan_diagnostics);
         diagnostics.dedup();
 
-        deleted.sort_unstable();
-        deleted.dedup();
+        deleted.sort_unstable_by(|left, right| {
+            left.identity()
+                .cmp(&right.identity())
+                .then_with(|| left.relative_path().cmp(right.relative_path()))
+        });
+        deleted.dedup_by(|left, right| left.identity() == right.identity());
 
         let metrics = ScanMetrics {
             discovered: saturating_usize_to_u64(present.len()),
@@ -526,7 +559,8 @@ impl ProjectScanner {
         budget: &mut AssetLoadBudget,
     ) -> ReadSourceOutcome {
         let mut metrics = ScanMetrics::default();
-        let asset_relative = Path::new(&candidate.rel_path);
+        let relative_path = candidate.relative_path();
+        let asset_relative = Path::new(relative_path);
         if !is_supported_asset_path(asset_relative)
             || self.validate_relative_boundary(asset_relative).is_err()
         {
@@ -548,7 +582,7 @@ impl ProjectScanner {
             Err(failure) => {
                 return rejected_read_failure(
                     &failure,
-                    &candidate.rel_path,
+                    relative_path,
                     DiagnosticPath::Joined {
                         root: self.project_root(),
                         relative: asset_relative,
@@ -563,7 +597,7 @@ impl ProjectScanner {
             Err(failure) => {
                 return rejected_read_failure(
                     &failure,
-                    &candidate.rel_path,
+                    relative_path,
                     DiagnosticPath::Joined {
                         root: self.project_root(),
                         relative: asset_relative,
@@ -583,7 +617,7 @@ impl ProjectScanner {
                 };
                 return rejected_read_failure(
                     &failure,
-                    &candidate.rel_path,
+                    relative_path,
                     DiagnosticPath::Joined {
                         root: self.project_root(),
                         relative: &meta_relative,
@@ -606,7 +640,7 @@ impl ProjectScanner {
             Err(failure) => {
                 return rejected_read_failure(
                     &failure,
-                    &candidate.rel_path,
+                    relative_path,
                     DiagnosticPath::Joined {
                         root: self.project_root(),
                         relative: asset_relative,
@@ -630,7 +664,7 @@ impl ProjectScanner {
                 Err(failure) => {
                     return rejected_read_failure(
                         &failure,
-                        &candidate.rel_path,
+                        relative_path,
                         DiagnosticPath::Joined {
                             root: self.project_root(),
                             relative: &meta_relative,
@@ -648,7 +682,7 @@ impl ProjectScanner {
         {
             return rejected_read_failure(
                 &failure,
-                &candidate.rel_path,
+                relative_path,
                 DiagnosticPath::Joined {
                     root: self.project_root(),
                     relative: asset_relative,
@@ -663,7 +697,7 @@ impl ProjectScanner {
             {
                 return rejected_read_failure(
                     &failure,
-                    &candidate.rel_path,
+                    relative_path,
                     DiagnosticPath::Joined {
                         root: self.project_root(),
                         relative: &meta_relative,
@@ -675,7 +709,7 @@ impl ProjectScanner {
         } else if let Err(failure) = self.revalidate_absent_meta(&meta_relative, &mut metrics) {
             return rejected_read_failure(
                 &failure,
-                &candidate.rel_path,
+                relative_path,
                 DiagnosticPath::Joined {
                     root: self.project_root(),
                     relative: &meta_relative,
@@ -697,7 +731,7 @@ impl ProjectScanner {
                 };
                 return rejected_read_failure(
                     &failure,
-                    &candidate.rel_path,
+                    relative_path,
                     DiagnosticPath::Joined {
                         root: self.project_root(),
                         relative: asset_relative,
@@ -727,16 +761,16 @@ impl ProjectScanner {
         let diagnostic_specs = [
             asset
                 .diagnostic
-                .map(|note| read_note_spec(note, &candidate.rel_path)),
+                .map(|note| read_note_spec(note, relative_path)),
             meta.as_ref()
                 .and_then(|meta| meta.diagnostic)
-                .map(|note| read_note_spec(note, &candidate.rel_path)),
+                .map(|note| read_note_spec(note, relative_path)),
             malformed_guid.then_some(ReadDiagnosticSpec::MalformedGuid {
-                rel_path: &candidate.rel_path,
+                rel_path: relative_path,
             }),
             (asset.digest.is_some() && asset.bytes.is_none()).then_some(
                 ReadDiagnosticSpec::PayloadNotRetained {
-                    rel_path: &candidate.rel_path,
+                    rel_path: relative_path,
                     length: asset.hint.size,
                     retained_limit: self.limits.max_retained_asset_bytes,
                 },
@@ -772,6 +806,7 @@ impl ProjectScanner {
             Err(error) => return rejected_scan_error(error, SourcePart::Asset, metrics, budget),
         };
         let source = ReadSource {
+            coordinate: candidate.coordinate(),
             rel_path: prepared.rel_path,
             abs_path,
             name: prepared.name,
@@ -788,7 +823,7 @@ impl ProjectScanner {
             unchanged,
         };
         let source_proof = match prepared_source_proof(
-            &candidate.rel_path,
+            relative_path,
             &asset,
             meta.as_ref(),
             meta_relative,
@@ -982,7 +1017,7 @@ impl ProjectScanner {
     fn discover_changed(
         &self,
         paths: ProjectPathSet,
-        known: &[String],
+        known: &[ProjectSourcePath],
         policy: &SearchIgnoreV1,
         policy_match_budget: &mut PolicyMatchBudget,
         diagnostics: &mut Vec<ScanDiagnostic>,
@@ -1108,7 +1143,7 @@ impl ProjectScanner {
                         budget,
                         "missing changed path proof list",
                     )?;
-                    if sorted_paths_have_strict_descendant(known, &normalized) {
+                    if known_paths_have_strict_descendant(known, &normalized) {
                         let prefix =
                             prepared_string_clone(&normalized, budget, "missing rescan prefix")?;
                         push_retained(
@@ -1132,18 +1167,20 @@ impl ProjectScanner {
                 }
             }
 
-            let rel_path = if delete_unconditionally {
-                match sorted_paths_get(known, &normalized) {
-                    Some(known_path) => {
-                        prepared_string_clone(known_path, budget, "canonical deleted changed path")?
-                    }
-                    None => normalized,
+            let path = if delete_unconditionally {
+                match known_paths_get(known, &normalized) {
+                    Some(known_path) => prepared_project_source_path_clone(
+                        known_path,
+                        budget,
+                        "canonical deleted changed path",
+                    )?,
+                    None => self.project_source_path(normalized)?,
                 }
             } else {
-                normalized
+                self.project_source_path(normalized)?
             };
             let request = RequestedPath {
-                rel_path,
+                path,
                 delete_unconditionally,
             };
             push_retained(
@@ -1205,12 +1242,12 @@ impl ProjectScanner {
         let mut deleted = Vec::new();
         for request in requested {
             if request.delete_unconditionally
-                || (sorted_paths_contain(known, &request.rel_path)
-                    && !contains_candidate(&present, &request.rel_path))
+                || (known_paths_contain(known, request.path.relative_path())
+                    && !contains_candidate(&present, &request.path))
             {
                 push_retained(
                     &mut deleted,
-                    request.rel_path,
+                    request.path,
                     |_| Ok(0),
                     budget,
                     "known deletion list",
@@ -1218,13 +1255,17 @@ impl ProjectScanner {
             }
         }
         for prefix in &rescan_prefixes {
-            for known_path in &known[sorted_path_descendant_range(known, prefix)] {
+            for known_path in &known[known_path_descendant_range(known, prefix)] {
                 if !contains_candidate(&present, known_path) {
-                    let path = prepared_string_clone(known_path, budget, "known deletion path")?;
+                    let path = prepared_project_source_path_clone(
+                        known_path,
+                        budget,
+                        "known deletion path",
+                    )?;
                     push_retained(
                         &mut deleted,
                         path,
-                        string_backing_bytes,
+                        project_source_path_backing_bytes,
                         budget,
                         "known deletion list",
                     )?;
@@ -1239,6 +1280,143 @@ impl ProjectScanner {
         })
     }
 
+    fn observe_scan_root(
+        &self,
+        configured: &Path,
+        diagnostics: &mut Vec<ScanDiagnostic>,
+        directory_proofs: &mut Vec<DirectoryProof>,
+        ledger: &mut ScanLedger,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<Option<ObservedScanRoot>, ScanError> {
+        let mut handle = match self.project.reopen_bound() {
+            Ok(handle) => handle,
+            Err(source) => {
+                push_anchored_diagnostic(
+                    diagnostics,
+                    self.project_root(),
+                    configured,
+                    source,
+                    ledger,
+                    budget,
+                )?;
+                return Ok(None);
+            }
+        };
+        let mut relative = PathBuf::new();
+        let mut normalized = String::new();
+
+        for component in configured.components() {
+            let Component::Normal(expected_name) = component else {
+                return Err(ScanError::TraversalChangedDuringScan);
+            };
+            ledger.observe_kind(ScanEntryKind::Directory)?;
+            let parent_identity = handle
+                .stable_identity()
+                .map_err(directory_revalidation_error)?;
+            let child_depth = path_depth(&relative)?
+                .checked_add(1)
+                .ok_or(ScanError::Budget(BudgetError::ArithmeticOverflow {
+                    resource: "scan path depth",
+                }))?;
+            let preflight =
+                preflight_directory_entries(&handle, &normalized, child_depth, ledger, budget)?;
+            let entries = collect_preflighted_directory_entries(
+                &handle,
+                &normalized,
+                &preflight,
+                parent_identity,
+                budget,
+            )?;
+            if !relative.as_os_str().is_empty() {
+                let proof = DirectoryProof {
+                    relative: prepared_path_clone(
+                        &relative,
+                        budget,
+                        "observed scan root ancestor proof",
+                    )?,
+                    identity: parent_identity,
+                };
+                push_retained(
+                    directory_proofs,
+                    proof,
+                    directory_proof_backing_bytes,
+                    budget,
+                    "scan directory proof list",
+                )?;
+            }
+
+            let mut observed_name = None;
+            for entry in entries {
+                if observed_component_matches(expected_name, entry.name()) {
+                    if observed_name.is_some() {
+                        return Err(ScanError::TraversalChangedDuringScan);
+                    }
+                    observed_name = Some(entry.into_name());
+                }
+            }
+            let Some(observed_name) = observed_name else {
+                push_anchored_diagnostic(
+                    diagnostics,
+                    self.project_root(),
+                    configured,
+                    AnchoredFsError::Io(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "configured scan root component is missing",
+                    )),
+                    ledger,
+                    budget,
+                )?;
+                return Ok(None);
+            };
+            let observed_text = observed_name
+                .to_str()
+                .filter(|name| is_portable_component(name))
+                .ok_or(ScanError::TraversalChangedDuringScan)?;
+            let next_handle = match handle.open_directory(&observed_name) {
+                Ok(handle) => handle,
+                Err(source) => {
+                    push_anchored_diagnostic(
+                        diagnostics,
+                        self.project_root(),
+                        configured,
+                        source,
+                        ledger,
+                        budget,
+                    )?;
+                    return Ok(None);
+                }
+            };
+            let next_relative = prepared_relative_child_path(
+                &relative,
+                &observed_name,
+                budget,
+                "observed scan root relative path",
+            )?;
+            budget.consume_bytes(path_backing_bytes(&next_relative)?)?;
+            let next_normalized = prepared_portable_child_path(
+                &normalized,
+                observed_text,
+                budget,
+                "observed scan root portable path",
+            )?;
+            budget.consume_bytes(string_backing_bytes(&next_normalized)?)?;
+            handle = next_handle;
+            relative = next_relative;
+            normalized = next_normalized;
+        }
+
+        ledger.observe_kind(ScanEntryKind::Directory)?;
+        let identity = handle
+            .stable_identity()
+            .map_err(directory_revalidation_error)?;
+        Ok(Some(ObservedScanRoot {
+            relative,
+            normalized,
+            handle,
+            identity,
+        }))
+    }
+
     fn discover_scope(
         &self,
         scope: &DiscoveryScope<'_>,
@@ -1251,53 +1429,36 @@ impl ProjectScanner {
     ) -> std::result::Result<Vec<ScanCandidate>, ScanError> {
         let mut pending = Vec::new();
         for root in self.scan_roots.iter().rev() {
-            let normalized =
+            let configured_normalized =
                 relative_path_to_portable(root).ok_or(ScanError::TraversalChangedDuringScan)?;
-            if !scope.should_visit_directory(&normalized)
+            if !scope.should_visit_directory(&configured_normalized)
                 || self.is_explicitly_excluded(root)
-                || (!normalized.is_empty()
-                    && policy.decide(&normalized, true, policy_match_budget)?
+                || (!configured_normalized.is_empty()
+                    && policy.decide(&configured_normalized, true, policy_match_budget)?
                         == PolicyDecision::ExcludeAndPrune)
             {
                 continue;
             }
-            let handle = if root.as_os_str().is_empty() {
-                self.project.reopen_bound()
-            } else {
-                self.read_root().open_directory(root)
+            let Some(observed) =
+                self.observe_scan_root(root, diagnostics, directory_proofs, ledger, budget)?
+            else {
+                continue;
             };
-            let handle = match handle {
-                Ok(handle) => handle,
-                Err(source) => {
-                    push_anchored_diagnostic(
-                        diagnostics,
-                        self.project_root(),
-                        root,
-                        source,
-                        ledger,
-                        budget,
-                    )?;
-                    continue;
-                }
-            };
-            if self.is_index_directory(&handle)? {
+            if self.is_index_directory(&observed.handle)? {
                 continue;
             }
-            let depth = path_depth(root)?;
+            let depth = path_depth(&observed.relative)?;
             ledger.observe_root_depth(depth)?;
-            ledger.observe_kind(ScanEntryKind::Directory)?;
             let directory = PendingDirectory {
-                relative: prepared_path_clone(root, budget, "scan root relative path")?,
-                normalized: prepared_string_clone(&normalized, budget, "scan root portable path")?,
+                relative: observed.relative,
+                normalized: observed.normalized,
                 depth,
-                identity: handle
-                    .stable_identity()
-                    .map_err(directory_revalidation_error)?,
+                identity: observed.identity,
             };
             push_retained(
                 &mut pending,
                 directory,
-                pending_directory_backing_bytes,
+                |_| Ok(0),
                 budget,
                 "pending scan directory list",
             )?;
@@ -1477,11 +1638,12 @@ impl ProjectScanner {
                             )?;
                             continue;
                         };
-                        let candidate = ScanCandidate {
-                            rel_path: normalized,
-                            name: prepared_string_clone(stem, budget, "scan candidate name")?,
-                            kind: classify_kind(&relative),
-                        };
+                        let project_path = self.project_source_path(normalized)?;
+                        let candidate = ScanCandidate::new(
+                            project_path,
+                            prepared_string_clone(stem, budget, "scan candidate name")?,
+                            classify_kind(&relative),
+                        );
                         push_retained(
                             &mut present,
                             candidate,
@@ -1688,34 +1850,6 @@ impl ProjectScanner {
             after: Some(file_hint(&metadata)),
         })
     }
-
-    fn diagnose_known_paths(
-        &self,
-        known_rel_paths: &[String],
-        diagnostics: &mut Vec<ScanDiagnostic>,
-        ledger: &mut ScanLedger,
-        budget: &mut AssetLoadBudget,
-    ) -> std::result::Result<(), ScanError> {
-        for rel_path in known_rel_paths {
-            if !is_portable_known_path(rel_path) {
-                let path = prepared_path_clone(
-                    Path::new(rel_path),
-                    budget,
-                    "invalid known path diagnostic",
-                )?;
-                push_scan_diagnostic(
-                    diagnostics,
-                    ScanDiagnostic::PathRejected {
-                        path,
-                        reason: PathRejection::InvalidPath,
-                    },
-                    ledger,
-                    budget,
-                )?;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -1760,6 +1894,14 @@ impl DiscoveryScope<'_> {
             }
         }
     }
+}
+
+#[derive(Debug)]
+struct ObservedScanRoot {
+    relative: PathBuf,
+    normalized: String,
+    handle: ReadDirectory,
+    identity: StableDirectoryIdentity,
 }
 
 #[derive(Debug)]
@@ -1811,13 +1953,13 @@ enum OpenedEntry {
 #[derive(Debug)]
 struct ChangedDiscovery {
     present: Vec<ScanCandidate>,
-    deleted: Vec<String>,
+    deleted: Vec<ProjectSourcePath>,
     absence_proofs: Vec<AbsenceProof>,
 }
 
 #[derive(Debug)]
 struct RequestedPath {
-    rel_path: String,
+    path: ProjectSourcePath,
     delete_unconditionally: bool,
 }
 
@@ -2373,7 +2515,7 @@ fn prepare_read_source_backing(
     let source_layout = checked_usize_bytes(std::mem::size_of::<ReadSource>())?;
     let planned_strings = checked_byte_add(
         checked_byte_add(
-            checked_string_bytes(candidate.rel_path.len())?,
+            checked_string_bytes(candidate.relative_path().len())?,
             checked_string_bytes(candidate.name.len())?,
         )?,
         checked_string_bytes(guid_value.map_or(0, |value| value.len()))?,
@@ -2386,7 +2528,8 @@ fn prepare_read_source_backing(
         budget,
         retained_bytes: 0,
     };
-    let rel_path = materializer.string_clone(&candidate.rel_path, "read source relative path")?;
+    let rel_path =
+        materializer.string_clone(candidate.relative_path(), "read source relative path")?;
     let name = materializer.string_clone(&candidate.name, "read source name")?;
     let guid = match guid_value {
         Some(value) => {
@@ -2617,6 +2760,14 @@ fn rejected_read_failure<'diagnostic>(
         },
         ReadFailure::Anchored {
             part,
+            source: AnchoredFsError::UnsupportedCaseSensitiveDirectory,
+        } => ReadDiagnosticSpec::PathRejected {
+            path: diagnostic_path,
+            reason: PathRejection::UnsupportedCaseSensitiveDirectory,
+            part: *part,
+        },
+        ReadFailure::Anchored {
+            part,
             source: AnchoredFsError::Io(source),
         } if source.kind() == io::ErrorKind::InvalidInput => ReadDiagnosticSpec::PathRejected {
             path: diagnostic_path,
@@ -2723,7 +2874,8 @@ fn rejected_scan_error(
         | ScanError::TraversalChangedDuringScan
         | ScanError::SourceChangedDuringScan
         | ScanError::TraversalLimitExceeded { .. }
-        | ScanError::ChangedPathProjectMismatch { .. } => ReadDiagnosticSpec::ReadFailed {
+        | ScanError::ChangedPathProjectMismatch { .. }
+        | ScanError::ProjectPath(_) => ReadDiagnosticSpec::ReadFailed {
             rel_path: "",
             part,
             kind: io::ErrorKind::InvalidData,
@@ -2907,20 +3059,20 @@ fn system_time_millis(time: SystemTime) -> Option<u64> {
 }
 
 fn append_missing_known_paths(
-    known: &[String],
+    known: &[ProjectSourcePath],
     present: &[ScanCandidate],
-    deleted: &mut Vec<String>,
+    deleted: &mut Vec<ProjectSourcePath>,
     budget: &mut AssetLoadBudget,
 ) -> std::result::Result<(), ScanError> {
     for path in known {
         if contains_candidate(present, path) {
             continue;
         }
-        let path = prepared_string_clone(path, budget, "known deletion path")?;
+        let path = prepared_project_source_path_clone(path, budget, "known deletion path")?;
         push_retained(
             deleted,
             path,
-            string_backing_bytes,
+            project_source_path_backing_bytes,
             budget,
             "known deletion list",
         )?;
@@ -2930,7 +3082,8 @@ fn append_missing_known_paths(
 
 fn sort_and_dedup_candidates(candidates: &mut Vec<ScanCandidate>) {
     candidates.sort_unstable_by(compare_candidates);
-    candidates.dedup_by(|left, right| portable_paths_equal(&left.rel_path, &right.rel_path));
+    candidates
+        .dedup_by(|left, right| portable_paths_equal(left.relative_path(), right.relative_path()));
 }
 
 fn sort_directory_entries(entries: &mut [DirectoryEntryHint]) {
@@ -3069,16 +3222,20 @@ fn directory_entry_path_bytes(parent: &str, name: &OsStr) -> Result<u64, ScanErr
 }
 
 fn compare_candidates(left: &ScanCandidate, right: &ScanCandidate) -> Ordering {
-    compare_portable_paths(&left.rel_path, &right.rel_path)
-        .then_with(|| left.rel_path.cmp(&right.rel_path))
+    compare_portable_paths(left.relative_path(), right.relative_path())
+        .then_with(|| left.relative_path().cmp(right.relative_path()))
         .then_with(|| left.name.cmp(&right.name))
         .then_with(|| left.kind.canonical_name().cmp(right.kind.canonical_name()))
 }
 
-fn contains_candidate(candidates: &[ScanCandidate], rel_path: &str) -> bool {
+fn contains_candidate(candidates: &[ScanCandidate], path: &ProjectSourcePath) -> bool {
     candidates
-        .binary_search_by(|candidate| compare_portable_paths(&candidate.rel_path, rel_path))
-        .is_ok()
+        .binary_search_by(|candidate| {
+            compare_portable_paths(candidate.relative_path(), path.relative_path())
+        })
+        .ok()
+        .and_then(|index| candidates.get(index))
+        .is_some_and(|candidate| candidate.coordinate() == path.coordinate())
 }
 
 fn push_diagnostic(
@@ -3161,6 +3318,9 @@ fn push_anchored_diagnostic(
                 "unsupported-platform diagnostic",
             )?,
         },
+        source @ AnchoredFsError::UnsupportedCaseSensitiveDirectory => {
+            return Err(ScanError::TraversalRead { source });
+        }
         AnchoredFsError::IdentityChanged => ScanDiagnostic::WalkFailed {
             message: prepared_string_clone(
                 "anchored filesystem identity changed during traversal",
@@ -3173,16 +3333,7 @@ fn push_anchored_diagnostic(
 }
 
 fn directory_revalidation_error(source: AnchoredFsError) -> ScanError {
-    if matches!(
-        &source,
-        AnchoredFsError::IdentityChanged
-            | AnchoredFsError::LinkOrReparse
-            | AnchoredFsError::NotDirectory
-            | AnchoredFsError::NotRegular
-    ) || matches!(
-        &source,
-        AnchoredFsError::Io(error) if error.kind() == io::ErrorKind::NotFound
-    ) {
+    if is_revalidation_change(&source) {
         ScanError::TraversalChangedDuringScan
     } else {
         ScanError::TraversalRead { source }
@@ -3190,20 +3341,24 @@ fn directory_revalidation_error(source: AnchoredFsError) -> ScanError {
 }
 
 fn source_revalidation_error(source: AnchoredFsError) -> ScanError {
-    if matches!(
-        &source,
+    if is_revalidation_change(&source) {
+        ScanError::SourceChangedDuringScan
+    } else {
+        ScanError::TraversalRead { source }
+    }
+}
+
+fn is_revalidation_change(source: &AnchoredFsError) -> bool {
+    matches!(
+        source,
         AnchoredFsError::IdentityChanged
             | AnchoredFsError::LinkOrReparse
             | AnchoredFsError::NotDirectory
             | AnchoredFsError::NotRegular
     ) || matches!(
-        &source,
+        source,
         AnchoredFsError::Io(error) if error.kind() == io::ErrorKind::NotFound
-    ) {
-        ScanError::SourceChangedDuringScan
-    } else {
-        ScanError::TraversalRead { source }
-    }
+    )
 }
 
 fn push_retained<T>(
@@ -3268,6 +3423,18 @@ fn prepared_string_clone(
     cloned.push_str(value);
     budget.check_bytes(string_backing_bytes(&cloned)?)?;
     Ok(cloned)
+}
+
+fn prepared_project_source_path_clone(
+    path: &ProjectSourcePath,
+    budget: &AssetLoadBudget,
+    allocation: &'static str,
+) -> std::result::Result<ProjectSourcePath, ScanError> {
+    let relative_path = prepared_string_clone(path.relative_path(), budget, allocation)?;
+    Ok(ProjectSourcePath::from_validated_parts(
+        path.identity(),
+        relative_path,
+    ))
 }
 
 fn prepared_path_clone(
@@ -3463,7 +3630,7 @@ fn prepared_portable_relative_path(
 
 fn candidate_backing_bytes(candidate: &ScanCandidate) -> std::result::Result<u64, ScanError> {
     checked_byte_add(
-        string_backing_bytes(&candidate.rel_path)?,
+        checked_string_bytes(candidate.relative_path_capacity())?,
         string_backing_bytes(&candidate.name)?,
     )
 }
@@ -3498,7 +3665,13 @@ fn directory_entry_backing_bytes(
 }
 
 fn requested_path_backing_bytes(requested: &RequestedPath) -> std::result::Result<u64, ScanError> {
-    string_backing_bytes(&requested.rel_path)
+    project_source_path_backing_bytes(&requested.path)
+}
+
+fn project_source_path_backing_bytes(
+    path: &ProjectSourcePath,
+) -> std::result::Result<u64, ScanError> {
+    checked_string_bytes(path.relative_path_capacity())
 }
 
 fn diagnostic_backing_bytes(diagnostic: &ScanDiagnostic) -> std::result::Result<u64, ScanError> {
@@ -3853,13 +4026,6 @@ fn meta_relative_path_capacity_bound(asset_relative: &Path) -> Option<usize> {
         .checked_add(READ_META_PATH_EXTRA_CAPACITY)
 }
 
-fn is_portable_known_path(path: &str) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    path.split('/').all(is_portable_component)
-}
-
 fn configured_relative_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
     configured_relative_path_if_inside(project_root, path)?.ok_or_else(|| {
         anyhow!(
@@ -3954,6 +4120,16 @@ fn normalize_relative_scan_roots(paths: &mut Vec<PathBuf>) {
         retained += 1;
     }
     paths.truncate(retained);
+}
+
+#[cfg(not(windows))]
+fn observed_component_matches(configured: &OsStr, observed: &OsStr) -> bool {
+    configured == observed
+}
+
+#[cfg(windows)]
+fn observed_component_matches(configured: &OsStr, observed: &OsStr) -> bool {
+    windows_path_component_eq(configured, observed)
 }
 
 fn is_anchored_type_mismatch(error: &AnchoredFsError) -> bool {
@@ -4140,11 +4316,28 @@ fn sorted_paths_contain(paths: &[String], path: &str) -> bool {
         .is_ok()
 }
 
+#[cfg(test)]
 fn sorted_paths_get<'paths>(paths: &'paths [String], path: &str) -> Option<&'paths str> {
     paths
         .binary_search_by(|candidate| compare_portable_paths(candidate, path))
         .ok()
         .map(|index| paths[index].as_str())
+}
+
+fn known_paths_contain(paths: &[ProjectSourcePath], path: &str) -> bool {
+    paths
+        .binary_search_by(|candidate| compare_portable_paths(candidate.relative_path(), path))
+        .is_ok()
+}
+
+fn known_paths_get<'paths>(
+    paths: &'paths [ProjectSourcePath],
+    path: &str,
+) -> Option<&'paths ProjectSourcePath> {
+    paths
+        .binary_search_by(|candidate| compare_portable_paths(candidate.relative_path(), path))
+        .ok()
+        .and_then(|index| paths.get(index))
 }
 
 fn sorted_paths_have_descendant(paths: &[String], prefix: &str) -> bool {
@@ -4155,6 +4348,7 @@ fn sorted_paths_have_descendant(paths: &[String], prefix: &str) -> bool {
         .is_some_and(|path| is_path_at_or_below(path, prefix))
 }
 
+#[cfg(test)]
 fn sorted_paths_have_strict_descendant(paths: &[String], prefix: &str) -> bool {
     let range = sorted_path_descendant_range(paths, prefix);
     paths[range]
@@ -4162,6 +4356,25 @@ fn sorted_paths_have_strict_descendant(paths: &[String], prefix: &str) -> bool {
         .any(|path| !portable_paths_equal(path, prefix))
 }
 
+fn known_paths_have_strict_descendant(paths: &[ProjectSourcePath], prefix: &str) -> bool {
+    let range = known_path_descendant_range(paths, prefix);
+    paths[range]
+        .iter()
+        .any(|path| !portable_paths_equal(path.relative_path(), prefix))
+}
+
+fn known_path_descendant_range(
+    paths: &[ProjectSourcePath],
+    prefix: &str,
+) -> std::ops::Range<usize> {
+    let start =
+        paths.partition_point(|path| compare_portable_paths(path.relative_path(), prefix).is_lt());
+    let end = start
+        + paths[start..].partition_point(|path| is_path_at_or_below(path.relative_path(), prefix));
+    start..end
+}
+
+#[cfg(test)]
 fn sorted_path_descendant_range(paths: &[String], prefix: &str) -> std::ops::Range<usize> {
     let start = paths.partition_point(|path| compare_portable_paths(path, prefix).is_lt());
     let end = start + paths[start..].partition_point(|path| is_path_at_or_below(path, prefix));
@@ -4291,9 +4504,54 @@ mod tests {
         intent: ScanIntent,
         known: &[String],
     ) -> ScanPlan {
+        let known = project_source_paths(scanner, known);
         scanner
-            .plan(intent, known, &mut AssetLoadBudget::default())
+            .plan(intent, &known, &mut AssetLoadBudget::default())
             .unwrap()
+    }
+
+    fn project_source_path(scanner: &ProjectScanner, relative_path: &str) -> ProjectSourcePath {
+        let path = scanner
+            .project
+            .path_space()
+            .resolve(Path::new(relative_path))
+            .unwrap()
+            .unwrap();
+        ProjectSourcePath::from_project_path(&path, relative_path.to_owned())
+    }
+
+    fn project_source_paths(
+        scanner: &ProjectScanner,
+        relative_paths: &[String],
+    ) -> Vec<ProjectSourcePath> {
+        let mut paths = relative_paths
+            .iter()
+            .map(|path| project_source_path(scanner, path))
+            .collect::<Vec<_>>();
+        paths.sort_unstable_by(|left, right| {
+            compare_portable_paths(left.relative_path(), right.relative_path())
+        });
+        paths
+    }
+
+    fn deleted_paths(plan: &ScanPlan) -> Vec<&str> {
+        plan.deleted
+            .iter()
+            .map(ProjectSourcePath::relative_path)
+            .collect()
+    }
+
+    fn candidate_facts(plan: &ScanPlan) -> Vec<(&str, &str, SearchKind)> {
+        plan.present
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.relative_path(),
+                    candidate.name.as_str(),
+                    candidate.kind,
+                )
+            })
+            .collect()
     }
 
     fn changed_paths<I, P>(scanner: &ProjectScanner, paths: I) -> ScanIntent
@@ -4302,6 +4560,17 @@ mod tests {
         P: AsRef<Path>,
     {
         ScanIntent::ChangedPaths(scanner.project.path_space().resolve_set(paths).unwrap())
+    }
+
+    fn traversal_limit_intent(scanner: &ProjectScanner) -> ScanIntent {
+        changed_paths(
+            scanner,
+            [
+                PathBuf::from("Assets"),
+                PathBuf::from("Assets/.first.asset"),
+                PathBuf::from("Assets/.Second.asset"),
+            ],
+        )
     }
 
     #[test]
@@ -4329,23 +4598,34 @@ mod tests {
 
     #[test]
     fn candidate_lookup_matches_the_primary_portable_sort_order() {
+        let project = tempfile::tempdir().unwrap();
+        let scanner = scanner(&project, ScanReadLimits::default());
         let mut candidates = vec![
-            ScanCandidate {
-                rel_path: "Assets/Z.asset".to_owned(),
-                name: "Z".to_owned(),
-                kind: SearchKind::Asset,
-            },
-            ScanCandidate {
-                rel_path: "Assets/A.asset".to_owned(),
-                name: "A".to_owned(),
-                kind: SearchKind::Asset,
-            },
+            ScanCandidate::new(
+                project_source_path(&scanner, "Assets/Z.asset"),
+                "Z".to_owned(),
+                SearchKind::Asset,
+            ),
+            ScanCandidate::new(
+                project_source_path(&scanner, "Assets/A.asset"),
+                "A".to_owned(),
+                SearchKind::Asset,
+            ),
         ];
         sort_and_dedup_candidates(&mut candidates);
 
-        assert!(contains_candidate(&candidates, "Assets/A.asset"));
-        assert!(contains_candidate(&candidates, "Assets/Z.asset"));
-        assert!(!contains_candidate(&candidates, "Assets/Missing.asset"));
+        assert!(contains_candidate(
+            &candidates,
+            &project_source_path(&scanner, "Assets/A.asset")
+        ));
+        assert!(contains_candidate(
+            &candidates,
+            &project_source_path(&scanner, "Assets/Z.asset")
+        ));
+        assert!(!contains_candidate(
+            &candidates,
+            &project_source_path(&scanner, "Assets/Missing.asset")
+        ));
     }
 
     #[test]
@@ -4382,7 +4662,7 @@ mod tests {
         fs::write(project.path().join("README.md"), b"project notes").unwrap();
 
         let plan = plan_with_default_budget(&scanner, ScanIntent::Full, &[]);
-        assert_eq!(plan.present[0].rel_path, "Assets/Visible.asset");
+        assert_eq!(plan.present[0].relative_path(), "Assets/Visible.asset");
     }
 
     #[test]
@@ -4395,7 +4675,7 @@ mod tests {
         let known = before
             .present
             .iter()
-            .map(|candidate| candidate.rel_path.clone())
+            .map(|candidate| candidate.relative_path().to_owned())
             .collect::<Vec<_>>();
         let policy = project.path().join(SEARCH_IGNORE_V1_FILE);
 
@@ -4404,7 +4684,7 @@ mod tests {
         let intent = changed_paths(&scanner, [policy]);
         let changed = plan_with_default_budget(&scanner, intent, &known);
         assert!(changed.present.is_empty());
-        assert_eq!(changed.deleted, ["Assets/Hidden.asset"]);
+        assert_eq!(deleted_paths(&changed), ["Assets/Hidden.asset"]);
     }
 
     fn exact_traversal_limits(plan: &ScanPlan) -> crate::ScanTraversalLimits {
@@ -4434,7 +4714,7 @@ mod tests {
     ) -> u64 {
         path_backing_bytes(&source.abs_path).unwrap()
             + u64::try_from(
-                meta_relative_path_capacity_bound(Path::new(&candidate.rel_path)).unwrap(),
+                meta_relative_path_capacity_bound(Path::new(candidate.relative_path())).unwrap(),
             )
             .unwrap()
             + u64::try_from(std::mem::size_of::<ReadSource>()).unwrap()
@@ -4464,11 +4744,11 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/A.asset", "Assets/Z/B.asset"]
         );
-        assert_eq!(plan.deleted, ["Assets/Removed.asset"]);
+        assert_eq!(deleted_paths(&plan), ["Assets/Removed.asset"]);
         assert_eq!(plan.metrics.discovered, 2);
         assert_eq!(plan.metrics.deleted, 1);
     }
@@ -4533,7 +4813,10 @@ mod tests {
             &[],
         );
 
-        assert_eq!(forward_plan.present, reverse_plan.present);
+        assert_eq!(
+            candidate_facts(&forward_plan),
+            candidate_facts(&reverse_plan)
+        );
         assert_eq!(forward_plan.deleted, reverse_plan.deleted);
         assert_eq!(forward_plan.metrics, reverse_plan.metrics);
         assert_eq!(forward_plan.traversal_usage, reverse_plan.traversal_usage);
@@ -4633,17 +4916,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn candidate_deduplication_uses_windows_path_equivalence() {
+        let project = tempfile::tempdir().unwrap();
+        let scanner = scanner(&project, ScanReadLimits::default());
         let mut candidates = vec![
-            ScanCandidate {
-                rel_path: "Assets/Owner.prefab".to_owned(),
-                name: "Owner".to_owned(),
-                kind: SearchKind::Prefab,
-            },
-            ScanCandidate {
-                rel_path: "ASSETS/OWNER.prefab".to_owned(),
-                name: "OWNER".to_owned(),
-                kind: SearchKind::Prefab,
-            },
+            ScanCandidate::new(
+                project_source_path(&scanner, "Assets/Owner.prefab"),
+                "Owner".to_owned(),
+                SearchKind::Prefab,
+            ),
+            ScanCandidate::new(
+                project_source_path(&scanner, "ASSETS/OWNER.prefab"),
+                "OWNER".to_owned(),
+                SearchKind::Prefab,
+            ),
         ];
 
         sort_and_dedup_candidates(&mut candidates);
@@ -4661,14 +4946,13 @@ mod tests {
             b"second",
         )
         .unwrap();
-        let known = [
-            "../invalid.asset".to_owned(),
-            r"invalid\portable.asset".to_owned(),
-        ];
+        fs::write(project.path().join("Assets/.first.asset"), b"hidden").unwrap();
+        fs::write(project.path().join("Assets/.Second.asset"), b"hidden").unwrap();
+        let baseline_scanner = scanner(&project, ScanReadLimits::default());
         let baseline = plan_with_default_budget(
-            &scanner(&project, ScanReadLimits::default()),
-            ScanIntent::Full,
-            &known,
+            &baseline_scanner,
+            traversal_limit_intent(&baseline_scanner),
+            &[],
         );
         let usage = baseline.traversal_usage;
         assert!(usage.entries > 1);
@@ -4684,11 +4968,10 @@ mod tests {
         };
         exact_options.validate().unwrap();
 
-        let exact_plan = plan_with_default_budget(
-            &scanner_with_options(&project, exact_options, ScanReadLimits::default()),
-            ScanIntent::Full,
-            &known,
-        );
+        let exact_scanner =
+            scanner_with_options(&project, exact_options, ScanReadLimits::default());
+        let exact_plan =
+            plan_with_default_budget(&exact_scanner, traversal_limit_intent(&exact_scanner), &[]);
 
         assert_eq!(exact_plan.traversal_usage, usage);
     }
@@ -4703,14 +4986,13 @@ mod tests {
             b"second",
         )
         .unwrap();
-        let known = [
-            "../invalid.asset".to_owned(),
-            r"invalid\portable.asset".to_owned(),
-        ];
+        fs::write(project.path().join("Assets/.first.asset"), b"hidden").unwrap();
+        fs::write(project.path().join("Assets/.Second.asset"), b"hidden").unwrap();
+        let baseline_scanner = scanner(&project, ScanReadLimits::default());
         let baseline = plan_with_default_budget(
-            &scanner(&project, ScanReadLimits::default()),
-            ScanIntent::Full,
-            &known,
+            &baseline_scanner,
+            traversal_limit_intent(&baseline_scanner),
+            &[],
         );
         let exact = exact_traversal_limits(&baseline);
         let cases = [
@@ -4771,7 +5053,11 @@ mod tests {
             };
             options.validate().unwrap();
             let scanner = scanner_with_options(&project, options, ScanReadLimits::default());
-            let result = scanner.plan(ScanIntent::Full, &known, &mut AssetLoadBudget::default());
+            let result = scanner.plan(
+                traversal_limit_intent(&scanner),
+                &[],
+                &mut AssetLoadBudget::default(),
+            );
 
             match result {
                 Err(ScanError::TraversalLimitExceeded {
@@ -4852,7 +5138,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/valid.asset"]
         );
@@ -4913,7 +5199,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Owner.prefab"]
         );
@@ -4925,7 +5211,68 @@ mod tests {
             changed_paths(&scanner, [project.path().join("assets/owner.prefab")]),
             &known,
         );
-        assert_eq!(plan.deleted, ["Assets/Owner.prefab"]);
+        assert_eq!(deleted_paths(&plan), ["Assets/Owner.prefab"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn configured_scan_root_case_rename_refreshes_observed_spelling() {
+        let project = tempfile::tempdir().unwrap();
+        let original_root = project.path().join("Assets/Characters");
+        fs::create_dir_all(&original_root).unwrap();
+        fs::write(original_root.join("Hero.prefab"), b"asset").unwrap();
+        let paths = IndexPaths::for_project(
+            project.path().to_path_buf(),
+            None,
+            Some(vec![original_root.clone()]),
+        )
+        .unwrap();
+        let scanner = ProjectScanner::new(
+            &paths,
+            SearchIndexOptions::default(),
+            ScanReadLimits::default(),
+        )
+        .unwrap();
+        let before = plan_with_default_budget(&scanner, ScanIntent::Full, &[]);
+        let coordinate = before.present[0].coordinate();
+        assert_eq!(
+            before.present[0].relative_path(),
+            "Assets/Characters/Hero.prefab"
+        );
+
+        let intermediate_root = project.path().join("Assets/Characters-renaming");
+        let observed_root = project.path().join("Assets/characters");
+        fs::rename(&original_root, &intermediate_root).unwrap();
+        fs::rename(&intermediate_root, &observed_root).unwrap();
+        let known = ["Assets/Characters/Hero.prefab".to_owned()];
+        for intent in [
+            ScanIntent::Full,
+            ScanIntent::Reconcile,
+            changed_paths(&scanner, [observed_root.join("Hero.prefab")]),
+        ] {
+            let plan = plan_with_default_budget(&scanner, intent, &known);
+            assert_eq!(plan.present.len(), 1);
+            assert_eq!(
+                plan.present[0].relative_path(),
+                "Assets/characters/Hero.prefab"
+            );
+            assert_eq!(plan.present[0].coordinate(), coordinate);
+            assert!(plan.deleted.is_empty());
+        }
+
+        let reopened = ProjectScanner::new(
+            &paths,
+            SearchIndexOptions::default(),
+            ScanReadLimits::default(),
+        )
+        .unwrap();
+        let plan = plan_with_default_budget(&reopened, ScanIntent::Full, &known);
+        assert_eq!(
+            plan.present[0].relative_path(),
+            "Assets/characters/Hero.prefab"
+        );
+        assert_eq!(plan.present[0].coordinate(), coordinate);
+        assert!(plan.deleted.is_empty());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -5053,7 +5400,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Keep.asset", "Assets/Nested/Visible.asset"]
         );
@@ -5078,7 +5425,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Generated/Keep.asset"]
         );
@@ -5096,7 +5443,7 @@ mod tests {
         let plan = plan_with_default_budget(&scanner, ScanIntent::Full, &[]);
 
         assert_eq!(plan.present.len(), 1);
-        assert_eq!(plan.present[0].rel_path, "Assets/Hidden.asset");
+        assert_eq!(plan.present[0].relative_path(), "Assets/Hidden.asset");
     }
 
     #[test]
@@ -5319,7 +5666,7 @@ mod tests {
         let known = before
             .present
             .iter()
-            .map(|candidate| candidate.rel_path.clone())
+            .map(|candidate| candidate.relative_path().to_owned())
             .collect::<Vec<_>>();
         fs::write(&ignore_path, b"exact:Assets/Keep.asset\n").unwrap();
 
@@ -5331,16 +5678,16 @@ mod tests {
             changed
                 .present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             full.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>()
         );
         assert_eq!(changed.deleted, full.deleted);
-        assert_eq!(changed.present[0].rel_path, "Assets/Ignored.asset");
-        assert_eq!(changed.deleted, ["Assets/Keep.asset"]);
+        assert_eq!(changed.present[0].relative_path(), "Assets/Ignored.asset");
+        assert_eq!(deleted_paths(&changed), ["Assets/Keep.asset"]);
     }
 
     #[test]
@@ -5366,7 +5713,7 @@ mod tests {
         let known = before
             .present
             .iter()
-            .map(|candidate| candidate.rel_path.clone())
+            .map(|candidate| candidate.relative_path().to_owned())
             .collect::<Vec<_>>();
         fs::write(&ignore_path, b"exact:Root.asset\n").unwrap();
 
@@ -5377,7 +5724,7 @@ mod tests {
         assert_eq!(changed.present, full.present);
         assert_eq!(changed.deleted, full.deleted);
         assert!(changed.present.is_empty());
-        assert_eq!(changed.deleted, ["Root.asset"]);
+        assert_eq!(deleted_paths(&changed), ["Root.asset"]);
     }
 
     #[cfg(any(windows, target_os = "macos"))]
@@ -5398,7 +5745,7 @@ mod tests {
         let known = before
             .present
             .iter()
-            .map(|candidate| candidate.rel_path.clone())
+            .map(|candidate| candidate.relative_path().to_owned())
             .collect::<Vec<_>>();
         fs::write(&ignore_path, b"exact:Assets/Hidden.asset\n").unwrap();
 
@@ -5409,7 +5756,7 @@ mod tests {
         assert_eq!(changed.present, full.present);
         assert_eq!(changed.deleted, full.deleted);
         assert!(changed.present.is_empty());
-        assert_eq!(changed.deleted, ["Assets/Hidden.asset"]);
+        assert_eq!(deleted_paths(&changed), ["Assets/Hidden.asset"]);
     }
 
     #[test]
@@ -5466,6 +5813,57 @@ mod tests {
         ));
         assert_eq!(budget.usage().bytes, 0);
         assert_eq!(budget.usage().entries, 0);
+    }
+
+    #[test]
+    fn cloned_deletion_path_is_charged_with_its_collection_slot() {
+        let project = tempfile::tempdir().unwrap();
+        let scanner = scanner(&project, ScanReadLimits::default());
+        let known = [project_source_path(&scanner, "Assets/Removed.asset")];
+        let retained_path = prepared_project_source_path_clone(
+            &known[0],
+            &AssetLoadBudget::default(),
+            "deletion budget probe",
+        )
+        .unwrap();
+        let path_bytes = project_source_path_backing_bytes(&retained_path).unwrap();
+        let mut vector_probe = Vec::<ProjectSourcePath>::new();
+        vector_probe.try_reserve_exact(1).unwrap();
+        let vector_bytes = checked_vec_bytes::<ProjectSourcePath>(vector_probe.capacity()).unwrap();
+        let retained_bytes = path_bytes.checked_add(vector_bytes).unwrap();
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            max_bytes: retained_bytes,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let mut deleted = Vec::new();
+
+        append_missing_known_paths(&known, &[], &mut deleted, &mut exact).unwrap();
+
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(exact.usage().entries, 1);
+        assert_eq!(exact.usage().bytes, retained_bytes);
+
+        let mut one_byte_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_entries: 1,
+            max_bytes: retained_bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        let error = append_missing_known_paths(&known, &[], &mut Vec::new(), &mut one_byte_short)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ScanError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                limit,
+                requested,
+            }) if limit == retained_bytes - 1 && requested == retained_bytes
+        ));
+        assert_eq!(one_byte_short.usage().entries, 0);
+        assert_eq!(one_byte_short.usage().bytes, 0);
     }
 
     #[test]
@@ -5535,8 +5933,8 @@ mod tests {
             &["Packages/Old.asset".to_owned()],
         );
 
-        assert_eq!(plan.deleted, ["Packages/Old.asset"]);
-        assert_eq!(plan.present[0].rel_path, "Assets/Current.asset");
+        assert_eq!(deleted_paths(&plan), ["Packages/Old.asset"]);
+        assert_eq!(plan.present[0].relative_path(), "Assets/Current.asset");
     }
 
     #[test]
@@ -5581,7 +5979,7 @@ mod tests {
         let scanner = scanner(&project, ScanReadLimits::default());
         let plan = plan_with_default_budget(&scanner, ScanIntent::Full, &[]);
         let meta_path_bytes = u64::try_from(
-            meta_relative_path_capacity_bound(Path::new(&plan.present[0].rel_path)).unwrap(),
+            meta_relative_path_capacity_bound(Path::new(plan.present[0].relative_path())).unwrap(),
         )
         .unwrap();
         let max_bytes = meta_path_bytes.checked_add(5).unwrap();
@@ -5626,7 +6024,8 @@ mod tests {
             checked_vec_bytes::<ScanDiagnostic>(diagnostic_probe.capacity()).unwrap();
         assert!(
             u64::try_from(
-                meta_relative_path_capacity_bound(Path::new(&plan.present[0].rel_path)).unwrap()
+                meta_relative_path_capacity_bound(Path::new(plan.present[0].relative_path()))
+                    .unwrap()
             )
             .unwrap()
                 > diagnostic_bytes
@@ -5887,11 +6286,11 @@ mod tests {
 
         let intent = changed_paths(&scanner, [directory]);
         let plan = plan_with_default_budget(&scanner, intent, &known);
-        assert_eq!(plan.deleted, ["Assets/Area/Removed.asset"]);
+        assert_eq!(deleted_paths(&plan), ["Assets/Area/Removed.asset"]);
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Area/Present.asset"]
         );
@@ -5912,8 +6311,10 @@ mod tests {
             &known,
         );
 
+        let mut deleted = deleted_paths(&plan);
+        deleted.sort_unstable();
         assert_eq!(
-            plan.deleted,
+            deleted,
             [
                 "Assets/Removed",
                 "Assets/Removed/A.asset",
@@ -5933,6 +6334,7 @@ mod tests {
             } else {
                 vec![format!("{relative}/Nested.asset")]
             };
+            let known = project_source_paths(&scanner, &known);
             let mut budget = AssetLoadBudget::default();
             let plan = scanner
                 .plan(
@@ -5977,7 +6379,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Public.asset"]
         );
@@ -6009,7 +6411,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Public.asset"]
         );
@@ -6045,7 +6447,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Assets/Public.asset"]
         );
@@ -6086,7 +6488,7 @@ mod tests {
         assert_eq!(
             plan.present
                 .iter()
-                .map(|candidate| candidate.rel_path.as_str())
+                .map(ScanCandidate::relative_path)
                 .collect::<Vec<_>>(),
             ["Visible/Keep.asset"]
         );

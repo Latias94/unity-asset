@@ -23,13 +23,16 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_ATTRIBUTE_TAG_INFO, FILE_BASIC_INFO, FILE_CASE_SENSITIVE_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE,
-    FileAttributeTagInfo, FileBasicInfo, FileIdInfo, FileStandardInfo,
+    FileAttributeTagInfo, FileBasicInfo, FileCaseSensitiveInfo, FileIdInfo, FileStandardInfo,
     GetFileInformationByHandleEx, OPEN_EXISTING, SYNCHRONIZE,
 };
+#[cfg(test)]
+use windows_sys::Win32::Storage::FileSystem::{FILE_WRITE_ATTRIBUTES, SetFileInformationByHandle};
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 use super::{AnchoredFsError, DirectoryEntryHint, EntryKindHint, OpenPolicy};
@@ -183,6 +186,7 @@ impl Iterator for DirectoryEntries<'_> {
 
 impl DirectoryEntries<'_> {
     fn refill(&mut self) -> Result<bool, AnchoredFsError> {
+        validate_directory_case_sensitivity(self.handle.raw())?;
         let buffer_bytes = size_of::<[u64; DIRECTORY_BUFFER_WORDS]>();
         let buffer_length = u32::try_from(buffer_bytes)
             .map_err(|_| invalid_data("Windows directory enumeration buffer exceeds u32"))?;
@@ -326,6 +330,7 @@ pub(super) fn open_regular_at(
     name: &OsStr,
     policy: OpenPolicy,
 ) -> Result<(File, FileIdentity), AnchoredFsError> {
+    validate_directory_case_sensitivity(parent.handle.raw())?;
     validate_leaf(name)?;
     let handle = nt_create_at(
         parent.handle.raw(),
@@ -411,6 +416,63 @@ pub(super) fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> io::Result
     file.seek_read(buffer, offset)
 }
 
+#[cfg(test)]
+pub(crate) fn try_enable_case_sensitive_directory_for_test(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "case-sensitive directory test path must be absolute",
+        ));
+    }
+    let mut encoded = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    if encoded.is_empty() || encoded.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "case-sensitive directory test path is invalid",
+        ));
+    }
+    encoded.push(0);
+
+    let raw_handle = unsafe {
+        CreateFileW(
+            encoded.as_ptr(),
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw_handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = OwnedHandle(raw_handle);
+    let information = FILE_CASE_SENSITIVE_INFO {
+        Flags: FILE_CS_FLAG_CASE_SENSITIVE_DIR,
+    };
+    let information_size = u32::try_from(size_of::<FILE_CASE_SENSITIVE_INFO>())
+        .map_err(|_| io::Error::other("Windows case-sensitivity information exceeds u32"))?;
+    let succeeded = unsafe {
+        SetFileInformationByHandle(
+            handle.raw(),
+            FileCaseSensitiveInfo,
+            (&raw const information).cast(),
+            information_size,
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let flags = query_case_sensitivity_flags(handle.raw())?;
+    if flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR == 0 {
+        return Err(io::Error::other(
+            "Windows accepted the case-sensitivity update without setting the directory flag",
+        ));
+    }
+    Ok(())
+}
+
 fn open_root(root: &OsStr, policy: OpenPolicy) -> Result<OwnedHandle, AnchoredFsError> {
     let mut path = [0_u16; WINDOWS_ROOT_BUFFER_UTF16_UNITS];
     encode_root(root, &mut path)?;
@@ -438,6 +500,7 @@ fn open_directory_handle_at(
     name: &OsStr,
     policy: OpenPolicy,
 ) -> Result<OwnedHandle, AnchoredFsError> {
+    validate_directory_case_sensitivity(parent)?;
     let handle = nt_create_at(
         parent,
         name,
@@ -513,9 +576,41 @@ fn nt_create_at(
 fn validate_directory_handle(handle: HANDLE) -> Result<(), AnchoredFsError> {
     validate_non_reparse(handle)?;
     if file_standard_information(handle)?.Directory {
-        Ok(())
+        validate_directory_case_sensitivity(handle)
     } else {
         Err(AnchoredFsError::NotDirectory)
+    }
+}
+
+fn validate_directory_case_sensitivity(handle: HANDLE) -> Result<(), AnchoredFsError> {
+    validate_case_sensitivity_query(query_case_sensitivity_flags(handle))
+}
+
+fn query_case_sensitivity_flags(handle: HANDLE) -> io::Result<u32> {
+    let mut information = FILE_CASE_SENSITIVE_INFO::default();
+    let information_size = u32::try_from(size_of::<FILE_CASE_SENSITIVE_INFO>())
+        .map_err(|_| io::Error::other("Windows case-sensitivity information exceeds u32"))?;
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
+            FileCaseSensitiveInfo,
+            (&raw mut information).cast(),
+            information_size,
+        )
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(information.Flags)
+    }
+}
+
+fn validate_case_sensitivity_query(result: io::Result<u32>) -> Result<(), AnchoredFsError> {
+    let flags = result.map_err(AnchoredFsError::Io)?;
+    if flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR == 0 {
+        Ok(())
+    } else {
+        Err(AnchoredFsError::UnsupportedCaseSensitiveDirectory)
     }
 }
 
@@ -823,9 +918,14 @@ fn invalid_data(message: &'static str) -> AnchoredFsError {
 
 #[cfg(test)]
 mod tests {
-    use windows_sys::Win32::Foundation::{STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY};
+    use std::io;
 
-    use super::{AnchoredFsError, ntstatus_error};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, STATUS_FILE_IS_A_DIRECTORY, STATUS_NOT_A_DIRECTORY,
+    };
+    use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
+
+    use super::{AnchoredFsError, ntstatus_error, validate_case_sensitivity_query};
 
     #[test]
     fn maps_ntstatus_type_mismatches_to_typed_errors() {
@@ -836,6 +936,29 @@ mod tests {
         assert!(matches!(
             ntstatus_error(STATUS_FILE_IS_A_DIRECTORY),
             AnchoredFsError::NotRegular
+        ));
+    }
+
+    #[test]
+    fn maps_case_sensitivity_query_results_to_typed_errors() {
+        assert!(validate_case_sensitivity_query(Ok(0)).is_ok());
+        assert!(matches!(
+            validate_case_sensitivity_query(Ok(FILE_CS_FLAG_CASE_SENSITIVE_DIR)),
+            Err(AnchoredFsError::UnsupportedCaseSensitiveDirectory)
+        ));
+        assert!(matches!(
+            validate_case_sensitivity_query(Ok(FILE_CS_FLAG_CASE_SENSITIVE_DIR | 0x8000_0000)),
+            Err(AnchoredFsError::UnsupportedCaseSensitiveDirectory)
+        ));
+
+        let error = validate_case_sensitivity_query(Err(io::Error::from_raw_os_error(
+            ERROR_ACCESS_DENIED as i32,
+        )))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AnchoredFsError::Io(source)
+                if source.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32)
         ));
     }
 }

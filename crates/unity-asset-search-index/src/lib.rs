@@ -27,12 +27,16 @@ mod reference_payload;
 mod reference_query;
 mod scan;
 mod semantics;
+mod source_coordinate;
 mod store;
 mod wire;
 
 pub use config::{IndexPaths, ScanTraversalLimits, SearchIgnoreV1Limits, SearchIndexOptions};
 pub use generation::{FilesystemReindexIntent, FilesystemReindexScope};
-pub use path_semantics::{ProjectPath, ProjectPathError, ProjectPathSet, ProjectPathSpace};
+pub use path_semantics::{
+    ProjectPath, ProjectPathError, ProjectPathIdentity, ProjectPathSemantics, ProjectPathSet,
+    ProjectPathSpace,
+};
 pub use unity_asset::workspace::WorkspaceView;
 pub use unity_asset_core::{AssetLoadBudget, ChangeSet, DigestV1, DigestV1Builder};
 pub use unity_asset_search_core::{SearchKind, SearchRequest};
@@ -919,7 +923,8 @@ GameObject:
             .analysis_cache_identity(stale_semantics_manifest.options_digest())
             .unwrap();
         let source_state_directory = generation_directory.join("state");
-        let source_state_path = source_state_directory.join("source-state-v3.json");
+        let source_state_path =
+            source_state_directory.join(crate::generation_store::SOURCE_STATE_FILE);
         let source_state: crate::generation_store::SourceStateSnapshot =
             serde_json::from_slice(&fs::read(&source_state_path).unwrap()).unwrap();
         let source_state = source_state

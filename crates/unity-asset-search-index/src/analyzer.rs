@@ -22,6 +22,8 @@ use crate::analysis::{
     WorkspaceGraphInputs, WorkspaceObjectFact,
 };
 use crate::scan::ReadSource;
+#[cfg(test)]
+use crate::source_coordinate::IndexedSourceCoordinate;
 
 const PAYLOAD_UNAVAILABLE: &str = "ANALYSIS_PAYLOAD_UNAVAILABLE";
 const WORKSPACE_UNAVAILABLE: &str = "ANALYSIS_WORKSPACE_UNAVAILABLE";
@@ -1869,6 +1871,7 @@ fn analyzed_source(
         charge_locator(workspace_source, budget)?;
     }
     Ok(AnalyzedSource {
+        coordinate: source.coordinate,
         relative_path: source.rel_path.clone(),
         content_digest: source.content_identity,
         length: source.length,
@@ -2817,6 +2820,14 @@ mod tests {
         );
         let bytes = bytes.map(|bytes| BudgetedSourceBytes::from_arc(bytes, budget).unwrap());
         ReadSource {
+            coordinate: IndexedSourceCoordinate::workspace(
+                SourceId::new(
+                    WorkspaceId::from_u128(1).unwrap(),
+                    SourceKind::SerializedFile,
+                    1,
+                )
+                .unwrap(),
+            ),
             rel_path: relative_path.to_owned(),
             abs_path: PathBuf::from("this/path/must/not/be/opened"),
             name: relative_path
