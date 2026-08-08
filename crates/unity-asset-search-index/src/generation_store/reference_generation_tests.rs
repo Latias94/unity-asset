@@ -1480,6 +1480,67 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
 }
 
 #[test]
+fn already_active_retry_confirms_durability_before_pruning_old_heads() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 0,
+    };
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+
+    let mut first = store.begin().unwrap();
+    write_artifacts(&first, "candidate");
+    let manifest = manifest_for(&store, &first, "candidate", Some(baseline));
+    let first_report = store
+        .prepare_publish_with_failpoint(
+            &mut first,
+            manifest,
+            GenerationFailpoint::ActivationDirectorySync,
+        )
+        .unwrap()
+        .activate()
+        .unwrap();
+    let candidate = first_report.active.generation();
+    drop(first);
+
+    let mut refreshed = store.begin().unwrap();
+    write_artifacts(&refreshed, "candidate");
+    let manifest = manifest_for(&store, &refreshed, "candidate", Some(candidate));
+    store
+        .prepare_publish_with_failpoint(
+            &mut refreshed,
+            manifest,
+            GenerationFailpoint::ActivationDirectorySync,
+        )
+        .unwrap()
+        .activate()
+        .unwrap();
+    drop(refreshed);
+
+    let active_ordinal = store.active().unwrap().activation_ordinal();
+    assert_eq!(
+        fs::read_dir(temporary.path().join(super::ACTIVATIONS_DIRECTORY))
+            .unwrap()
+            .count(),
+        3
+    );
+
+    let mut retry = store.begin().unwrap();
+    write_artifacts(&retry, "candidate");
+    let manifest = manifest_for(&store, &retry, "candidate", Some(candidate));
+    let prepared = store.prepare_publish(&mut retry, manifest).unwrap();
+    assert_eq!(prepared.snapshot().activation_ordinal(), active_ordinal);
+    prepared.activate().unwrap();
+
+    assert_eq!(
+        fs::read_dir(temporary.path().join(super::ACTIVATIONS_DIRECTORY))
+            .unwrap()
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn activation_cleanup_failure_returns_committed_generation_consistent_with_reopen() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions {
@@ -1519,6 +1580,96 @@ fn activation_cleanup_failure_returns_committed_generation_consistent_with_reope
     let reopened = open_store(temporary.path(), options).unwrap();
     assert_eq!(reopened.active().unwrap().generation(), candidate);
     assert!(!abandoned_staging_activation.exists());
+}
+
+#[test]
+fn staging_recovery_requires_a_successful_directory_sync_before_reporting_clean() {
+    let temporary = TempDir::new().unwrap();
+    let staging = temporary.path().join(super::STAGING_DIRECTORY);
+    fs::create_dir(&staging).unwrap();
+    let residue = staging.join(activation_staging_file_name(7));
+    fs::write(&residue, b"staging residue").unwrap();
+
+    let error = super::recover_owned_staging(
+        &staging,
+        &mut AssetLoadBudget::default(),
+        Some(GenerationFailpoint::StartupStagingDirectorySync),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::InjectedFailure {
+            checkpoint: GenerationFailpoint::StartupStagingDirectorySync
+        }
+    ));
+    assert!(!residue.exists());
+
+    let recovered =
+        super::recover_owned_staging(&staging, &mut AssetLoadBudget::default(), None).unwrap();
+    assert_eq!(recovered.removed_entries(), 0);
+}
+
+#[test]
+fn generation_recovery_requires_a_successful_directory_sync_before_reporting_clean() {
+    let temporary = TempDir::new().unwrap();
+    let generations = temporary.path().join(super::GENERATIONS_DIRECTORY);
+    fs::create_dir(&generations).unwrap();
+    let residue = generations.join(format!("generation-v1-{}", "0".repeat(64)));
+    fs::create_dir(&residue).unwrap();
+
+    let error = super::recover_unreferenced_generation_directories(
+        &generations,
+        false,
+        &mut AssetLoadBudget::default(),
+        Some(GenerationFailpoint::StartupGenerationDirectorySync),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::InjectedFailure {
+            checkpoint: GenerationFailpoint::StartupGenerationDirectorySync
+        }
+    ));
+    assert!(!residue.exists());
+
+    let recovered = super::recover_unreferenced_generation_directories(
+        &generations,
+        false,
+        &mut AssetLoadBudget::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(recovered.removed_entries(), 0);
+}
+
+#[test]
+fn full_activation_capacity_compacts_before_rejecting_the_next_commit() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 0,
+    };
+    let mut store = open_store(temporary.path(), options).unwrap();
+    publish_generation(&mut store, "baseline", None);
+    let active_ordinal = store.active().unwrap().activation_ordinal();
+    let activations = temporary.path().join(super::ACTIVATIONS_DIRECTORY);
+    for ordinal in [active_ordinal + 10, active_ordinal + 11] {
+        fs::write(activations.join(activation_file_name(ordinal)), b"{}").unwrap();
+    }
+
+    store
+        .ensure_activation_capacity_with_limit(3, &mut AssetLoadBudget::default())
+        .unwrap();
+
+    let remaining = fs::read_dir(&activations)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remaining,
+        [std::ffi::OsString::from(activation_file_name(
+            active_ordinal
+        ))]
+    );
 }
 
 #[test]

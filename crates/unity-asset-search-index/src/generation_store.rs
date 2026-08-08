@@ -11,6 +11,13 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt as _;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+};
+
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
     SearchGenerationId, SearchGenerationManifestV1,
@@ -930,20 +937,6 @@ impl fmt::Display for GenerationPublishWarning {
     }
 }
 
-fn platform_durability_warnings() -> Vec<GenerationPublishWarning> {
-    #[cfg(unix)]
-    {
-        Vec::new()
-    }
-    #[cfg(not(unix))]
-    {
-        vec![GenerationPublishWarning::new(
-            GenerationPublishWarningKind::PostCommitDurability,
-            "directory namespace durability is platform-dependent; file contents and create-new activation were synced, but the standard library cannot fsync directories on this platform",
-        )]
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GenerationPublishReport {
     pub active: GenerationSnapshot,
@@ -1043,6 +1036,10 @@ pub(crate) enum GenerationFailpoint {
     SourceState,
     #[cfg(test)]
     StartupStagingCleanup,
+    #[cfg(test)]
+    StartupStagingDirectorySync,
+    #[cfg(test)]
+    StartupGenerationDirectorySync,
     Activation,
     ActivationPreCommit,
     ActivationDirectorySync,
@@ -1353,6 +1350,9 @@ impl GenerationStore {
         let generations = ensure_managed_directory(&root, GENERATIONS_DIRECTORY)?;
         let staging = ensure_managed_directory(&root, STAGING_DIRECTORY)?;
         let activations = ensure_managed_directory(&root, ACTIVATIONS_DIRECTORY)?;
+        // A prior open may have created these entries and then failed to sync their parent. Every
+        // successful open therefore confirms the complete managed namespace, not only new entries.
+        sync_directory(&root)?;
         // Staging is recovery input, not persisted authority. Remove crash residue before opening
         // committed heads because an activation residue may still be the second hard link of an
         // already-committed head. Obsolete activation heads remain append-only in `activations`
@@ -1411,6 +1411,8 @@ impl GenerationStore {
             &generations,
             startup_disposition.rebuild_required().is_some(),
             &mut recovery_budget,
+            #[cfg(test)]
+            startup_recovery_failpoint,
         );
         staging_recovery = merge_recovery_results(staging_recovery, generation_recovery);
 
@@ -1488,7 +1490,7 @@ impl GenerationStore {
         let report = self.activate_prepared(
             updated.clone(),
             updated.manifest_digest,
-            platform_durability_warnings(),
+            Vec::new(),
             None,
             budget,
         )?;
@@ -1788,7 +1790,7 @@ impl GenerationStore {
                     activation: PreparedActivation::Activate {
                         manifest_digest: completed.manifest_digest,
                     },
-                    warnings: platform_durability_warnings(),
+                    warnings: Vec::new(),
                     failpoint,
                 });
             }
@@ -1822,7 +1824,7 @@ impl GenerationStore {
                         activation: PreparedActivation::Activate {
                             manifest_digest: completed.manifest_digest,
                         },
-                        warnings: platform_durability_warnings(),
+                        warnings: Vec::new(),
                         failpoint,
                     });
                 }
@@ -1901,7 +1903,6 @@ impl GenerationStore {
             }
         }
         let manifest_digest = DigestV1::hash_bytes(&manifest_bytes);
-        warnings.extend(platform_durability_warnings());
         let activation_ordinal = self.allocate_activation_ordinal()?;
         let snapshot = GenerationSnapshot {
             activation_ordinal,
@@ -1967,6 +1968,7 @@ impl GenerationStore {
             transaction_receipts: snapshot.transaction_receipts().clone(),
         };
         self.revalidate_private_root("revalidate private index root before writing activation")?;
+        self.ensure_activation_capacity(budget)?;
         let activation = self.write_activation(&record, failpoint, budget)?;
         warnings.extend(activation.warnings);
 
@@ -2050,6 +2052,32 @@ impl GenerationStore {
             if !path_exists_no_follow(&final_path)? && !path_exists_no_follow(&temporary_path)? {
                 return Ok(ordinal);
             }
+        }
+    }
+
+    fn ensure_activation_capacity(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError> {
+        self.ensure_activation_capacity_with_limit(MAX_ACTIVATION_CANDIDATES, budget)
+    }
+
+    fn ensure_activation_capacity_with_limit(
+        &self,
+        maximum: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), GenerationStoreError> {
+        if activation_directory_has_capacity(&self.activations, maximum, budget)? {
+            return Ok(());
+        }
+
+        // A full append-only history must compact before the next commit. Retention confirms the
+        // current head's directory entry before deleting any older recovery authority.
+        self.prune_retention(budget)?;
+        if activation_directory_has_capacity(&self.activations, maximum, budget)? {
+            Ok(())
+        } else {
+            Err(GenerationStoreError::ActivationCandidateLimitExceeded { maximum })
         }
     }
 
@@ -2184,6 +2212,9 @@ impl GenerationStore {
         let Some(active) = &self.active else {
             return Ok(());
         };
+        // Every destructive retention path crosses this gate, including AlreadyActive retries and
+        // capacity recovery after an earlier post-commit sync failure.
+        sync_directory(&self.activations)?;
         let historical = self.retained_historical_snapshots(budget)?;
         let retained_directories = historical
             .iter()
@@ -2577,7 +2608,6 @@ fn recover_owned_staging(
     budget: &mut AssetLoadBudget,
     #[cfg(test)] failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
-    let mut changed = false;
     let mut removed_entries = 0_u64;
     visit_directory_entries_budgeted(staging, budget, |entry, budget| {
         let metadata = metadata_no_follow(&entry.path)?;
@@ -2591,7 +2621,6 @@ fn recover_owned_staging(
             #[cfg(test)]
             inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
             remove_tree_no_follow(&entry.path, budget)?;
-            changed = true;
             removed_entries =
                 removed_entries
                     .checked_add(1)
@@ -2607,7 +2636,6 @@ fn recover_owned_staging(
             #[cfg(test)]
             inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
             remove_tree_no_follow(&entry.path, budget)?;
-            changed = true;
             removed_entries =
                 removed_entries
                     .checked_add(1)
@@ -2629,7 +2657,6 @@ fn recover_owned_staging(
                     source,
                 )
             })?;
-            changed = true;
             removed_entries =
                 removed_entries
                     .checked_add(1)
@@ -2639,10 +2666,44 @@ fn recover_owned_staging(
         }
         Ok(())
     })?;
-    if changed {
-        sync_directory(staging)?;
-    }
+    #[cfg(test)]
+    inject_failure(failpoint, GenerationFailpoint::StartupStagingDirectorySync)?;
+    // A successful pass is the evidence used to clear RecoveryRequired. Sync even when the
+    // namespace is already empty so a previous remove-then-sync failure cannot be forgotten.
+    sync_directory(staging)?;
     Ok(GenerationStagingRecoveryReport { removed_entries })
+}
+
+fn activation_directory_has_capacity(
+    activations: &Path,
+    maximum: usize,
+    budget: &mut AssetLoadBudget,
+) -> Result<bool, GenerationStoreError> {
+    let opened =
+        SecureReadDirectory::open(activations, OpenPolicy::PersistedState).map_err(|source| {
+            persisted_read_error(
+                "open activations directory",
+                activations.to_path_buf(),
+                source,
+            )
+        })?;
+    let mut candidates = 0_usize;
+    visit_opened_directory_entries_budgeted(activations, &opened, budget, |entry, _budget| {
+        let Some(name) = entry.file_name.to_str() else {
+            return Ok(());
+        };
+        if parse_activation_file_name(name).is_none() {
+            return Ok(());
+        }
+        if entry.kind != OpenedDirectoryEntryKind::Regular {
+            return Err(GenerationStoreError::UnsupportedFileType {
+                path: entry.display_path,
+            });
+        }
+        candidates = candidates.saturating_add(1);
+        Ok(())
+    })?;
+    Ok(candidates < maximum)
 }
 
 fn next_staging_ordinal(
@@ -2675,8 +2736,8 @@ fn recover_unreferenced_generation_directories(
     generations: &Path,
     retire_current_generations: bool,
     budget: &mut AssetLoadBudget,
+    #[cfg(test)] failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
-    let mut changed = false;
     let mut removed_entries = 0_u64;
     visit_directory_entries_budgeted(generations, budget, |entry, budget| {
         let Some(name) = entry.file_name.to_str() else {
@@ -2693,7 +2754,6 @@ fn recover_unreferenced_generation_directories(
             return Err(GenerationStoreError::UnsupportedFileType { path: entry.path });
         }
         remove_tree_no_follow(&entry.path, budget)?;
-        changed = true;
         removed_entries =
             removed_entries
                 .checked_add(1)
@@ -2702,9 +2762,14 @@ fn recover_unreferenced_generation_directories(
                 })?;
         Ok(())
     })?;
-    if changed {
-        sync_directory(generations)?;
-    }
+    #[cfg(test)]
+    inject_failure(
+        failpoint,
+        GenerationFailpoint::StartupGenerationDirectorySync,
+    )?;
+    // A successful pass also confirms a prior remove-then-sync failure whose directory entry is
+    // no longer visible in this process but may reappear after a crash.
+    sync_directory(generations)?;
     Ok(GenerationStagingRecoveryReport { removed_entries })
 }
 
@@ -4624,11 +4689,45 @@ fn sync_directory(path: &Path) -> Result<(), GenerationStoreError> {
         })
 }
 
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> Result<(), GenerationStoreError> {
-    // Rust's standard library has no portable API for opening and syncing directories.
-    // File contents are synced explicitly; namespace durability follows the platform contract.
-    Ok(())
+#[cfg(windows)]
+fn sync_directory(path: &Path) -> Result<(), GenerationStoreError> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|source| {
+            GenerationStoreError::io(
+                "open generation directory for sync",
+                path.to_path_buf(),
+                source,
+            )
+        })?;
+    let metadata = directory.metadata().map_err(|source| {
+        GenerationStoreError::io(
+            "inspect generation directory for sync",
+            path.to_path_buf(),
+            source,
+        )
+    })?;
+    reject_link_or_reparse(path, &metadata)?;
+    if !metadata.is_dir() {
+        return Err(GenerationStoreError::NotDirectory {
+            path: path.to_path_buf(),
+        });
+    }
+    directory.sync_all().map_err(|source| {
+        GenerationStoreError::io("sync generation directory", path.to_path_buf(), source)
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn sync_directory(path: &Path) -> Result<(), GenerationStoreError> {
+    Err(GenerationStoreError::UnsupportedPlatform {
+        operation: "sync generation directory",
+        path: path.to_path_buf(),
+    })
 }
 
 fn inject_failure(
@@ -5343,6 +5442,25 @@ mod generation_store_tests {
                 maximum: MAX_ACTIVATION_CANDIDATES
             })
         ));
+    }
+
+    #[test]
+    fn activation_capacity_is_rejected_before_the_reopen_limit_is_exceeded() {
+        let temporary = tempfile::TempDir::new().unwrap();
+        let activations = temporary.path().join(ACTIVATIONS_DIRECTORY);
+        fs::create_dir(&activations).unwrap();
+        for ordinal in [1, 2] {
+            fs::write(activations.join(activation_file_name(ordinal)), b"{}").unwrap();
+        }
+
+        assert!(
+            activation_directory_has_capacity(&activations, 3, &mut AssetLoadBudget::default())
+                .unwrap()
+        );
+        assert!(
+            !activation_directory_has_capacity(&activations, 2, &mut AssetLoadBudget::default())
+                .unwrap()
+        );
     }
 
     #[test]
