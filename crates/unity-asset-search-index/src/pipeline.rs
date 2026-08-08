@@ -74,6 +74,27 @@ pub(crate) enum PipelineBuildDisposition {
     AlreadyApplied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceStateAvailability {
+    Reusable,
+    OpaqueLegacy,
+    IncompatibleSemantics,
+}
+
+impl SourceStateAvailability {
+    fn classify(snapshot: Option<&GenerationSnapshot>, semantic_layout_matches: bool) -> Self {
+        match snapshot {
+            Some(snapshot) if !snapshot.source_state_storage_current() => Self::OpaqueLegacy,
+            Some(_) if !semantic_layout_matches => Self::IncompatibleSemantics,
+            _ => Self::Reusable,
+        }
+    }
+
+    const fn is_reusable(self) -> bool {
+        matches!(self, Self::Reusable)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PipelineBuildMetrics {
     pub(crate) scan: ScanMetrics,
@@ -219,6 +240,60 @@ impl ActiveGeneration {
             stamp,
             query,
             references,
+            indexed_assets: summary.assets(),
+            indexed_search_documents: summary.search_documents(),
+            indexed_reference_facts: summary.reference_documents(),
+            incomplete_assets: summary.incomplete_assets(),
+            projection_truncations: summary.projection_truncations(),
+        })
+    }
+
+    fn open_projection_only(
+        snapshot: GenerationSnapshot,
+        readers: &ProjectionReaders,
+        semantics_current: bool,
+        configuration_current: bool,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, PipelineError> {
+        let manifest = snapshot.manifest();
+        let stamp = GenerationStamp::current(
+            snapshot.generation(),
+            manifest.workspace(),
+            manifest.revision(),
+        )
+        .with_desired_revision(snapshot.desired_revision())
+        .with_semantics_current(semantics_current)
+        .with_configuration_current(configuration_current);
+        let search_fields = SearchQueryFields::from_schema(&readers.search().index().schema())
+            .map_err(PipelineError::Query)?;
+        let paths = readers
+            .search()
+            .stored_paths(budget)
+            .map_err(PipelineError::Projection)?;
+        let query_snapshot = QuerySnapshot::new(
+            stamp.clone(),
+            readers.search().reader().clone(),
+            search_fields,
+            paths,
+            budget,
+        )
+        .map_err(PipelineError::Query)?;
+        let completeness =
+            ReferenceQueryCompleteness::new(false, false, std::iter::empty(), budget).map_err(
+                |error| match error {
+                    ReferenceQueryCompletenessError::Budget(error) => PipelineError::Budget(error),
+                    error => PipelineError::Query(error.into()),
+                },
+            )?;
+        let references =
+            ReferenceQuerySnapshot::new(stamp.clone(), readers.references(), completeness);
+        validate_projection_summary_without_source_state(manifest.projection_summary(), readers)?;
+        let summary = manifest.projection_summary();
+        Ok(Self {
+            snapshot,
+            stamp,
+            query: QueryEngine::new(Arc::new(query_snapshot)),
+            references: ReferenceQueryEngine::new(Arc::new(references)),
             indexed_assets: summary.assets(),
             indexed_search_documents: summary.search_documents(),
             indexed_reference_facts: summary.reference_documents(),
@@ -459,10 +534,11 @@ impl SearchGenerationPipeline {
                     persisted_semantics.source_state_layout_compatible_with(semantics),
                 )
             });
-        // A semantic mismatch can include an incompatible source-state wire shape. The manifest
-        // remains sufficient to preserve the workspace identity, but no persisted analysis or
-        // projection is decoded under rules that did not create it.
-        let source_state = if active_source_state_layout_match {
+        let source_state_availability =
+            SourceStateAvailability::classify(recovered.as_ref(), active_source_state_layout_match);
+        // Physical storage and analysis semantics can each make source-state bytes opaque while
+        // leaving the independently attested projection queryable as stale.
+        let source_state = if source_state_availability.is_reusable() {
             recovered
                 .as_ref()
                 .map(|snapshot| snapshot.load_source_state(budget))
@@ -500,7 +576,9 @@ impl SearchGenerationPipeline {
             }
         };
         let mut active_compatibility_match = if recovered.is_some() {
-            active_semantics_match && active_configuration_match
+            active_semantics_match
+                && active_configuration_match
+                && source_state_availability.is_reusable()
         } else {
             startup_disposition.rebuild_required().is_none()
         };
@@ -513,7 +591,7 @@ impl SearchGenerationPipeline {
                         &readers,
                         None,
                         options,
-                        active_semantics_match,
+                        active_semantics_match && source_state_availability.is_reusable(),
                         active_configuration_match,
                         budget,
                     )?)),
@@ -529,7 +607,22 @@ impl SearchGenerationPipeline {
                     Err(error) => return Err(PipelineError::Projection(error)),
                 }
             }
-            (Some(_), None) if !active_source_state_layout_match => None,
+            (Some(snapshot), None) if !source_state_availability.is_reusable() => {
+                match ProjectionReaders::open(snapshot.directory(), budget) {
+                    Ok(readers) => Some(Arc::new(ActiveGeneration::open_projection_only(
+                        snapshot,
+                        &readers,
+                        false,
+                        active_configuration_match,
+                        budget,
+                    )?)),
+                    Err(error) if is_rebuildable_projection_schema_version(&error) => {
+                        active_compatibility_match = false;
+                        None
+                    }
+                    Err(error) => return Err(PipelineError::Projection(error)),
+                }
+            }
             (None, None) => None,
             (Some(_), None) => {
                 return Err(PipelineError::Invariant(
@@ -2551,6 +2644,22 @@ fn validate_projection_summary(
         "incomplete assets",
         summary.incomplete_assets(),
         actual_incomplete,
+    )
+}
+
+fn validate_projection_summary_without_source_state(
+    summary: GenerationProjectionSummary,
+    readers: &ProjectionReaders,
+) -> Result<(), PipelineError> {
+    validate_summary_count(
+        "search documents",
+        summary.search_documents(),
+        readers.search().reader().searcher().num_docs(),
+    )?;
+    validate_summary_count(
+        "reference documents",
+        summary.reference_documents(),
+        readers.references().reader().searcher().num_docs(),
     )
 }
 
@@ -4708,10 +4817,15 @@ mod tests {
     }
 
     #[test]
-    fn semantic_layout_mismatch_rebuilds_without_decoding_the_obsolete_source_state() {
+    fn storage_migration_keeps_the_old_projection_queryable_until_rebuild_commits() {
         let temporary = crate::secure_test_tempdir();
         let project_root = temporary.path().join("project");
         std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        std::fs::write(
+            project_root.join("Assets/migration-note.txt"),
+            b"search storage migration",
+        )
+        .unwrap();
         let paths = IndexPaths::for_project(
             project_root,
             Some(temporary.path().join("index")),
@@ -4730,9 +4844,230 @@ mod tests {
                 &mut AssetLoadBudget::default(),
             )
             .unwrap();
-        let old_generation = published.active.unwrap().snapshot.generation();
+        let active = published.active.unwrap();
+        let old_generation = active.snapshot.generation();
+        let activation_ordinal = active.snapshot.activation_ordinal();
+        let current_directory = active.snapshot.directory().to_path_buf();
+        drop(active);
+        drop(current);
+
+        let obsolete_contract = crate::generation::LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION;
+        let activation_path = paths
+            .index_root()
+            .join("activations")
+            .join(format!("{activation_ordinal:020}.json"));
+        let obsolete_directory =
+            crate::generation_store::rewrite_generation_fixture_as_opaque_storage(
+                &current_directory,
+                &activation_path,
+                old_generation,
+                obsolete_contract,
+                b"must not be parsed during storage migration",
+            );
+
+        let mut reopened = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let stale = reopened.active.as_ref().unwrap();
+        assert_eq!(stale.snapshot.generation(), old_generation);
+        assert!(stale.stamp.stale);
+        assert!(!stale.stamp.semantics_current);
+        assert!(!reopened.active_analysis_match);
+        assert!(!reopened.active_compatibility_match);
+        let response = stale.search(SearchRequest::new("migration", 10)).unwrap();
+        assert_eq!(response.returned_hits, 1);
+
+        let rebuilt = reopened
+            .reindex_filesystem(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(rebuilt.disposition, PipelineBuildDisposition::Published);
+        assert!(rebuilt.metrics.forced_full_analysis);
+        let rebuilt_active = rebuilt.active.unwrap();
+        assert_eq!(rebuilt_active.snapshot.generation(), old_generation);
+        assert!(rebuilt_active.snapshot.source_state_storage_current());
+        assert_ne!(rebuilt_active.snapshot.directory(), obsolete_directory);
+        drop(rebuilt_active);
+        drop(reopened);
+
+        let generations_root = paths.index_root().join("generations");
+        let reopened = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            reopened
+                .active
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .source_state_storage_current()
+        );
+        assert!(
+            !obsolete_directory.exists(),
+            "obsolete directory remained; generations={:?}, warnings={:?}",
+            std::fs::read_dir(generations_root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            rebuilt.warnings
+        );
+    }
+
+    #[test]
+    fn coupled_storage_v4_reopens_as_stale_projection_until_rebuild_commits() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        std::fs::write(
+            project_root.join("Assets/coupled-note.txt"),
+            b"coupled storage migration",
+        )
+        .unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut current = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let published = current
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let active = published.active.unwrap();
+        let generation = active.snapshot.generation();
+        let activation_path = paths
+            .index_root()
+            .join("activations")
+            .join(format!("{:020}.json", active.snapshot.activation_ordinal()));
+        let current_directory = active.snapshot.directory().to_path_buf();
+        drop(active);
+        drop(current);
+
+        let obsolete_directory =
+            crate::generation_store::rewrite_generation_fixture_as_coupled_storage(
+                &current_directory,
+                &activation_path,
+                generation,
+            );
+        let mut reopened = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let stale = reopened.active.as_ref().unwrap();
+        assert_eq!(stale.snapshot.generation(), generation);
+        assert!(!stale.snapshot.source_state_storage_current());
+        assert!(stale.stamp.stale);
+        assert!(
+            stale
+                .search(SearchRequest::new("coupled", 10))
+                .unwrap()
+                .returned_hits
+                > 0
+        );
+        assert!(reopened.source_state.is_none());
+
+        let rebuilt = reopened
+            .reindex_filesystem(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let active = rebuilt.active.unwrap();
+        assert!(active.snapshot.source_state_storage_current());
+        assert_ne!(active.snapshot.directory(), obsolete_directory);
+        drop(active);
+        drop(reopened);
+        let reopened_after_cleanup = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            reopened_after_cleanup
+                .active
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .source_state_storage_current()
+        );
+        drop(reopened_after_cleanup);
+        assert!(
+            !obsolete_directory.exists(),
+            "coupled obsolete directory remained; generations={:?}, warnings={:?}",
+            std::fs::read_dir(paths.index_root().join("generations"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            rebuilt.warnings
+        );
+    }
+
+    #[test]
+    fn semantic_layout_mismatch_rebuilds_without_decoding_the_obsolete_source_state() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        std::fs::write(
+            project_root.join("Assets/semantic-note.txt"),
+            b"semantic layout migration",
+        )
+        .unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut current = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        let published = current
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let active = published.active.unwrap();
+        let old_generation = active.snapshot.generation();
+        let activation_ordinal = active.snapshot.activation_ordinal();
+        let generation_directory = active.snapshot.directory().to_path_buf();
+        drop(active);
         let workspace = current.workspace.workspace_id();
         drop(current);
+
+        let activation_path = paths
+            .index_root()
+            .join("activations")
+            .join(format!("{activation_ordinal:020}.json"));
+        crate::generation_store::rewrite_generation_fixture_source_state(
+            &generation_directory,
+            &activation_path,
+            crate::generation_store::SOURCE_STATE_FILE,
+            None,
+            b"must remain opaque under incompatible analysis semantics",
+        );
 
         let changed_semantics = SearchSemantics::current().with_analysis_version(
             SearchSemantics::current()
@@ -4746,11 +5081,16 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        assert!(reopened.active.is_none());
+        let stale = reopened.active.as_ref().unwrap();
+        assert_eq!(stale.snapshot.generation(), old_generation);
+        assert!(stale.stamp.stale);
+        assert!(!stale.stamp.semantics_current);
         assert!(reopened.source_state.is_none());
         assert_eq!(reopened.workspace.workspace_id(), workspace);
         assert!(!reopened.active_analysis_match);
         assert!(!reopened.active_compatibility_match);
+        let response = stale.search(SearchRequest::new("semantic", 10)).unwrap();
+        assert_eq!(response.returned_hits, 1);
 
         let rebuilt = reopened
             .reindex_filesystem(

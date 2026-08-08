@@ -7,8 +7,19 @@ use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use crate::ProjectPathSet;
 use crate::semantics::SearchSemantics;
 
-pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 3;
-const GENERATION_DIRECTORY_PREFIX: &str = "generation-v3-";
+/// Version of the durable generation namespace and activation-to-directory binding.
+pub(crate) const SEARCH_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 5;
+/// The previous storage contract coupled the physical namespace to the manifest envelope.
+pub(crate) const LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION: u16 = 4;
+/// The older storage contract kept source-state v4 as an opaque projection sidecar.
+#[cfg(test)]
+pub(crate) const LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION: u16 = 3;
+/// Version of the manifest and artifact-evidence envelope.
+///
+/// The namespace can migrate independently from the logical manifest. Keeping this contract
+/// stable lets a rebuilt index continue serving a validated stale projection while its source
+/// state is being upgraded.
+pub(crate) const SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION: u16 = 3;
 const GENERATION_ID_DOMAIN: &[u8] = b"unity-asset:search-generation:logical:v3\0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -29,16 +40,32 @@ impl SearchGenerationId {
     /// Returns the portable directory component used by the generation store.
     #[must_use]
     pub(crate) fn directory_name(self) -> String {
-        format!(
-            "{GENERATION_DIRECTORY_PREFIX}{}",
-            hex::encode(self.0.as_bytes())
-        )
+        self.directory_name_for_storage_contract(SEARCH_GENERATION_STORAGE_CONTRACT_VERSION)
+    }
+
+    /// Returns the directory component used by a specific generation storage contract.
+    #[must_use]
+    pub(crate) fn directory_name_for_storage_contract(self, contract: u16) -> String {
+        format!("generation-v{contract}-{}", hex::encode(self.0.as_bytes()))
     }
 
     /// Parses a directory component emitted by [`Self::directory_name`].
     #[must_use]
     pub(crate) fn from_directory_name(value: &str) -> Option<Self> {
-        let encoded = value.strip_prefix(GENERATION_DIRECTORY_PREFIX)?;
+        Self::from_directory_name_for_storage_contract(
+            value,
+            SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+        )
+    }
+
+    /// Parses a directory component emitted by a specific generation storage contract.
+    #[must_use]
+    pub(crate) fn from_directory_name_for_storage_contract(
+        value: &str,
+        contract: u16,
+    ) -> Option<Self> {
+        let prefix = format!("generation-v{contract}-");
+        let encoded = value.strip_prefix(&prefix)?;
         if encoded.len() != DigestV1::BYTE_LEN * 2
             || !encoded
                 .bytes()
@@ -168,7 +195,7 @@ impl ArtifactTreeEvidence {
     #[must_use]
     pub const fn new(digest: DigestV1, files: u64, bytes: u64) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
             digest,
             files,
             bytes,
@@ -197,7 +224,7 @@ impl<'de> Deserialize<'de> for ArtifactTreeEvidence {
         D: Deserializer<'de>,
     {
         let wire = ArtifactTreeEvidenceWire::deserialize(deserializer)?;
-        validate_storage_contract_version::<D::Error>(
+        validate_generation_manifest_contract_version::<D::Error>(
             "artifact tree evidence",
             wire.contract_version,
         )?;
@@ -222,7 +249,7 @@ impl GenerationArtifactEvidence {
         source_state: ArtifactTreeEvidence,
     ) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
             search,
             references,
             source_state,
@@ -258,7 +285,7 @@ impl<'de> Deserialize<'de> for GenerationArtifactEvidence {
         D: Deserializer<'de>,
     {
         let wire = GenerationArtifactEvidenceWire::deserialize(deserializer)?;
-        validate_storage_contract_version::<D::Error>(
+        validate_generation_manifest_contract_version::<D::Error>(
             "generation artifact evidence",
             wire.contract_version,
         )?;
@@ -319,7 +346,7 @@ impl GenerationProjectionSummary {
             });
         }
         Ok(Self {
-            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
             assets,
             search_documents,
             reference_documents,
@@ -357,7 +384,7 @@ impl GenerationProjectionSummary {
 impl Default for GenerationProjectionSummary {
     fn default() -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
             assets: 0,
             search_documents: 0,
             reference_documents: 0,
@@ -384,7 +411,7 @@ impl<'de> Deserialize<'de> for GenerationProjectionSummary {
         D: Deserializer<'de>,
     {
         let wire = GenerationProjectionSummaryWire::deserialize(deserializer)?;
-        validate_storage_contract_version::<D::Error>(
+        validate_generation_manifest_contract_version::<D::Error>(
             "generation projection summary",
             wire.contract_version,
         )?;
@@ -479,7 +506,7 @@ impl SearchGenerationManifestV1 {
         artifacts: GenerationArtifactEvidence,
     ) -> Self {
         Self {
-            contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            contract_version: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
             workspace: identity.workspace,
             revision: identity.revision,
             search_projection_digest: identity.projections.search,
@@ -580,7 +607,7 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
         D: Deserializer<'de>,
     {
         let wire = SearchGenerationManifestWire::deserialize(deserializer)?;
-        validate_storage_contract_version::<D::Error>(
+        validate_generation_manifest_contract_version::<D::Error>(
             "search generation manifest",
             wire.contract_version,
         )?;
@@ -601,18 +628,29 @@ impl<'de> Deserialize<'de> for SearchGenerationManifestV1 {
     }
 }
 
-fn validate_storage_contract_version<E>(contract: &'static str, actual: u16) -> Result<(), E>
+fn validate_generation_manifest_contract_version<E>(
+    contract: &'static str,
+    actual: u16,
+) -> Result<(), E>
 where
     E: serde::de::Error,
 {
-    if actual != SEARCH_GENERATION_STORAGE_CONTRACT_VERSION {
+    if !is_supported_generation_manifest_contract_version(actual) {
         return Err(E::custom(GenerationManifestError::UnsupportedVersion {
             contract,
             actual,
-            expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            expected: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
         }));
     }
     Ok(())
+}
+
+pub(crate) const fn is_supported_generation_manifest_contract_version(actual: u16) -> bool {
+    matches!(
+        actual,
+        SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION
+            | LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

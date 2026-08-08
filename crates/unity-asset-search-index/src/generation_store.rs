@@ -19,7 +19,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 
 use crate::generation::{
-    ArtifactTreeEvidence, GenerationArtifactEvidence, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+    ArtifactTreeEvidence, GenerationArtifactEvidence,
+    LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
     SearchGenerationId, SearchGenerationManifestV1,
 };
 use fs2::FileExt;
@@ -43,7 +44,7 @@ const ACTIVATIONS_DIRECTORY: &str = "activations";
 const SEARCH_ARTIFACT_DIRECTORY: &str = "search";
 const REFERENCE_ARTIFACT_DIRECTORY: &str = "references";
 const SOURCE_STATE_ARTIFACT_DIRECTORY: &str = "state";
-pub(crate) const SOURCE_STATE_FILE: &str = "source-state-v4.json";
+pub(crate) const SOURCE_STATE_FILE: &str = "source-state-v5.json";
 const MANIFEST_FILE: &str = "manifest.json";
 const LEGACY_ACTIVATION_CONTRACT_VERSION: u16 = 1;
 const REVISIONED_ACTIVATION_CONTRACT_VERSION: u16 = 2;
@@ -112,7 +113,30 @@ pub(crate) use source_state::{
 
 const WRITER_LEASE_FILE: &str = ".writer.lock";
 const QUARANTINE_DIRECTORY_PREFIX: &str = "quarantine-";
-const OBSOLETE_GENERATION_DIRECTORY_PREFIXES: [&str; 2] = ["generation-v1-", "generation-v2-"];
+const OBSOLETE_GENERATION_DIRECTORY_PREFIXES: [&str; 4] = [
+    "generation-v1-",
+    "generation-v2-",
+    "generation-v3-",
+    "generation-v4-",
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationStorageLayout {
+    RebuildOnly,
+    OpaqueProjection,
+    CurrentSourceStateV5,
+}
+
+impl GenerationStorageLayout {
+    fn from_contract(contract: u16) -> Option<Self> {
+        match contract {
+            1 | 2 => Some(Self::RebuildOnly),
+            3 | LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION => Some(Self::OpaqueProjection),
+            SEARCH_GENERATION_STORAGE_CONTRACT_VERSION => Some(Self::CurrentSourceStateV5),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct GenerationStoreOptions {
@@ -590,6 +614,7 @@ impl GenerationActivationEvidence {
 pub(crate) struct GenerationSnapshot {
     activation_ordinal: u64,
     generation: SearchGenerationId,
+    storage_contract: u16,
     manifest_digest: DigestV1,
     manifest: SearchGenerationManifestV1,
     desired_revision: WorkspaceRevision,
@@ -606,6 +631,16 @@ impl GenerationSnapshot {
     #[must_use]
     pub const fn generation(&self) -> SearchGenerationId {
         self.generation
+    }
+
+    #[must_use]
+    pub(crate) const fn storage_contract(&self) -> u16 {
+        self.storage_contract
+    }
+
+    #[must_use]
+    pub(crate) const fn source_state_storage_current(&self) -> bool {
+        self.storage_contract == SEARCH_GENERATION_STORAGE_CONTRACT_VERSION
     }
 
     #[must_use]
@@ -648,6 +683,12 @@ impl GenerationSnapshot {
         &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<SourceStateSnapshot, GenerationStoreError> {
+        if !self.source_state_storage_current() {
+            return Err(GenerationStoreError::ObsoleteSourceStateStorage {
+                actual: self.storage_contract,
+                expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            });
+        }
         self.load_source_state_with_limits(budget, SourceStateLimits::default())
     }
 
@@ -890,11 +931,8 @@ where
     budget
         .check_entries(structure.array_entries)
         .map_err(GenerationStoreError::Budget)?;
-    // Total repeated wire fields are bounded by the source-state contract itself. Charging only
-    // the widest object to the caller's member ledger keeps supported source count independent of
-    // how many fixed schema fields each persisted record repeats.
     budget
-        .check_members(structure.max_object_members)
+        .check_members(structure.object_members)
         .map_err(GenerationStoreError::Budget)?;
     budget
         .check_depth(structure.max_depth)
@@ -906,7 +944,7 @@ where
         .consume_entries(structure.array_entries)
         .map_err(GenerationStoreError::Budget)?;
     budget
-        .consume_members(structure.max_object_members)
+        .consume_members(structure.object_members)
         .map_err(GenerationStoreError::Budget)?;
     budget
         .observe_depth(structure.max_depth)
@@ -1299,6 +1337,9 @@ pub(crate) struct IndexRebuildRequired {
     reason: IndexRebuildReason,
     activation_ordinal: u64,
     generation: SearchGenerationId,
+    storage_contract: u16,
+    manifest_digest: DigestV1,
+    parent_generation: Option<SearchGenerationId>,
     bootstrap: GenerationRebuildBootstrap,
 }
 
@@ -1337,6 +1378,21 @@ impl IndexRebuildRequired {
     pub(crate) const fn bootstrap(&self) -> &GenerationRebuildBootstrap {
         &self.bootstrap
     }
+
+    #[must_use]
+    pub(crate) const fn storage_contract(&self) -> u16 {
+        self.storage_contract
+    }
+
+    #[must_use]
+    pub(crate) const fn manifest_digest(&self) -> DigestV1 {
+        self.manifest_digest
+    }
+
+    #[must_use]
+    pub(crate) const fn parent_generation(&self) -> Option<SearchGenerationId> {
+        self.parent_generation
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1348,15 +1404,15 @@ pub(crate) enum IndexRebuildReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GenerationStartupDisposition {
     Ready,
-    RebuildRequired(IndexRebuildRequired),
+    RebuildRequired(Box<IndexRebuildRequired>),
 }
 
 impl GenerationStartupDisposition {
     #[must_use]
-    pub(crate) const fn rebuild_required(&self) -> Option<&IndexRebuildRequired> {
+    pub(crate) fn rebuild_required(&self) -> Option<&IndexRebuildRequired> {
         match self {
             Self::Ready => None,
-            Self::RebuildRequired(required) => Some(required),
+            Self::RebuildRequired(required) => Some(required.as_ref()),
         }
     }
 }
@@ -1548,19 +1604,18 @@ impl GenerationStore {
         drop(opened_staging);
 
         let (active, startup_disposition) = match selected {
-            Ok(active) => (active, GenerationStartupDisposition::Ready),
-            Err(GenerationStoreError::IndexRebuildRequired(required)) => {
-                let required = *required;
-                (
-                    None,
-                    GenerationStartupDisposition::RebuildRequired(required),
-                )
-            }
+            Ok(SelectedGeneration::Ready(active)) => (active, GenerationStartupDisposition::Ready),
+            Ok(SelectedGeneration::RebuildRequired { active, required }) => (
+                active,
+                GenerationStartupDisposition::RebuildRequired(required),
+            ),
             Err(error) => return Err(error),
         };
+        let protected_generation = active.as_ref().map(|snapshot| snapshot.directory.clone());
         let generation_recovery = recover_unreferenced_generation_directories(
             &generations,
             startup_disposition.rebuild_required().is_some(),
+            protected_generation.as_deref(),
             &mut recovery_budget,
             #[cfg(test)]
             startup_recovery_failpoint,
@@ -1817,6 +1872,7 @@ impl GenerationStore {
 
     pub fn estimate_publish(
         &self,
+        incoming_generation: SearchGenerationId,
         new_generation_bytes: u64,
         budget: &mut AssetLoadBudget,
     ) -> Result<GenerationDiskEstimate, GenerationStoreError> {
@@ -1831,33 +1887,31 @@ impl GenerationStore {
             .and_then(|active| {
                 existing_generations
                     .iter()
-                    .find(|(generation, _)| *generation == active.generation())
+                    .find(|(directory, _)| directory == active.directory())
                     .map(|(_, bytes)| *bytes)
             })
             .unwrap_or(0);
 
         let historical = self.retained_historical_snapshots(budget)?;
-        let mut retained_after_publish = Vec::new();
-        if self.options.retain_previous_generations != 0 {
-            if let Some(active) = &self.active {
-                retained_after_publish.push(active.generation());
-            }
-            retained_after_publish.extend(
-                historical
-                    .into_iter()
-                    .map(|generation| generation.generation())
-                    .take(self.options.retain_previous_generations.saturating_sub(1)),
-            );
-        }
-        let retained_historical_bytes = checked_sum(
-            retained_after_publish.iter().filter_map(|generation| {
-                existing_generations
+        let retained_historical_bytes = if self.options.retain_previous_generations == 0 {
+            0
+        } else {
+            checked_sum(
+                self.active
                     .iter()
-                    .find(|(candidate, _)| candidate == generation)
-                    .map(|(_, bytes)| *bytes)
-            }),
-            "retained historical generation bytes",
-        )?;
+                    .chain(historical.iter())
+                    .filter(|snapshot| snapshot.generation() != incoming_generation)
+                    .take(self.options.retain_previous_generations)
+                    .map(GenerationSnapshot::directory)
+                    .filter_map(|directory| {
+                        existing_generations
+                            .iter()
+                            .find(|(candidate, _)| candidate == directory)
+                            .map(|(_, bytes)| *bytes)
+                    }),
+                "retained historical generation bytes",
+            )?
+        };
         let retained_bytes_after_publish = new_generation_bytes
             .checked_add(retained_historical_bytes)
             .ok_or(GenerationStoreError::SizeOverflow {
@@ -1904,7 +1958,7 @@ impl GenerationStore {
                 resource: "incoming generation bytes",
             },
         )?;
-        self.estimate_publish(new_generation_bytes, budget)
+        self.estimate_publish(manifest.generation_id(), new_generation_bytes, budget)
     }
 
     fn prepare_publish_inner(
@@ -1940,10 +1994,13 @@ impl GenerationStore {
         if let Some(active) = self
             .active
             .as_ref()
-            .filter(|active| active.generation == generation)
+            .filter(|active| {
+                active.generation == generation && active.source_state_storage_current()
+            })
             .cloned()
         {
             let completed = inspect_completed_generation(&active.directory, generation, budget)?;
+            validate_persisted_source_state(&active.directory, &completed.manifest, budget)?;
             build.abort_with_budget(budget)?;
             if active.desired_revision != desired_revision || active.activation != activation {
                 let mut refreshed = active;
@@ -1972,13 +2029,23 @@ impl GenerationStore {
 
         let completed_directory = self.generation_directory(generation);
         let replace_invalid_completed = if path_exists_no_follow(&completed_directory)? {
-            match inspect_completed_generation(&completed_directory, generation, budget) {
+            match inspect_completed_generation(&completed_directory, generation, budget).and_then(
+                |completed| {
+                    validate_persisted_source_state(
+                        &completed_directory,
+                        &completed.manifest,
+                        budget,
+                    )?;
+                    Ok(completed)
+                },
+            ) {
                 Ok(completed) => {
                     build.abort_with_budget(budget)?;
                     let activation_ordinal = self.allocate_activation_ordinal()?;
                     let snapshot = GenerationSnapshot {
                         activation_ordinal,
                         generation,
+                        storage_contract: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
                         manifest_digest: completed.manifest_digest,
                         desired_revision,
                         manifest: completed.manifest,
@@ -2074,6 +2141,7 @@ impl GenerationStore {
         let snapshot = GenerationSnapshot {
             activation_ordinal,
             generation,
+            storage_contract: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
             manifest_digest,
             desired_revision,
             manifest,
@@ -2126,7 +2194,7 @@ impl GenerationStore {
             contract_version: GENERATION_HEAD_CONTRACT_VERSION,
             ordinal: snapshot.activation_ordinal,
             generation: snapshot.generation(),
-            generation_storage_contract: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            generation_storage_contract: snapshot.storage_contract(),
             manifest_digest,
             workspace: snapshot.manifest.workspace(),
             revision: snapshot.manifest.revision(),
@@ -2412,9 +2480,14 @@ impl GenerationStore {
         let historical = self.retained_historical_snapshots(budget)?;
         let retained_directories = historical
             .iter()
-            .map(GenerationSnapshot::generation)
-            .chain(std::iter::once(active.generation()))
-            .map(SearchGenerationId::directory_name)
+            .chain(std::iter::once(active))
+            .filter_map(|snapshot| {
+                snapshot
+                    .directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
             .collect::<BTreeSet<_>>();
         let retained_activations = historical
             .iter()
@@ -2431,7 +2504,9 @@ impl GenerationStore {
             let Some(name) = entry.file_name.to_str() else {
                 return Ok(());
             };
-            if SearchGenerationId::from_directory_name(name).is_none() {
+            if SearchGenerationId::from_directory_name(name).is_none()
+                && !is_obsolete_generation_directory_name(name)
+            {
                 return Ok(());
             }
             if retained_directories.contains(name) {
@@ -2523,6 +2598,15 @@ struct ActivationDirectorySnapshot {
     candidates: Vec<ActivationCandidate>,
     next_ordinal: u64,
     directory_identity: StableDirectoryIdentity,
+}
+
+#[derive(Debug)]
+enum SelectedGeneration {
+    Ready(Option<GenerationSnapshot>),
+    RebuildRequired {
+        active: Option<GenerationSnapshot>,
+        required: Box<IndexRebuildRequired>,
+    },
 }
 
 #[derive(Debug)]
@@ -3116,6 +3200,7 @@ fn next_staging_ordinal(
 fn recover_unreferenced_generation_directories(
     generations: &Path,
     retire_current_generations: bool,
+    protected_generation: Option<&Path>,
     budget: &mut AssetLoadBudget,
     #[cfg(test)] failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
@@ -3126,7 +3211,8 @@ fn recover_unreferenced_generation_directories(
         };
         let current = SearchGenerationId::from_directory_name(name);
         let obsolete = is_obsolete_generation_directory_name(name);
-        let remove = obsolete || retire_current_generations && current.is_some();
+        let protected = protected_generation.is_some_and(|protected| protected == entry.path);
+        let remove = !protected && (obsolete || retire_current_generations && current.is_some());
         if !remove {
             return Ok(());
         }
@@ -3313,7 +3399,7 @@ fn select_active_generation(
     opened_activations: &SecureReadDirectory,
     snapshot: &ActivationDirectorySnapshot,
     budget: &mut AssetLoadBudget,
-) -> Result<Option<GenerationSnapshot>, GenerationStoreError> {
+) -> Result<SelectedGeneration, GenerationStoreError> {
     let selected = if let Some(candidate) = snapshot.candidates.last() {
         let record = read_activation_record(
             opened_activations,
@@ -3322,11 +3408,31 @@ fn select_active_generation(
             candidate.ordinal,
             budget,
         );
-        record.and_then(|record| {
-            load_completed_generation(generations, opened_generations, record, budget).map(Some)
-        })
+        match record {
+            Ok(record) => {
+                load_completed_generation(generations, opened_generations, record, budget)
+                    .map(|generation| SelectedGeneration::Ready(Some(generation)))
+            }
+            Err(GenerationStoreError::IndexRebuildRequired(required)) => {
+                let active = if matches!(
+                    GenerationStorageLayout::from_contract(required.storage_contract()),
+                    Some(GenerationStorageLayout::OpaqueProjection)
+                ) {
+                    Some(load_obsolete_projection_generation(
+                        generations,
+                        opened_generations,
+                        required.as_ref(),
+                        budget,
+                    )?)
+                } else {
+                    None
+                };
+                Ok(SelectedGeneration::RebuildRequired { active, required })
+            }
+            Err(error) => Err(error),
+        }
     } else {
-        Ok(None)
+        Ok(SelectedGeneration::Ready(None))
     };
     revalidate_opened_directory_snapshot(
         activations,
@@ -3403,6 +3509,31 @@ fn read_activation_record(
     Ok(record)
 }
 
+fn load_obsolete_projection_generation(
+    generations: &Path,
+    opened_generations: &SecureReadDirectory,
+    required: &IndexRebuildRequired,
+    budget: &mut AssetLoadBudget,
+) -> Result<GenerationSnapshot, GenerationStoreError> {
+    load_completed_generation(
+        generations,
+        opened_generations,
+        GenerationHeadRecord {
+            contract_version: GENERATION_HEAD_CONTRACT_VERSION,
+            ordinal: required.activation_ordinal,
+            generation: required.generation,
+            generation_storage_contract: required.storage_contract(),
+            manifest_digest: required.manifest_digest(),
+            workspace: required.bootstrap.workspace(),
+            revision: required.bootstrap.actual_revision(),
+            desired_revision: Some(required.bootstrap.desired_revision()),
+            parent_generation: required.parent_generation(),
+            transaction_receipts: required.bootstrap.transaction_receipts().clone(),
+        },
+        budget,
+    )
+}
+
 fn decode_generation_head_record(
     wire: GenerationHeadRecordWire,
     path: &Path,
@@ -3453,6 +3584,9 @@ fn decode_generation_head_record(
                     },
                     activation_ordinal: ordinal,
                     generation,
+                    storage_contract: 0,
+                    manifest_digest,
+                    parent_generation: None,
                     bootstrap: GenerationRebuildBootstrap {
                         workspace,
                         actual_revision: revision,
@@ -3491,6 +3625,9 @@ fn decode_generation_head_record(
                     },
                     activation_ordinal: ordinal,
                     generation,
+                    storage_contract: 0,
+                    manifest_digest,
+                    parent_generation: None,
                     bootstrap: GenerationRebuildBootstrap {
                         workspace,
                         actual_revision: revision,
@@ -3524,37 +3661,43 @@ fn decode_generation_head_record(
                 "activation v3 is missing its transaction receipts",
                 "activation v3 transaction receipts must not be null",
             )?;
-            if (1..SEARCH_GENERATION_STORAGE_CONTRACT_VERSION)
-                .contains(&generation_storage_contract)
-            {
-                return Err(GenerationStoreError::IndexRebuildRequired(Box::new(
-                    IndexRebuildRequired {
-                        reason: IndexRebuildReason::ObsoleteGenerationStorage {
-                            actual: generation_storage_contract,
+            match GenerationStorageLayout::from_contract(generation_storage_contract) {
+                Some(GenerationStorageLayout::CurrentSourceStateV5) => (
+                    Some(desired_revision),
+                    parent_generation,
+                    transaction_receipts,
+                ),
+                Some(
+                    GenerationStorageLayout::RebuildOnly
+                    | GenerationStorageLayout::OpaqueProjection,
+                ) => {
+                    return Err(GenerationStoreError::IndexRebuildRequired(Box::new(
+                        IndexRebuildRequired {
+                            reason: IndexRebuildReason::ObsoleteGenerationStorage {
+                                actual: generation_storage_contract,
+                            },
+                            activation_ordinal: ordinal,
+                            generation,
+                            storage_contract: generation_storage_contract,
+                            manifest_digest,
+                            parent_generation,
+                            bootstrap: GenerationRebuildBootstrap {
+                                workspace,
+                                actual_revision: revision,
+                                desired_revision,
+                                transaction_receipts,
+                            },
                         },
-                        activation_ordinal: ordinal,
-                        generation,
-                        bootstrap: GenerationRebuildBootstrap {
-                            workspace,
-                            actual_revision: revision,
-                            desired_revision,
-                            transaction_receipts,
-                        },
-                    },
-                )));
+                    )));
+                }
+                None => {
+                    return Err(GenerationStoreError::UnsupportedVersion {
+                        artifact: "generation storage",
+                        actual: generation_storage_contract,
+                        expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+                    });
+                }
             }
-            if generation_storage_contract != SEARCH_GENERATION_STORAGE_CONTRACT_VERSION {
-                return Err(GenerationStoreError::UnsupportedVersion {
-                    artifact: "generation storage",
-                    actual: generation_storage_contract,
-                    expected: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
-                });
-            }
-            (
-                Some(desired_revision),
-                parent_generation,
-                transaction_receipts,
-            )
         }
         actual => {
             return Err(GenerationStoreError::UnsupportedVersion {
@@ -3621,7 +3764,9 @@ fn load_completed_generation(
     record: GenerationHeadRecord,
     budget: &mut AssetLoadBudget,
 ) -> Result<GenerationSnapshot, GenerationStoreError> {
-    let directory_name = record.generation.directory_name();
+    let directory_name = record
+        .generation
+        .directory_name_for_storage_contract(record.generation_storage_contract);
     let directory = generations.join(&directory_name);
     let opened_directory = opened_generations
         .open_directory(OsStr::new(&directory_name))
@@ -3654,6 +3799,7 @@ fn load_completed_generation(
     Ok(GenerationSnapshot {
         activation_ordinal: record.ordinal,
         generation: record.generation,
+        storage_contract: record.generation_storage_contract,
         manifest_digest: completed.manifest_digest,
         desired_revision,
         manifest: completed.manifest,
@@ -3704,23 +3850,6 @@ fn inspect_completed_generation_in(
             actual: Box::new(actual_artifacts),
         });
     }
-    let source_state_directory = directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
-    let opened_source_state = opened_directory
-        .open_directory(OsStr::new(SOURCE_STATE_ARTIFACT_DIRECTORY))
-        .map_err(|source| {
-            persisted_read_error(
-                "open completed source-state directory",
-                source_state_directory.clone(),
-                source,
-            )
-        })?;
-    validate_persisted_source_state_in(
-        directory,
-        &source_state_directory,
-        &opened_source_state,
-        &manifest,
-        budget,
-    )?;
     Ok(CompletedGeneration {
         manifest,
         manifest_digest,
@@ -3851,6 +3980,117 @@ pub(crate) fn measure_artifact_tree(
 ) -> Result<ArtifactTreeEvidence, GenerationStoreError> {
     let mut budget = AssetLoadBudget::default();
     measure_artifact_tree_with_budget(root, &mut budget)
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_generation_fixture_as_opaque_storage(
+    current_directory: &Path,
+    activation_path: &Path,
+    generation: SearchGenerationId,
+    storage_contract: u16,
+    opaque_source_state: &[u8],
+) -> PathBuf {
+    let obsolete_directory = current_directory
+        .with_file_name(generation.directory_name_for_storage_contract(storage_contract));
+    fs::rename(current_directory, &obsolete_directory).unwrap();
+
+    let state_directory = obsolete_directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
+    fs::rename(
+        state_directory.join(SOURCE_STATE_FILE),
+        state_directory.join("source-state-v4.json"),
+    )
+    .unwrap();
+    rewrite_generation_fixture_source_state(
+        &obsolete_directory,
+        activation_path,
+        "source-state-v4.json",
+        Some(storage_contract),
+        opaque_source_state,
+    );
+    obsolete_directory
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_generation_fixture_source_state(
+    generation_directory: &Path,
+    activation_path: &Path,
+    source_state_file: &str,
+    storage_contract: Option<u16>,
+    source_state: &[u8],
+) {
+    let state_directory = generation_directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY);
+    fs::write(state_directory.join(source_state_file), source_state).unwrap();
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(generation_directory.join(MANIFEST_FILE)).unwrap())
+            .unwrap();
+    manifest["artifacts"]["source_state"] =
+        serde_json::to_value(measure_artifact_tree(&state_directory).unwrap()).unwrap();
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(generation_directory.join(MANIFEST_FILE), &manifest_bytes).unwrap();
+
+    let mut activation: serde_json::Value =
+        serde_json::from_slice(&fs::read(activation_path).unwrap()).unwrap();
+    if let Some(storage_contract) = storage_contract {
+        activation["generation_storage_contract"] = serde_json::json!(storage_contract);
+    }
+    activation["manifest_digest"] =
+        serde_json::to_value(DigestV1::hash_bytes(&manifest_bytes)).unwrap();
+    fs::write(activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+}
+
+#[cfg(test)]
+pub(crate) fn rewrite_generation_fixture_as_coupled_storage(
+    current_directory: &Path,
+    activation_path: &Path,
+    generation: SearchGenerationId,
+) -> PathBuf {
+    let storage_contract = LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION;
+    let obsolete_directory = current_directory
+        .with_file_name(generation.directory_name_for_storage_contract(storage_contract));
+    fs::rename(current_directory, &obsolete_directory).unwrap();
+
+    for artifact_directory in [SEARCH_ARTIFACT_DIRECTORY, REFERENCE_ARTIFACT_DIRECTORY] {
+        let marker_path = obsolete_directory
+            .join(artifact_directory)
+            .join("schema-contract.json");
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        marker["generation_contract_version"] = serde_json::json!(storage_contract);
+        fs::write(marker_path, serde_json::to_vec(&marker).unwrap()).unwrap();
+    }
+
+    let manifest_path = obsolete_directory.join(MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["contract_version"] = serde_json::json!(storage_contract);
+    manifest["projection_summary"]["contract_version"] = serde_json::json!(storage_contract);
+    manifest["artifacts"]["contract_version"] = serde_json::json!(storage_contract);
+    for (key, directory) in [
+        ("search", obsolete_directory.join(SEARCH_ARTIFACT_DIRECTORY)),
+        (
+            "references",
+            obsolete_directory.join(REFERENCE_ARTIFACT_DIRECTORY),
+        ),
+        (
+            "source_state",
+            obsolete_directory.join(SOURCE_STATE_ARTIFACT_DIRECTORY),
+        ),
+    ] {
+        let mut evidence =
+            serde_json::to_value(measure_artifact_tree(&directory).unwrap()).unwrap();
+        evidence["contract_version"] = serde_json::json!(storage_contract);
+        manifest["artifacts"][key] = evidence;
+    }
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    fs::write(&manifest_path, &manifest_bytes).unwrap();
+
+    let mut activation: serde_json::Value =
+        serde_json::from_slice(&fs::read(activation_path).unwrap()).unwrap();
+    activation["generation_storage_contract"] = serde_json::json!(storage_contract);
+    activation["manifest_digest"] =
+        serde_json::to_value(DigestV1::hash_bytes(&manifest_bytes)).unwrap();
+    fs::write(activation_path, serde_json::to_vec(&activation).unwrap()).unwrap();
+    obsolete_directory
 }
 
 fn measure_artifact_tree_with_budget(
@@ -4548,7 +4788,7 @@ fn encode_artifact_tree(
 fn completed_generation_sizes(
     generations: &Path,
     budget: &mut AssetLoadBudget,
-) -> Result<Vec<(SearchGenerationId, u64)>, GenerationStoreError> {
+) -> Result<Vec<(PathBuf, u64)>, GenerationStoreError> {
     let mut sizes = Vec::new();
     visit_directory_entries_budgeted(generations, budget, |entry, budget| {
         let metadata = metadata_no_follow(&entry.path)?;
@@ -4558,12 +4798,17 @@ fn completed_generation_sizes(
         let Some(name) = entry.file_name.to_str() else {
             return Ok(());
         };
-        let Some(generation) = SearchGenerationId::from_directory_name(name) else {
+        let recognized = SearchGenerationId::from_directory_name(name).or_else(|| {
+            (1..SEARCH_GENERATION_STORAGE_CONTRACT_VERSION).find_map(|contract| {
+                SearchGenerationId::from_directory_name_for_storage_contract(name, contract)
+            })
+        });
+        if recognized.is_none() {
             return Ok(());
-        };
+        }
         let bytes = tree_size_no_follow(&entry.path, budget)?;
         reserve_artifact_vec(&mut sizes, 1, "completed generation sizes", budget)?;
-        sizes.push((generation, bytes));
+        sizes.push((entry.path, bytes));
         Ok(())
     })?;
     Ok(sizes)
@@ -5298,6 +5543,10 @@ pub(crate) enum GenerationStoreError {
         actual: u16,
         expected: u16,
     },
+    ObsoleteSourceStateStorage {
+        actual: u16,
+        expected: u16,
+    },
     IndexRebuildRequired(Box<IndexRebuildRequired>),
     ActivationOrdinalMismatch {
         path: PathBuf,
@@ -5572,6 +5821,10 @@ impl fmt::Display for GenerationStoreError {
                 formatter,
                 "{artifact} version {actual} is unsupported; expected {expected}"
             ),
+            Self::ObsoleteSourceStateStorage { actual, expected } => write!(
+                formatter,
+                "source-state storage version {actual} is obsolete; expected {expected}"
+            ),
             Self::IndexRebuildRequired(required) => match required.reason {
                 IndexRebuildReason::ObsoleteActivationContract { actual } => write!(
                     formatter,
@@ -5702,13 +5955,14 @@ mod generation_store_tests {
     #[test]
     fn quarantine_parser_recognizes_all_rebuildable_generation_contracts() {
         let digest = "0".repeat(DigestV1::BYTE_LEN * 2);
-        for version in [1, 2, SEARCH_GENERATION_STORAGE_CONTRACT_VERSION] {
+        for version in 1..=SEARCH_GENERATION_STORAGE_CONTRACT_VERSION {
             let name = format!("quarantine-00000000000000000007-generation-v{version}-{digest}");
             assert_eq!(parse_quarantine_directory_name(&name), Some(7));
         }
         assert_eq!(
             parse_quarantine_directory_name(&format!(
-                "quarantine-00000000000000000007-generation-v4-{digest}"
+                "quarantine-00000000000000000007-generation-v{}-{digest}",
+                SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1
             )),
             None
         );

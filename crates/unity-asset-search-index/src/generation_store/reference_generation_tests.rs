@@ -12,6 +12,8 @@ use super::{
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
+    LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION,
+    LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION, SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
     SEARCH_GENERATION_STORAGE_CONTRACT_VERSION, SearchGenerationId, SearchGenerationIdentityV1,
     SearchGenerationManifestV1,
 };
@@ -791,6 +793,149 @@ fn storage_v1_activation_requires_rebuild_without_parsing_legacy_generation_byte
 }
 
 #[test]
+fn storage_v3_keeps_a_valid_projection_queryable_until_current_rebuild_commits() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let generation = publish_generation(&mut store, "legacy-projection", None);
+    let current_directory = store.active().unwrap().directory().to_path_buf();
+    let current_activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(super::activation_file_name(1));
+    drop(store);
+
+    let legacy_directory = super::rewrite_generation_fixture_as_opaque_storage(
+        &current_directory,
+        &current_activation,
+        generation,
+        LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION,
+        b"must not be parsed",
+    );
+
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (mut store, recovery, disposition) = opened.into_parts();
+    assert_eq!(recovery.unwrap().removed_entries(), 0);
+    assert_eq!(store.active().unwrap().directory(), legacy_directory);
+    let GenerationStartupDisposition::RebuildRequired(required) = disposition else {
+        panic!("expected a rebuild-required startup disposition");
+    };
+    assert_eq!(
+        required.reason,
+        IndexRebuildReason::ObsoleteGenerationStorage {
+            actual: LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION,
+        }
+    );
+    assert_eq!(required.activation_ordinal, 1);
+    assert_eq!(required.generation, generation);
+    assert_eq!(
+        required.bootstrap.actual_revision(),
+        revision("legacy-projection")
+    );
+
+    let rebuilt = publish_generation(&mut store, "rebuilt-projection", Some(generation));
+    assert_ne!(rebuilt, generation);
+    assert!(!legacy_directory.exists());
+}
+
+#[test]
+fn storage_v3_source_state_evidence_mismatch_fails_closed() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let generation = publish_generation(&mut store, "legacy-corruption", None);
+    let current_directory = store.active().unwrap().directory().to_path_buf();
+    let activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(super::activation_file_name(1));
+    drop(store);
+
+    let legacy_directory = super::rewrite_generation_fixture_as_opaque_storage(
+        &current_directory,
+        &activation,
+        generation,
+        LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION,
+        b"attested opaque state",
+    );
+    fs::write(
+        legacy_directory
+            .join(super::SOURCE_STATE_ARTIFACT_DIRECTORY)
+            .join("source-state-v4.json"),
+        b"tampered opaque state",
+    )
+    .unwrap();
+
+    let error = open_store_with_startup_disposition(temporary.path(), options).unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ArtifactEvidenceMismatch { .. }
+    ));
+    assert!(legacy_directory.is_dir());
+    assert!(activation.is_file());
+}
+
+#[test]
+fn desired_revision_on_storage_v3_preserves_the_obsolete_storage_contract() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let generation = publish_generation(&mut store, "legacy-desired", None);
+    let current_directory = store.active().unwrap().directory().to_path_buf();
+    let activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(super::activation_file_name(1));
+    drop(store);
+
+    super::rewrite_generation_fixture_as_opaque_storage(
+        &current_directory,
+        &activation,
+        generation,
+        LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION,
+        b"attested opaque state",
+    );
+    let opened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (mut store, recovery, disposition) = opened.into_parts();
+    recovery.unwrap();
+    assert!(matches!(
+        disposition,
+        GenerationStartupDisposition::RebuildRequired(_)
+    ));
+
+    let desired = revision("legacy-desired-next");
+    store
+        .record_desired_revision(desired, &mut AssetLoadBudget::default())
+        .unwrap();
+    let active = store.active().unwrap();
+    assert_eq!(active.desired_revision(), desired);
+    assert_eq!(
+        active.storage_contract(),
+        LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION
+    );
+    let latest_activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(super::activation_file_name(active.activation_ordinal()));
+    let activation: serde_json::Value =
+        serde_json::from_slice(&fs::read(latest_activation).unwrap()).unwrap();
+    assert_eq!(
+        activation["generation_storage_contract"],
+        serde_json::json!(LEGACY_SOURCE_STATE_V4_STORAGE_CONTRACT_VERSION)
+    );
+    drop(store);
+
+    let reopened = open_store_with_startup_disposition(temporary.path(), options).unwrap();
+    let (store, recovery, disposition) = reopened.into_parts();
+    recovery.unwrap();
+    assert_eq!(store.active().unwrap().desired_revision(), desired);
+    let GenerationStartupDisposition::RebuildRequired(required) = disposition else {
+        panic!("expected storage migration to remain rebuild-required");
+    };
+    assert_eq!(required.bootstrap().desired_revision(), desired);
+}
+
+#[test]
 fn future_storage_contract_fails_closed_and_preserves_its_activation() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions::default();
@@ -1064,8 +1209,9 @@ fn logical_generation_id_is_independent_of_physical_layout() {
         Some(first.generation_id())
     );
     let directory_name = first.generation_id().directory_name();
-    let encoded = directory_name.strip_prefix("generation-v3-").unwrap();
-    let uppercase_alias = format!("generation-v3-{}", encoded.to_ascii_uppercase());
+    let prefix = format!("generation-v{SEARCH_GENERATION_STORAGE_CONTRACT_VERSION}-");
+    let encoded = directory_name.strip_prefix(&prefix).unwrap();
+    let uppercase_alias = format!("{prefix}{}", encoded.to_ascii_uppercase());
     assert_eq!(
         SearchGenerationId::from_directory_name(&uppercase_alias),
         None
@@ -1247,7 +1393,7 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
     let manifest = SearchGenerationManifestV1::new(identity, evidence);
     assert_eq!(
         serde_json::to_value(&manifest).unwrap()["contract_version"],
-        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION
+        SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION
     );
 
     let mut unknown = serde_json::to_value(&manifest).unwrap();
@@ -1270,8 +1416,8 @@ fn manifest_deserialization_rejects_unknown_fields_and_versions() {
     assert!(serde_json::from_value::<SearchGenerationManifestV1>(zero_semantic_version).is_err());
 
     for unsupported_version in [
-        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION - 1,
-        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION + 1,
+        SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION - 1,
+        SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
     ] {
         let mut unsupported = serde_json::to_value(&manifest).unwrap();
         unsupported["contract_version"] = serde_json::json!(unsupported_version);
@@ -1776,6 +1922,7 @@ fn generation_recovery_requires_a_successful_directory_sync_before_reporting_cle
     let error = super::recover_unreferenced_generation_directories(
         &generations,
         false,
+        None,
         &mut AssetLoadBudget::default(),
         Some(GenerationFailpoint::StartupGenerationDirectorySync),
     )
@@ -1791,6 +1938,7 @@ fn generation_recovery_requires_a_successful_directory_sync_before_reporting_cle
     let recovered = super::recover_unreferenced_generation_directories(
         &generations,
         false,
+        None,
         &mut AssetLoadBudget::default(),
         None,
     )
@@ -2221,7 +2369,11 @@ fn disk_estimate_accounts_for_old_and_new_generations() {
     publish_generation(&mut store, "baseline", None);
 
     let estimate = store
-        .estimate_publish(4_096, &mut AssetLoadBudget::default())
+        .estimate_publish(
+            SearchGenerationId::new(digest("incoming")),
+            4_096,
+            &mut AssetLoadBudget::default(),
+        )
         .unwrap();
     assert!(estimate.old_active_generation_bytes > 0);
     assert_eq!(
@@ -2233,6 +2385,37 @@ fn disk_estimate_accounts_for_old_and_new_generations() {
         estimate.reclaimable_bytes_after_publish,
         estimate.existing_generation_bytes
     );
+}
+
+#[test]
+fn disk_estimate_binds_the_active_size_to_its_physical_storage_directory() {
+    let temporary = TempDir::new().unwrap();
+    let mut store = open_store(temporary.path(), GenerationStoreOptions::default()).unwrap();
+    let generation = publish_generation(&mut store, "physical-active", None);
+    let active_directory = store.active().unwrap().directory().to_path_buf();
+    let active_bytes =
+        super::tree_size_no_follow(&active_directory, &mut AssetLoadBudget::default()).unwrap();
+
+    let obsolete_directory =
+        active_directory.with_file_name(generation.directory_name_for_storage_contract(
+            LEGACY_COUPLED_GENERATION_STORAGE_CONTRACT_VERSION,
+        ));
+    fs::create_dir(&obsolete_directory).unwrap();
+    fs::write(
+        obsolete_directory.join("retention-residue"),
+        vec![0_u8; 64 * 1024],
+    )
+    .unwrap();
+
+    let estimate = store
+        .estimate_publish(
+            SearchGenerationId::new(digest("incoming")),
+            4_096,
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(estimate.old_active_generation_bytes, active_bytes);
+    assert!(estimate.existing_generation_bytes > active_bytes);
 }
 
 #[cfg(unix)]

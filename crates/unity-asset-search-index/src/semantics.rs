@@ -5,7 +5,7 @@ use unity_asset_core::{DigestBuildError, DigestV1, DigestV1Builder};
 pub(crate) const SEARCH_SEMANTICS_WIRE_VERSION: u16 = 1;
 
 /// Version of the analysis rules that produce persisted analysis values.
-pub(crate) const ANALYSIS_SEMANTICS_VERSION: u16 = 3;
+pub(crate) const ANALYSIS_SEMANTICS_VERSION: u16 = 4;
 
 /// Version of the search projection rules that produce Tantivy documents.
 pub(crate) const SEARCH_PROJECTION_SEMANTICS_VERSION: u16 = 2;
@@ -16,7 +16,7 @@ pub(crate) const REFERENCE_PROJECTION_SEMANTICS_VERSION: u16 = 4;
 /// Version of the persisted per-source analysis cache identity.
 pub(crate) const ANALYSIS_CACHE_IDENTITY_VERSION: u16 = 2;
 
-const ANALYSIS_SEMANTICS_DOMAIN: &[u8] = b"unity-asset:search:analysis-semantics:v3\0";
+const ANALYSIS_SEMANTICS_DOMAIN: &[u8] = b"unity-asset:search:analysis-semantics:v4\0";
 const SEARCH_PROJECTION_SEMANTICS_DOMAIN: &[u8] =
     b"unity-asset:search:search-projection-semantics:v2\0";
 const REFERENCE_PROJECTION_SEMANTICS_DOMAIN: &[u8] =

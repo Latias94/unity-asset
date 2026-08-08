@@ -30,7 +30,7 @@ use crate::anchored_fs::{
 };
 use crate::generation::{
     ArtifactTreeEvidence, GenerationArtifactEvidence, GenerationProjectionDigests,
-    SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+    SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION, is_supported_generation_manifest_contract_version,
 };
 use crate::generation_store::measure_artifact_tree;
 use crate::projection::{GenerationProjection, ReferenceDocument, SearchDocument};
@@ -1048,7 +1048,9 @@ struct SchemaMarker {
 impl SchemaMarker {
     fn new(schema_contract: &str, schema_version: u16) -> Self {
         Self {
-            generation_contract_version: SEARCH_GENERATION_STORAGE_CONTRACT_VERSION,
+            // Keep the historical wire field name. This value describes the projection marker,
+            // not the surrounding generation namespace, which can migrate independently.
+            generation_contract_version: SEARCH_GENERATION_MANIFEST_CONTRACT_VERSION,
             schema_contract: schema_contract.to_owned(),
             schema_version,
         }
@@ -1234,7 +1236,7 @@ fn validate_schema_marker(
     let expected = SchemaMarker::new(contract, version);
     if contract == REFERENCE_SCHEMA_CONTRACT
         && version == REFERENCE_SCHEMA_VERSION
-        && actual.generation_contract_version == SEARCH_GENERATION_STORAGE_CONTRACT_VERSION
+        && is_supported_generation_manifest_contract_version(actual.generation_contract_version)
         && actual.schema_contract == contract
         && (1..REFERENCE_SCHEMA_VERSION).contains(&actual.schema_version)
     {
@@ -1245,7 +1247,9 @@ fn validate_schema_marker(
         .into());
     }
     ensure!(
-        actual == expected,
+        is_supported_generation_manifest_contract_version(actual.generation_contract_version)
+            && actual.schema_contract == expected.schema_contract
+            && actual.schema_version == expected.schema_version,
         "schema marker for `{contract}` does not match version {version}"
     );
     Ok(())

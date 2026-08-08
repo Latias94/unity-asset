@@ -6,6 +6,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use unity_asset_core::{
     AssetLoadBudget, BudgetedJsonError, ChangeSet, Diagnostic, DigestBuildError, DigestV1,
@@ -25,7 +26,7 @@ use crate::semantics::AnalysisCacheIdentityV1;
 use crate::semantics::SearchSemantics;
 use crate::source_coordinate::IndexedSourceCoordinate;
 
-pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 4;
+pub(super) const SOURCE_STATE_CONTRACT_VERSION: u16 = 5;
 pub(super) const SOURCE_STATE_LOGICAL_IDENTITY_VERSION: u16 = 3;
 const MAX_SOURCE_STATE_ASSETS: usize = 1_000_000;
 const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
@@ -33,9 +34,12 @@ const MAX_TRANSACTION_RECEIPTS: usize = 4_096;
 const TRANSACTION_RECEIPT_CONTRACT_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_RELATIVE_PATH_BYTES: usize = MAX_PORTABLE_PATH_BYTES;
 const MAX_SOURCE_STATE_STRUCTURAL_MEMBERS: u64 = 64_000_000;
-// Vec capacity stays below twice its logical length. JSON parser work covers transient Content
-// maps used by internally tagged enums; it must not be multiplied by every repeated wire field.
+// Vec capacity stays below twice its logical length. Internally tagged Serde enums may buffer an
+// entire object as `Content::Map`; charge every member independently of Serde's private layout so
+// dense unknown fields cannot allocate outside the caller-owned budget.
 const SOURCE_STATE_VEC_SLOTS_PER_ENTRY: u64 = 2;
+const SOURCE_STATE_CONTENT_MAP_BYTES_PER_MEMBER: u64 = 512;
+const SOURCE_STATE_STRING_BACKING_COPIES: u64 = 2;
 const SOURCE_STATE_JSON_PARSER_WORK_MULTIPLIER: u64 = 6;
 const SOURCE_STATE_JSON_PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
 
@@ -399,17 +403,13 @@ impl<'de> Deserialize<'de> for TransactionReceiptWindow {
 }
 
 /// Filesystem metadata used only as a fast unchanged-source hint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceScanHint {
     pub(crate) coordinate: IndexedSourceCoordinate,
     pub(crate) relative_path: String,
     pub(crate) source_length: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_modified_unix_ms: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) metadata_length: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) metadata_modified_unix_ms: Option<u64>,
 }
 
@@ -440,7 +440,7 @@ impl SourceScanHint {
 ///
 /// Scan hints are excluded from the logical digest because timestamps are not content identity.
 /// They are covered by physical artifact evidence and must never be used as correctness evidence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SourceStateSnapshot {
     contract_version: u16,
     workspace: WorkspaceId,
@@ -676,6 +676,101 @@ impl SourceStateSnapshot {
     }
 }
 
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceStateSnapshotWireRef<'state> {
+    contract_version: u16,
+    workspace: WorkspaceId,
+    revision: WorkspaceRevision,
+    analysis_cache_identity: AnalysisCacheIdentityV1,
+    assets: &'state [AssetAnalysis],
+    scan_hints: SourceScanHintsWireRef<'state>,
+    logical_digest: DigestV1,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceScanHintWire {
+    asset_ordinal: u32,
+    source_length: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_modified_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_modified_unix_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SourceScanHintsWireRef<'state> {
+    scan_hints: &'state [SourceScanHint],
+    assets: &'state [AssetAnalysis],
+}
+
+impl Serialize for SourceScanHintsWireRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut sequence = serializer.serialize_seq(Some(self.scan_hints.len()))?;
+        let mut asset_ordinal = 0usize;
+        for hint in self.scan_hints {
+            while self
+                .assets
+                .get(asset_ordinal)
+                .is_some_and(|analysis| analysis.source.coordinate < hint.coordinate)
+            {
+                asset_ordinal = asset_ordinal.saturating_add(1);
+            }
+            let Some(analysis) = self
+                .assets
+                .get(asset_ordinal)
+                .filter(|analysis| analysis.source.coordinate == hint.coordinate)
+            else {
+                return Err(serde::ser::Error::custom(
+                    "source-state scan hint has no canonical asset",
+                ));
+            };
+            if analysis.source.relative_path != hint.relative_path {
+                return Err(serde::ser::Error::custom(
+                    "source-state scan hint display differs from its canonical asset",
+                ));
+            }
+            let asset_ordinal = u32::try_from(asset_ordinal)
+                .map_err(|_| serde::ser::Error::custom("source-state asset ordinal exceeds u32"))?;
+            sequence.serialize_element(&SourceScanHintWire {
+                asset_ordinal,
+                source_length: hint.source_length,
+                source_modified_unix_ms: hint.source_modified_unix_ms,
+                metadata_length: hint.metadata_length,
+                metadata_modified_unix_ms: hint.metadata_modified_unix_ms,
+            })?;
+        }
+        sequence.end()
+    }
+}
+
+impl Serialize for SourceStateSnapshot {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SourceStateSnapshotWireRef {
+            contract_version: self.contract_version,
+            workspace: self.workspace,
+            revision: self.revision,
+            analysis_cache_identity: self.analysis_cache_identity,
+            assets: &self.assets,
+            scan_hints: SourceScanHintsWireRef {
+                scan_hints: &self.scan_hints,
+                assets: &self.assets,
+            },
+            logical_digest: self.logical_digest,
+        }
+        .serialize(serializer)
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceStateSnapshotWire {
@@ -683,8 +778,8 @@ struct SourceStateSnapshotWire {
     workspace: WorkspaceId,
     revision: WorkspaceRevision,
     analysis_cache_identity: AnalysisCacheIdentityV1,
-    scan_hints: Vec<SourceScanHint>,
     assets: Vec<AssetAnalysis>,
+    scan_hints: Vec<SourceScanHintWire>,
     logical_digest: DigestV1,
 }
 
@@ -702,14 +797,21 @@ impl<'de> Deserialize<'de> for SourceStateSnapshot {
                 },
             ));
         }
-        ensure_source_state_canonical_order(&wire.scan_hints, &wire.assets)
-            .map_err(serde::de::Error::custom)?;
+        ensure_strictly_sorted_identities(
+            "assets",
+            wire.assets
+                .iter()
+                .map(|analysis| analysis.source.coordinate),
+        )
+        .map_err(serde::de::Error::custom)?;
         ensure_source_state_assets_canonical(&wire.assets).map_err(serde::de::Error::custom)?;
+        let scan_hints =
+            decode_scan_hints(&wire.scan_hints, &wire.assets).map_err(serde::de::Error::custom)?;
         let snapshot = Self::new_with_analysis_cache_identity(
             wire.workspace,
             wire.revision,
             wire.analysis_cache_identity,
-            wire.scan_hints,
+            scan_hints,
             wire.assets,
         )
         .map_err(serde::de::Error::custom)?;
@@ -893,15 +995,49 @@ impl Write for DigestWriter<'_> {
     }
 }
 
-fn ensure_source_state_canonical_order(
-    scan_hints: &[SourceScanHint],
+fn decode_scan_hints(
+    encoded: &[SourceScanHintWire],
     assets: &[AssetAnalysis],
-) -> Result<(), SourceStateError> {
-    ensure_strictly_sorted_identities("scan hints", scan_hints.iter().map(|hint| hint.coordinate))?;
-    ensure_strictly_sorted_identities(
-        "assets",
-        assets.iter().map(|analysis| analysis.source.coordinate),
-    )
+) -> Result<Vec<SourceScanHint>, SourceStateError> {
+    let mut scan_hints = Vec::new();
+    scan_hints
+        .try_reserve_exact(encoded.len())
+        .map_err(|source| SourceStateError::AllocationFailed {
+            requested: encoded
+                .len()
+                .saturating_mul(std::mem::size_of::<SourceScanHint>()),
+            source,
+        })?;
+    let mut previous_ordinal = None;
+    for hint in encoded {
+        if previous_ordinal.is_some_and(|previous| previous >= hint.asset_ordinal) {
+            return Err(SourceStateError::NonCanonicalOrder {
+                collection: "scan hints",
+            });
+        }
+        previous_ordinal = Some(hint.asset_ordinal);
+        let ordinal = usize::try_from(hint.asset_ordinal).map_err(|_| {
+            SourceStateError::ScanHintAssetOrdinalOutOfRange {
+                ordinal: hint.asset_ordinal,
+                assets: assets.len(),
+            }
+        })?;
+        let Some(analysis) = assets.get(ordinal) else {
+            return Err(SourceStateError::ScanHintAssetOrdinalOutOfRange {
+                ordinal: hint.asset_ordinal,
+                assets: assets.len(),
+            });
+        };
+        scan_hints.push(SourceScanHint {
+            coordinate: analysis.source.coordinate,
+            relative_path: analysis.source.relative_path.clone(),
+            source_length: hint.source_length,
+            source_modified_unix_ms: hint.source_modified_unix_ms,
+            metadata_length: hint.metadata_length,
+            metadata_modified_unix_ms: hint.metadata_modified_unix_ms,
+        });
+    }
+    Ok(scan_hints)
 }
 
 fn normalize_asset_analysis(analysis: &mut AssetAnalysis) {
@@ -1129,7 +1265,6 @@ fn source_state_entry_count_parts(
 pub(super) struct JsonStructure {
     pub(super) array_entries: u64,
     pub(super) object_members: u64,
-    pub(super) max_object_members: u64,
     // JSON escape syntax never decodes to more UTF-8 bytes than its raw string body.
     pub(super) string_backing_bytes: u64,
     pub(super) max_depth: u32,
@@ -1138,7 +1273,7 @@ pub(super) struct JsonStructure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonContainer {
     Array { expects_value: bool },
-    Object { members: u64 },
+    Object,
 }
 
 fn mark_json_array_value(
@@ -1174,7 +1309,6 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
     let mut max_depth = 0_u32;
     let mut array_entries = 0_u64;
     let mut object_members = 0_u64;
-    let mut max_object_members = 0_u64;
     let mut string_backing_bytes = 0_u64;
     let mut index = 0_usize;
     while let Some(byte) = encoded.get(index).copied() {
@@ -1231,7 +1365,7 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
                         expects_value: true,
                     }
                 } else {
-                    JsonContainer::Object { members: 0 }
+                    JsonContainer::Object
                 });
                 depth += 1;
                 max_depth = max_depth.max(u32::try_from(depth).map_err(|_| {
@@ -1267,17 +1401,6 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
                         .ok_or(SourceStateError::SizeOverflow {
                             resource: "source state structural members",
                         })?;
-                if let Some(JsonContainer::Object { members }) = depth
-                    .checked_sub(1)
-                    .and_then(|slot| containers[slot].as_mut())
-                {
-                    *members = members
-                        .checked_add(1)
-                        .ok_or(SourceStateError::SizeOverflow {
-                            resource: "source state object width",
-                        })?;
-                    max_object_members = max_object_members.max(*members);
-                }
             }
             b' ' | b'\t' | b'\r' | b'\n' => {}
             _ => {
@@ -1290,7 +1413,6 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
     Ok(JsonStructure {
         array_entries,
         object_members,
-        max_object_members,
         string_backing_bytes,
         max_depth,
     })
@@ -1335,8 +1457,19 @@ pub(super) fn source_state_owned_allocation_bound(
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state JSON parser work",
         })?;
-    structure
+    let string_backing = structure
         .string_backing_bytes
+        .checked_mul(SOURCE_STATE_STRING_BACKING_COPIES)
+        .ok_or(SourceStateError::SizeOverflow {
+            resource: "source state retained string allocation",
+        })?;
+    let content_map_backing = structure
+        .object_members
+        .checked_mul(SOURCE_STATE_CONTENT_MAP_BYTES_PER_MEMBER)
+        .ok_or(SourceStateError::SizeOverflow {
+            resource: "source state transient content maps",
+        })?;
+    string_backing
         .checked_add(parser_work)
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state string allocation",
@@ -1344,6 +1477,13 @@ pub(super) fn source_state_owned_allocation_bound(
         .checked_add(container_backing)
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state owned allocation",
+        })
+        .and_then(|bytes| {
+            bytes
+                .checked_add(content_map_backing)
+                .ok_or(SourceStateError::SizeOverflow {
+                    resource: "source state owned allocation",
+                })
         })
 }
 
@@ -1405,6 +1545,10 @@ pub(crate) enum SourceStateError {
     },
     ScanHintDisplayMismatch {
         coordinate: IndexedSourceCoordinate,
+    },
+    ScanHintAssetOrdinalOutOfRange {
+        ordinal: u32,
+        assets: usize,
     },
     InvalidRelativePath {
         relative_path: String,
@@ -1543,6 +1687,10 @@ impl fmt::Display for SourceStateError {
             Self::ScanHintDisplayMismatch { coordinate } => write!(
                 formatter,
                 "source state scan hint {coordinate:?} does not use its analyzed source display path"
+            ),
+            Self::ScanHintAssetOrdinalOutOfRange { ordinal, assets } => write!(
+                formatter,
+                "source state scan hint ordinal {ordinal} is outside the {assets}-asset table"
             ),
             Self::InvalidRelativePath {
                 relative_path,
@@ -1773,6 +1921,18 @@ mod source_state_tests {
         assert_eq!(changed_hints.logical_digest(), snapshot.logical_digest());
 
         let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let encoded_value = serde_json::to_value(&snapshot).unwrap();
+        assert!(
+            encoded_value["scan_hints"][0]
+                .get("asset_ordinal")
+                .is_some()
+        );
+        assert!(encoded_value["scan_hints"][0].get("coordinate").is_none());
+        assert!(
+            encoded_value["scan_hints"][0]
+                .get("relative_path")
+                .is_none()
+        );
         let decoded = serde_json::from_slice::<SourceStateSnapshot>(&encoded).unwrap();
         assert_eq!(decoded, snapshot);
 
@@ -1783,6 +1943,10 @@ mod source_state_tests {
         let mut unknown = serde_json::to_value(&snapshot).unwrap();
         unknown["unknown"] = serde_json::json!(true);
         assert!(serde_json::from_value::<SourceStateSnapshot>(unknown).is_err());
+
+        let mut invalid_hint = serde_json::to_value(&snapshot).unwrap();
+        invalid_hint["scan_hints"][0]["asset_ordinal"] = serde_json::json!(99);
+        assert!(serde_json::from_value::<SourceStateSnapshot>(invalid_hint).is_err());
 
         for unsupported_version in [
             SOURCE_STATE_CONTRACT_VERSION - 1,
@@ -1914,7 +2078,6 @@ mod source_state_tests {
 
         assert_eq!(structure.array_entries, 4);
         assert_eq!(structure.object_members, 3);
-        assert_eq!(structure.max_object_members, 2);
         assert_eq!(structure.string_backing_bytes, 5);
         assert_eq!(structure.max_depth, 4);
     }
@@ -1932,7 +2095,16 @@ mod source_state_tests {
         assert_eq!(
             source_state_owned_allocation_bound(encoded_length, structure).unwrap()
                 - source_state_owned_allocation_bound(encoded_length, without_strings).unwrap(),
-            structure.string_backing_bytes
+            structure.string_backing_bytes * SOURCE_STATE_STRING_BACKING_COPIES
+        );
+        let without_members = JsonStructure {
+            object_members: 0,
+            ..structure
+        };
+        assert_eq!(
+            source_state_owned_allocation_bound(encoded_length, structure).unwrap()
+                - source_state_owned_allocation_bound(encoded_length, without_members).unwrap(),
+            structure.object_members * SOURCE_STATE_CONTENT_MAP_BYTES_PER_MEMBER
         );
         assert_eq!(
             source_state_owned_allocation_bound(encoded_length + 10, structure).unwrap()
@@ -2270,6 +2442,68 @@ mod source_state_tests {
     }
 
     #[test]
+    fn source_state_precharges_dense_internally_tagged_maps_before_deserializing() {
+        const UNKNOWN_MEMBERS: usize = 4_096;
+
+        let temporary = TempDir::new().unwrap();
+        let workspace = WorkspaceId::from_u128(0x57_01).unwrap();
+        let revision = WorkspaceRevision::new(digest("dense internally tagged map"));
+        let mut value = serde_json::to_value(source_state(workspace, revision)).unwrap();
+        let coordinate = value["assets"][0]["source"]["coordinate"]
+            .as_object_mut()
+            .unwrap();
+        for ordinal in 0..UNKNOWN_MEMBERS {
+            coordinate.insert(format!("x{ordinal:04}"), serde_json::json!(0));
+        }
+        let encoded = serde_json::to_vec(&value).unwrap();
+        fs::write(temporary.path().join(SOURCE_STATE_FILE), &encoded).unwrap();
+
+        let encoded_length = u64::try_from(encoded.len()).unwrap();
+        let read_limit = encoded_length + 1;
+        let structure = scan_json_structure(&encoded).unwrap();
+        let owned_allocation =
+            source_state_owned_allocation_bound(encoded_length, structure).unwrap();
+        let content_map_backing = structure
+            .object_members
+            .checked_mul(SOURCE_STATE_CONTENT_MAP_BYTES_PER_MEMBER)
+            .unwrap();
+        let load_limits = AssetLoadLimits {
+            max_bytes: read_limit
+                .checked_add(owned_allocation)
+                .and_then(|bytes| bytes.checked_sub(content_map_backing))
+                .unwrap(),
+            ..AssetLoadLimits::default()
+        };
+        let limits = SourceStateLimits {
+            max_encoded_bytes: read_limit,
+            ..SourceStateLimits::default()
+        };
+
+        assert!(matches!(
+            read_source_state_snapshot(
+                temporary.path(),
+                &mut AssetLoadBudget::new(load_limits).unwrap(),
+                limits,
+            ),
+            Err(GenerationStoreError::Budget(_))
+        ));
+
+        let sufficient_limits = AssetLoadLimits {
+            max_bytes: read_limit.checked_add(owned_allocation).unwrap(),
+            ..AssetLoadLimits::default()
+        };
+        assert!(matches!(
+            read_source_state_snapshot(
+                temporary.path(),
+                &mut AssetLoadBudget::new(sufficient_limits).unwrap(),
+                limits,
+            ),
+            Err(GenerationStoreError::SourceState { source, .. })
+                if matches!(source.as_ref(), SourceStateError::Json(_))
+        ));
+    }
+
+    #[test]
     fn default_budget_loads_forty_thousand_minimal_filesystem_sources() {
         const SOURCE_COUNT: usize = 40_000;
 
@@ -2327,7 +2561,7 @@ mod source_state_tests {
         let snapshot = SourceStateSnapshot::new(workspace, revision, scan_hints, assets).unwrap();
         let encoded = serde_json::to_vec(&snapshot).unwrap();
         let structure = scan_json_structure(&encoded).unwrap();
-        assert!(structure.object_members > AssetLoadLimits::default().max_members);
+        assert!(structure.object_members <= AssetLoadLimits::default().max_members);
         fs::write(temporary.path().join(SOURCE_STATE_FILE), encoded).unwrap();
 
         let mut budget = AssetLoadBudget::default();
@@ -2338,8 +2572,7 @@ mod source_state_tests {
         assert_eq!(loaded.scan_hints().len(), SOURCE_COUNT);
         assert_eq!(loaded.assets().len(), SOURCE_COUNT);
         assert_eq!(loaded.logical_digest(), snapshot.logical_digest());
-        assert_eq!(budget.usage().members, structure.max_object_members);
-        assert!(budget.usage().members < structure.object_members);
+        assert_eq!(budget.usage().members, structure.object_members);
     }
 
     #[test]
