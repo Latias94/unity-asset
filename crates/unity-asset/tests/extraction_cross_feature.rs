@@ -109,10 +109,20 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
         "stream": null,
         "descriptor": descriptor,
     });
+    persisted["artifacts"][0]["representation_semantics"] = serde_json::json!({
+        "kind": "texture_png",
+        "pixels": "top_left_rgba8_v1",
+        "platform_transform": "serialized_file_build_target_closed_v1",
+        "encoder": "filter_none_stored_deflate_block_per_idat_rgba8_v1",
+    });
     persisted["artifacts"][0]["fallback"] = serde_json::json!({
         "kind": "binary_raw",
         "path": fallback_path.clone(),
         "content": { "kind": "raw_binary" },
+        "representation_semantics": {
+            "kind": "raw_binary",
+            "bytes": "workspace_object_raw_bytes_v1",
+        },
     });
     let raw_working_set = u64::try_from(expected.len()).unwrap().max(1);
     persisted["artifacts"][0]["working_set_bytes"] = serde_json::Value::from(raw_working_set + 1);
@@ -121,6 +131,10 @@ fn default_build_executes_a_persisted_decoded_plan_through_its_raw_fallback() {
     downgraded["artifacts"][0]["preferred_path"] = serde_json::json!(raw_path.clone());
     downgraded["artifacts"][0]["preferred_content"] = serde_json::json!({
         "kind": "raw_binary",
+    });
+    downgraded["artifacts"][0]["representation_semantics"] = serde_json::json!({
+        "kind": "raw_binary",
+        "bytes": "workspace_object_raw_bytes_v1",
     });
     downgraded["artifacts"][0]["fallback"] = serde_json::Value::Null;
     let downgraded_address = downgraded["artifacts"][0]["address"].clone();

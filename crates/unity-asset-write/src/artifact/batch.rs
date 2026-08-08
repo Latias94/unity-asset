@@ -9,7 +9,9 @@ use thiserror::Error;
 use unity_asset_binary::BinaryError;
 #[cfg(test)]
 use unity_asset_core::vec_allocation_bytes;
-use unity_asset_core::{AssetLoadBudget, DigestBuildError, DigestV1, SourceId};
+use unity_asset_core::{
+    AssetLoadBudget, DigestBuildError, DigestV1, SourceFingerprint, SourceId, SourceKind,
+};
 
 use super::budget::{ArtifactBudgetTransaction, CodecScratchBudget, ScratchAllocation};
 use super::format::{ExpectedArtifactFormat, StreamedResourceLayoutProof};
@@ -21,7 +23,9 @@ use super::{
     ArtifactNameError, ArtifactPayload, ArtifactPayloadError, ArtifactPayloadProvenance,
     ArtifactReader, ArtifactSetFootprint, ArtifactSourceDependency, ArtifactStreamError,
     ArtifactStreamReceipt, ImageBuilder, LogicalArtifactName, PreparedArtifactFormat,
-    StreamedResourceExtentInspection, VerbatimSourceInspection,
+    PreparedArtifactKind, PreparedArtifactSourceCompatibility,
+    PreparedArtifactSourceCompatibilityError, StreamedResourceExtentInspection,
+    VerbatimSourceInspection,
 };
 
 static NEXT_BATCH_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -463,10 +467,11 @@ impl<'artifact, 'inspection> ArtifactBatch<'artifact, 'inspection> {
         )
     }
 
-    /// Independently reparses one complete YAML payload into a prepared YAML leaf.
+    /// Independently parses one complete YAML payload into a prepared YAML leaf.
     ///
-    /// Source-backed payloads must carry YAML source identity. The image remains segmented and is
-    /// parsed without first materializing a contiguous copy.
+    /// Source-backed payloads must carry YAML source identity. The artifact remains segmented for
+    /// publication, while the canonical parser retains its opaque document proof for downstream
+    /// Workspace validation.
     pub fn prepare_yaml(
         &mut self,
         payload: &ArtifactPayload,
@@ -1224,9 +1229,44 @@ pub struct PreparedArtifact {
 }
 
 impl PreparedArtifact {
+    /// Returns the independently inspected wire family of this exact image.
     #[must_use]
-    pub const fn format(&self) -> &PreparedArtifactFormat {
+    pub const fn kind(&self) -> PreparedArtifactKind {
+        self.format.kind()
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn format(&self) -> &PreparedArtifactFormat {
         &self.format
+    }
+
+    /// Checks this exact parser-proven image against one candidate logical source image.
+    ///
+    /// The returned evidence borrows this artifact and does not reparse, re-encode, or copy its
+    /// image. Workspace catalog, output, and publication-destination authority remain the caller's
+    /// responsibility.
+    pub fn prove_source_compatibility(
+        &self,
+        source_id: SourceId,
+        fingerprint: SourceFingerprint,
+    ) -> Result<PreparedArtifactSourceCompatibility<'_>, PreparedArtifactSourceCompatibilityError>
+    {
+        PreparedArtifactSourceCompatibility::mint(
+            source_id,
+            fingerprint,
+            &self.format,
+            self.digest(),
+        )
+    }
+
+    /// Returns the source family established by the artifact's own parser proof.
+    ///
+    /// This is format evidence only. It does not bind a logical `SourceId` to a workspace
+    /// catalog entry; that authority belongs to the workspace publication seal.
+    #[must_use]
+    pub const fn source_kind(&self) -> SourceKind {
+        self.format.source_kind()
     }
 
     #[must_use]
@@ -1557,10 +1597,14 @@ pub enum ArtifactBuildError {
     Payload(ArtifactPayloadError),
     #[error("failed to consume a prepared dependency: {0}")]
     DependencyIo(std::io::Error),
-    #[error("invalid UTF-8 in YAML artifact at byte offset {offset}")]
-    InvalidYamlUtf8 { offset: u64 },
-    #[error("invalid YAML artifact: {0}")]
-    InvalidYaml(#[source] yaml_rust2::ScanError),
+    #[error("canonical Unity YAML parser rejected the artifact: {0}")]
+    CanonicalYaml(#[source] Box<unity_asset_yaml::BudgetedYamlError>),
+    #[error("failed to allocate {requested} bytes for the canonical YAML image")]
+    YamlImageAllocationFailed {
+        requested: usize,
+        #[source]
+        source: std::collections::TryReserveError,
+    },
     #[error("{codec} codec failed while attempting to {operation}")]
     CodecFailure {
         codec: &'static str,

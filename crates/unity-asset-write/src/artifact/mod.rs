@@ -27,10 +27,11 @@ pub(crate) use codec::encode_brotli;
 pub use footprint::{
     ArtifactBuildCounters, ArtifactFootprint, ArtifactSetFootprint, ArtifactSourceDependency,
 };
+pub(crate) use format::{PreparedArtifactFormat, VerbatimSourceInspection};
 pub use format::{
-    PreparedArtifactFormat, PreparedArtifactKind, ResourceLayoutDigest,
-    StreamedResourceExtentInspection, StreamedResourceInspection, VerbatimSourceInspection,
-    YamlInspection,
+    PreparedArtifactFormatProof, PreparedArtifactKind, PreparedArtifactSourceCompatibility,
+    PreparedArtifactSourceCompatibilityError, PreparedYamlProof, ResourceLayoutDigest,
+    StreamedResourceExtentInspection, StreamedResourceInspection, YamlInspection,
 };
 pub use image::ArtifactReader;
 pub use name::{ArtifactNameError, LogicalArtifactName};

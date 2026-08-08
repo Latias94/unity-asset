@@ -10,7 +10,7 @@ use unity_asset_core::{
 };
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactBuildError, ArtifactLimits,
-    PreparedArtifactFormat,
+    PreparedArtifactKind,
 };
 use unity_asset_write::resources::StreamedResourceFlags;
 
@@ -975,10 +975,7 @@ fn companion_sidecar_prepares_one_exact_output_without_filesystem_writes() {
     assert_eq!(output.name().as_str(), expected_name);
     assert_eq!(output.handle(), handle);
     let artifact = artifacts.artifact(handle).unwrap();
-    assert!(matches!(
-        artifact.format(),
-        PreparedArtifactFormat::StreamedResource(_)
-    ));
+    assert_eq!(artifact.kind(), PreparedArtifactKind::StreamedResource);
     assert_eq!(artifact.len(), 5);
     assert_eq!(artifact.digest(), update.fingerprint().digest());
     let mut actual = Vec::new();

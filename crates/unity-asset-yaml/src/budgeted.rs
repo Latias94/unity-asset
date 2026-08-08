@@ -50,12 +50,75 @@ const YAML_RUST2_0_11_FIXED_CONTAINER_BYTES: u64 = 128 * 1024;
 const UNITY_TAG_PREFIX: &str = "tag:unity3d.com,2011:";
 const UNITY_DOCUMENT_CLASS_NAME: &str = "YamlDocument";
 
+/// Structural evidence produced by the canonical Unity YAML parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct YamlInspection {
+    encoded_bytes: u64,
+    documents: u64,
+    events: u64,
+    max_depth: u32,
+}
+
+impl YamlInspection {
+    #[must_use]
+    pub const fn encoded_bytes(self) -> u64 {
+        self.encoded_bytes
+    }
+
+    #[must_use]
+    pub const fn documents(self) -> u64 {
+        self.documents
+    }
+
+    #[must_use]
+    pub const fn events(self) -> u64 {
+        self.events
+    }
+
+    #[must_use]
+    pub const fn max_depth(self) -> u32 {
+        self.max_depth
+    }
+}
+
+/// Opaque canonical parse proof for one exact Unity YAML image.
+///
+/// The proof retains the parsed document and a conservative upper bound for the heap storage that
+/// remains live with it. Callers can therefore promote the parse result into another retained
+/// ownership domain without reparsing the source bytes.
+#[derive(Debug, Clone)]
+pub struct PreparedYamlProof {
+    inspection: YamlInspection,
+    document: Arc<YamlDocument>,
+    retained_heap_bytes: u64,
+}
+
+impl PreparedYamlProof {
+    /// Returns the structural evidence produced while parsing the exact image.
+    #[must_use]
+    pub const fn inspection(&self) -> YamlInspection {
+        self.inspection
+    }
+
+    /// Returns the canonical parsed document retained by this proof.
+    #[must_use]
+    pub const fn document(&self) -> &Arc<YamlDocument> {
+        &self.document
+    }
+
+    /// Returns a conservative upper bound for heap storage retained by this proof.
+    #[must_use]
+    pub const fn retained_heap_bytes(&self) -> u64 {
+        self.retained_heap_bytes
+    }
+}
+
 /// A parsed YAML document that retains the exact bytes used to fingerprint its source.
 #[derive(Debug, Clone)]
 pub struct BudgetedYamlSource {
     encoded: Arc<[u8]>,
     budgeted_encoded: BudgetedSourceBytes,
-    document: Arc<YamlDocument>,
+    proof: PreparedYamlProof,
 }
 
 impl BudgetedYamlSource {
@@ -66,7 +129,26 @@ impl BudgetedYamlSource {
 
     /// Returns the parsed Unity YAML document.
     pub fn document(&self) -> &Arc<YamlDocument> {
-        &self.document
+        self.proof.document()
+    }
+
+    /// Returns the structural evidence produced while parsing the exact source image.
+    #[must_use]
+    pub const fn inspection(&self) -> YamlInspection {
+        self.proof.inspection()
+    }
+
+    /// Consumes the source image and returns its canonical parse proof.
+    ///
+    /// The caller must present the budget domain that paid for the source parse. Retaining the
+    /// returned proof in another ownership domain still requires charging
+    /// [`PreparedYamlProof::retained_heap_bytes`].
+    pub fn into_prepared_proof(
+        self,
+        budget: &AssetLoadBudget,
+    ) -> Result<PreparedYamlProof, BudgetError> {
+        self.budgeted_encoded.validate_budget(budget)?;
+        Ok(self.proof)
     }
 
     /// Returns the budget-bound source proof and parsed document.
@@ -75,14 +157,25 @@ impl BudgetedYamlSource {
         budget: &AssetLoadBudget,
     ) -> Result<(BudgetedSourceBytes, Arc<YamlDocument>), BudgetError> {
         self.budgeted_encoded.validate_budget(budget)?;
-        Ok((self.budgeted_encoded, self.document))
+        Ok((self.budgeted_encoded, self.proof.document))
     }
 
-    fn attach_path(&mut self, path: PathBuf) {
-        let document = Arc::get_mut(&mut self.document)
+    fn attach_path(&mut self, path: BudgetedPath) -> Result<(), BudgetedYamlError> {
+        self.proof.retained_heap_bytes = self
+            .proof
+            .retained_heap_bytes
+            .checked_add(path.retained_heap_bytes)
+            .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+        let document = Arc::get_mut(&mut self.proof.document)
             .expect("a newly parsed YAML source uniquely owns its document");
-        document.set_file_path(path);
+        document.set_file_path(path.value);
+        Ok(())
     }
+}
+
+struct BudgetedPath {
+    value: PathBuf,
+    retained_heap_bytes: u64,
 }
 
 /// Typed failures produced while parsing a budgeted Unity YAML source.
@@ -183,7 +276,8 @@ pub fn parse_prebudgeted_yaml_source(
         valid_up_to: source.valid_up_to(),
         source,
     })?;
-    charge_yaml_rust2_allocation_envelope(input, budget)?;
+    let parser_usage_start = budget.usage().bytes;
+    let parser_envelope = charge_yaml_rust2_allocation_envelope(input, budget)?;
 
     let headers = scan_headers(input, budget)?;
     let parser_input = StrippedHeaderChars::new(input, &headers)?;
@@ -195,9 +289,18 @@ pub fn parse_prebudgeted_yaml_source(
     let mut header_cursor = 0;
     let mut document_ordinal = 0_u64;
     let mut current: Option<DocumentBuilder<'_>> = None;
+    let mut events = 0_u64;
+    let mut documents = 0_u64;
+    let mut event_depth = 0_u32;
+    let mut max_depth = 0_u32;
 
     loop {
         let (event, mark) = parser.next_token()?;
+        events = events
+            .checked_add(1)
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "YAML parser events",
+            })?;
         match event {
             Event::Nothing => {
                 return Err(invalid_document(mark, "parser emitted an internal event"));
@@ -218,6 +321,11 @@ pub fn parse_prebudgeted_yaml_source(
                 break;
             }
             Event::DocumentStart => {
+                documents = documents
+                    .checked_add(1)
+                    .ok_or(BudgetError::ArithmeticOverflow {
+                        resource: "YAML documents",
+                    })?;
                 if current.is_some() {
                     return Err(invalid_document(mark, "nested document start"));
                 }
@@ -247,32 +355,98 @@ pub fn parse_prebudgeted_yaml_source(
             }
             Event::Scalar(value, style, anchor, tag) => current_builder(&mut current, mark)?
                 .scalar(value, style, anchor, tag, budget, mark)?,
-            Event::SequenceStart(anchor, tag) => current_builder(&mut current, mark)?
-                .start_container(ContainerKind::Sequence, anchor, tag, budget, mark)?,
-            Event::SequenceEnd => current_builder(&mut current, mark)?.end_container(
-                ContainerKind::Sequence,
-                budget,
-                mark,
-            )?,
-            Event::MappingStart(anchor, tag) => current_builder(&mut current, mark)?
-                .start_container(ContainerKind::Mapping, anchor, tag, budget, mark)?,
-            Event::MappingEnd => current_builder(&mut current, mark)?.end_container(
-                ContainerKind::Mapping,
-                budget,
-                mark,
-            )?,
+            Event::SequenceStart(anchor, tag) => {
+                current_builder(&mut current, mark)?.start_container(
+                    ContainerKind::Sequence,
+                    anchor,
+                    tag,
+                    budget,
+                    mark,
+                )?;
+                event_depth =
+                    event_depth
+                        .checked_add(1)
+                        .ok_or(BudgetError::ArithmeticOverflow {
+                            resource: "YAML parser depth",
+                        })?;
+                max_depth = max_depth.max(event_depth);
+            }
+            Event::SequenceEnd => {
+                current_builder(&mut current, mark)?.end_container(
+                    ContainerKind::Sequence,
+                    budget,
+                    mark,
+                )?;
+                event_depth = event_depth
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid_document(mark, "unmatched sequence end"))?;
+            }
+            Event::MappingStart(anchor, tag) => {
+                current_builder(&mut current, mark)?.start_container(
+                    ContainerKind::Mapping,
+                    anchor,
+                    tag,
+                    budget,
+                    mark,
+                )?;
+                event_depth =
+                    event_depth
+                        .checked_add(1)
+                        .ok_or(BudgetError::ArithmeticOverflow {
+                            resource: "YAML parser depth",
+                        })?;
+                max_depth = max_depth.max(event_depth);
+            }
+            Event::MappingEnd => {
+                current_builder(&mut current, mark)?.end_container(
+                    ContainerKind::Mapping,
+                    budget,
+                    mark,
+                )?;
+                event_depth = event_depth
+                    .checked_sub(1)
+                    .ok_or_else(|| invalid_document(mark, "unmatched mapping end"))?;
+            }
         }
+    }
+
+    if event_depth != 0 {
+        return Err(YamlAdapterError::InvalidDocument {
+            line: 0,
+            column: 0,
+            reason: "parser ended with open collections",
+        });
     }
 
     let document_allocation = arc_value_allocation_bytes::<YamlDocument>()
         .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
     budget.check_bytes(document_allocation)?;
     budget.consume_bytes(document_allocation)?;
-    let document = YamlDocument::from_entries(document_entries);
+    let document = Arc::new(YamlDocument::from_entries(document_entries));
+    let parser_bytes = budget
+        .usage()
+        .bytes
+        .checked_sub(parser_usage_start)
+        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    // The yaml-rust2 envelope bounds parser-owned scratch that is released before the proof is
+    // returned. Every other adapter charge is either retained document storage or a conservative
+    // overestimate of short-lived header/frame storage, so subtraction remains fail-safe.
+    let retained_heap_bytes = parser_bytes
+        .checked_sub(parser_envelope)
+        .ok_or(BudgetError::ArithmeticOverflow { resource: "bytes" })?;
     Ok(BudgetedYamlSource {
+        proof: PreparedYamlProof {
+            inspection: YamlInspection {
+                encoded_bytes: usize_to_u64(encoded.len())?,
+                documents,
+                events,
+                max_depth,
+            },
+            document,
+            retained_heap_bytes,
+        },
         encoded,
         budgeted_encoded,
-        document: Arc::new(document),
     })
 }
 
@@ -295,7 +469,7 @@ pub fn load_budgeted_yaml_path(
     verify_open_file_binding(file, path, before)?;
 
     let mut source = parse_prebudgeted_yaml_source(encoded, budget)?;
-    source.attach_path(clone_path_budgeted(path, budget)?);
+    source.attach_path(clone_path_budgeted(path, budget)?)?;
     Ok(source)
 }
 
@@ -321,7 +495,7 @@ where
     verify_open_file_binding_async(file, path, before).await?;
 
     let mut source = parse_prebudgeted_yaml_source(encoded, budget)?;
-    source.attach_path(clone_path_budgeted(path, budget)?);
+    source.attach_path(clone_path_budgeted(path, budget)?)?;
     Ok(source)
 }
 
@@ -589,7 +763,7 @@ fn source_changed(path: &Path) -> BudgetedYamlError {
 fn clone_path_budgeted(
     path: &Path,
     budget: &mut AssetLoadBudget,
-) -> Result<PathBuf, BudgetedYamlError> {
+) -> Result<BudgetedPath, BudgetedYamlError> {
     let requested = path.as_os_str().len();
     budget.check_bytes(usize_to_u64(requested)?)?;
     let mut owned = OsString::new();
@@ -600,9 +774,13 @@ fn clone_path_budgeted(
             requested,
             source,
         })?;
-    budget.consume_bytes(usize_to_u64(requested)?)?;
     owned.push(path);
-    Ok(PathBuf::from(owned))
+    let retained_heap_bytes = usize_to_u64(owned.capacity())?;
+    budget.consume_bytes(retained_heap_bytes)?;
+    Ok(BudgetedPath {
+        value: PathBuf::from(owned),
+        retained_heap_bytes,
+    })
 }
 
 fn current_builder<'a, 'input>(
@@ -617,11 +795,11 @@ fn current_builder<'a, 'input>(
 fn charge_yaml_rust2_allocation_envelope(
     input: &str,
     budget: &mut AssetLoadBudget,
-) -> Result<(), YamlAdapterError> {
+) -> Result<u64, YamlAdapterError> {
     let envelope = yaml_rust2_allocation_envelope(input)?;
     budget.check_bytes(envelope)?;
     budget.consume_bytes(envelope)?;
-    Ok(())
+    Ok(envelope)
 }
 
 fn yaml_rust2_allocation_envelope(input: &str) -> Result<u64, YamlAdapterError> {
@@ -1448,12 +1626,12 @@ fn document_anchor(ordinal: u64, budget: &mut AssetLoadBudget) -> Result<String,
             requested: CAPACITY,
             source,
         })?;
-    budget.consume_bytes(usize_to_u64(CAPACITY)?)?;
     write!(&mut anchor, "doc_{ordinal}").map_err(|_| YamlAdapterError::InvalidDocument {
         line: 1,
         column: 1,
         reason: "failed to format the document ordinal",
     })?;
+    budget.consume_bytes(usize_to_u64(anchor.capacity())?)?;
     Ok(anchor)
 }
 
@@ -1564,8 +1742,7 @@ fn clone_string_budgeted(
     budget: &mut AssetLoadBudget,
     context: &'static str,
 ) -> Result<String, YamlAdapterError> {
-    let bytes = usize_to_u64(value.len())?;
-    budget.check_bytes(bytes)?;
+    budget.check_bytes(usize_to_u64(value.len())?)?;
     let mut owned = String::new();
     owned
         .try_reserve_exact(value.len())
@@ -1574,16 +1751,16 @@ fn clone_string_budgeted(
             requested: value.len(),
             source,
         })?;
-    budget.consume_bytes(bytes)?;
     owned.push_str(value);
+    budget.consume_bytes(usize_to_u64(owned.capacity())?)?;
     Ok(owned)
 }
 
 fn charge_retained_string(
-    value: &str,
+    value: &String,
     budget: &mut AssetLoadBudget,
 ) -> Result<(), YamlAdapterError> {
-    budget.consume_bytes(usize_to_u64(value.len())?)?;
+    budget.consume_bytes(usize_to_u64(value.capacity())?)?;
     Ok(())
 }
 
@@ -1625,6 +1802,44 @@ mod tests {
                 Err(error) => return error,
             }
         }
+    }
+
+    #[test]
+    fn retained_strings_charge_their_allocated_capacity() {
+        let mut value = String::new();
+        value.try_reserve_exact(32).unwrap();
+        value.push('x');
+        assert!(value.capacity() > value.len());
+
+        let mut budget = AssetLoadBudget::default();
+        charge_retained_string(&value, &mut budget).unwrap();
+
+        assert_eq!(
+            budget.usage().bytes,
+            u64::try_from(value.capacity()).unwrap()
+        );
+    }
+
+    #[test]
+    fn attached_paths_extend_the_prepared_proof_bound() {
+        let mut budget = AssetLoadBudget::default();
+        let mut source =
+            parse_budgeted_yaml_source(Arc::from(b"root: value\n".as_slice()), &mut budget)
+                .unwrap();
+        let retained_before = source.proof.retained_heap_bytes;
+        let path = clone_path_budgeted(Path::new("nested/source.yaml"), &mut budget).unwrap();
+        let path_bytes = path.retained_heap_bytes;
+
+        source.attach_path(path).unwrap();
+
+        assert_eq!(
+            source.proof.retained_heap_bytes,
+            retained_before + path_bytes
+        );
+        assert_eq!(
+            source.document().file_path(),
+            Some(Path::new("nested/source.yaml"))
+        );
     }
 
     struct ChangingReader {

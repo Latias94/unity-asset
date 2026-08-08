@@ -448,6 +448,7 @@ impl BundleParser {
         options: &BundleLoadOptions,
         budget: &mut AssetLoadBudget,
     ) -> Result<BundleInspection> {
+        let compression = header.compression_type()?;
         let legacy = header.legacy_web_raw.as_ref().ok_or_else(|| {
             BinaryError::invalid_data("Legacy bundle header fields were not parsed")
         })?;
@@ -485,8 +486,8 @@ impl BundleParser {
         let prefix_size = usize::try_from(file_info_header_size).map_err(|_| {
             BinaryError::invalid_data("Legacy directory header size does not fit usize")
         })?;
-        let (directory_prefix, max_temporary_bytes, compression) = match header.signature.as_str() {
-            "UnityRaw" => {
+        let (directory_prefix, max_temporary_bytes) = match compression {
+            CompressionType::None => {
                 if legacy.compressed_size != legacy.uncompressed_size {
                     return Err(BinaryError::invalid_data(format!(
                         "UnityRaw encoded size {} does not match decoded size {}",
@@ -507,13 +508,9 @@ impl BundleParser {
                 let prefix =
                     ByteCursor::with_range(source, blob_start..prefix_end, ByteOrder::Big, budget)?
                         .read_bytes(u64::from(file_info_header_size))?;
-                (
-                    prefix,
-                    u64::from(file_info_header_size),
-                    CompressionType::None,
-                )
+                (prefix, u64::from(file_info_header_size))
             }
-            "UnityWeb" => {
+            CompressionType::Lzma => {
                 let input = ByteSourceReader::with_range(source, blob_range)?;
                 let inspected = inspect_lzma_size_stream_with_budget(
                     input,
@@ -527,15 +524,12 @@ impl BundleParser {
                         "Legacy LZMA decoder returned an inconsistent length",
                     ));
                 }
-                (
-                    inspected.prefix,
-                    inspected.max_temporary_bytes,
-                    CompressionType::Lzma,
-                )
+                (inspected.prefix, inspected.max_temporary_bytes)
             }
-            signature => {
+            compression => {
                 return Err(BinaryError::unsupported(format!(
-                    "Unsupported legacy bundle signature: {signature}"
+                    "Unsupported legacy bundle compression: {}",
+                    compression.name()
                 )));
             }
         };
@@ -881,6 +875,7 @@ impl BundleParser {
         let header_size = legacy.header_size as usize;
         let compressed_size = legacy.compressed_size;
         let uncompressed_size = legacy.uncompressed_size;
+        let compression = bundle.header.compression_type()?;
         budget.check_compressed_bytes(u64::from(compressed_size))?;
 
         // Seek to the (compressed) directory+file-content blob (UnityPy uses `reader.Position = headerSize`).
@@ -891,19 +886,24 @@ impl BundleParser {
         let uncompressed_size = usize::try_from(uncompressed_size).map_err(|_| {
             BinaryError::invalid_data("Legacy bundle uncompressed size does not fit usize")
         })?;
-        let directory_data = if bundle.header.signature == "UnityWeb" {
-            crate::compression::decompress_lzma_size_stream_with_budget(
+        let directory_data = match compression {
+            CompressionType::Lzma => crate::compression::decompress_lzma_size_stream_with_budget(
                 &compressed_data,
                 uncompressed_size,
                 budget,
-            )?
-        } else {
-            crate::compression::decompress_with_budget(
+            )?,
+            CompressionType::None => crate::compression::decompress_with_budget(
                 &compressed_data,
                 CompressionType::None,
                 uncompressed_size,
                 budget,
-            )?
+            )?,
+            compression => {
+                return Err(BinaryError::unsupported(format!(
+                    "Unsupported legacy bundle compression: {}",
+                    compression.name()
+                )));
+            }
         };
 
         // Legacy bundles store directory entries + file content in the same blob.
@@ -1411,12 +1411,11 @@ impl BundleParser {
         })?)?;
         let mut reader = BinaryReader::new(data, ByteOrder::Big);
         let header = BundleHeader::from_reader(&mut reader)?;
+        let compression_type = header.compression_type()?;
+        let has_compression = compression_type != CompressionType::None;
 
         let complexity = match header.layout_kind()? {
             BundleLayoutKind::FileStream => {
-                let compression_type = header.compression_type()?;
-                let has_compression = compression_type != CompressionType::None;
-
                 ParsingComplexity {
                     format: header.signature.clone(),
                     estimated_time: if has_compression { "Medium" } else { "Fast" }.to_string(),
@@ -1429,7 +1428,7 @@ impl BundleParser {
                 format: header.signature.clone(),
                 estimated_time: "Fast".to_string(),
                 memory_usage: header.size,
-                has_compression: header.signature == "UnityWeb",
+                has_compression,
                 block_count: 1,
             },
         };
@@ -2177,12 +2176,51 @@ mod tests {
         bytes
     }
 
+    fn legacy_v3_header(signature: &str) -> Vec<u8> {
+        let mut bytes = signature.as_bytes().to_vec();
+        bytes.push(0);
+        bytes.extend_from_slice(&3_u32.to_be_bytes());
+        bytes.push(0);
+        bytes.push(0);
+
+        let minimum_streamed_bytes_offset = bytes.len();
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        let header_size_offset = bytes.len();
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        let complete_file_size_offset = bytes.len();
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+        bytes.extend_from_slice(&0_u32.to_be_bytes());
+
+        let header_size = u32::try_from(bytes.len()).expect("test header size fits in u32");
+        for offset in [
+            minimum_streamed_bytes_offset,
+            header_size_offset,
+            complete_file_size_offset,
+        ] {
+            bytes[offset..offset + 4].copy_from_slice(&header_size.to_be_bytes());
+        }
+        bytes
+    }
+
     #[test]
     fn test_parser_creation() {
         // Basic test to ensure parser can be created
         // In practice, you'd need actual bundle data to test parsing
         let _dummy = 1 + 1;
         assert_eq!(_dummy, 2);
+    }
+
+    #[test]
+    fn legacy_complexity_uses_layout_compression_semantics() {
+        let web = BundleParser::estimate_complexity(&legacy_v3_header("UnityWeb")).unwrap();
+        let raw = BundleParser::estimate_complexity(&legacy_v3_header("UnityRaw")).unwrap();
+
+        assert!(web.has_compression);
+        assert!(!raw.has_compression);
     }
 
     #[test]

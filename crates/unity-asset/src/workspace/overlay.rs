@@ -2,7 +2,6 @@
 
 use std::fmt;
 use std::io::{Read, Seek, SeekFrom};
-use std::mem::MaybeUninit;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -13,11 +12,11 @@ use unity_asset_binary::asset::{
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, DigestV1, ObjectAddress, ObjectId, ObjectKind,
     RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityDocument,
-    WorkspaceId, WorkspaceRevision, arc_slice_allocation_bytes, arc_value_allocation_bytes,
-    vec_allocation_bytes, yaml_schema_digest,
+    WorkspaceId, WorkspaceRevision, arc_value_allocation_bytes, vec_allocation_bytes,
+    yaml_schema_digest,
 };
 use unity_asset_write::artifact::{
-    ArtifactHandle, PreparedArtifact, PreparedArtifactFormat, PreparedArtifactSet,
+    ArtifactHandle, PreparedArtifact, PreparedArtifactFormatProof, PreparedArtifactSet,
 };
 use unity_asset_yaml::YamlDocument;
 
@@ -27,18 +26,18 @@ use crate::reference::{
 };
 use crate::schema::SchemaProvenance;
 
+use super::inspection::WorkspaceSourceFormatInspection;
 use super::preflight::PrepareStage;
 use super::snapshot::{
     WorkspaceSnapshot, consume_retained_bytes, consume_single_result, invalid_lookup,
     project_catalog_source, yaml_object_id,
 };
 use super::source_catalog::{LocatorResolution, SourceCatalog};
-use super::source_loading::{map_yaml_error, validate_yaml_identities};
+use super::source_loading::validate_yaml_identities;
 use super::view::{
     self, WorkspaceByteRange, WorkspaceError, WorkspaceLookup, WorkspaceObject,
-    WorkspaceObjectValue, WorkspaceSource, WorkspaceView, validate_prepared_artifact,
+    WorkspaceObjectValue, WorkspaceSource, WorkspaceView,
 };
-use unity_asset_yaml::parse_budgeted_yaml_source;
 
 /// Candidate artifact selected for one logical workspace source.
 ///
@@ -76,13 +75,6 @@ impl PreparedSourceBinding {
     }
 }
 
-#[derive(Debug)]
-enum PreparedSourceProof {
-    NonObject,
-    Serialized,
-    Yaml(Arc<YamlDocument>),
-}
-
 /// Private proof binding minted only after reparsing the exact artifact.
 #[derive(Debug)]
 pub(crate) struct ProvenPreparedSourceBinding {
@@ -90,7 +82,8 @@ pub(crate) struct ProvenPreparedSourceBinding {
     fingerprint: SourceFingerprint,
     artifact: ArtifactHandle,
     publication_root: bool,
-    proof: PreparedSourceProof,
+    format: WorkspaceSourceFormatInspection,
+    yaml_document: Option<Arc<YamlDocument>>,
 }
 
 impl ProvenPreparedSourceBinding {
@@ -110,11 +103,27 @@ impl ProvenPreparedSourceBinding {
         self.publication_root
     }
 
-    fn yaml_document(&self) -> Option<&Arc<YamlDocument>> {
-        match &self.proof {
-            PreparedSourceProof::Yaml(document) => Some(document),
-            PreparedSourceProof::NonObject | PreparedSourceProof::Serialized => None,
+    pub(crate) const fn format(&self) -> &WorkspaceSourceFormatInspection {
+        &self.format
+    }
+
+    fn serialized_inspection<'artifact>(
+        &self,
+        artifacts: &'artifact PreparedArtifactSet,
+    ) -> Option<&'artifact SerializedFileInspection> {
+        let proof = artifacts
+            .artifact(self.artifact)
+            .ok()?
+            .prove_source_compatibility(self.source, self.fingerprint)
+            .ok()?;
+        match proof.format() {
+            PreparedArtifactFormatProof::SerializedFile(inspection) => Some(inspection),
+            _ => None,
         }
+    }
+
+    pub(super) fn yaml_document(&self) -> Option<&Arc<YamlDocument>> {
+        self.yaml_document.as_ref()
     }
 }
 
@@ -245,6 +254,7 @@ impl PreparedStateCore {
         {
             return Err(invalid_prepared_state("duplicate prepared source binding").into());
         }
+        let mut object_binding_capacity = 0_usize;
         for binding in &source_bindings {
             if binding.source.workspace() != base.workspace_id() {
                 return Err(WorkspaceError::from(ContractError::WorkspaceMismatch {
@@ -265,7 +275,49 @@ impl PreparedStateCore {
             let artifact = artifacts
                 .artifact(binding.artifact)
                 .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
-            validate_prepared_artifact(binding.source, binding.fingerprint, artifact)?;
+            let source_proof = artifact
+                .prove_source_compatibility(binding.source, binding.fingerprint)
+                .map_err(WorkspaceError::from)?;
+            let object_count = match source_proof.format() {
+                PreparedArtifactFormatProof::SerializedFile(inspection) => {
+                    inspection.objects().len()
+                }
+                PreparedArtifactFormatProof::Yaml(proof) => {
+                    usize::try_from(proof.inspection().documents()).map_err(|_| {
+                        WorkspaceError::Budget(BudgetError::ArithmeticOverflow {
+                            resource: "prepared_object_binding_count",
+                        })
+                    })?
+                }
+                PreparedArtifactFormatProof::VerbatimSource
+                    if matches!(
+                        binding.source.kind(),
+                        SourceKind::SerializedFile | SourceKind::Yaml
+                    ) =>
+                {
+                    return Err(invalid_prepared_state(
+                        "object-bearing prepared sources require an independently parsed exact artifact",
+                    )
+                    .into());
+                }
+                PreparedArtifactFormatProof::AssetBundle(_)
+                | PreparedArtifactFormatProof::WebFile(_)
+                | PreparedArtifactFormatProof::StreamedResource(_)
+                | PreparedArtifactFormatProof::VerbatimSource => 0,
+                _ => {
+                    return Err(invalid_prepared_state(
+                        "prepared source uses an unsupported format proof",
+                    )
+                    .into());
+                }
+            };
+            object_binding_capacity = object_binding_capacity
+                .checked_add(object_count)
+                .ok_or_else(|| {
+                    WorkspaceError::Budget(BudgetError::ArithmeticOverflow {
+                        resource: "prepared_object_binding_count",
+                    })
+                })?;
         }
 
         let output_count = artifacts.outputs().len();
@@ -324,30 +376,6 @@ impl PreparedStateCore {
             "prepared source proof bindings",
             budget,
         )?;
-        let object_binding_capacity =
-            source_bindings.iter().try_fold(0_usize, |total, binding| {
-                let artifact = artifacts
-                    .artifact(binding.artifact)
-                    .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
-                let count = match artifact.format() {
-                    PreparedArtifactFormat::SerializedFile(inspection) => {
-                        inspection.objects().len()
-                    }
-                    PreparedArtifactFormat::Yaml(inspection) => {
-                        usize::try_from(inspection.documents()).map_err(|_| {
-                            BudgetError::ArithmeticOverflow {
-                                resource: "prepared_object_binding_count",
-                            }
-                        })?
-                    }
-                    _ => 0,
-                };
-                total.checked_add(count).ok_or_else(|| {
-                    WorkspaceError::Budget(BudgetError::ArithmeticOverflow {
-                        resource: "prepared_object_binding_count",
-                    })
-                })
-            })?;
         let mut object_bindings = budgeted_vec(
             object_binding_capacity,
             "prepared object proof bindings",
@@ -357,11 +385,27 @@ impl PreparedStateCore {
             let artifact = artifacts
                 .artifact(binding.artifact)
                 .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
-            let proof = match (binding.source.kind(), artifact.format()) {
-                (
-                    SourceKind::SerializedFile,
-                    PreparedArtifactFormat::SerializedFile(inspection),
-                ) => {
+            let source_proof = artifact
+                .prove_source_compatibility(binding.source, binding.fingerprint)
+                .map_err(WorkspaceError::from)?;
+            let baseline_format = if matches!(
+                source_proof.format(),
+                PreparedArtifactFormatProof::VerbatimSource
+            ) {
+                base.state()
+                    .store()
+                    .get(binding.source)
+                    .map(|entry| entry.format())
+            } else {
+                None
+            };
+            let format = WorkspaceSourceFormatInspection::from_prepared_source(
+                source_proof,
+                baseline_format,
+                budget,
+            )?;
+            let yaml_document = match source_proof.format() {
+                PreparedArtifactFormatProof::SerializedFile(inspection) => {
                     prove_serialized_source(
                         &base,
                         binding.source,
@@ -371,39 +415,48 @@ impl PreparedStateCore {
                         budget,
                     )
                     .map_err(PreparedStateBuildError::IndependentReparse)?;
-                    PreparedSourceProof::Serialized
+                    None
                 }
-                (SourceKind::Yaml, PreparedArtifactFormat::Yaml(_)) => {
+                PreparedArtifactFormatProof::Yaml(proof) => {
                     let document = prove_yaml_source(
                         &base,
                         binding.source,
-                        artifact,
+                        proof,
                         &mut object_bindings,
                         budget,
                     )
                     .map_err(PreparedStateBuildError::IndependentReparse)?;
-                    PreparedSourceProof::Yaml(document)
+                    Some(document)
                 }
-                (SourceKind::SerializedFile | SourceKind::Yaml, _) => {
+                PreparedArtifactFormatProof::VerbatimSource
+                    if matches!(
+                        binding.source.kind(),
+                        SourceKind::SerializedFile | SourceKind::Yaml
+                    ) =>
+                {
                     return Err(invalid_prepared_state(
                         "object-bearing prepared sources require an independently parsed exact artifact",
                     )
                     .into());
                 }
-                (
-                    SourceKind::AssetBundle
-                    | SourceKind::WebFile
-                    | SourceKind::Archive
-                    | SourceKind::StreamedResource,
-                    _,
-                ) => PreparedSourceProof::NonObject,
+                PreparedArtifactFormatProof::AssetBundle(_)
+                | PreparedArtifactFormatProof::WebFile(_)
+                | PreparedArtifactFormatProof::StreamedResource(_)
+                | PreparedArtifactFormatProof::VerbatimSource => None,
+                _ => {
+                    return Err(invalid_prepared_state(
+                        "prepared source uses an unsupported format proof",
+                    )
+                    .into());
+                }
             };
             proven_sources.push(ProvenPreparedSourceBinding {
                 source: binding.source,
                 fingerprint: binding.fingerprint,
                 artifact: binding.artifact,
                 publication_root: binding.publication_root,
-                proof,
+                format,
+                yaml_document,
             });
         }
 
@@ -511,10 +564,7 @@ impl PreparedReferenceOverlay for PreparedStateCore {
     ) -> Option<&'overlay FileIdentifier> {
         let _ = file;
         let binding = self.source_binding(source)?;
-        let artifact = self.artifacts.artifact(binding.artifact).ok()?;
-        let PreparedArtifactFormat::SerializedFile(inspection) = artifact.format() else {
-            return None;
-        };
+        let inspection = binding.serialized_inspection(&self.artifacts)?;
         inspection.externals().get(index)
     }
 
@@ -1291,15 +1341,12 @@ fn artifact_range_equals(
 fn prove_yaml_source(
     base: &WorkspaceSnapshot,
     source: SourceId,
-    artifact: &PreparedArtifact,
+    proof: &unity_asset_write::artifact::PreparedYamlProof,
     object_bindings: &mut Vec<PreparedObjectBinding>,
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<YamlDocument>, WorkspaceError> {
-    let encoded = materialize_artifact(artifact, budget)?;
-    let parsed = parse_budgeted_yaml_source(encoded, budget)
-        .map_err(|error| map_yaml_error("prepared YAML artifact parsing", error))?;
-    validate_yaml_identities(parsed.document(), budget)?;
-    let exact = Arc::clone(parsed.document());
+    validate_yaml_identities(proof.document(), budget)?;
+    let exact = Arc::clone(proof.document());
     let entry = base
         .state()
         .store()
@@ -1344,34 +1391,6 @@ fn prove_yaml_source(
         object_bindings.push(PreparedObjectBinding::exact(object)?);
     }
     Ok(exact)
-}
-
-fn materialize_artifact(
-    artifact: &PreparedArtifact,
-    budget: &mut AssetLoadBudget,
-) -> Result<Arc<[u8]>, WorkspaceError> {
-    let length = usize::try_from(artifact.len()).map_err(|_| BudgetError::ArithmeticOverflow {
-        resource: "prepared_artifact_materialization",
-    })?;
-    let retained = arc_slice_allocation_bytes::<u8>(length)
-        .map_err(|error| WorkspaceError::operation("prepared artifact allocation", error))?;
-    budget.consume_bytes(retained)?;
-    let mut bytes = Arc::<[u8]>::new_uninit_slice(length);
-    Arc::get_mut(&mut bytes)
-        .ok_or_else(|| {
-            invalid_prepared_state("new prepared artifact allocation is unexpectedly shared")
-        })?
-        .fill(MaybeUninit::new(0));
-    // SAFETY: every element in the uniquely owned Arc slice was initialized immediately above.
-    let mut bytes: Arc<[u8]> = unsafe { bytes.assume_init() };
-    let writable = Arc::get_mut(&mut bytes).ok_or_else(|| {
-        invalid_prepared_state("prepared artifact allocation became shared before parsing")
-    })?;
-    artifact
-        .reader()
-        .read_exact(writable)
-        .map_err(|error| WorkspaceError::operation("prepared artifact materialization", error))?;
-    Ok(bytes)
 }
 
 fn budgeted_vec<T>(

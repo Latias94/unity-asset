@@ -16,6 +16,7 @@ categories = ["parsing", "game-development"]
 [dependencies]
 unity-asset-core = { workspace = true }
 unity-asset-binary = { workspace = true }
+unity-asset-yaml = { workspace = true }
 indexmap = { workspace = true }
 lz4_flex = { workspace = true }
 lzma-rs = "0.3"
@@ -24,7 +25,6 @@ flate2 = { workspace = true }
 libc = "0.2"
 thiserror = { workspace = true }
 unicode-normalization = { workspace = true }
-yaml-rust2 = { workspace = true }
 
 [build-dependencies]
 cc = "1"

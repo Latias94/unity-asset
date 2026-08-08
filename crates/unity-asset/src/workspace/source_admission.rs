@@ -793,12 +793,7 @@ fn classify_workspace_error(error: &WorkspaceError) -> SourceAdmissionErrorCateg
         | WorkspaceError::MissingObject(_)
         | WorkspaceError::AmbiguousObject { .. }
         | WorkspaceError::PreparedArtifact(_)
-        | WorkspaceError::PreparedSourceKindMismatch { .. }
-        | WorkspaceError::PreparedArtifactKindMismatch { .. }
-        | WorkspaceError::PreparedArtifactDigestMismatch { .. }
-        | WorkspaceError::PreparedArtifactLengthMismatch { .. }
-        | WorkspaceError::PreparedArtifactSourceProvenanceMismatch { .. }
-        | WorkspaceError::PreparedArtifactFingerprintProvenanceMismatch { .. } => {
+        | WorkspaceError::PreparedArtifactSourceCompatibility(_) => {
             SourceAdmissionErrorCategory::WorkspaceInvariant
         }
     }
@@ -2163,6 +2158,8 @@ mod workspace_load_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_core::{DigestV1, WorkspaceId};
+    use unity_asset_write::artifact::PreparedArtifactSourceCompatibilityError;
 
     fn budget_with(bytes: u64) -> AssetLoadBudget {
         AssetLoadBudget::new(unity_asset_core::AssetLoadLimits {
@@ -2369,6 +2366,25 @@ mod tests {
         });
 
         assert_eq!(failure.category(), SourceAdmissionErrorCategory::Allocation);
+        assert!(!SourceAdmissionPolicy::TolerantContent.tolerates(failure.category()));
+    }
+
+    #[test]
+    fn prepared_artifact_compatibility_failure_is_never_tolerated() {
+        let source_id =
+            SourceId::new(WorkspaceId::from_u128(0x51).unwrap(), SourceKind::Yaml, 1).unwrap();
+        let failure = SourceAdmissionFailure::from(WorkspaceError::from(
+            PreparedArtifactSourceCompatibilityError::DigestMismatch {
+                source_id,
+                expected: DigestV1::hash_bytes(b"expected"),
+                actual: DigestV1::hash_bytes(b"actual"),
+            },
+        ));
+
+        assert_eq!(
+            failure.category(),
+            SourceAdmissionErrorCategory::WorkspaceInvariant
+        );
         assert!(!SourceAdmissionPolicy::TolerantContent.tolerates(failure.category()));
     }
 }

@@ -9,13 +9,13 @@ use thiserror::Error;
 use unity_asset_binary::asset::ObjectInfo;
 use unity_asset_binary::object::UnityObject;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, ContractError, Diagnostic, DigestV1, ObjectAddress,
-    RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass,
-    UnityDocument, VerifiedSourceImage, WorkspaceId, WorkspaceRevision,
+    AssetLoadBudget, BudgetError, ContractError, Diagnostic, ObjectAddress, RevisionedObjectHandle,
+    SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass, UnityDocument,
+    VerifiedSourceImage, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_write::artifact::{
-    ArtifactBuildError, ArtifactHandle, ArtifactReader, PreparedArtifact, PreparedArtifactFormat,
-    PreparedArtifactKind, PreparedArtifactSet,
+    ArtifactBuildError, ArtifactHandle, ArtifactReader, PreparedArtifact, PreparedArtifactSet,
+    PreparedArtifactSourceCompatibilityError,
 };
 use unity_asset_yaml::YamlDocument;
 
@@ -212,17 +212,12 @@ impl WorkspaceByteRange {
         handle: ArtifactHandle,
         range: Range<u64>,
     ) -> Result<Self, WorkspaceError> {
-        if source.kind() != fingerprint.kind() {
-            return Err(WorkspaceError::PreparedSourceKindMismatch {
-                source_id: source,
-                fingerprint_kind: fingerprint.kind(),
-            });
-        }
-
         let artifact = artifacts
             .artifact(handle)
             .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
-        validate_prepared_artifact(source, fingerprint, artifact)?;
+        artifact
+            .prove_source_compatibility(source, fingerprint)
+            .map_err(WorkspaceError::from)?;
         let artifact_len = artifact.len();
         if range.start > range.end || range.end > artifact_len {
             return Err(WorkspaceError::RangeOutOfBounds {
@@ -533,82 +528,6 @@ fn bounded_seek_target(current: u64, len: u64, position: SeekFrom) -> io::Result
             "workspace byte range seek target does not fit u64",
         )
     })
-}
-
-pub(super) fn validate_prepared_artifact(
-    source: SourceId,
-    fingerprint: SourceFingerprint,
-    artifact: &PreparedArtifact,
-) -> Result<(), WorkspaceError> {
-    let format = artifact.format();
-    if !prepared_format_matches_source(format, source.kind()) {
-        return Err(WorkspaceError::PreparedArtifactKindMismatch {
-            source_id: source,
-            source_kind: source.kind(),
-            artifact_kind: format.kind(),
-        });
-    }
-    if let PreparedArtifactFormat::VerbatimSource(proof) = format {
-        if proof.source_id() != source {
-            return Err(WorkspaceError::PreparedArtifactSourceProvenanceMismatch {
-                expected: Box::new(source),
-                actual: proof.source_id(),
-            });
-        }
-        if proof.fingerprint() != fingerprint {
-            return Err(
-                WorkspaceError::PreparedArtifactFingerprintProvenanceMismatch {
-                    expected: fingerprint,
-                    actual: proof.fingerprint(),
-                },
-            );
-        }
-    }
-    if artifact.digest() != fingerprint.digest() {
-        return Err(WorkspaceError::PreparedArtifactDigestMismatch {
-            source_id: Box::new(source),
-            expected: fingerprint.digest(),
-            actual: artifact.digest(),
-        });
-    }
-    let inspected_len =
-        inspected_artifact_len(format).ok_or(WorkspaceError::PreparedArtifactKindMismatch {
-            source_id: source,
-            source_kind: source.kind(),
-            artifact_kind: format.kind(),
-        })?;
-    if inspected_len != artifact.len() {
-        return Err(WorkspaceError::PreparedArtifactLengthMismatch {
-            source_id: source,
-            inspected: inspected_len,
-            actual: artifact.len(),
-        });
-    }
-    Ok(())
-}
-
-fn prepared_format_matches_source(format: &PreparedArtifactFormat, kind: SourceKind) -> bool {
-    match format {
-        PreparedArtifactFormat::SerializedFile(_) => kind == SourceKind::SerializedFile,
-        PreparedArtifactFormat::AssetBundle(_) => kind == SourceKind::AssetBundle,
-        PreparedArtifactFormat::WebFile(_) => kind == SourceKind::WebFile,
-        PreparedArtifactFormat::StreamedResource(_) => kind == SourceKind::StreamedResource,
-        PreparedArtifactFormat::Yaml(_) => kind == SourceKind::Yaml,
-        PreparedArtifactFormat::VerbatimSource(_) => true,
-        _ => false,
-    }
-}
-
-fn inspected_artifact_len(format: &PreparedArtifactFormat) -> Option<u64> {
-    match format {
-        PreparedArtifactFormat::SerializedFile(proof) => Some(proof.declared_file_size()),
-        PreparedArtifactFormat::AssetBundle(proof) => Some(proof.stats().encoded_bytes()),
-        PreparedArtifactFormat::WebFile(proof) => Some(proof.stats().encoded_bytes()),
-        PreparedArtifactFormat::StreamedResource(proof) => Some(proof.length()),
-        PreparedArtifactFormat::Yaml(proof) => Some(proof.encoded_bytes()),
-        PreparedArtifactFormat::VerbatimSource(proof) => Some(proof.length()),
-        _ => None,
-    }
 }
 
 /// Format-specific value behind one revision-bound object handle.
@@ -962,45 +881,8 @@ pub enum WorkspaceError {
     },
     #[error("prepared artifact capability validation failed: {0}")]
     PreparedArtifact(#[source] Box<ArtifactBuildError>),
-    #[error(
-        "prepared source {source_id:?} kind does not match fingerprint kind {fingerprint_kind:?}"
-    )]
-    PreparedSourceKindMismatch {
-        source_id: SourceId,
-        fingerprint_kind: SourceKind,
-    },
-    #[error(
-        "prepared artifact kind {artifact_kind:?} cannot represent source {source_id:?} kind {source_kind:?}"
-    )]
-    PreparedArtifactKindMismatch {
-        source_id: SourceId,
-        source_kind: SourceKind,
-        artifact_kind: PreparedArtifactKind,
-    },
-    #[error("prepared artifact for source {source_id:?} has digest {actual}, expected {expected}")]
-    PreparedArtifactDigestMismatch {
-        source_id: Box<SourceId>,
-        expected: DigestV1,
-        actual: DigestV1,
-    },
-    #[error(
-        "prepared artifact for source {source_id:?} inspected {inspected} bytes but retains {actual}"
-    )]
-    PreparedArtifactLengthMismatch {
-        source_id: SourceId,
-        inspected: u64,
-        actual: u64,
-    },
-    #[error("prepared verbatim artifact source is {actual:?}, expected {expected:?}")]
-    PreparedArtifactSourceProvenanceMismatch {
-        expected: Box<SourceId>,
-        actual: SourceId,
-    },
-    #[error("prepared verbatim artifact fingerprint is {actual}, expected {expected}")]
-    PreparedArtifactFingerprintProvenanceMismatch {
-        expected: SourceFingerprint,
-        actual: SourceFingerprint,
-    },
+    #[error("prepared artifact source compatibility failed: {0}")]
+    PreparedArtifactSourceCompatibility(#[source] Box<PreparedArtifactSourceCompatibilityError>),
     #[error("binary source parsing failed: {0}")]
     Binary(#[source] BinaryError),
     #[error("binary {container} member at wire ordinal {wire_ordinal} failed: {source}")]
@@ -1023,6 +905,12 @@ pub enum WorkspaceError {
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
+}
+
+impl From<PreparedArtifactSourceCompatibilityError> for WorkspaceError {
+    fn from(error: PreparedArtifactSourceCompatibilityError) -> Self {
+        Self::PreparedArtifactSourceCompatibility(Box::new(error))
+    }
 }
 
 impl WorkspaceError {

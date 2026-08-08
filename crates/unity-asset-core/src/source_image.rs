@@ -165,6 +165,22 @@ impl BudgetedVerifiedSourceImage {
         self.backing(budget).map(Arc::clone)
     }
 
+    /// Reconstitutes the budget-bound source-byte capability without charging the shared backing
+    /// a second time.
+    ///
+    /// This is intended for canonical parsers that need to retain the exact verified allocation.
+    /// The returned proof remains confined to the same load-budget domain.
+    pub fn clone_budgeted_bytes(
+        &self,
+        budget: &AssetLoadBudget,
+    ) -> Result<BudgetedSourceBytes, BudgetError> {
+        self.validate_budget(budget)?;
+        Ok(BudgetedSourceBytes {
+            bytes: Arc::clone(self.image.backing()),
+            domain: Arc::clone(&self.domain),
+        })
+    }
+
     /// Consumes the budget proof and returns the already-verified image without rehashing.
     pub fn into_image(self, budget: &AssetLoadBudget) -> Result<VerifiedSourceImage, BudgetError> {
         self.validate_budget(budget)?;
@@ -403,6 +419,31 @@ mod tests {
         let backing = Arc::clone(image.backing(&first).unwrap());
         let verified = image.into_image(&first).unwrap();
         assert!(Arc::ptr_eq(verified.backing(), &backing));
+    }
+
+    #[test]
+    fn verified_image_reconstitutes_budgeted_bytes_without_recharging() {
+        let mut budget = AssetLoadBudget::default();
+        let image = BudgetedSourceBytes::from_vec(b"verified".to_vec(), &mut budget)
+            .unwrap()
+            .verify(SourceKind::Yaml);
+        let charged = budget.usage().bytes;
+
+        let bytes = image.clone_budgeted_bytes(&budget).unwrap();
+
+        assert_eq!(budget.usage().bytes, charged);
+        assert!(Arc::ptr_eq(
+            bytes.backing(&budget).unwrap(),
+            image.backing(&budget).unwrap()
+        ));
+
+        let other = AssetLoadBudget::default();
+        assert!(matches!(
+            image.clone_budgeted_bytes(&other),
+            Err(BudgetError::DomainMismatch {
+                resource: "verified source image"
+            })
+        ));
     }
 
     #[test]

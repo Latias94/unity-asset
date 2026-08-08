@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use unity_asset_binary::reader::ByteOrder;
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadUsage, DigestV1, SourceId, SourceKind, VerifiedSourceImage,
-    WorkspaceId, vec_allocation_bytes,
+    AssetLoadBudget, AssetLoadUsage, DigestV1, SourceFingerprint, SourceId, SourceKind,
+    UnityDocument, VerifiedSourceImage, WorkspaceId, vec_allocation_bytes,
 };
 
 use super::*;
@@ -106,6 +106,78 @@ fn assert_footprint_matches_committed_usage(
     assert_eq!(footprint.pinned_source_bytes(), usage.pinned_source_bytes());
     assert_eq!(footprint.retained_bytes(), usage.retained_bytes());
     assert_eq!(footprint.segments(), usage.segments());
+}
+
+#[test]
+fn prepared_artifact_mints_source_proof_and_rejects_mismatched_authority() {
+    let payload = resource_payload(b"prepared resource", 900);
+    let mut artifact_budget = ArtifactBudget::new(ArtifactLimits::default()).unwrap();
+    let mut inspection_budget = AssetLoadBudget::default();
+    let mut declaration =
+        ArtifactBatchDeclaration::begin(&mut artifact_budget, &mut inspection_budget).unwrap();
+    let output = declaration.declare_output(name("prepared.resS")).unwrap();
+    let mut batch = declaration.seal_output_names().unwrap();
+    let handle = prepare_resource(&mut batch, &payload).unwrap();
+    batch.bind_output(output, handle).unwrap();
+    let artifacts = batch.finish().unwrap();
+    let artifact = artifacts.artifact(handle).unwrap();
+    let workspace = WorkspaceId::from_u128(17).unwrap();
+    let source = SourceId::new(workspace, SourceKind::StreamedResource, 901).unwrap();
+    let fingerprint = SourceFingerprint::new(SourceKind::StreamedResource, artifact.digest());
+    let footprint = artifact.footprint();
+    let counters = artifact.build_counters();
+    let dependency_ptr = artifact.source_dependencies().as_ptr();
+    let dependency_len = artifact.source_dependencies().len();
+
+    let proof = artifact
+        .prove_source_compatibility(source, fingerprint)
+        .unwrap();
+    assert_eq!(proof.source_id(), source);
+    assert_eq!(proof.fingerprint(), fingerprint);
+    assert_eq!(proof.source_kind(), SourceKind::StreamedResource);
+    assert!(matches!(
+        proof.format(),
+        PreparedArtifactFormatProof::StreamedResource(_)
+    ));
+    assert_eq!(artifact.footprint(), footprint);
+    assert_eq!(artifact.build_counters(), counters);
+    assert_eq!(artifact.source_dependencies().as_ptr(), dependency_ptr);
+    assert_eq!(artifact.source_dependencies().len(), dependency_len);
+
+    let wrong_fingerprint_kind = SourceFingerprint::new(SourceKind::Yaml, artifact.digest());
+    assert!(matches!(
+        artifact.prove_source_compatibility(source, wrong_fingerprint_kind),
+        Err(PreparedArtifactSourceCompatibilityError::FingerprintKindMismatch {
+            source_id,
+            fingerprint_kind: SourceKind::Yaml,
+        }) if source_id == source
+    ));
+
+    let yaml_source = SourceId::new(workspace, SourceKind::Yaml, 902).unwrap();
+    assert!(matches!(
+        artifact.prove_source_compatibility(
+            yaml_source,
+            SourceFingerprint::new(SourceKind::Yaml, artifact.digest()),
+        ),
+        Err(PreparedArtifactSourceCompatibilityError::ArtifactKindMismatch {
+            source_id,
+            source_kind: SourceKind::Yaml,
+            artifact_kind: PreparedArtifactKind::StreamedResource,
+        }) if source_id == yaml_source
+    ));
+
+    let wrong_digest = DigestV1::hash_bytes(b"wrong prepared source digest");
+    assert!(matches!(
+        artifact.prove_source_compatibility(
+            source,
+            SourceFingerprint::new(SourceKind::StreamedResource, wrong_digest),
+        ),
+        Err(PreparedArtifactSourceCompatibilityError::DigestMismatch {
+            source_id,
+            expected,
+            actual,
+        }) if source_id == source && expected == wrong_digest && actual == artifact.digest()
+    ));
 }
 
 fn independent_reparse_source(error: ArtifactBuildError) -> ArtifactBuildError {
@@ -274,11 +346,28 @@ fn serialized_format_is_produced_only_by_the_fixed_binary_inspector() {
         .unwrap();
     batch.bind_output(slot, artifact).unwrap();
     let set = batch.finish().unwrap();
+    let prepared = set.artifact(artifact).unwrap();
 
     assert!(matches!(
-        set.outputs().next().unwrap().artifact().format(),
+        prepared.format(),
         PreparedArtifactFormat::SerializedFile(proof)
             if proof.version() == 8 && proof.byte_order() == ByteOrder::Little
+    ));
+    let source = SourceId::new(
+        WorkspaceId::from_u128(17).unwrap(),
+        SourceKind::SerializedFile,
+        20,
+    )
+    .unwrap();
+    let proof = prepared
+        .prove_source_compatibility(
+            source,
+            SourceFingerprint::new(SourceKind::SerializedFile, prepared.digest()),
+        )
+        .unwrap();
+    assert!(matches!(
+        proof.format(),
+        PreparedArtifactFormatProof::SerializedFile(_)
     ));
 }
 
@@ -472,6 +561,38 @@ fn verbatim_source_leaf_retains_exact_provenance_without_generated_bytes() {
     assert_eq!(artifact.build_counters().source_ranges(), 1);
     assert_eq!(artifact.build_counters().digest_reuses(), 1);
     assert!(Arc::strong_count(&backing) > initial_strong_count);
+
+    let source_proof = artifact
+        .prove_source_compatibility(source, fingerprint)
+        .unwrap();
+    assert!(matches!(
+        source_proof.format(),
+        PreparedArtifactFormatProof::VerbatimSource
+    ));
+    assert_eq!(source_proof.source_kind(), SourceKind::AssetBundle);
+
+    let foreign_source = SourceId::new(
+        source.workspace(),
+        SourceKind::AssetBundle,
+        source.local() + 1,
+    )
+    .unwrap();
+    assert!(matches!(
+        artifact.prove_source_compatibility(foreign_source, fingerprint),
+        Err(PreparedArtifactSourceCompatibilityError::VerbatimSourceMismatch {
+            expected,
+            actual,
+        }) if expected == foreign_source && actual == source
+    ));
+
+    let foreign_fingerprint = SourceFingerprint::from_bytes(SourceKind::AssetBundle, b"foreign");
+    assert!(matches!(
+        artifact.prove_source_compatibility(source, foreign_fingerprint),
+        Err(PreparedArtifactSourceCompatibilityError::VerbatimFingerprintMismatch {
+            expected,
+            actual,
+        }) if expected == foreign_fingerprint && actual == fingerprint
+    ));
 }
 
 #[test]
@@ -517,11 +638,24 @@ fn yaml_leaf_reparses_valid_source_bytes_and_retains_syntax_proof() {
         panic!("YAML preparation must retain a syntax proof");
     };
     assert_eq!(artifact.format().kind(), PreparedArtifactKind::Yaml);
-    assert_eq!(proof.encoded_bytes(), payload.len());
-    assert_eq!(proof.documents(), 1);
-    assert!(proof.events() >= 10);
-    assert_eq!(proof.max_depth(), 3);
+    assert_eq!(proof.inspection().encoded_bytes(), payload.len());
+    assert_eq!(proof.inspection().documents(), 1);
+    assert!(proof.inspection().events() >= 10);
+    assert_eq!(proof.inspection().max_depth(), 3);
+    assert_eq!(proof.document().entries().len(), 1);
+    assert!(proof.retained_heap_bytes() > 0);
     assert_eq!(artifact.source_dependencies().len(), 1);
+    let source = SourceId::new(WorkspaceId::from_u128(17).unwrap(), SourceKind::Yaml, 103).unwrap();
+    let source_proof = artifact
+        .prove_source_compatibility(
+            source,
+            SourceFingerprint::new(SourceKind::Yaml, artifact.digest()),
+        )
+        .unwrap();
+    assert!(matches!(
+        source_proof.format(),
+        PreparedArtifactFormatProof::Yaml(_)
+    ));
 }
 
 #[test]
@@ -545,7 +679,8 @@ fn yaml_leaf_accepts_unity_directives_tags_and_document_anchors() {
     assert!(matches!(
         set.artifact(handle).unwrap().format(),
         PreparedArtifactFormat::Yaml(proof)
-            if proof.documents() == 1 && proof.encoded_bytes() == payload.len()
+            if proof.inspection().documents() == 1
+                && proof.inspection().encoded_bytes() == payload.len()
     ));
 }
 
@@ -568,7 +703,8 @@ fn yaml_writer_promotes_budgeted_generated_bytes_only_after_reparse() {
     assert!(matches!(
         artifact.format(),
         PreparedArtifactFormat::Yaml(proof)
-            if proof.encoded_bytes() == encoded.len() as u64 && proof.documents() == 1
+            if proof.inspection().encoded_bytes() == encoded.len() as u64
+                && proof.inspection().documents() == 1
     ));
     assert!(artifact.source_dependencies().is_empty());
     assert_eq!(artifact.footprint().proof_bytes(), encoded.len() as u64);
@@ -603,7 +739,8 @@ fn yaml_reparse_accepts_utf8_code_points_split_across_source_segments() {
     assert!(matches!(
         artifact.format(),
         PreparedArtifactFormat::Yaml(proof)
-            if proof.encoded_bytes() == declared_len && proof.documents() == 1
+            if proof.inspection().encoded_bytes() == declared_len
+                && proof.inspection().documents() == 1
     ));
     assert_eq!(artifact.footprint().segments(), 2);
     assert_eq!(artifact.source_dependencies().len(), 2);
@@ -622,7 +759,8 @@ fn yaml_leaf_rejects_invalid_syntax_without_committing_artifact_usage() {
         let error = batch.prepare_yaml(&payload).unwrap_err();
         assert!(matches!(
             independent_reparse_source(error),
-            ArtifactBuildError::InvalidYaml(_)
+            ArtifactBuildError::CanonicalYaml(source)
+                if matches!(*source, unity_asset_yaml::BudgetedYamlError::Syntax(_))
         ));
         assert!(matches!(
             batch.finish(),
@@ -657,7 +795,11 @@ fn yaml_leaf_rejects_invalid_segmented_utf8_with_a_typed_offset() {
         .unwrap_err();
     assert!(matches!(
         independent_reparse_source(error),
-        ArtifactBuildError::InvalidYamlUtf8 { offset: 6 }
+        ArtifactBuildError::CanonicalYaml(source)
+            if matches!(
+                *source,
+                unity_asset_yaml::BudgetedYamlError::InvalidUtf8 { valid_up_to: 6, .. }
+            )
     ));
 }
 

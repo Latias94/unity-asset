@@ -11,7 +11,7 @@ use unity_asset_binary::object::ObjectPayloadProvenance;
 use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, ContractError, DigestV1, SourceAlias,
-    SourceFingerprint, SourceKind, UnityValue, VerifiedSourceImage, arc_slice_allocation_bytes,
+    SourceFingerprint, SourceKind, UnityValue, VerifiedSourceImage,
 };
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactLimits, ArtifactPayload, LogicalArtifactName,
@@ -27,7 +27,9 @@ use crate::reference::{RawReferenceTarget, ReferenceGraphBuildOptions, Reference
 
 use super::*;
 use crate::workspace::source_catalog::PhysicalDomainChange;
-use crate::workspace::{AssetWorkspace, SourceOpenRequest};
+use crate::workspace::{
+    AssetWorkspace, SourceOpenRequest, WorkspaceInspector, WorkspaceSourceFormatInspection,
+};
 
 struct TestAllocator;
 
@@ -260,6 +262,17 @@ fn prepared_view_projects_one_candidate_revision_across_all_queries() {
         view.state().catalog().fingerprint(source).unwrap()
     );
     assert!(projected.physical_origin().is_some());
+
+    let inspected = WorkspaceInspector::new(&view)
+        .source(source, &mut AssetLoadBudget::default())
+        .unwrap();
+    let WorkspaceLookup::Resolved(inspected) = inspected else {
+        panic!("prepared source inspection must resolve");
+    };
+    assert!(matches!(
+        inspected.format(),
+        WorkspaceSourceFormatInspection::Yaml { document_count: 2 }
+    ));
 
     let objects = WorkspaceView::objects(&view, &mut AssetLoadBudget::default()).unwrap();
     assert!(
@@ -526,41 +539,49 @@ fn build_yaml_state_with_limits(limits: AssetLoadLimits) -> Result<u64, Prepared
 }
 
 #[test]
-fn yaml_artifact_materialization_has_one_exactly_budgeted_backing_allocation() {
-    let (_directory, _workspace, source) = loaded_yaml_workspace();
-    let (artifacts, handle, _fingerprint) = prepared_yaml_artifact(source);
-    let artifact = artifacts.artifact(handle).unwrap();
-    let length = usize::try_from(artifact.len()).unwrap();
-    let retained = arc_slice_allocation_bytes::<u8>(length).unwrap();
-    let mut exact_budget = AssetLoadBudget::new(AssetLoadLimits {
-        max_bytes: retained,
-        ..AssetLoadLimits::default()
-    })
-    .unwrap();
+fn prepared_yaml_proof_is_reused_by_workspace_without_reparsing() {
+    let (_directory, workspace, source) = loaded_yaml_workspace();
+    let snapshot = workspace.snapshot();
+    let (artifacts, handle, fingerprint) = prepared_yaml_artifact(source);
+    let proof_document = match artifacts
+        .artifact(handle)
+        .unwrap()
+        .prove_source_compatibility(source, fingerprint)
+        .unwrap()
+        .format()
+    {
+        PreparedArtifactFormatProof::Yaml(proof) => Arc::clone(proof.document()),
+        _ => panic!("prepared fixture must carry a YAML proof"),
+    };
 
-    let (encoded, allocation_count) =
-        count_allocations_at_least(length, || materialize_artifact(artifact, &mut exact_budget));
-    let encoded = encoded.unwrap();
-    assert_eq!(encoded.as_ref(), PREPARED_YAML.as_bytes());
-    assert_eq!(exact_budget.usage().bytes, retained);
-    assert_eq!(allocation_count, 1);
-
-    let mut one_short_budget = AssetLoadBudget::new(AssetLoadLimits {
-        max_bytes: retained - 1,
-        ..AssetLoadLimits::default()
-    })
+    let mut budget = AssetLoadBudget::default();
+    let mut transaction = snapshot
+        .state()
+        .catalog()
+        .begin_transaction(&mut budget)
+        .unwrap();
+    transaction
+        .rewrite_physical_domains_from_changes(
+            &[PhysicalDomainChange::new(source, fingerprint)],
+            &mut budget,
+        )
+        .unwrap();
+    let catalog = transaction.commit(&mut budget).unwrap();
+    let state = PreparedState::new(
+        snapshot,
+        catalog,
+        DigestV1::hash_bytes(b"prepared-yaml-proof-reuse"),
+        artifacts,
+        vec![PreparedSourceBinding::new(source, fingerprint, handle)],
+        &mut budget,
+    )
     .unwrap();
-    let (failure, allocation_count) = count_allocations_at_least(length, || {
-        materialize_artifact(artifact, &mut one_short_budget)
-    });
-    assert!(matches!(
-        failure,
-        Err(WorkspaceError::Budget(BudgetError::Exceeded {
-            resource: "bytes",
-            ..
-        }))
-    ));
-    assert_eq!(allocation_count, 0);
+    let bound_document = state
+        .core
+        .source_binding(source)
+        .and_then(ProvenPreparedSourceBinding::yaml_document)
+        .expect("prepared YAML source must retain its exact document proof");
+    assert!(Arc::ptr_eq(&proof_document, bound_document));
 }
 
 #[test]
@@ -606,6 +627,45 @@ fn prepared_binary_objects_are_derived_from_the_exact_serialized_artifact() {
         )
         .unwrap();
     let snapshot = workspace.snapshot();
+
+    let baseline_format = snapshot.state().store().get(source).unwrap().format();
+    let mut clone_measurement = AssetLoadBudget::default();
+    let measured_clone = baseline_format
+        .try_clone_with_budget(&mut clone_measurement)
+        .unwrap();
+    let clone_bytes = clone_measurement.usage().bytes;
+    assert!(clone_bytes > 0);
+    assert_eq!(&measured_clone, baseline_format);
+
+    let mut exact_clone_budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: clone_bytes,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    assert_eq!(
+        baseline_format
+            .try_clone_with_budget(&mut exact_clone_budget)
+            .unwrap(),
+        measured_clone
+    );
+    assert_eq!(exact_clone_budget.usage().bytes, clone_bytes);
+
+    let mut one_short_clone_budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: clone_bytes - 1,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    let (clone_failure, allocation_count) = count_allocations_at_least(1, || {
+        baseline_format.try_clone_with_budget(&mut one_short_clone_budget)
+    });
+    assert!(matches!(
+        clone_failure,
+        Err(WorkspaceError::Budget(BudgetError::Exceeded {
+            resource: "bytes",
+            ..
+        }))
+    ));
+    assert_eq!(allocation_count, 0);
 
     let backing: Arc<[u8]> = Arc::from(V22_SERIALIZED_FILE);
     let file = SerializedFileParser::from_shared_range(
@@ -680,6 +740,13 @@ fn prepared_binary_objects_are_derived_from_the_exact_serialized_artifact() {
     )
     .unwrap();
     let view = PreparedView::new(state);
+    let inspected = WorkspaceInspector::new(&view)
+        .source(source, &mut AssetLoadBudget::default())
+        .unwrap();
+    let WorkspaceLookup::Resolved(inspected) = inspected else {
+        panic!("prepared SerializedFile inspection must resolve");
+    };
+    assert_eq!(inspected.format(), &measured_clone);
     let handle = WorkspaceView::objects(&view, &mut AssetLoadBudget::default())
         .unwrap()
         .into_iter()

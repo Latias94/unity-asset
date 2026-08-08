@@ -1,19 +1,18 @@
+use thiserror::Error;
 use unity_asset_binary::SegmentedBytes;
 use unity_asset_binary::asset::{SerializedFileInspection, SerializedFileParser};
 use unity_asset_binary::bundle::{BundleInspection, BundleParser};
 use unity_asset_binary::webfile::{WebFile, WebFileInspection};
 use unity_asset_core::{
-    AssetLoadBudget, DigestV1, DigestV1Builder, SourceFingerprint, SourceId, vec_allocation_bytes,
+    AssetLoadBudget, BudgetedSourceBytes, DigestV1, DigestV1Builder, SourceFingerprint, SourceId,
+    SourceKind, vec_allocation_bytes,
 };
-use yaml_rust2::parser::{Event, Parser};
+use unity_asset_yaml::{BudgetedYamlError, parse_prebudgeted_yaml_source};
+pub use unity_asset_yaml::{PreparedYamlProof, YamlInspection};
 
 use super::{ArtifactBudgetError, ArtifactBuildError, ArtifactSourceDependency};
 
 const RESOURCE_LAYOUT_DOMAIN: &[u8] = b"unity-asset:resource-layout:v1\0";
-// yaml-rust2 owns scanner stacks, token strings, and anchor/tag tables. Charge a conservative
-// linear allowance plus small-input overhead before entering its infallible allocation paths.
-const YAML_PARSER_WORK_MULTIPLIER: u64 = 32;
-const YAML_PARSER_FIXED_WORK_BYTES: u64 = 8 * 1024;
 
 /// The independently inspected wire family of a prepared artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,20 +27,19 @@ pub enum PreparedArtifactKind {
 }
 
 /// Opaque parser proof retained with one exact byte image.
-#[derive(Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PreparedArtifactFormat {
+#[derive(Debug)]
+pub(crate) enum PreparedArtifactFormat {
     SerializedFile(SerializedFileInspection),
     AssetBundle(BundleInspection),
     WebFile(WebFileInspection),
     StreamedResource(StreamedResourceInspection),
-    Yaml(YamlInspection),
+    Yaml(PreparedYamlProof),
     VerbatimSource(VerbatimSourceInspection),
 }
 
 impl PreparedArtifactFormat {
     #[must_use]
-    pub const fn kind(&self) -> PreparedArtifactKind {
+    pub(crate) const fn kind(&self) -> PreparedArtifactKind {
         match self {
             Self::SerializedFile(_) => PreparedArtifactKind::SerializedFile,
             Self::AssetBundle(_) => PreparedArtifactKind::AssetBundle,
@@ -52,6 +50,28 @@ impl PreparedArtifactFormat {
         }
     }
 
+    pub(crate) const fn source_kind(&self) -> SourceKind {
+        match self {
+            Self::SerializedFile(_) => SourceKind::SerializedFile,
+            Self::AssetBundle(_) => SourceKind::AssetBundle,
+            Self::WebFile(_) => SourceKind::WebFile,
+            Self::StreamedResource(_) => SourceKind::StreamedResource,
+            Self::Yaml(_) => SourceKind::Yaml,
+            Self::VerbatimSource(proof) => proof.fingerprint().kind(),
+        }
+    }
+
+    const fn inspected_len(&self) -> u64 {
+        match self {
+            Self::SerializedFile(proof) => proof.declared_file_size(),
+            Self::AssetBundle(proof) => proof.stats().encoded_bytes(),
+            Self::WebFile(proof) => proof.stats().encoded_bytes(),
+            Self::StreamedResource(proof) => proof.length(),
+            Self::Yaml(proof) => proof.inspection().encoded_bytes(),
+            Self::VerbatimSource(proof) => proof.length(),
+        }
+    }
+
     pub(crate) fn inspect(
         expected: ExpectedArtifactFormat,
         image: &SegmentedBytes,
@@ -59,36 +79,40 @@ impl PreparedArtifactFormat {
         source_dependencies: &[ArtifactSourceDependency],
         budget: &mut AssetLoadBudget,
     ) -> Result<(Self, u64), ArtifactBuildError> {
-        match expected {
-            ExpectedArtifactFormat::SerializedFile => Ok((
+        let (format, preaccounted_heap_bytes) = match expected {
+            ExpectedArtifactFormat::SerializedFile => (
                 Self::SerializedFile(SerializedFileParser::validate_segmented_with_budget(
                     image, budget,
                 )?),
                 0,
-            )),
-            ExpectedArtifactFormat::AssetBundle => Ok((
+            ),
+            ExpectedArtifactFormat::AssetBundle => (
                 Self::AssetBundle(BundleParser::inspect_segmented_with_budget(image, budget)?),
                 0,
-            )),
-            ExpectedArtifactFormat::WebFile => Ok((
+            ),
+            ExpectedArtifactFormat::WebFile => (
                 Self::WebFile(WebFile::inspect_segmented_with_budget(image, budget)?),
                 0,
-            )),
+            ),
             ExpectedArtifactFormat::StreamedResource(layout) => {
                 let preaccounted_heap_bytes = layout.inspection_metadata_precharged();
-                Ok((
+                (
                     Self::StreamedResource(layout.inspect_image(image, budget)?),
                     preaccounted_heap_bytes,
-                ))
+                )
             }
-            ExpectedArtifactFormat::Yaml => {
-                Ok((Self::Yaml(YamlInspection::inspect(image, budget)?), 0))
-            }
+            ExpectedArtifactFormat::Yaml => (Self::Yaml(inspect_yaml(image, budget)?), 0),
             ExpectedArtifactFormat::VerbatimSource(proof) => {
                 proof.validate(image, image_digest, source_dependencies)?;
-                Ok((Self::VerbatimSource(proof), 0))
+                (Self::VerbatimSource(proof), 0)
             }
+        };
+        if format.inspected_len() != image.len() {
+            return Err(ArtifactBuildError::InternalInvariant {
+                message: "prepared artifact inspection length does not match the exact image",
+            });
         }
+        Ok((format, preaccounted_heap_bytes))
     }
 
     pub(crate) fn retained_heap_bytes(&self) -> Result<u64, ArtifactBuildError> {
@@ -97,128 +121,228 @@ impl PreparedArtifactFormat {
             Self::AssetBundle(proof) => Ok(proof.retained_heap_bytes()?),
             Self::WebFile(proof) => Ok(proof.retained_heap_bytes()?),
             Self::StreamedResource(proof) => proof.retained_heap_bytes(),
-            Self::Yaml(_) | Self::VerbatimSource(_) => Ok(0),
+            Self::Yaml(proof) => Ok(proof.retained_heap_bytes()),
+            Self::VerbatimSource(_) => Ok(0),
         }
     }
 }
 
-/// Syntax proof produced by reparsing the exact segmented YAML image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct YamlInspection {
-    encoded_bytes: u64,
-    documents: u64,
-    events: u64,
-    max_depth: u32,
+/// Format-owned evidence carried by one exact prepared artifact.
+///
+/// The discriminant and its parser evidence are returned together so callers cannot accidentally
+/// separate a wire-family decision from the proof that established it.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum PreparedArtifactFormatProof<'artifact> {
+    /// A validated Unity SerializedFile image.
+    SerializedFile(&'artifact SerializedFileInspection),
+    /// A validated Unity AssetBundle image.
+    AssetBundle(&'artifact BundleInspection),
+    /// A validated Unity WebFile image.
+    WebFile(&'artifact WebFileInspection),
+    /// A validated streamed-resource image and layout.
+    StreamedResource(&'artifact StreamedResourceInspection),
+    /// A syntactically validated Unity YAML image.
+    Yaml(&'artifact PreparedYamlProof),
+    /// An unchanged image whose source authority was retained exactly.
+    VerbatimSource,
 }
 
-impl YamlInspection {
-    fn inspect(
-        image: &SegmentedBytes,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, ArtifactBuildError> {
-        let parser_work = image
-            .len()
-            .checked_mul(YAML_PARSER_WORK_MULTIPLIER)
-            .and_then(|bytes| bytes.checked_add(YAML_PARSER_FIXED_WORK_BYTES))
-            .ok_or(ArtifactBuildError::ArithmeticOverflow {
-                resource: "yaml_parser_work_bytes",
-            })?;
-        let charged_bytes =
-            image
-                .len()
-                .checked_add(parser_work)
-                .ok_or(ArtifactBuildError::ArithmeticOverflow {
-                    resource: "yaml_parser_work_bytes",
-                })?;
-        budget.consume_bytes(charged_bytes)?;
-        validate_segmented_utf8(image)?;
+/// Evidence that one exact prepared image is compatible with a candidate logical source image.
+///
+/// This validates parser evidence, byte length, digest, source kind, and verbatim provenance. It
+/// does not prove workspace catalog membership, output ownership, or destination authority.
+#[derive(Debug, Clone, Copy)]
+pub struct PreparedArtifactSourceCompatibility<'artifact> {
+    source_id: SourceId,
+    fingerprint: SourceFingerprint,
+    format: &'artifact PreparedArtifactFormat,
+}
 
-        let mut parser = Parser::new(SegmentedChars::new(image)).keep_tags(true);
-        let mut documents = 0_u64;
-        let mut events = 0_u64;
-        let mut depth = 0_u32;
-        let mut max_depth = 0_u32;
-        loop {
-            let (event, _) = parser
-                .next_token()
-                .map_err(ArtifactBuildError::InvalidYaml)?;
-            budget.consume_entries(1)?;
-            events = events
-                .checked_add(1)
-                .ok_or(ArtifactBuildError::ArithmeticOverflow {
-                    resource: "yaml_event_count",
-                })?;
-            match event {
-                Event::DocumentStart => {
-                    documents =
-                        documents
-                            .checked_add(1)
-                            .ok_or(ArtifactBuildError::ArithmeticOverflow {
-                                resource: "yaml_document_count",
-                            })?;
-                }
-                Event::SequenceStart(..) | Event::MappingStart(..) => {
-                    depth = depth
-                        .checked_add(1)
-                        .ok_or(ArtifactBuildError::ArithmeticOverflow {
-                            resource: "yaml_depth",
-                        })?;
-                    budget.observe_depth(depth)?;
-                    max_depth = max_depth.max(depth);
-                }
-                Event::SequenceEnd | Event::MappingEnd => {
-                    depth = depth
-                        .checked_sub(1)
-                        .ok_or(ArtifactBuildError::InternalInvariant {
-                            message: "YAML parser emitted an unmatched collection end",
-                        })?;
-                }
-                Event::StreamEnd => break,
-                Event::Nothing => {
-                    return Err(ArtifactBuildError::InternalInvariant {
-                        message: "YAML parser emitted its reserved Nothing event",
-                    });
-                }
-                Event::StreamStart | Event::DocumentEnd | Event::Alias(_) | Event::Scalar(..) => {}
+impl<'artifact> PreparedArtifactSourceCompatibility<'artifact> {
+    pub(crate) fn mint(
+        source_id: SourceId,
+        fingerprint: SourceFingerprint,
+        format: &'artifact PreparedArtifactFormat,
+        artifact_digest: DigestV1,
+    ) -> Result<Self, PreparedArtifactSourceCompatibilityError> {
+        if source_id.kind() != fingerprint.kind() {
+            return Err(
+                PreparedArtifactSourceCompatibilityError::FingerprintKindMismatch {
+                    source_id,
+                    fingerprint_kind: fingerprint.kind(),
+                },
+            );
+        }
+        if format.source_kind() != source_id.kind() {
+            return Err(
+                PreparedArtifactSourceCompatibilityError::ArtifactKindMismatch {
+                    source_id,
+                    source_kind: source_id.kind(),
+                    artifact_kind: format.kind(),
+                },
+            );
+        }
+        if let PreparedArtifactFormat::VerbatimSource(proof) = format {
+            if proof.source_id() != source_id {
+                return Err(
+                    PreparedArtifactSourceCompatibilityError::VerbatimSourceMismatch {
+                        expected: source_id,
+                        actual: proof.source_id(),
+                    },
+                );
+            }
+            if proof.fingerprint() != fingerprint {
+                return Err(
+                    PreparedArtifactSourceCompatibilityError::VerbatimFingerprintMismatch {
+                        expected: fingerprint,
+                        actual: proof.fingerprint(),
+                    },
+                );
             }
         }
-        if depth != 0 {
-            return Err(ArtifactBuildError::InternalInvariant {
-                message: "YAML parser ended with open collections",
+        if artifact_digest != fingerprint.digest() {
+            return Err(PreparedArtifactSourceCompatibilityError::DigestMismatch {
+                source_id,
+                expected: fingerprint.digest(),
+                actual: artifact_digest,
             });
         }
         Ok(Self {
-            encoded_bytes: image.len(),
-            documents,
-            events,
-            max_depth,
+            source_id,
+            fingerprint,
+            format,
         })
     }
 
+    /// Returns the candidate logical source checked by this compatibility evidence.
     #[must_use]
-    pub const fn encoded_bytes(&self) -> u64 {
-        self.encoded_bytes
+    pub const fn source_id(self) -> SourceId {
+        self.source_id
     }
 
+    /// Returns the candidate source fingerprint checked by this compatibility evidence.
     #[must_use]
-    pub const fn documents(&self) -> u64 {
-        self.documents
+    pub const fn fingerprint(self) -> SourceFingerprint {
+        self.fingerprint
     }
 
+    /// Returns the logical source family accepted by the prepared image.
     #[must_use]
-    pub const fn events(&self) -> u64 {
-        self.events
+    pub const fn source_kind(self) -> SourceKind {
+        self.source_id.kind()
     }
 
+    /// Returns the wire-family evidence carried by the exact artifact.
     #[must_use]
-    pub const fn max_depth(&self) -> u32 {
-        self.max_depth
+    pub const fn format(self) -> PreparedArtifactFormatProof<'artifact> {
+        match self.format {
+            PreparedArtifactFormat::SerializedFile(proof) => {
+                PreparedArtifactFormatProof::SerializedFile(proof)
+            }
+            PreparedArtifactFormat::AssetBundle(proof) => {
+                PreparedArtifactFormatProof::AssetBundle(proof)
+            }
+            PreparedArtifactFormat::WebFile(proof) => PreparedArtifactFormatProof::WebFile(proof),
+            PreparedArtifactFormat::StreamedResource(proof) => {
+                PreparedArtifactFormatProof::StreamedResource(proof)
+            }
+            PreparedArtifactFormat::Yaml(proof) => PreparedArtifactFormatProof::Yaml(proof),
+            PreparedArtifactFormat::VerbatimSource(_) => {
+                PreparedArtifactFormatProof::VerbatimSource
+            }
+        }
+    }
+}
+
+/// Why a prepared image is incompatible with a candidate logical source image.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[non_exhaustive]
+pub enum PreparedArtifactSourceCompatibilityError {
+    #[error("source {source_id:?} kind does not match fingerprint kind {fingerprint_kind:?}")]
+    FingerprintKindMismatch {
+        source_id: SourceId,
+        fingerprint_kind: SourceKind,
+    },
+    #[error(
+        "prepared artifact kind {artifact_kind:?} cannot represent source {source_id:?} kind {source_kind:?}"
+    )]
+    ArtifactKindMismatch {
+        source_id: SourceId,
+        source_kind: SourceKind,
+        artifact_kind: PreparedArtifactKind,
+    },
+    #[error("prepared artifact for source {source_id:?} has digest {actual}, expected {expected}")]
+    DigestMismatch {
+        source_id: SourceId,
+        expected: DigestV1,
+        actual: DigestV1,
+    },
+    #[error("prepared verbatim artifact source is {actual:?}, expected {expected:?}")]
+    VerbatimSourceMismatch {
+        expected: SourceId,
+        actual: SourceId,
+    },
+    #[error("prepared verbatim artifact fingerprint is {actual}, expected {expected}")]
+    VerbatimFingerprintMismatch {
+        expected: SourceFingerprint,
+        actual: SourceFingerprint,
+    },
+}
+
+fn inspect_yaml(
+    image: &SegmentedBytes,
+    budget: &mut AssetLoadBudget,
+) -> Result<PreparedYamlProof, ArtifactBuildError> {
+    let length =
+        usize::try_from(image.len()).map_err(|_| ArtifactBuildError::ArithmeticOverflow {
+            resource: "canonical_yaml_image_length",
+        })?;
+    let temporary = vec_allocation_bytes::<u8>(length).map_err(ArtifactBudgetError::from)?;
+    budget.consume_bytes(temporary)?;
+
+    let mut encoded = Vec::new();
+    encoded.try_reserve_exact(length).map_err(|source| {
+        ArtifactBuildError::YamlImageAllocationFailed {
+            requested: length,
+            source,
+        }
+    })?;
+    let actual_temporary =
+        vec_allocation_bytes::<u8>(encoded.capacity()).map_err(ArtifactBudgetError::from)?;
+    let additional_temporary =
+        actual_temporary
+            .checked_sub(temporary)
+            .ok_or(ArtifactBuildError::InternalInvariant {
+                message: "canonical YAML allocation is smaller than its requested capacity",
+            })?;
+    budget.consume_bytes(additional_temporary)?;
+    for segment in image.segments() {
+        encoded.extend_from_slice(segment.as_slice());
+    }
+    if encoded.len() != length {
+        return Err(ArtifactBuildError::InternalInvariant {
+            message: "canonical YAML image length changed during materialization",
+        });
+    }
+
+    let encoded = BudgetedSourceBytes::from_vec(encoded, budget)?;
+    let parsed = parse_prebudgeted_yaml_source(encoded, budget).map_err(map_yaml_error)?;
+    parsed
+        .into_prepared_proof(budget)
+        .map_err(ArtifactBuildError::LoadBudget)
+}
+
+fn map_yaml_error(error: BudgetedYamlError) -> ArtifactBuildError {
+    match error {
+        BudgetedYamlError::Budget(error) => ArtifactBuildError::LoadBudget(error),
+        error => ArtifactBuildError::CanonicalYaml(Box::new(error)),
     }
 }
 
 /// Identity proof for an unchanged artifact that retains its complete verified source image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VerbatimSourceInspection {
+pub(crate) struct VerbatimSourceInspection {
     source_id: SourceId,
     fingerprint: SourceFingerprint,
     length: u64,
@@ -268,110 +392,19 @@ impl VerbatimSourceInspection {
     }
 
     #[must_use]
-    pub const fn source_id(&self) -> SourceId {
+    pub(crate) const fn source_id(&self) -> SourceId {
         self.source_id
     }
 
     #[must_use]
-    pub const fn fingerprint(&self) -> SourceFingerprint {
+    pub(crate) const fn fingerprint(&self) -> SourceFingerprint {
         self.fingerprint
     }
 
     #[must_use]
-    pub const fn length(&self) -> u64 {
+    pub(crate) const fn length(&self) -> u64 {
         self.length
     }
-}
-
-struct SegmentedByteCursor<'image> {
-    image: &'image SegmentedBytes,
-    segment: usize,
-    byte: usize,
-    position: u64,
-}
-
-impl<'image> SegmentedByteCursor<'image> {
-    const fn new(image: &'image SegmentedBytes) -> Self {
-        Self {
-            image,
-            segment: 0,
-            byte: 0,
-            position: 0,
-        }
-    }
-
-    fn next_byte(&mut self) -> Option<u8> {
-        loop {
-            let segment = self.image.segments().get(self.segment)?;
-            if let Some(value) = segment.as_slice().get(self.byte).copied() {
-                self.byte += 1;
-                self.position += 1;
-                return Some(value);
-            }
-            self.segment += 1;
-            self.byte = 0;
-        }
-    }
-
-    fn next_char(&mut self) -> Result<Option<char>, u64> {
-        let start = self.position;
-        let Some(first) = self.next_byte() else {
-            return Ok(None);
-        };
-        let width = match first {
-            0x00..=0x7f => 1,
-            0xc2..=0xdf => 2,
-            0xe0..=0xef => 3,
-            0xf0..=0xf4 => 4,
-            _ => return Err(start),
-        };
-        let mut encoded = [0_u8; 4];
-        encoded[0] = first;
-        for slot in &mut encoded[1..width] {
-            *slot = self.next_byte().ok_or(start)?;
-        }
-        let encoded = std::str::from_utf8(&encoded[..width]).map_err(|_| start)?;
-        encoded.chars().next().map(Some).ok_or(start)
-    }
-}
-
-struct SegmentedChars<'image> {
-    bytes: SegmentedByteCursor<'image>,
-}
-
-impl<'image> SegmentedChars<'image> {
-    const fn new(image: &'image SegmentedBytes) -> Self {
-        Self {
-            bytes: SegmentedByteCursor::new(image),
-        }
-    }
-}
-
-impl Iterator for SegmentedChars<'_> {
-    type Item = char;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.bytes.next_char() {
-            Ok(value) => value,
-            Err(_) => {
-                debug_assert!(
-                    false,
-                    "segmented YAML was validated before character iteration"
-                );
-                None
-            }
-        }
-    }
-}
-
-fn validate_segmented_utf8(image: &SegmentedBytes) -> Result<(), ArtifactBuildError> {
-    let mut cursor = SegmentedByteCursor::new(image);
-    while cursor
-        .next_char()
-        .map_err(|offset| ArtifactBuildError::InvalidYamlUtf8 { offset })?
-        .is_some()
-    {}
-    Ok(())
 }
 
 /// Digest of canonical resource extents, independent from artifact content identity.

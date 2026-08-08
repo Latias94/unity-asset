@@ -32,8 +32,8 @@ pub mod yaml_document;
 #[cfg(feature = "async")]
 pub use budgeted::load_budgeted_yaml_path_async;
 pub use budgeted::{
-    BudgetedYamlError, BudgetedYamlSource, load_budgeted_yaml_path, parse_budgeted_yaml_source,
-    parse_prebudgeted_yaml_source,
+    BudgetedYamlError, BudgetedYamlSource, PreparedYamlProof, YamlInspection,
+    load_budgeted_yaml_path, parse_budgeted_yaml_source, parse_prebudgeted_yaml_source,
 };
 pub use reference::{
     YamlReferenceClassification, YamlReferenceDiagnostic, YamlReferenceField,
@@ -61,6 +61,11 @@ mod tests {
         let parsed: std::result::Result<BudgetedYamlSource, BudgetedYamlError> =
             parse_budgeted_yaml_source(encoded, &mut budget);
 
-        assert_eq!(parsed.unwrap().document().entries().len(), 1);
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.document().entries().len(), 1);
+        assert_eq!(parsed.inspection().encoded_bytes(), 12);
+        assert_eq!(parsed.inspection().documents(), 1);
+        assert!(parsed.inspection().events() >= 7);
+        assert_eq!(parsed.inspection().max_depth(), 1);
     }
 }

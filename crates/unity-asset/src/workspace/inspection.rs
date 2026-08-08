@@ -21,7 +21,9 @@ use unity_asset_core::{
     RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityValue,
     WorkspaceId, WorkspaceRevision, read_contract_json, string_allocation_bytes,
 };
-use unity_asset_write::artifact::PreparedArtifactFormat;
+use unity_asset_write::artifact::{
+    PreparedArtifactFormatProof, PreparedArtifactSourceCompatibility,
+};
 
 use super::snapshot::{budgeted_result_vec, consume_retained_bytes, consume_single_result};
 use super::{
@@ -324,8 +326,26 @@ impl SerializedFileSummary {
         self.path_ids
     }
 
-    fn retained_clone_bytes(&self) -> Result<usize, WorkspaceError> {
-        retained_string_clone_bytes(&[&self.unity_version])
+    fn try_clone_with_budget(&self, budget: &mut AssetLoadBudget) -> Result<Self, WorkspaceError> {
+        Ok(Self {
+            version: self.version,
+            byte_order: self.byte_order,
+            metadata_size: self.metadata_size,
+            data_offset: self.data_offset,
+            declared_file_size: self.declared_file_size,
+            unity_version: clone_text(&self.unity_version, budget, "source_inspection_clone")?,
+            target_platform: self.target_platform,
+            #[cfg(feature = "decode")]
+            object_context: self.object_context,
+            type_tree_enabled: self.type_tree_enabled,
+            legacy_big_id: self.legacy_big_id,
+            object_count: self.object_count,
+            type_count: self.type_count,
+            script_type_count: self.script_type_count,
+            external_count: self.external_count,
+            reference_type_count: self.reference_type_count,
+            path_ids: self.path_ids,
+        })
     }
 }
 
@@ -459,8 +479,19 @@ impl AssetBundleSummary {
         self.directory_count
     }
 
-    fn retained_clone_bytes(&self) -> Result<usize, WorkspaceError> {
-        retained_string_clone_bytes(&[&self.signature, &self.unity_version, &self.unity_revision])
+    fn try_clone_with_budget(&self, budget: &mut AssetLoadBudget) -> Result<Self, WorkspaceError> {
+        Ok(Self {
+            signature: clone_text(&self.signature, budget, "source_inspection_clone")?,
+            version: self.version,
+            unity_version: clone_text(&self.unity_version, budget, "source_inspection_clone")?,
+            unity_revision: clone_text(&self.unity_revision, budget, "source_inspection_clone")?,
+            layout: self.layout,
+            declared_size: self.declared_size,
+            flags: self.flags,
+            compression: self.compression,
+            block_count: self.block_count,
+            directory_count: self.directory_count,
+        })
     }
 }
 
@@ -510,8 +541,12 @@ impl WebFileSummary {
         self.directory_count
     }
 
-    fn retained_clone_bytes(&self) -> Result<usize, WorkspaceError> {
-        retained_string_clone_bytes(&[&self.signature])
+    fn try_clone_with_budget(&self, budget: &mut AssetLoadBudget) -> Result<Self, WorkspaceError> {
+        Ok(Self {
+            signature: clone_text(&self.signature, budget, "source_inspection_clone")?,
+            compression: self.compression,
+            directory_count: self.directory_count,
+        })
     }
 }
 
@@ -540,18 +575,60 @@ impl WorkspaceSourceFormatInspection {
         }
     }
 
+    pub(crate) fn from_prepared_source(
+        proof: PreparedArtifactSourceCompatibility<'_>,
+        baseline: Option<&Self>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, WorkspaceError> {
+        match proof.format() {
+            PreparedArtifactFormatProof::SerializedFile(proof) => Ok(Self::SerializedFile(
+                SerializedFileSummary::from_proof(proof, budget)?,
+            )),
+            PreparedArtifactFormatProof::AssetBundle(proof) => Ok(Self::AssetBundle(
+                AssetBundleSummary::from_proof(proof, budget)?,
+            )),
+            PreparedArtifactFormatProof::WebFile(proof) => {
+                Ok(Self::WebFile(WebFileSummary::from_proof(proof, budget)?))
+            }
+            PreparedArtifactFormatProof::StreamedResource(_) => Ok(Self::StreamedResource),
+            PreparedArtifactFormatProof::Yaml(proof) => Ok(Self::Yaml {
+                document_count: proof.inspection().documents(),
+            }),
+            PreparedArtifactFormatProof::VerbatimSource => baseline
+                .ok_or_else(|| {
+                    WorkspaceError::operation(
+                        "prepared source format projection",
+                        io::Error::other("verbatim prepared source has no baseline format"),
+                    )
+                })?
+                .try_clone_with_budget(budget),
+            _ => Err(WorkspaceError::operation(
+                "prepared source format projection",
+                io::Error::other("unsupported prepared source format proof"),
+            )),
+        }
+    }
+
     pub(crate) fn try_clone_with_budget(
         &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, WorkspaceError> {
-        let retained = match self {
-            Self::AssetBundle(summary) => summary.retained_clone_bytes()?,
-            Self::SerializedFile(summary) => summary.retained_clone_bytes()?,
-            Self::WebFile(summary) => summary.retained_clone_bytes()?,
-            Self::Archive { .. } | Self::StreamedResource | Self::Yaml { .. } => 0,
-        };
-        consume_retained_bytes(retained, "source_inspection_clone", budget)?;
-        Ok(self.clone())
+        match self {
+            Self::AssetBundle(summary) => {
+                Ok(Self::AssetBundle(summary.try_clone_with_budget(budget)?))
+            }
+            Self::SerializedFile(summary) => {
+                Ok(Self::SerializedFile(summary.try_clone_with_budget(budget)?))
+            }
+            Self::WebFile(summary) => Ok(Self::WebFile(summary.try_clone_with_budget(budget)?)),
+            Self::Archive { member_count } => Ok(Self::Archive {
+                member_count: *member_count,
+            }),
+            Self::StreamedResource => Ok(Self::StreamedResource),
+            Self::Yaml { document_count } => Ok(Self::Yaml {
+                document_count: *document_count,
+            }),
+        }
     }
 
     #[cfg(test)]
@@ -1532,45 +1609,7 @@ fn format_inspection(
                     .format()
                     .try_clone_with_budget(budget);
             };
-            let artifact = state
-                .artifacts()
-                .artifact(binding.artifact())
-                .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
-            match artifact.format() {
-                PreparedArtifactFormat::SerializedFile(proof) => {
-                    Ok(WorkspaceSourceFormatInspection::SerializedFile(
-                        SerializedFileSummary::from_proof(proof, budget)?,
-                    ))
-                }
-                PreparedArtifactFormat::AssetBundle(proof) => {
-                    Ok(WorkspaceSourceFormatInspection::AssetBundle(
-                        AssetBundleSummary::from_proof(proof, budget)?,
-                    ))
-                }
-                PreparedArtifactFormat::WebFile(proof) => {
-                    Ok(WorkspaceSourceFormatInspection::WebFile(
-                        WebFileSummary::from_proof(proof, budget)?,
-                    ))
-                }
-                PreparedArtifactFormat::StreamedResource(_) => {
-                    Ok(WorkspaceSourceFormatInspection::StreamedResource)
-                }
-                PreparedArtifactFormat::Yaml(proof) => Ok(WorkspaceSourceFormatInspection::Yaml {
-                    document_count: proof.documents(),
-                }),
-                PreparedArtifactFormat::VerbatimSource(_) => state
-                    .base()
-                    .state()
-                    .store()
-                    .get(source)
-                    .ok_or(WorkspaceError::MissingSource(source))?
-                    .format()
-                    .try_clone_with_budget(budget),
-                _ => Err(WorkspaceError::operation(
-                    "workspace source inspection",
-                    io::Error::other("prepared artifact has an unsupported source format"),
-                )),
-            }
+            binding.format().try_clone_with_budget(budget)
         }
     }
 }
@@ -1596,21 +1635,7 @@ fn serialized_object_context(
                     .ok_or(WorkspaceError::MissingSource(source))
                     .and_then(|entry| stored_object_context(entry.format()));
             };
-            let artifact = state
-                .artifacts()
-                .artifact(binding.artifact())
-                .map_err(|error| WorkspaceError::PreparedArtifact(Box::new(error)))?;
-            match artifact.format() {
-                PreparedArtifactFormat::SerializedFile(proof) => Ok(proof.object_context()),
-                PreparedArtifactFormat::VerbatimSource(_) => state
-                    .base()
-                    .state()
-                    .store()
-                    .get(source)
-                    .ok_or(WorkspaceError::MissingSource(source))
-                    .and_then(|entry| stored_object_context(entry.format())),
-                _ => Err(invalid_texture_owner()),
-            }
+            stored_object_context(binding.format())
         }
     }
 }
@@ -1708,7 +1733,7 @@ fn clone_text(
     resource: &'static str,
 ) -> Result<String, WorkspaceError> {
     let minimum = string_allocation_bytes(value.len())
-        .map_err(|error| WorkspaceError::operation(resource, error))?;
+        .map_err(|_| WorkspaceError::Budget(BudgetError::ArithmeticOverflow { resource }))?;
     budget.check_bytes(minimum)?;
     let mut output = String::new();
     output
@@ -1720,31 +1745,11 @@ fn clone_text(
             message: error.to_string(),
         })?;
     let actual = string_allocation_bytes(output.capacity())
-        .map_err(|error| WorkspaceError::operation(resource, error))?;
+        .map_err(|_| WorkspaceError::Budget(BudgetError::ArithmeticOverflow { resource }))?;
     budget.check_bytes(actual)?;
     budget.consume_bytes(actual)?;
     output.push_str(value);
     Ok(output)
-}
-
-fn retained_string_clone_bytes(values: &[&str]) -> Result<usize, WorkspaceError> {
-    let mut retained = 0_u64;
-    for value in values {
-        retained = retained
-            .checked_add(
-                string_allocation_bytes(value.len())
-                    .map_err(|error| WorkspaceError::operation("source inspection size", error))?,
-            )
-            .ok_or(BudgetError::ArithmeticOverflow {
-                resource: "source_inspection_clone",
-            })?;
-    }
-    usize::try_from(retained).map_err(|_| {
-        BudgetError::ArithmeticOverflow {
-            resource: "source_inspection_clone",
-        }
-        .into()
-    })
 }
 
 fn usize_to_u64(value: usize, resource: &'static str) -> Result<u64, WorkspaceError> {
@@ -1853,4 +1858,75 @@ fn invalid_stream_resolution(
     let diagnostic = Diagnostic::new(DiagnosticSeverity::Error, code, message)
         .map_err(|error| WorkspaceError::operation("streamed-resource diagnostic", error))?;
     Ok(StreamedResourceResolution::Invalid { diagnostic })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use unity_asset_core::AssetLoadLimits;
+
+    fn clone_cost(value: &str) -> u64 {
+        let mut budget = AssetLoadBudget::default();
+        clone_text(value, &mut budget, "asset_bundle_summary_clone_test").unwrap();
+        budget.usage().bytes
+    }
+
+    #[test]
+    fn asset_bundle_summary_clone_is_exactly_budgeted_across_all_strings() {
+        let summary = AssetBundleSummary {
+            signature: "UnityFS".to_owned(),
+            version: 7,
+            unity_version: "2022.3.31f1".to_owned(),
+            unity_revision: "2022.3.31f1 (abcdef012345)".to_owned(),
+            layout: WorkspaceBundleLayout::FileStream,
+            declared_size: 128,
+            flags: 0xc0,
+            compression: WorkspaceCompression::Lz4,
+            block_count: 2,
+            directory_count: 3,
+        };
+        let signature = clone_cost(summary.signature());
+        let unity_version = clone_cost(summary.unity_version());
+        let unity_revision = clone_cost(summary.unity_revision());
+        let total = signature
+            .checked_add(unity_version)
+            .and_then(|value| value.checked_add(unity_revision))
+            .unwrap();
+
+        let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: total,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert_eq!(summary.try_clone_with_budget(&mut exact).unwrap(), summary);
+        assert_eq!(exact.usage().bytes, total);
+
+        let mut second_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: signature + unity_version - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            summary.try_clone_with_budget(&mut second_short),
+            Err(WorkspaceError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(second_short.usage().bytes, signature);
+
+        let mut third_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: total - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            summary.try_clone_with_budget(&mut third_short),
+            Err(WorkspaceError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(third_short.usage().bytes, signature + unity_version);
+    }
 }

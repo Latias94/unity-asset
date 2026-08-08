@@ -9,6 +9,7 @@ use unity_asset_core::{
 use unity_asset_write::artifact::{
     ArtifactBatchDeclaration, ArtifactBudget, ArtifactBuildError, ArtifactHandle, ArtifactLimits,
     ArtifactPayload, LogicalArtifactName, PreparedArtifactKind, PreparedArtifactSet,
+    PreparedArtifactSourceCompatibilityError,
 };
 use unity_asset_write::resources::{
     StreamedResourceExtent, StreamedResourceFlags, StreamedResourcePlan,
@@ -22,6 +23,13 @@ struct PreparedFixture {
     handle: ArtifactHandle,
     source: SourceId,
     fingerprint: SourceFingerprint,
+}
+
+fn compatibility_error(error: &WorkspaceError) -> &PreparedArtifactSourceCompatibilityError {
+    let WorkspaceError::PreparedArtifactSourceCompatibility(source) = error else {
+        panic!("expected prepared artifact source compatibility error");
+    };
+    source.as_ref()
 }
 
 fn source_payload(workspace: WorkspaceId, local: u128, bytes: &'static [u8]) -> ArtifactPayload {
@@ -185,11 +193,11 @@ fn prepared_range_rejects_source_fingerprint_and_artifact_kind_mismatches() {
     )
     .unwrap_err();
     assert!(matches!(
-        fingerprint_kind_error,
-        WorkspaceError::PreparedSourceKindMismatch {
-            source_id,
-            fingerprint_kind: SourceKind::Yaml,
-        } if source_id == fixture.source
+        compatibility_error(&fingerprint_kind_error),
+        PreparedArtifactSourceCompatibilityError::FingerprintKindMismatch {
+                source_id,
+                fingerprint_kind: SourceKind::Yaml,
+            } if *source_id == fixture.source
     ));
 
     let yaml_source = SourceId::new(fixture.source.workspace(), SourceKind::Yaml, 4).unwrap();
@@ -202,12 +210,12 @@ fn prepared_range_rejects_source_fingerprint_and_artifact_kind_mismatches() {
     )
     .unwrap_err();
     assert!(matches!(
-        artifact_kind_error,
-        WorkspaceError::PreparedArtifactKindMismatch {
+        compatibility_error(&artifact_kind_error),
+        PreparedArtifactSourceCompatibilityError::ArtifactKindMismatch {
             source_id,
             source_kind: SourceKind::Yaml,
             artifact_kind: PreparedArtifactKind::StreamedResource,
-        } if source_id == yaml_source
+        } if *source_id == yaml_source
     ));
 }
 
@@ -225,14 +233,14 @@ fn prepared_range_rejects_digest_and_range_mismatches() {
     )
     .unwrap_err();
     assert!(matches!(
-        digest_error,
-        WorkspaceError::PreparedArtifactDigestMismatch {
+        compatibility_error(&digest_error),
+        PreparedArtifactSourceCompatibilityError::DigestMismatch {
             source_id,
             expected,
             actual,
         } if *source_id == fixture.source
-            && expected == wrong_digest
-            && actual == fixture.fingerprint.digest()
+            && *expected == wrong_digest
+            && *actual == fixture.fingerprint.digest()
     ));
 
     for (range, expected_offset, expected_end) in
@@ -278,11 +286,11 @@ fn prepared_verbatim_range_rejects_source_and_fingerprint_provenance_mismatches(
     )
     .unwrap_err();
     assert!(matches!(
-        source_error,
-        WorkspaceError::PreparedArtifactSourceProvenanceMismatch {
+        compatibility_error(&source_error),
+        PreparedArtifactSourceCompatibilityError::VerbatimSourceMismatch {
             expected,
             actual,
-        } if *expected == foreign_source && actual == fixture.source
+        } if *expected == foreign_source && *actual == fixture.source
     ));
 
     let foreign_fingerprint = SourceFingerprint::from_bytes(SourceKind::AssetBundle, b"other");
@@ -295,12 +303,12 @@ fn prepared_verbatim_range_rejects_source_and_fingerprint_provenance_mismatches(
     )
     .unwrap_err();
     assert!(matches!(
-        fingerprint_error,
-        WorkspaceError::PreparedArtifactFingerprintProvenanceMismatch {
+        compatibility_error(&fingerprint_error),
+        PreparedArtifactSourceCompatibilityError::VerbatimFingerprintMismatch {
             expected,
             actual,
-        } if expected == foreign_fingerprint
-            && actual == fixture.fingerprint
+        } if *expected == foreign_fingerprint
+            && *actual == fixture.fingerprint
     ));
 }
 

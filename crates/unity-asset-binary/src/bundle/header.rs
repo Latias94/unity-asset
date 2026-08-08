@@ -211,9 +211,24 @@ impl BundleHeader {
         Ok(header)
     }
 
-    /// Get the compression type from flags
+    /// Returns the compression implied by the bundle's physical layout.
+    ///
+    /// FileStream bundles encode compression in their archive flags. Legacy
+    /// UnityWeb and UnityRaw bundles instead imply LZMA and no compression,
+    /// respectively, because their headers do not contain archive flags.
     pub fn compression_type(&self) -> Result<CompressionType> {
-        CompressionType::from_flags(self.flags & ArchiveFlags::COMPRESSION_TYPE_MASK)
+        match self.layout_kind()? {
+            BundleLayoutKind::FileStream => {
+                CompressionType::from_flags(self.flags & ArchiveFlags::COMPRESSION_TYPE_MASK)
+            }
+            BundleLayoutKind::Legacy => match self.signature.as_str() {
+                "UnityWeb" => Ok(CompressionType::Lzma),
+                "UnityRaw" => Ok(CompressionType::None),
+                signature => Err(BinaryError::unsupported(format!(
+                    "Unsupported legacy bundle signature: {signature}"
+                ))),
+            },
+        }
     }
 
     /// Check if block info is at the end of the file
@@ -308,14 +323,10 @@ impl BundleHeader {
     /// Get bundle format information
     pub fn format_info(&self) -> BundleFormatInfo {
         let layout = self.layout_kind().ok();
-        let is_compressed = match layout {
-            Some(BundleLayoutKind::FileStream) => self
-                .compression_type()
-                .map(|compression| compression != CompressionType::None)
-                .unwrap_or(false),
-            Some(BundleLayoutKind::Legacy) => self.signature == "UnityWeb",
-            None => false,
-        };
+        let is_compressed = self
+            .compression_type()
+            .map(|compression| compression != CompressionType::None)
+            .unwrap_or(false);
         BundleFormatInfo {
             signature: self.signature.clone(),
             version: self.version,
@@ -408,5 +419,43 @@ mod tests {
         let web_v6_info = web_v6.format_info();
         assert!(!web_v6_info.is_compressed);
         assert!(web_v6_info.has_directory_info);
+    }
+
+    #[test]
+    fn compression_type_follows_the_physical_layout() {
+        let legacy_web = BundleHeader {
+            signature: "UnityWeb".to_string(),
+            version: 5,
+            flags: CompressionType::None as u32,
+            ..Default::default()
+        };
+        let legacy_raw = BundleHeader {
+            signature: "UnityRaw".to_string(),
+            version: 5,
+            flags: CompressionType::Lz4 as u32,
+            ..Default::default()
+        };
+        let file_stream_web = BundleHeader {
+            signature: "UnityWeb".to_string(),
+            version: 6,
+            flags: CompressionType::Lz4Hc as u32,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            legacy_web.compression_type().unwrap(),
+            CompressionType::Lzma
+        );
+        assert!(legacy_web.format_info().is_compressed);
+        assert_eq!(
+            legacy_raw.compression_type().unwrap(),
+            CompressionType::None
+        );
+        assert!(!legacy_raw.format_info().is_compressed);
+        assert_eq!(
+            file_stream_web.compression_type().unwrap(),
+            CompressionType::Lz4Hc
+        );
+        assert!(file_stream_web.format_info().is_compressed);
     }
 }

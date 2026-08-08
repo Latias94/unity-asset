@@ -9,10 +9,8 @@ use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, BudgetedVerifiedSourceImage,
     SourceFingerprint, SourceId, SourceKind, UnityDocument, vec_allocation_bytes,
 };
-use unity_asset_write::artifact::{
-    ArtifactHandle, ArtifactStreamError, PreparedArtifactFormat, PreparedArtifactSet,
-};
-use unity_asset_yaml::parse_budgeted_yaml_source;
+use unity_asset_write::artifact::{ArtifactHandle, ArtifactStreamError, PreparedArtifactSet};
+use unity_asset_yaml::parse_prebudgeted_yaml_source;
 
 use super::super::WorkspaceInstallationDigest;
 use super::super::adapter::binary::{BinaryPayload, BinaryWorkspaceAdapter};
@@ -267,17 +265,20 @@ pub(crate) fn build(
         if transaction.content_fingerprint(binding.source()) == Some(verified.fingerprint()) {
             continue;
         }
-        let artifact = artifacts
-            .artifact(binding.artifact())
-            .map_err(|error| BaselineBuildError::Artifact(error.to_string()))?;
-        let parse = parse_source(
-            binding.source(),
-            verified.clone_backing(budget)?,
-            base,
-            binary,
-            budget,
-        )?;
-        let format = format_from_artifact(binding.source(), artifact.format(), base, budget)?;
+        let parse = match binding.source().kind() {
+            SourceKind::Yaml => {
+                FrozenSourceParse::Yaml(Arc::clone(binding.yaml_document().ok_or_else(|| {
+                    BaselineBuildError::Parse {
+                        message: "prepared YAML source has no canonical parse proof".to_owned(),
+                    }
+                })?))
+            }
+            _ => parse_source(binding.source(), &verified, base, binary, budget)?,
+        };
+        let format = binding
+            .format()
+            .try_clone_with_budget(budget)
+            .map_err(map_workspace_parse_error)?;
         let content =
             VerifiedSourceContent::from_budgeted(binding.source(), verified, parse, format);
         transaction
@@ -413,13 +414,7 @@ pub(crate) fn build_from_journal_with_images(
         if transaction.content_fingerprint(source.source()) == Some(verified.fingerprint()) {
             continue;
         }
-        let parse = parse_source(
-            source.source(),
-            verified.clone_backing(budget)?,
-            base,
-            binary,
-            budget,
-        )?;
+        let parse = parse_source(source.source(), &verified, base, binary, budget)?;
         let format = inspect_recovered_source(
             source.source(),
             verified.backing(budget)?,
@@ -742,7 +737,7 @@ fn reserve_recovery_vec<T>(
 
 fn parse_source(
     source: SourceId,
-    image: Arc<[u8]>,
+    image: &BudgetedVerifiedSourceImage,
     base: &WorkspaceState,
     binary: &BinaryWorkspaceAdapter,
     budget: &mut AssetLoadBudget,
@@ -750,7 +745,7 @@ fn parse_source(
     match source.kind() {
         SourceKind::SerializedFile => {
             let payload = binary
-                .parse(Arc::clone(&image), budget)
+                .parse(image.clone_backing(budget)?, budget)
                 .map_err(map_binary_adapter_error)
                 .map_err(map_workspace_parse_error)?;
             let BinaryPayload::SerializedFile(file) = payload else {
@@ -772,7 +767,7 @@ fn parse_source(
             Ok(FrozenSourceParse::Serialized(file))
         }
         SourceKind::Yaml => {
-            let parsed = parse_budgeted_yaml_source(image, budget)
+            let parsed = parse_prebudgeted_yaml_source(image.clone_budgeted_bytes(budget)?, budget)
                 .map_err(|error| map_yaml_error("baseline YAML parsing", error))
                 .map_err(map_workspace_parse_error)?;
             validate_yaml_identities(parsed.document(), budget)
@@ -783,48 +778,6 @@ fn parse_source(
         | SourceKind::WebFile
         | SourceKind::Archive
         | SourceKind::StreamedResource => Ok(FrozenSourceParse::None),
-    }
-}
-
-fn format_from_artifact(
-    source: SourceId,
-    format: &PreparedArtifactFormat,
-    base: &WorkspaceState,
-    budget: &mut AssetLoadBudget,
-) -> Result<WorkspaceSourceFormatInspection, BaselineBuildError> {
-    match format {
-        PreparedArtifactFormat::SerializedFile(proof) => {
-            Ok(WorkspaceSourceFormatInspection::SerializedFile(
-                SerializedFileSummary::from_proof(proof, budget)
-                    .map_err(map_workspace_parse_error)?,
-            ))
-        }
-        PreparedArtifactFormat::AssetBundle(proof) => {
-            Ok(WorkspaceSourceFormatInspection::AssetBundle(
-                AssetBundleSummary::from_proof(proof, budget).map_err(map_workspace_parse_error)?,
-            ))
-        }
-        PreparedArtifactFormat::WebFile(proof) => Ok(WorkspaceSourceFormatInspection::WebFile(
-            WebFileSummary::from_proof(proof, budget).map_err(map_workspace_parse_error)?,
-        )),
-        PreparedArtifactFormat::StreamedResource(_) => {
-            Ok(WorkspaceSourceFormatInspection::StreamedResource)
-        }
-        PreparedArtifactFormat::Yaml(proof) => Ok(WorkspaceSourceFormatInspection::Yaml {
-            document_count: proof.documents(),
-        }),
-        PreparedArtifactFormat::VerbatimSource(_) => base
-            .store()
-            .get(source)
-            .ok_or_else(|| BaselineBuildError::Parse {
-                message: format!("verbatim artifact source {source:?} is absent from the baseline"),
-            })?
-            .format()
-            .try_clone_with_budget(budget)
-            .map_err(map_workspace_parse_error),
-        _ => Err(BaselineBuildError::Parse {
-            message: "prepared artifact uses an unsupported inspection format".to_owned(),
-        }),
     }
 }
 

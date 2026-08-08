@@ -211,10 +211,7 @@ fn prepared_webfile_records_member_edges_for_every_packing_mode() -> anyhow::Res
         // The child remains reachable through both the segmented and compressed derivation paths.
         assert_eq!(prepared.proof_image_count(), 2);
         let output = prepared.outputs().next().expect("declared output exists");
-        assert_eq!(
-            output.artifact().format().kind(),
-            PreparedArtifactKind::WebFile
-        );
+        assert_eq!(output.artifact().kind(), PreparedArtifactKind::WebFile);
 
         let mut encoded = Vec::new();
         output.artifact().stream_verified_to(&mut encoded)?;

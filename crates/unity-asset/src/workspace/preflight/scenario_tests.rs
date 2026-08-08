@@ -176,6 +176,39 @@ fn prepared_resource_change() -> (tempfile::TempDir, AssetWorkspace, PreparedCha
     (directory, workspace, prepared)
 }
 
+#[test]
+fn committed_yaml_reuses_the_prepared_document_authority() {
+    let (directory, mut workspace, prepared) = prepared_resource_change();
+    let (source, proof_document) = prepared
+        .state()
+        .core()
+        .source_bindings()
+        .iter()
+        .find_map(|binding| {
+            binding
+                .yaml_document()
+                .map(|document| (binding.source(), Arc::clone(document)))
+        })
+        .expect("prepared resource fixture must retain a canonical YAML proof");
+
+    workspace
+        .commit(
+            prepared,
+            PublicationTarget::in_place(directory.path()).unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    let snapshot = workspace.snapshot();
+    let committed = snapshot
+        .state()
+        .store()
+        .get(source)
+        .and_then(|entry| entry.cached_yaml())
+        .expect("committed YAML source must retain its canonical parse");
+    assert!(Arc::ptr_eq(&proof_document, committed));
+}
+
 fn observe_prepared_destinations(prepared: &PreparedChange) -> DestinationProofSet {
     let destinations = prepared
         .publications()
@@ -542,6 +575,59 @@ fn prepared_publication_set_rejects_swapped_source_authority() {
             &mut AssetLoadBudget::default(),
         ),
         Err(PreparedPublicationError::SourceBindingMismatch { output: 0, .. })
+    ));
+}
+
+#[test]
+fn destination_observation_defers_same_kind_source_authority_to_publication_seal() {
+    let (_directory, _workspace, prepared) = prepared_resource_change();
+    let publications = prepared.publications().iter().collect::<Vec<_>>();
+    let yaml_source = publications
+        .iter()
+        .map(|publication| publication.source())
+        .find(|source| source.kind() == SourceKind::Yaml)
+        .unwrap();
+    let foreign_yaml = SourceId::new(
+        yaml_source.workspace(),
+        SourceKind::Yaml,
+        yaml_source.local().checked_add(10_000).unwrap(),
+    )
+    .unwrap();
+    let destinations = publications
+        .iter()
+        .map(|publication| {
+            let output = prepared.artifacts().output(publication.output()).unwrap();
+            let source = if publication.source() == yaml_source {
+                foreign_yaml
+            } else {
+                publication.source()
+            };
+            PublicationDestination::exact(
+                source,
+                publication.output(),
+                output.name(),
+                publication.target(),
+                DestinationExpectation::Observe,
+            )
+        })
+        .collect::<Vec<_>>();
+    let proofs = DestinationProofSet::observe(
+        prepared.artifacts(),
+        &destinations,
+        &mut AssetLoadBudget::default(),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        PreparedPublicationSet::seal(
+            proofs,
+            prepared.state().as_ref(),
+            &mut AssetLoadBudget::default(),
+        ),
+        Err(PreparedPublicationError::SourceBindingMissing {
+            source_id,
+            ..
+        }) if source_id == foreign_yaml
     ));
 }
 

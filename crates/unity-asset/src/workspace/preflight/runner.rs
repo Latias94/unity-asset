@@ -1,3 +1,4 @@
+use std::error::Error as StdError;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -6,10 +7,11 @@ use std::sync::Arc;
 
 use indexmap::IndexMap;
 use unity_asset_binary::asset::SerializedFile;
+use unity_asset_binary::error::BinaryError;
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, DigestV1, FieldPath,
-    ObjectAddress, ObjectId, ObjectKind, RevisionedObjectHandle, SourceFingerprint, SourceId,
-    SourceKind, SourceLocator, UnityDocument, UnityValue, arc_value_allocation_bytes,
+    AllocationSizeError, AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, DigestV1,
+    FieldPath, ObjectAddress, ObjectId, ObjectKind, RevisionedObjectHandle, SourceFingerprint,
+    SourceId, SourceKind, SourceLocator, UnityDocument, UnityValue, arc_value_allocation_bytes,
     index_map_allocation_bytes, string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_write::artifact::{
@@ -26,7 +28,7 @@ use unity_asset_write::serialized_file::{
     BudgetedExternalPath, ExternalTableAllocator, SerializedFileEdits, SerializedFileSource,
     SerializedFileWriter,
 };
-use unity_asset_yaml::UnityYamlSerializer;
+use unity_asset_yaml::{BudgetedYamlError, UnityYamlSerializer, YamlReferenceScanError};
 
 use super::artifact_graph::{PreparedArtifactGraph, prepare_artifact_graph};
 use super::destination::{
@@ -47,8 +49,9 @@ use super::{
     PrepareFailureReport, PrepareOptions, PrepareReport, PrepareStage, PreparedChange,
     PreparedLogicalChanges, PreparedPublicationError, PreparedPublicationSet, PreparedSourceReport,
 };
+use crate::reference::ReferenceGraphError;
 use crate::schema::protected_plain_field_owner;
-use crate::workspace::overlay::{PreparedSourceBinding, PreparedState};
+use crate::workspace::overlay::{PreparedSourceBinding, PreparedState, PreparedStateBuildError};
 use crate::workspace::plan::{
     GenericMutation, MutationOperation, MutationPlan, MutationValueOwned, PlanPayload,
     SequenceMutation,
@@ -56,7 +59,9 @@ use crate::workspace::plan::{
 use crate::workspace::source_catalog::{
     CatalogError, LocatorResolution, PhysicalDomainChange, SourceCatalog, SourceLocationKind,
 };
-use crate::workspace::{AssetWorkspace, WorkspaceLookup, WorkspaceSnapshot, WorkspaceView};
+use crate::workspace::{
+    AssetWorkspace, WorkspaceError, WorkspaceLookup, WorkspaceSnapshot, WorkspaceView,
+};
 
 const MAX_RUNNER_DIAGNOSTIC_BYTES: usize = 4_096;
 
@@ -614,18 +619,7 @@ fn prepare_with_observer(
         source_bindings,
         budget,
     )
-    .map_err(|error| {
-        let stage = error.prepare_stage();
-        let code = match stage {
-            PrepareStage::IndependentReparse => "PREPARE_INDEPENDENT_REPARSE_FAILED",
-            _ => "PREPARE_PREPARED_VIEW_FAILED",
-        };
-        reject(
-            &snapshot,
-            Some(plan_digest),
-            RunnerFailure::new(None, stage, code, error.to_string()),
-        )
-    })?;
+    .map_err(|error| reject(&snapshot, Some(plan_digest), prepared_state_failure(error)))?;
 
     let publications =
         PreparedPublicationSet::seal(destination_proofs, &state, budget).map_err(|error| {
@@ -4138,8 +4132,7 @@ fn destination_error_output(error: &DestinationProofError) -> Option<usize> {
         | DestinationProofError::ArithmeticOverflow { .. }
         | DestinationProofError::Allocation { .. }
         | DestinationProofError::OutputCountMismatch { .. }
-        | DestinationProofError::DuplicateOutput { .. }
-        | DestinationProofError::UnsupportedArtifactFormat => None,
+        | DestinationProofError::DuplicateOutput { .. } => None,
     }
 }
 
@@ -4194,6 +4187,105 @@ fn mutation_field_path(action: &GenericMutation) -> Option<&FieldPath> {
 
 fn artifact_failure(stage: PrepareStage, error: ArtifactBuildError) -> RunnerFailure {
     RunnerFailure::new(None, stage, "PREPARE_ARTIFACT_REJECTED", error.to_string())
+}
+
+fn prepared_state_failure(error: PreparedStateBuildError) -> RunnerFailure {
+    let stage = error.prepare_stage();
+    let code = prepared_state_resource_code(&error).unwrap_or(match stage {
+        PrepareStage::IndependentReparse => "PREPARE_INDEPENDENT_REPARSE_FAILED",
+        _ => "PREPARE_PREPARED_VIEW_FAILED",
+    });
+    RunnerFailure::new(None, stage, code, error.to_string())
+}
+
+fn prepared_state_resource_code(error: &PreparedStateBuildError) -> Option<&'static str> {
+    match error {
+        PreparedStateBuildError::Workspace(error)
+        | PreparedStateBuildError::IndependentReparse(error) => workspace_resource_code(error),
+        PreparedStateBuildError::Reference(error) => reference_resource_code(error),
+    }
+}
+
+fn workspace_resource_code(error: &WorkspaceError) -> Option<&'static str> {
+    match error {
+        WorkspaceError::Budget(error) => Some(budget_resource_code(error)),
+        WorkspaceError::Allocation { .. } => Some("PREPARE_ALLOCATION_REJECTED"),
+        WorkspaceError::Binary(error) | WorkspaceError::BinaryMember { source: error, .. } => {
+            binary_resource_code(error)
+        }
+        _ => error.source().and_then(nested_resource_code),
+    }
+}
+
+fn reference_resource_code(error: &ReferenceGraphError) -> Option<&'static str> {
+    match error {
+        ReferenceGraphError::Workspace(error) => workspace_resource_code(error),
+        ReferenceGraphError::Budget(error) => Some(budget_resource_code(error)),
+        ReferenceGraphError::Binary(error) => binary_resource_code(error),
+        ReferenceGraphError::Yaml(error) => yaml_reference_resource_code(error),
+        ReferenceGraphError::Allocation { .. } => Some("PREPARE_ALLOCATION_REJECTED"),
+        _ => error.source().and_then(nested_resource_code),
+    }
+}
+
+fn yaml_resource_code(error: &BudgetedYamlError) -> Option<&'static str> {
+    match error {
+        BudgetedYamlError::Budget(error) => Some(budget_resource_code(error)),
+        BudgetedYamlError::AllocationFailed { .. }
+        | BudgetedYamlError::IndexMapAllocationFailed { .. } => Some("PREPARE_ALLOCATION_REJECTED"),
+        BudgetedYamlError::DepthExceeded { .. } => Some("PREPARE_BUDGET_REJECTED"),
+        _ => error.source().and_then(nested_resource_code),
+    }
+}
+
+fn yaml_reference_resource_code(error: &YamlReferenceScanError) -> Option<&'static str> {
+    match error {
+        YamlReferenceScanError::Budget(error) => Some(budget_resource_code(error)),
+        YamlReferenceScanError::AllocationFailed { .. } => Some("PREPARE_ALLOCATION_REJECTED"),
+        YamlReferenceScanError::CounterOverflow { .. } => Some("PREPARE_ALLOCATION_OVERFLOW"),
+        _ => error.source().and_then(nested_resource_code),
+    }
+}
+
+fn binary_resource_code(error: &BinaryError) -> Option<&'static str> {
+    match error {
+        BinaryError::Budget(error) => Some(budget_resource_code(error)),
+        BinaryError::MemoryError(_) | BinaryError::Allocation { .. } => {
+            Some("PREPARE_ALLOCATION_REJECTED")
+        }
+        _ => error.source().and_then(nested_resource_code),
+    }
+}
+
+fn nested_resource_code(error: &(dyn StdError + 'static)) -> Option<&'static str> {
+    if let Some(error) = error.downcast_ref::<WorkspaceError>() {
+        workspace_resource_code(error)
+    } else if let Some(error) = error.downcast_ref::<ReferenceGraphError>() {
+        reference_resource_code(error)
+    } else if let Some(error) = error.downcast_ref::<BudgetedYamlError>() {
+        yaml_resource_code(error)
+    } else if let Some(error) = error.downcast_ref::<YamlReferenceScanError>() {
+        yaml_reference_resource_code(error)
+    } else if let Some(error) = error.downcast_ref::<BinaryError>() {
+        binary_resource_code(error)
+    } else if let Some(error) = error.downcast_ref::<BudgetError>() {
+        Some(budget_resource_code(error))
+    } else if error.is::<AllocationSizeError>() {
+        Some("PREPARE_ALLOCATION_OVERFLOW")
+    } else if error.is::<std::collections::TryReserveError>()
+        || error.is::<indexmap::TryReserveError>()
+    {
+        Some("PREPARE_ALLOCATION_REJECTED")
+    } else {
+        error.source().and_then(nested_resource_code)
+    }
+}
+
+fn budget_resource_code(error: &BudgetError) -> &'static str {
+    match error {
+        BudgetError::ArithmeticOverflow { .. } => "PREPARE_ALLOCATION_OVERFLOW",
+        _ => "PREPARE_BUDGET_REJECTED",
+    }
 }
 
 fn prepared_publication_failure(error: PreparedPublicationError) -> RunnerFailure {
@@ -4453,6 +4545,92 @@ mod tests {
             destinations: 0,
         });
         assert_eq!(authority.0.code, "PREPARE_PUBLICATION_AUTHORITY_REJECTED");
+    }
+
+    #[test]
+    fn prepared_state_failure_preserves_recursive_resource_classification() {
+        let workspace_budget = prepared_state_failure(PreparedStateBuildError::Workspace(
+            WorkspaceError::Budget(BudgetError::Exceeded {
+                resource: "prepared state",
+                limit: 1,
+                requested: 2,
+            }),
+        ));
+        assert_eq!(workspace_budget.0.stage, PrepareStage::PreparedView);
+        assert_eq!(workspace_budget.0.code, "PREPARE_BUDGET_REJECTED");
+
+        let allocation_size = vec_allocation_bytes::<u128>(usize::MAX).unwrap_err();
+        let reparse_overflow = prepared_state_failure(PreparedStateBuildError::IndependentReparse(
+            WorkspaceError::operation("prepared YAML artifact parsing", allocation_size),
+        ));
+        assert_eq!(reparse_overflow.0.stage, PrepareStage::IndependentReparse);
+        assert_eq!(reparse_overflow.0.code, "PREPARE_ALLOCATION_OVERFLOW");
+
+        let mut allocation_probe = Vec::<u8>::new();
+        let yaml_allocation = allocation_probe.try_reserve(usize::MAX).unwrap_err();
+        let yaml_allocation = prepared_state_failure(PreparedStateBuildError::IndependentReparse(
+            WorkspaceError::operation(
+                "prepared YAML artifact parsing",
+                BudgetedYamlError::AllocationFailed {
+                    context: "prepared YAML values",
+                    requested: usize::MAX,
+                    source: yaml_allocation,
+                },
+            ),
+        ));
+        assert_eq!(yaml_allocation.0.code, "PREPARE_ALLOCATION_REJECTED");
+
+        let binary_allocation = prepared_state_failure(PreparedStateBuildError::Reference(
+            ReferenceGraphError::Workspace(WorkspaceError::Binary(BinaryError::MemoryError(
+                "allocation failed".to_owned(),
+            ))),
+        ));
+        assert_eq!(binary_allocation.0.stage, PrepareStage::PreparedView);
+        assert_eq!(binary_allocation.0.code, "PREPARE_ALLOCATION_REJECTED");
+
+        let binary_overflow = prepared_state_failure(PreparedStateBuildError::Reference(
+            ReferenceGraphError::Binary(BinaryError::Budget(BudgetError::ArithmeticOverflow {
+                resource: "prepared binary reference facts",
+            })),
+        ));
+        assert_eq!(binary_overflow.0.code, "PREPARE_ALLOCATION_OVERFLOW");
+
+        let mut allocation_probe = Vec::<u8>::new();
+        let reference_allocation = allocation_probe.try_reserve(usize::MAX).unwrap_err();
+        let reference_allocation = prepared_state_failure(PreparedStateBuildError::Reference(
+            ReferenceGraphError::Allocation {
+                resource: "prepared reference graph",
+                requested: usize::MAX,
+                unit: crate::reference::ReferenceAllocationUnit::Bytes,
+                source: reference_allocation,
+            },
+        ));
+        assert_eq!(reference_allocation.0.code, "PREPARE_ALLOCATION_REJECTED");
+
+        let yaml_overflow = prepared_state_failure(PreparedStateBuildError::Reference(
+            ReferenceGraphError::Yaml(YamlReferenceScanError::CounterOverflow {
+                counter: "prepared YAML reference facts",
+            }),
+        ));
+        assert_eq!(yaml_overflow.0.code, "PREPARE_ALLOCATION_OVERFLOW");
+    }
+
+    #[test]
+    fn prepared_state_failure_preserves_stage_specific_semantic_codes() {
+        let independent = prepared_state_failure(PreparedStateBuildError::IndependentReparse(
+            WorkspaceError::InvalidSource {
+                path: "prepared.asset".into(),
+                message: "invalid prepared source".to_owned(),
+            },
+        ));
+        assert_eq!(independent.0.stage, PrepareStage::IndependentReparse);
+        assert_eq!(independent.0.code, "PREPARE_INDEPENDENT_REPARSE_FAILED");
+
+        let prepared_view = prepared_state_failure(PreparedStateBuildError::Reference(
+            ReferenceGraphError::Invariant("invalid prepared reference graph"),
+        ));
+        assert_eq!(prepared_view.0.stage, PrepareStage::PreparedView);
+        assert_eq!(prepared_view.0.code, "PREPARE_PREPARED_VIEW_FAILED");
     }
 
     #[test]

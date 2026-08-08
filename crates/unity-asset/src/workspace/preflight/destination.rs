@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use thiserror::Error;
 use unity_asset_core::{AssetLoadBudget, BudgetError, SourceFingerprint, SourceId, SourceKind};
 use unity_asset_write::artifact::{
-    LogicalArtifactName, OutputSlot, PreparedArtifact, PreparedArtifactFormat, PreparedArtifactSet,
+    LogicalArtifactName, OutputSlot, PreparedArtifact, PreparedArtifactSet,
 };
 
 use super::super::portable_path::{PortablePathError, native_key};
@@ -429,7 +429,9 @@ fn observe_destination(
     if destination.authority.output != prepared.slot {
         return Err(DestinationProofError::OutputAuthorityMismatch { output });
     }
-    let source_kind = artifact_source_kind(prepared.artifact)?;
+    // Destination observation records only the artifact-intrinsic source family. Logical source
+    // ownership is sealed later by `PreparedPublicationSet::seal`.
+    let source_kind = prepared.artifact.source_kind();
     match destination.location {
         DestinationLocation::Exact(target) => {
             if !target.is_absolute() {
@@ -629,18 +631,6 @@ fn ensure_contained(
         return Err(DestinationProofError::TargetEscapesRoot { output });
     }
     Ok(())
-}
-
-fn artifact_source_kind(artifact: &PreparedArtifact) -> Result<SourceKind, DestinationProofError> {
-    match artifact.format() {
-        PreparedArtifactFormat::SerializedFile(_) => Ok(SourceKind::SerializedFile),
-        PreparedArtifactFormat::AssetBundle(_) => Ok(SourceKind::AssetBundle),
-        PreparedArtifactFormat::WebFile(_) => Ok(SourceKind::WebFile),
-        PreparedArtifactFormat::StreamedResource(_) => Ok(SourceKind::StreamedResource),
-        PreparedArtifactFormat::Yaml(_) => Ok(SourceKind::Yaml),
-        PreparedArtifactFormat::VerbatimSource(proof) => Ok(proof.fingerprint().kind()),
-        _ => Err(DestinationProofError::UnsupportedArtifactFormat),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -903,8 +893,6 @@ pub(crate) enum DestinationProofError {
         #[source]
         source: Box<CatalogError>,
     },
-    #[error("prepared artifact format cannot be mapped to a publication source kind")]
-    UnsupportedArtifactFormat,
 }
 
 #[cfg(test)]
