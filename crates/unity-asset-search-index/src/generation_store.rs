@@ -876,13 +876,25 @@ where
 
     let structure = scan_json_structure(&encoded)
         .map_err(|source| classify_source_state_file_error(&path, source))?;
-    let owned_allocation = source_state_owned_allocation_bound(structure)
+    if structure.object_members > limits.max_structural_members {
+        return Err(classify_source_state_file_error(
+            &path,
+            SourceStateError::JsonStructureMembersExceeded {
+                actual: structure.object_members,
+                maximum: limits.max_structural_members,
+            },
+        ));
+    }
+    let owned_allocation = source_state_owned_allocation_bound(actual, structure)
         .map_err(|source| classify_source_state_file_error(&path, source))?;
     budget
         .check_entries(structure.array_entries)
         .map_err(GenerationStoreError::Budget)?;
+    // Total repeated wire fields are bounded by the source-state contract itself. Charging only
+    // the widest object to the caller's member ledger keeps supported source count independent of
+    // how many fixed schema fields each persisted record repeats.
     budget
-        .check_members(structure.object_members)
+        .check_members(structure.max_object_members)
         .map_err(GenerationStoreError::Budget)?;
     budget
         .check_depth(structure.max_depth)
@@ -894,7 +906,7 @@ where
         .consume_entries(structure.array_entries)
         .map_err(GenerationStoreError::Budget)?;
     budget
-        .consume_members(structure.object_members)
+        .consume_members(structure.max_object_members)
         .map_err(GenerationStoreError::Budget)?;
     budget
         .observe_depth(structure.max_depth)

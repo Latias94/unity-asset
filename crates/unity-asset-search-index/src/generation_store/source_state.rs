@@ -32,14 +32,12 @@ const MAX_SOURCE_STATE_SCAN_HINTS: usize = 1_000_000;
 const MAX_TRANSACTION_RECEIPTS: usize = 4_096;
 const TRANSACTION_RECEIPT_CONTRACT_VERSION: u16 = 1;
 const MAX_SOURCE_STATE_RELATIVE_PATH_BYTES: usize = MAX_PORTABLE_PATH_BYTES;
-// Vec starts with at most eight slots for supported non-zero-sized element types, then grows
-// geometrically. Internally tagged Serde enums may temporarily buffer one Content sequence/map
-// while constructing the final typed Vec. Two independently grown buffers therefore require at
-// most sixteen maximum-sized slots per observed array element or object member.
-const SOURCE_STATE_CONTAINER_SLOTS_PER_ITEM: u64 = 16;
-// serde_json retains one reusable byte scratch Vec for escaped strings. A byte Vec can begin with
-// an eight-byte allocation and geometric growth stays below twice the requested length.
-const SOURCE_STATE_JSON_SCRATCH_MIN_BYTES: u64 = 8;
+const MAX_SOURCE_STATE_STRUCTURAL_MEMBERS: u64 = 64_000_000;
+// Vec capacity stays below twice its logical length. JSON parser work covers transient Content
+// maps used by internally tagged enums; it must not be multiplied by every repeated wire field.
+const SOURCE_STATE_VEC_SLOTS_PER_ENTRY: u64 = 2;
+const SOURCE_STATE_JSON_PARSER_WORK_MULTIPLIER: u64 = 6;
+const SOURCE_STATE_JSON_PARSER_FIXED_WORK_BYTES: u64 = 4 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SourceStateLimits {
@@ -47,6 +45,7 @@ pub(crate) struct SourceStateLimits {
     pub(crate) max_assets: usize,
     pub(crate) max_scan_hints: usize,
     pub(crate) max_relative_path_bytes: usize,
+    pub(crate) max_structural_members: u64,
 }
 
 impl Default for SourceStateLimits {
@@ -56,6 +55,7 @@ impl Default for SourceStateLimits {
             max_assets: MAX_SOURCE_STATE_ASSETS,
             max_scan_hints: MAX_SOURCE_STATE_SCAN_HINTS,
             max_relative_path_bytes: MAX_SOURCE_STATE_RELATIVE_PATH_BYTES,
+            max_structural_members: MAX_SOURCE_STATE_STRUCTURAL_MEMBERS,
         }
     }
 }
@@ -1129,16 +1129,16 @@ fn source_state_entry_count_parts(
 pub(super) struct JsonStructure {
     pub(super) array_entries: u64,
     pub(super) object_members: u64,
+    pub(super) max_object_members: u64,
     // JSON escape syntax never decodes to more UTF-8 bytes than its raw string body.
     pub(super) string_backing_bytes: u64,
-    pub(super) max_escaped_string_body_bytes: u64,
     pub(super) max_depth: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JsonContainer {
     Array { expects_value: bool },
-    Object,
+    Object { members: u64 },
 }
 
 fn mark_json_array_value(
@@ -1174,18 +1174,12 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
     let mut max_depth = 0_u32;
     let mut array_entries = 0_u64;
     let mut object_members = 0_u64;
+    let mut max_object_members = 0_u64;
     let mut string_backing_bytes = 0_u64;
-    let mut current_string_body_bytes = 0_u64;
-    let mut current_string_has_escape = false;
-    let mut max_escaped_string_body_bytes = 0_u64;
     let mut index = 0_usize;
     while let Some(byte) = encoded.get(index).copied() {
         if in_string {
             if !escaped && byte == b'"' {
-                if current_string_has_escape {
-                    max_escaped_string_body_bytes =
-                        max_escaped_string_body_bytes.max(current_string_body_bytes);
-                }
                 in_string = false;
             } else {
                 string_backing_bytes =
@@ -1194,15 +1188,9 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
                         .ok_or(SourceStateError::SizeOverflow {
                             resource: "source state string backing",
                         })?;
-                current_string_body_bytes = current_string_body_bytes.checked_add(1).ok_or(
-                    SourceStateError::SizeOverflow {
-                        resource: "source state current string backing",
-                    },
-                )?;
                 if escaped {
                     escaped = false;
                 } else if byte == b'\\' {
-                    current_string_has_escape = true;
                     escaped = true;
                 }
             }
@@ -1228,8 +1216,6 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
         match byte {
             b'"' => {
                 mark_json_array_value(&mut containers, depth, &mut array_entries)?;
-                current_string_body_bytes = 0;
-                current_string_has_escape = false;
                 in_string = true;
             }
             b'[' | b'{' => {
@@ -1245,7 +1231,7 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
                         expects_value: true,
                     }
                 } else {
-                    JsonContainer::Object
+                    JsonContainer::Object { members: 0 }
                 });
                 depth += 1;
                 max_depth = max_depth.max(u32::try_from(depth).map_err(|_| {
@@ -1281,6 +1267,17 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
                         .ok_or(SourceStateError::SizeOverflow {
                             resource: "source state structural members",
                         })?;
+                if let Some(JsonContainer::Object { members }) = depth
+                    .checked_sub(1)
+                    .and_then(|slot| containers[slot].as_mut())
+                {
+                    *members = members
+                        .checked_add(1)
+                        .ok_or(SourceStateError::SizeOverflow {
+                            resource: "source state object width",
+                        })?;
+                    max_object_members = max_object_members.max(*members);
+                }
             }
             b' ' | b'\t' | b'\r' | b'\n' => {}
             _ => {
@@ -1290,25 +1287,22 @@ pub(super) fn scan_json_structure(encoded: &[u8]) -> Result<JsonStructure, Sourc
         }
         index += 1;
     }
-    if in_string && current_string_has_escape {
-        max_escaped_string_body_bytes =
-            max_escaped_string_body_bytes.max(current_string_body_bytes);
-    }
     Ok(JsonStructure {
         array_entries,
         object_members,
+        max_object_members,
         string_backing_bytes,
-        max_escaped_string_body_bytes,
         max_depth,
     })
 }
 
 pub(super) fn source_state_owned_allocation_bound(
+    encoded_length: u64,
     structure: JsonStructure,
 ) -> Result<u64, SourceStateError> {
-    // Every persisted Vec element has one of these layouts. Charging the maximum for each exact
-    // structural item deliberately overestimates mixed arrays while avoiding an encoded-length
-    // heuristic. Raw string bodies independently bound every owned String backing allocation.
+    // Every persisted Vec element has one of these layouts. Charge geometric Vec capacity using
+    // the largest retained slot, then account for owned strings and conservative parser work.
+    // Repeated object fields are schema syntax, not additional maximum-sized retained elements.
     let maximum_slot = [
         std::mem::size_of::<TransactionReceipt>(),
         std::mem::size_of::<SourceScanHint>(),
@@ -1328,32 +1322,22 @@ pub(super) fn source_state_owned_allocation_bound(
     .ok_or(SourceStateError::SizeOverflow {
         resource: "source state maximum array slot",
     })?;
-    let container_items = structure
+    let container_backing = structure
         .array_entries
-        .checked_add(structure.object_members)
-        .ok_or(SourceStateError::SizeOverflow {
-            resource: "source state container items",
-        })?;
-    let container_backing = container_items
-        .checked_mul(SOURCE_STATE_CONTAINER_SLOTS_PER_ITEM)
+        .checked_mul(SOURCE_STATE_VEC_SLOTS_PER_ENTRY)
         .and_then(|slots| slots.checked_mul(maximum_slot))
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state container backing",
         })?;
-    let json_scratch = if structure.max_escaped_string_body_bytes == 0 {
-        0
-    } else {
-        structure
-            .max_escaped_string_body_bytes
-            .checked_mul(2)
-            .ok_or(SourceStateError::SizeOverflow {
-                resource: "source state escaped string scratch",
-            })?
-            .max(SOURCE_STATE_JSON_SCRATCH_MIN_BYTES)
-    };
+    let parser_work = encoded_length
+        .checked_mul(SOURCE_STATE_JSON_PARSER_WORK_MULTIPLIER)
+        .and_then(|bytes| bytes.checked_add(SOURCE_STATE_JSON_PARSER_FIXED_WORK_BYTES))
+        .ok_or(SourceStateError::SizeOverflow {
+            resource: "source state JSON parser work",
+        })?;
     structure
         .string_backing_bytes
-        .checked_add(json_scratch)
+        .checked_add(parser_work)
         .ok_or(SourceStateError::SizeOverflow {
             resource: "source state string allocation",
         })?
@@ -1463,6 +1447,10 @@ pub(crate) enum SourceStateError {
     StructuralEntryUnderestimate {
         structural: u64,
         semantic: u64,
+    },
+    JsonStructureMembersExceeded {
+        actual: u64,
+        maximum: u64,
     },
     JsonStructureDepthExceeded {
         actual: usize,
@@ -1606,6 +1594,10 @@ impl fmt::Display for SourceStateError {
             } => write!(
                 formatter,
                 "source state structural entry count {structural} is below semantic count {semantic}"
+            ),
+            Self::JsonStructureMembersExceeded { actual, maximum } => write!(
+                formatter,
+                "source state JSON contains {actual} structural members; maximum is {maximum}"
             ),
             Self::JsonStructureDepthExceeded { actual, maximum } => write!(
                 formatter,
@@ -1922,45 +1914,36 @@ mod source_state_tests {
 
         assert_eq!(structure.array_entries, 4);
         assert_eq!(structure.object_members, 3);
+        assert_eq!(structure.max_object_members, 2);
         assert_eq!(structure.string_backing_bytes, 5);
-        assert_eq!(structure.max_escaped_string_body_bytes, 0);
         assert_eq!(structure.max_depth, 4);
     }
 
     #[test]
-    fn source_state_allocation_bound_includes_retained_json_escape_scratch() {
-        let structure =
-            scan_json_structure(br#"{"plain":"abcdefghij","escaped":"abc\n"}"#).unwrap();
-        let without_scratch = JsonStructure {
-            max_escaped_string_body_bytes: 0,
+    fn source_state_allocation_bound_includes_parser_work_and_retained_strings() {
+        let encoded = br#"{"plain":"abcdefghij","escaped":"abc\n"}"#;
+        let encoded_length = encoded.len() as u64;
+        let structure = scan_json_structure(encoded).unwrap();
+        let without_strings = JsonStructure {
+            string_backing_bytes: 0,
             ..structure
         };
 
-        assert_eq!(structure.max_escaped_string_body_bytes, 5);
         assert_eq!(
-            source_state_owned_allocation_bound(structure).unwrap()
-                - source_state_owned_allocation_bound(without_scratch).unwrap(),
-            10
+            source_state_owned_allocation_bound(encoded_length, structure).unwrap()
+                - source_state_owned_allocation_bound(encoded_length, without_strings).unwrap(),
+            structure.string_backing_bytes
         );
-
-        let minimum = scan_json_structure(br#"{"escaped":"\n"}"#).unwrap();
-        let minimum_without_scratch = JsonStructure {
-            max_escaped_string_body_bytes: 0,
-            ..minimum
-        };
         assert_eq!(
-            source_state_owned_allocation_bound(minimum).unwrap()
-                - source_state_owned_allocation_bound(minimum_without_scratch).unwrap(),
-            SOURCE_STATE_JSON_SCRATCH_MIN_BYTES
+            source_state_owned_allocation_bound(encoded_length + 10, structure).unwrap()
+                - source_state_owned_allocation_bound(encoded_length, structure).unwrap(),
+            10 * SOURCE_STATE_JSON_PARSER_WORK_MULTIPLIER
         );
 
         assert!(matches!(
-            source_state_owned_allocation_bound(JsonStructure {
-                max_escaped_string_body_bytes: u64::MAX,
-                ..minimum
-            }),
+            source_state_owned_allocation_bound(u64::MAX, structure),
             Err(SourceStateError::SizeOverflow {
-                resource: "source state escaped string scratch"
+                resource: "source state JSON parser work"
             })
         ));
     }
@@ -2184,7 +2167,9 @@ mod source_state_tests {
         fs::write(temporary.path().join(SOURCE_STATE_FILE), &encoded).unwrap();
         let read_limit = u64::try_from(encoded.len()).unwrap() + 1;
         let structure = scan_json_structure(&encoded).unwrap();
-        let owned_allocation = source_state_owned_allocation_bound(structure).unwrap();
+        let owned_allocation =
+            source_state_owned_allocation_bound(u64::try_from(encoded.len()).unwrap(), structure)
+                .unwrap();
         let required = read_limit.checked_add(owned_allocation).unwrap();
         let load_limits = AssetLoadLimits {
             max_bytes: required - 1,
@@ -2203,7 +2188,7 @@ mod source_state_tests {
     }
 
     #[test]
-    fn source_state_precharges_escaped_string_scratch_before_deserializing() {
+    fn source_state_precharges_json_parser_work_before_deserializing() {
         let temporary = TempDir::new().unwrap();
         let workspace = WorkspaceId::from_u128(0x58).unwrap();
         let revision = WorkspaceRevision::new(digest("escaped string"));
@@ -2215,14 +2200,18 @@ mod source_state_tests {
 
         let read_limit = u64::try_from(encoded.len()).unwrap() + 1;
         let structure = scan_json_structure(&encoded).unwrap();
-        assert!(structure.max_escaped_string_body_bytes >= 16_386);
-        let old_owned_bound = source_state_owned_allocation_bound(JsonStructure {
-            max_escaped_string_body_bytes: 0,
-            ..structure
-        })
-        .unwrap();
+        let encoded_length = u64::try_from(encoded.len()).unwrap();
+        let owned_allocation =
+            source_state_owned_allocation_bound(encoded_length, structure).unwrap();
+        let parser_work = encoded_length
+            .checked_mul(SOURCE_STATE_JSON_PARSER_WORK_MULTIPLIER)
+            .and_then(|bytes| bytes.checked_add(SOURCE_STATE_JSON_PARSER_FIXED_WORK_BYTES))
+            .unwrap();
         let load_limits = AssetLoadLimits {
-            max_bytes: read_limit.checked_add(old_owned_bound).unwrap(),
+            max_bytes: read_limit
+                .checked_add(owned_allocation)
+                .and_then(|bytes| bytes.checked_sub(parser_work))
+                .unwrap(),
             ..AssetLoadLimits::default()
         };
         let mut budget = AssetLoadBudget::new(load_limits).unwrap();
@@ -2251,7 +2240,9 @@ mod source_state_tests {
 
         let read_limit = u64::try_from(encoded.len()).unwrap() + 1;
         let structure = scan_json_structure(&encoded).unwrap();
-        let owned_allocation = source_state_owned_allocation_bound(structure).unwrap();
+        let owned_allocation =
+            source_state_owned_allocation_bound(u64::try_from(encoded.len()).unwrap(), structure)
+                .unwrap();
         let load_limits = AssetLoadLimits {
             max_bytes: read_limit.checked_add(owned_allocation).unwrap() - 1,
             ..AssetLoadLimits::default()
@@ -2275,6 +2266,109 @@ mod source_state_tests {
             read_source_state_snapshot(temporary.path(), &mut sufficient_budget, limits),
             Err(GenerationStoreError::SourceState { source, .. })
                 if matches!(source.as_ref(), SourceStateError::Json(_))
+        ));
+    }
+
+    #[test]
+    fn default_budget_loads_forty_thousand_minimal_filesystem_sources() {
+        const SOURCE_COUNT: usize = 40_000;
+
+        let temporary = TempDir::new().unwrap();
+        let workspace = WorkspaceId::from_u128(0x58_01).unwrap();
+        let revision = WorkspaceRevision::new(digest("large source state"));
+        #[cfg(windows)]
+        let root = PathBuf::from(r"C:\Project");
+        #[cfg(not(windows))]
+        let root = PathBuf::from("/Project");
+        let space = ProjectPathSpace::new(root, ProjectId::from_bytes([0x58; 32])).unwrap();
+        let mut scan_hints = Vec::with_capacity(SOURCE_COUNT);
+        let mut assets = Vec::with_capacity(SOURCE_COUNT);
+
+        for ordinal in 0..SOURCE_COUNT {
+            let relative_path = format!("Assets/{ordinal:05}.asset");
+            let coordinate = IndexedSourceCoordinate::project(
+                space
+                    .resolve(PathBuf::from(&relative_path).as_path())
+                    .unwrap()
+                    .unwrap()
+                    .identity(),
+            );
+            scan_hints.push(
+                SourceScanHint::new(
+                    coordinate,
+                    relative_path.clone(),
+                    ordinal as u64,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap(),
+            );
+            assets.push(AssetAnalysis::new(
+                AnalyzedSource {
+                    coordinate,
+                    relative_path,
+                    content_digest: DigestV1::hash_bytes(&(ordinal as u64).to_le_bytes()),
+                    length: ordinal as u64,
+                    search_kind: SearchKind::Asset,
+                    guid: None,
+                    workspace_source: None,
+                    workspace_fingerprint: None,
+                    locator: None,
+                },
+                SearchFacts::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                true,
+            ));
+        }
+
+        let snapshot = SourceStateSnapshot::new(workspace, revision, scan_hints, assets).unwrap();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let structure = scan_json_structure(&encoded).unwrap();
+        assert!(structure.object_members > AssetLoadLimits::default().max_members);
+        fs::write(temporary.path().join(SOURCE_STATE_FILE), encoded).unwrap();
+
+        let mut budget = AssetLoadBudget::default();
+        let loaded =
+            read_source_state_snapshot(temporary.path(), &mut budget, SourceStateLimits::default())
+                .unwrap();
+
+        assert_eq!(loaded.scan_hints().len(), SOURCE_COUNT);
+        assert_eq!(loaded.assets().len(), SOURCE_COUNT);
+        assert_eq!(loaded.logical_digest(), snapshot.logical_digest());
+        assert_eq!(budget.usage().members, structure.max_object_members);
+        assert!(budget.usage().members < structure.object_members);
+    }
+
+    #[test]
+    fn source_state_contract_bounds_total_wire_members_independently() {
+        let temporary = TempDir::new().unwrap();
+        let workspace = WorkspaceId::from_u128(0x58_02).unwrap();
+        let revision = WorkspaceRevision::new(digest("structural member limit"));
+        let snapshot = source_state(workspace, revision);
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let structure = scan_json_structure(&encoded).unwrap();
+        fs::write(temporary.path().join(SOURCE_STATE_FILE), encoded).unwrap();
+        let limits = SourceStateLimits {
+            max_structural_members: structure.object_members - 1,
+            ..SourceStateLimits::default()
+        };
+
+        assert!(matches!(
+            read_source_state_snapshot(
+                temporary.path(),
+                &mut AssetLoadBudget::default(),
+                limits,
+            ),
+            Err(GenerationStoreError::SourceState { source, .. })
+                if matches!(
+                    source.as_ref(),
+                    SourceStateError::JsonStructureMembersExceeded { actual, maximum }
+                        if *actual == structure.object_members
+                            && *maximum == structure.object_members - 1
+                )
         ));
     }
 
