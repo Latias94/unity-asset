@@ -1,14 +1,19 @@
 use std::fmt;
+use std::io::{self, Write};
+use std::mem::size_of;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
-use unity_asset::{AssetLoadBudget, ChangeSet, DigestV1, WorkspaceId, WorkspaceRevision};
+use unity_asset::{
+    AssetLoadBudget, ChangeSet, DigestV1, SourceId, TransactionId, WorkspaceId, WorkspaceRevision,
+};
+use unity_asset_core::{string_allocation_bytes, vec_allocation_bytes};
 use unity_asset_search_core::SearchRequest;
 use unity_asset_search_protocol::{
     GenerationMaintenanceState, GenerationMaintenanceStatus, MAX_REINDEX_PUBLISH_WARNINGS,
     ReferenceRequest, ReferencesResponse, ReindexEvidence, SearchResponse, SuggestResponse,
 };
 
-use crate::analysis::AssetAnalysisBatch;
+use crate::analysis::{AnalysisMetrics, AssetAnalysis, AssetAnalysisBatch};
 use crate::config::{IndexPaths, SearchIndexOptions};
 use crate::generation::{
     GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp,
@@ -22,6 +27,7 @@ use crate::generation_store::{
     GenerationSnapshot, GenerationStore, GenerationStoreError, GenerationStoreOptions,
     SourceScanHint, SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
 };
+use crate::path_semantics::compare_portable_paths;
 use crate::pipeline::PipelineError;
 use crate::projection::{
     GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
@@ -32,8 +38,9 @@ use crate::reference_query::{
     ReferenceQueryCompleteness, ReferenceQueryCompletenessError, ReferenceQueryEngine,
     ReferenceQueryError, ReferenceQuerySnapshot,
 };
-use crate::scan::{ProjectScanner, ScanValidation};
+use crate::scan::{ProjectScanner, ProjectSourcePath, ScanValidation};
 use crate::semantics::{AnalysisCacheIdentityV1, SearchSemantics};
+use crate::source_coordinate::IndexedSourceCoordinate;
 use crate::store::{ProjectionReaders, ProjectionStore, is_rebuildable_projection_schema_version};
 
 #[derive(Clone)]
@@ -525,23 +532,180 @@ impl<'paths> GenerationAuthorityConfig<'paths> {
     }
 }
 
-pub(crate) struct GenerationReuseView<'authority> {
-    source_state: Option<&'authority SourceStateSnapshot>,
-    analysis_reusable: bool,
-    incrementally_compatible: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FilesystemReusePolicy {
+    pub(crate) force_full_scan: bool,
+    pub(crate) force_full_analysis: bool,
 }
 
-impl<'authority> GenerationReuseView<'authority> {
-    pub(crate) const fn source_state(&self) -> Option<&'authority SourceStateSnapshot> {
-        self.source_state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceChangeAdmission {
+    Apply,
+    AlreadyApplied,
+    ObserveCurrent,
+}
+
+pub(crate) enum SourceScanHintUpdate {
+    Delete(IndexedSourceCoordinate),
+    Upsert(SourceScanHint),
+}
+
+impl SourceScanHintUpdate {
+    const fn coordinate(&self) -> IndexedSourceCoordinate {
+        match self {
+            Self::Delete(coordinate) => *coordinate,
+            Self::Upsert(hint) => hint.coordinate,
+        }
+    }
+}
+
+enum GenerationReuse {
+    Fresh,
+    Incremental(SourceStateSnapshot),
+    FullWithReusableAnalysis(SourceStateSnapshot),
+    FullWithDiscardedAnalysis(Option<SourceStateSnapshot>),
+    FullWithoutBaseline,
+}
+
+impl GenerationReuse {
+    fn classify(
+        source_state: Option<SourceStateSnapshot>,
+        analysis_reusable: bool,
+        incrementally_compatible: bool,
+    ) -> Result<Self, PipelineError> {
+        match (source_state, analysis_reusable, incrementally_compatible) {
+            (Some(state), true, true) => Ok(Self::Incremental(state)),
+            (None, true, true) => Ok(Self::Fresh),
+            (Some(state), true, false) => Ok(Self::FullWithReusableAnalysis(state)),
+            (state, false, false) => Ok(Self::FullWithDiscardedAnalysis(state)),
+            (None, true, false) => Ok(Self::FullWithoutBaseline),
+            (Some(_), false, true) | (None, false, true) => Err(PipelineError::Invariant(
+                "incremental generation cannot discard its analysis baseline",
+            )),
+        }
     }
 
-    pub(crate) const fn analysis_reusable(&self) -> bool {
-        self.analysis_reusable
+    const fn source_state(&self) -> Option<&SourceStateSnapshot> {
+        match self {
+            Self::Incremental(state)
+            | Self::FullWithReusableAnalysis(state)
+            | Self::FullWithDiscardedAnalysis(Some(state)) => Some(state),
+            Self::Fresh | Self::FullWithDiscardedAnalysis(None) | Self::FullWithoutBaseline => None,
+        }
     }
 
-    pub(crate) const fn incrementally_compatible(&self) -> bool {
-        self.incrementally_compatible
+    fn reusable_assets(&self) -> &[crate::analysis::AssetAnalysis] {
+        match self {
+            Self::Incremental(state) | Self::FullWithReusableAnalysis(state) => state.assets(),
+            Self::Fresh | Self::FullWithDiscardedAnalysis(_) | Self::FullWithoutBaseline => &[],
+        }
+    }
+
+    fn scan_hints(&self) -> &[SourceScanHint] {
+        self.source_state()
+            .map_or(&[], SourceStateSnapshot::scan_hints)
+    }
+
+    const fn incrementally_compatible(&self) -> bool {
+        matches!(self, Self::Fresh | Self::Incremental(_))
+    }
+
+    const fn analysis_reusable(&self) -> bool {
+        !matches!(self, Self::FullWithDiscardedAnalysis(_))
+    }
+}
+
+struct ReusableAnalysisEntry {
+    coordinate: IndexedSourceCoordinate,
+    analysis: Option<AssetAnalysis>,
+}
+
+pub(crate) struct ReusableAnalysisCache {
+    entries: Vec<ReusableAnalysisEntry>,
+    workspace_roots: Vec<(SourceId, usize)>,
+}
+
+impl ReusableAnalysisCache {
+    fn empty() -> Self {
+        Self {
+            entries: Vec::new(),
+            workspace_roots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn get(&self, coordinate: IndexedSourceCoordinate) -> Option<&AssetAnalysis> {
+        let index = self
+            .entries
+            .binary_search_by_key(&coordinate, |entry| entry.coordinate)
+            .ok()?;
+        self.entries[index].analysis.as_ref()
+    }
+
+    pub(crate) fn contains_key(&self, coordinate: IndexedSourceCoordinate) -> bool {
+        self.get(coordinate).is_some()
+    }
+
+    pub(crate) fn take(&mut self, coordinate: IndexedSourceCoordinate) -> Option<AssetAnalysis> {
+        let index = self
+            .entries
+            .binary_search_by_key(&coordinate, |entry| entry.coordinate)
+            .ok()?;
+        self.entries[index].analysis.take()
+    }
+
+    pub(crate) fn remove(&mut self, coordinate: IndexedSourceCoordinate) {
+        let _ = self.take(coordinate);
+    }
+
+    pub(crate) fn take_workspace_root(&mut self, root: SourceId) -> Option<AssetAnalysis> {
+        let index = self
+            .workspace_roots
+            .binary_search_by_key(&root, |(candidate, _)| *candidate)
+            .ok()
+            .map(|index| self.workspace_roots[index].1)?;
+        self.entries[index].analysis.take()
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &AssetAnalysis> {
+        self.entries
+            .iter()
+            .filter_map(|entry| entry.analysis.as_ref())
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (IndexedSourceCoordinate, &AssetAnalysis)> {
+        self.entries.iter().filter_map(|entry| {
+            entry
+                .analysis
+                .as_ref()
+                .map(|analysis| (entry.coordinate, analysis))
+        })
+    }
+
+    pub(crate) fn retain(
+        &mut self,
+        mut predicate: impl FnMut(IndexedSourceCoordinate, &AssetAnalysis) -> bool,
+    ) {
+        for entry in &mut self.entries {
+            let retain = entry
+                .analysis
+                .as_ref()
+                .is_none_or(|analysis| predicate(entry.coordinate, analysis));
+            if !retain {
+                let _ = entry.analysis.take();
+            }
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.values().count()
+    }
+
+    pub(crate) fn into_remaining(
+        self,
+    ) -> impl Iterator<Item = (IndexedSourceCoordinate, AssetAnalysis)> {
+        self.entries
+            .into_iter()
+            .filter_map(|entry| entry.analysis.map(|analysis| (entry.coordinate, analysis)))
     }
 }
 
@@ -553,37 +717,68 @@ pub(crate) struct GenerationPublicationInput {
 }
 
 impl GenerationPublicationInput {
-    pub(crate) fn workspace(
-        batch: AssetAnalysisBatch,
-        scan_hints: Vec<SourceScanHint>,
-        transaction_receipts: TransactionReceiptWindow,
+    pub(crate) fn asset_count(&self) -> usize {
+        self.batch.assets.len()
+    }
+}
+
+pub(crate) struct GenerationCandidate {
+    workspace: WorkspaceId,
+    revision: WorkspaceRevision,
+    assets: Vec<AssetAnalysis>,
+    metrics: AnalysisMetrics,
+    scan_hints: CandidateScanHints,
+}
+
+impl GenerationCandidate {
+    pub(crate) fn filesystem(
+        workspace: WorkspaceId,
+        revision: WorkspaceRevision,
+        assets: Vec<AssetAnalysis>,
+        metrics: AnalysisMetrics,
+        scan_hint_updates: Vec<SourceScanHintUpdate>,
     ) -> Self {
         Self {
-            batch,
-            scan_hints,
-            transaction_receipts,
-            observation: PublicationObservation::Workspace,
+            workspace,
+            revision,
+            assets,
+            metrics,
+            scan_hints: CandidateScanHints::Updates(scan_hint_updates),
         }
     }
 
-    pub(crate) fn filesystem(
-        batch: AssetAnalysisBatch,
-        scan_hints: Vec<SourceScanHint>,
-        transaction_receipts: TransactionReceiptWindow,
-        validation: ScanValidation,
+    pub(crate) fn workspace(
+        workspace: WorkspaceId,
+        revision: WorkspaceRevision,
+        assets: Vec<AssetAnalysis>,
+        metrics: AnalysisMetrics,
+        scan_hint_replacements: Vec<SourceScanHint>,
     ) -> Self {
         Self {
-            batch,
-            scan_hints,
-            transaction_receipts,
-            observation: PublicationObservation::Filesystem(validation),
+            workspace,
+            revision,
+            assets,
+            metrics,
+            scan_hints: CandidateScanHints::Replacements(scan_hint_replacements),
         }
     }
+}
+
+enum CandidateScanHints {
+    Preserve,
+    Updates(Vec<SourceScanHintUpdate>),
+    Replacements(Vec<SourceScanHint>),
 }
 
 enum PublicationObservation {
     Workspace,
     Filesystem(ScanValidation),
+}
+
+#[derive(Clone, Copy)]
+enum ScanHintRetention {
+    All,
+    IndexedAssetsOnly,
 }
 
 impl PublicationObservation {
@@ -614,10 +809,8 @@ pub(crate) struct SearchGenerationAuthority {
     semantics: SearchSemantics,
     analysis_cache_identity: AnalysisCacheIdentityV1,
     store: GenerationStore,
-    source_state: Option<SourceStateSnapshot>,
+    reuse: GenerationReuse,
     active: ActiveGenerationAuthority,
-    analysis_reusable: bool,
-    incrementally_compatible: bool,
     rebuild_bootstrap: Option<GenerationRebuildBootstrap>,
     maintenance: GenerationMaintenanceStatus,
     pending_warnings: Vec<String>,
@@ -634,8 +827,11 @@ impl fmt::Debug for SearchGenerationAuthority {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SearchGenerationAuthority")
-            .field("analysis_reusable", &self.analysis_reusable)
-            .field("incrementally_compatible", &self.incrementally_compatible)
+            .field("analysis_reusable", &self.reuse.analysis_reusable())
+            .field(
+                "incrementally_compatible",
+                &self.reuse.incrementally_compatible(),
+            )
             .field(
                 "active_generation",
                 &self
@@ -807,16 +1003,16 @@ impl SearchGenerationAuthority {
                 ));
             }
         };
+        let reuse =
+            GenerationReuse::classify(source_state, analysis_reusable, incrementally_compatible)?;
         Ok(Self {
             options: config.options,
             options_digest: config.options_digest,
             semantics: config.semantics,
             analysis_cache_identity: config.analysis_cache_identity,
             store,
-            source_state,
+            reuse,
             active: ActiveGenerationAuthority::new(active),
-            analysis_reusable,
-            incrementally_compatible,
             rebuild_bootstrap,
             maintenance,
             pending_warnings: Vec::new(),
@@ -831,8 +1027,8 @@ impl SearchGenerationAuthority {
     }
 
     pub(crate) fn workspace_id_hint(&self) -> Option<WorkspaceId> {
-        self.source_state
-            .as_ref()
+        self.reuse
+            .source_state()
             .map(SourceStateSnapshot::workspace)
             .or_else(|| {
                 self.store
@@ -858,15 +1054,85 @@ impl SearchGenerationAuthority {
         self.maintenance.clone()
     }
 
-    pub(crate) const fn reuse_view(&self) -> GenerationReuseView<'_> {
-        GenerationReuseView {
-            source_state: self.source_state.as_ref(),
-            analysis_reusable: self.analysis_reusable,
-            incrementally_compatible: self.incrementally_compatible,
+    pub(crate) const fn filesystem_reuse_policy(
+        &self,
+        workspace_hydrated: bool,
+    ) -> FilesystemReusePolicy {
+        FilesystemReusePolicy {
+            force_full_scan: !workspace_hydrated || !self.reuse.incrementally_compatible(),
+            force_full_analysis: !self.reuse.analysis_reusable(),
         }
     }
 
-    pub(crate) fn transaction_receipts(&self) -> Option<&TransactionReceiptWindow> {
+    pub(crate) fn reusable_analysis_cache(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ReusableAnalysisCache, PipelineError> {
+        clone_reusable_analysis_cache(self.reuse.reusable_assets(), budget)
+    }
+
+    pub(crate) fn known_project_paths(
+        &self,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<ProjectSourcePath>, PipelineError> {
+        clone_known_project_paths(
+            self.reuse
+                .source_state()
+                .map_or(&[], SourceStateSnapshot::assets),
+            budget,
+        )
+    }
+
+    fn indexed_workspace_revision(&self) -> Option<(WorkspaceId, WorkspaceRevision)> {
+        self.reuse
+            .source_state()
+            .map(|state| (state.workspace(), state.revision()))
+    }
+
+    pub(crate) fn admit_workspace_change(
+        &mut self,
+        changes: &ChangeSet,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<WorkspaceChangeAdmission, PipelineError> {
+        if !self.reuse.incrementally_compatible() {
+            return Err(PipelineError::FilesystemReindexRequired);
+        }
+        let Some((workspace, revision)) = self.indexed_workspace_revision() else {
+            return Ok(WorkspaceChangeAdmission::Apply);
+        };
+        if workspace != changes.workspace() {
+            return Err(PipelineError::WorkspaceMismatch {
+                expected: workspace,
+                actual: changes.workspace(),
+            });
+        }
+        match self.receipt_membership(changes, budget)? {
+            TransactionReceiptMembership::Exact => {
+                return Ok(WorkspaceChangeAdmission::AlreadyApplied);
+            }
+            TransactionReceiptMembership::Conflict => {
+                return Err(PipelineError::TransactionConflict {
+                    transaction: changes.transaction(),
+                });
+            }
+            TransactionReceiptMembership::Absent => {}
+        }
+        if revision != changes.from_revision() && revision != changes.to_revision() {
+            return Err(PipelineError::RevisionBarrierMismatch {
+                indexed: revision,
+                change_from: changes.from_revision(),
+                change_to: changes.to_revision(),
+            });
+        }
+        if revision == changes.to_revision() {
+            Ok(WorkspaceChangeAdmission::ObserveCurrent)
+        } else {
+            self.observe_desired_revision(changes.to_revision(), budget)?;
+            Ok(WorkspaceChangeAdmission::Apply)
+        }
+    }
+
+    fn transaction_receipts(&self) -> Option<&TransactionReceiptWindow> {
         self.store
             .active()
             .map(GenerationSnapshot::transaction_receipts)
@@ -878,7 +1144,7 @@ impl SearchGenerationAuthority {
             .is_some_and(|active| active.manifest().revision() == revision)
     }
 
-    pub(crate) fn receipt_membership(
+    fn receipt_membership(
         &self,
         changes: &ChangeSet,
         budget: &mut AssetLoadBudget,
@@ -891,10 +1157,7 @@ impl SearchGenerationAuthority {
             .membership(changes, budget)?)
     }
 
-    pub(crate) fn filesystem_transaction_receipts(
-        &self,
-        workspace: WorkspaceId,
-    ) -> TransactionReceiptWindow {
+    fn filesystem_transaction_receipts(&self, workspace: WorkspaceId) -> TransactionReceiptWindow {
         match self.store.active() {
             Some(active) if active.manifest().workspace() == workspace => {
                 active.transaction_receipts().clone()
@@ -912,6 +1175,132 @@ impl SearchGenerationAuthority {
             }
             Some(_) | None => TransactionReceiptWindow::empty(),
         }
+    }
+
+    pub(crate) fn prepare_observed_publication(
+        &self,
+        changes: &ChangeSet,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationPublicationInput, PipelineError> {
+        let (workspace, revision) =
+            self.indexed_workspace_revision()
+                .ok_or(PipelineError::Invariant(
+                    "observed transaction requires indexed source state",
+                ))?;
+        if workspace != changes.workspace() || revision != changes.to_revision() {
+            return Err(PipelineError::Invariant(
+                "observed transaction does not match indexed workspace revision",
+            ));
+        }
+        let receipts = self
+            .transaction_receipts()
+            .ok_or(PipelineError::Invariant(
+                "active generation disappeared during reconciled receipt update",
+            ))?
+            .after_reconciled_target(workspace, revision, changes, budget)?;
+        let assets = clone_reusable_analyses(self.reuse.reusable_assets(), budget)?;
+        let candidate = GenerationCandidate {
+            workspace,
+            revision,
+            assets,
+            metrics: AnalysisMetrics::default(),
+            scan_hints: CandidateScanHints::Preserve,
+        };
+        self.prepare_publication_input(
+            candidate,
+            receipts,
+            PublicationObservation::Workspace,
+            ScanHintRetention::All,
+            budget,
+        )
+    }
+
+    pub(crate) fn prepare_workspace_publication(
+        &self,
+        changes: &ChangeSet,
+        candidate: GenerationCandidate,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationPublicationInput, PipelineError> {
+        if candidate.workspace != changes.workspace() || candidate.revision != changes.to_revision()
+        {
+            return Err(PipelineError::Invariant(
+                "workspace publication candidate does not match its change set",
+            ));
+        }
+        let receipts = match (
+            self.indexed_workspace_revision(),
+            self.transaction_receipts(),
+        ) {
+            (Some((indexed_workspace, indexed_revision)), Some(receipts)) => {
+                receipts.after_change_set(indexed_workspace, indexed_revision, changes, budget)?
+            }
+            (None, None) => TransactionReceiptWindow::from_change_set(changes, budget)?,
+            _ => {
+                return Err(PipelineError::Invariant(
+                    "generation and source-state lifecycle diverged during receipt update",
+                ));
+            }
+        };
+        self.prepare_publication_input(
+            candidate,
+            receipts,
+            PublicationObservation::Workspace,
+            ScanHintRetention::IndexedAssetsOnly,
+            budget,
+        )
+    }
+
+    pub(crate) fn prepare_filesystem_publication(
+        &self,
+        candidate: GenerationCandidate,
+        validation: ScanValidation,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationPublicationInput, PipelineError> {
+        let receipts = self.filesystem_transaction_receipts(candidate.workspace);
+        self.prepare_publication_input(
+            candidate,
+            receipts,
+            PublicationObservation::Filesystem(validation),
+            ScanHintRetention::All,
+            budget,
+        )
+    }
+
+    fn prepare_publication_input(
+        &self,
+        candidate: GenerationCandidate,
+        transaction_receipts: TransactionReceiptWindow,
+        observation: PublicationObservation,
+        retention: ScanHintRetention,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<GenerationPublicationInput, PipelineError> {
+        let GenerationCandidate {
+            workspace,
+            revision,
+            assets,
+            metrics,
+            scan_hints,
+        } = candidate;
+        let mut scan_hints = match scan_hints {
+            CandidateScanHints::Preserve => clone_scan_hints(self.reuse.scan_hints(), budget)?,
+            CandidateScanHints::Updates(updates) => {
+                merge_scan_hint_updates(self.reuse.scan_hints(), updates, budget)?
+            }
+            CandidateScanHints::Replacements(replacements) => {
+                merge_scan_hint_replacements(self.reuse.scan_hints(), replacements, budget)?
+            }
+        };
+        let transactions = canonical_transaction_ids(&transaction_receipts, budget)?;
+        let batch = AssetAnalysisBatch::new(workspace, revision, transactions, assets, metrics);
+        if matches!(retention, ScanHintRetention::IndexedAssetsOnly) {
+            retain_scan_hints_for_assets(&mut scan_hints, &batch.assets);
+        }
+        Ok(GenerationPublicationInput {
+            batch,
+            scan_hints,
+            transaction_receipts,
+            observation,
+        })
     }
 
     pub(crate) fn ensure_operational(&mut self) -> Result<(), PipelineError> {
@@ -1042,15 +1431,15 @@ impl SearchGenerationAuthority {
             transaction_receipts,
             observation,
         } = input;
-        if self.incrementally_compatible
+        if self.reuse.incrementally_compatible()
             && self.store.active().is_some_and(|active| {
                 active
                     .transaction_receipts()
                     .matches_canonical_ids(&batch.transactions)
             })
             && self
-                .source_state
-                .as_ref()
+                .reuse
+                .source_state()
                 .is_some_and(|state| batch_matches_state(&batch, state))
         {
             if let Some(validation) = observation.filesystem_validation() {
@@ -1063,7 +1452,6 @@ impl SearchGenerationAuthority {
                     .validate_scan(validation)
                     .map_err(|error| PipelineError::Scan(Box::new(error)))?;
             }
-            self.incrementally_compatible = true;
             let active = self.active()?.ok_or(PipelineError::Invariant(
                 "unchanged generation is missing its public active authority",
             ))?;
@@ -1254,9 +1642,7 @@ impl SearchGenerationAuthority {
         drop(public_active);
         self.append_pending_warnings(publish_warnings);
         let warnings = self.take_pending_warnings();
-        self.source_state = Some(source_state);
-        self.analysis_reusable = true;
-        self.incrementally_compatible = true;
+        self.reuse = GenerationReuse::Incremental(source_state);
         self.rebuild_bootstrap = None;
 
         Ok(GenerationPublicationResult::Published {
@@ -1419,8 +1805,461 @@ impl SearchGenerationAuthority {
     }
 }
 
+fn clone_reusable_analysis_cache(
+    analyses: &[AssetAnalysis],
+    budget: &mut AssetLoadBudget,
+) -> Result<ReusableAnalysisCache, PipelineError> {
+    if analyses.is_empty() {
+        return Ok(ReusableAnalysisCache::empty());
+    }
+    for analysis in analyses {
+        charge_cached_analysis_clone(analysis, budget)?;
+    }
+    let mut entries = reserve_retained_vec(analyses.len(), "cached asset index", budget)?;
+    for analysis in analyses {
+        entries.push(ReusableAnalysisEntry {
+            coordinate: analysis.source.coordinate,
+            analysis: Some(analysis.clone()),
+        });
+    }
+    entries.sort_unstable_by_key(|entry| entry.coordinate);
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].coordinate == pair[1].coordinate)
+    {
+        return Err(PipelineError::Invariant(
+            "cached assets contain duplicate source coordinates",
+        ));
+    }
+
+    let workspace_root_count = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .analysis
+                .as_ref()
+                .and_then(|analysis| analysis.source.workspace_source)
+                .is_some()
+        })
+        .count();
+    let mut workspace_roots =
+        reserve_retained_vec(workspace_root_count, "cached workspace root index", budget)?;
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(root) = entry
+            .analysis
+            .as_ref()
+            .and_then(|analysis| analysis.source.workspace_source)
+        {
+            workspace_roots.push((root, index));
+        }
+    }
+    workspace_roots.sort_unstable_by_key(|(root, _)| *root);
+    if workspace_roots
+        .windows(2)
+        .any(|pair| pair[0].0 == pair[1].0)
+    {
+        return Err(PipelineError::Invariant(
+            "cached assets contain duplicate workspace roots",
+        ));
+    }
+    Ok(ReusableAnalysisCache {
+        entries,
+        workspace_roots,
+    })
+}
+
+fn clone_reusable_analyses(
+    analyses: &[AssetAnalysis],
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<AssetAnalysis>, PipelineError> {
+    for analysis in analyses {
+        charge_cached_analysis_clone(analysis, budget)?;
+    }
+    let mut cloned = reserve_retained_vec(analyses.len(), "observed transaction assets", budget)?;
+    cloned.extend(analyses.iter().cloned());
+    Ok(cloned)
+}
+
+fn clone_known_project_paths(
+    assets: &[AssetAnalysis],
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<ProjectSourcePath>, PipelineError> {
+    let project_path_count = assets
+        .iter()
+        .filter(|analysis| analysis.source.coordinate.project_path().is_some())
+        .count();
+    let mut known_paths =
+        reserve_retained_vec(project_path_count, "known source path index", budget)?;
+    for analysis in assets {
+        let Some(identity) = analysis.source.coordinate.project_path() else {
+            continue;
+        };
+        charge_retained_string(&analysis.source.relative_path, "known source path", budget)?;
+        let relative_path =
+            clone_precharged_string(&analysis.source.relative_path, "known source path")?;
+        known_paths.push(ProjectSourcePath::from_validated_parts(
+            identity,
+            relative_path,
+        ));
+    }
+    known_paths.sort_unstable_by(|left, right| {
+        compare_portable_paths(left.relative_path(), right.relative_path())
+            .then_with(|| left.identity().cmp(&right.identity()))
+    });
+    Ok(known_paths)
+}
+
+fn clone_scan_hints(
+    hints: &[SourceScanHint],
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<SourceScanHint>, PipelineError> {
+    let mut cloned = reserve_retained_vec(hints.len(), "source scan hints", budget)?;
+    for hint in hints {
+        push_cloned_scan_hint(&mut cloned, hint, budget)?;
+    }
+    Ok(cloned)
+}
+
+fn merge_scan_hint_updates(
+    previous: &[SourceScanHint],
+    mut updates: Vec<SourceScanHintUpdate>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<SourceScanHint>, PipelineError> {
+    updates.sort_unstable_by_key(SourceScanHintUpdate::coordinate);
+    if updates
+        .windows(2)
+        .any(|pair| pair[0].coordinate() == pair[1].coordinate())
+    {
+        return Err(PipelineError::Invariant(
+            "filesystem scan produced duplicate scan hint updates",
+        ));
+    }
+
+    let mut previous_index = 0;
+    let mut final_count = 0_usize;
+    for update in &updates {
+        let coordinate = update.coordinate();
+        while previous_index < previous.len() && previous[previous_index].coordinate < coordinate {
+            final_count = final_count
+                .checked_add(1)
+                .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
+            previous_index += 1;
+        }
+        if previous_index < previous.len() && previous[previous_index].coordinate == coordinate {
+            previous_index += 1;
+        }
+        if matches!(update, SourceScanHintUpdate::Upsert(_)) {
+            final_count = final_count
+                .checked_add(1)
+                .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
+        }
+    }
+    final_count = final_count
+        .checked_add(previous.len().saturating_sub(previous_index))
+        .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
+
+    let mut merged = reserve_retained_vec(final_count, "source scan hints", budget)?;
+    previous_index = 0;
+    for update in updates {
+        let coordinate = update.coordinate();
+        while previous_index < previous.len() && previous[previous_index].coordinate < coordinate {
+            push_cloned_scan_hint(&mut merged, &previous[previous_index], budget)?;
+            previous_index += 1;
+        }
+        if previous_index < previous.len() && previous[previous_index].coordinate == coordinate {
+            previous_index += 1;
+        }
+        if let SourceScanHintUpdate::Upsert(hint) = update {
+            merged.push(hint);
+        }
+    }
+    while previous_index < previous.len() {
+        push_cloned_scan_hint(&mut merged, &previous[previous_index], budget)?;
+        previous_index += 1;
+    }
+    debug_assert_eq!(merged.len(), final_count);
+    Ok(merged)
+}
+
+fn merge_scan_hint_replacements(
+    previous: &[SourceScanHint],
+    mut replacements: Vec<SourceScanHint>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<SourceScanHint>, PipelineError> {
+    replacements.sort_unstable_by_key(|hint| hint.coordinate);
+    if replacements
+        .windows(2)
+        .any(|pair| pair[0].coordinate == pair[1].coordinate)
+    {
+        return Err(PipelineError::Invariant(
+            "workspace reindex produced duplicate scan hint updates",
+        ));
+    }
+
+    let mut previous_index = 0;
+    let mut final_count = 0_usize;
+    for replacement in &replacements {
+        while previous_index < previous.len()
+            && previous[previous_index].coordinate < replacement.coordinate
+        {
+            final_count = final_count
+                .checked_add(1)
+                .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
+            previous_index += 1;
+        }
+        if previous_index < previous.len()
+            && previous[previous_index].coordinate == replacement.coordinate
+        {
+            previous_index += 1;
+        }
+        final_count = final_count
+            .checked_add(1)
+            .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
+    }
+    final_count = final_count
+        .checked_add(previous.len().saturating_sub(previous_index))
+        .ok_or(PipelineError::ArithmeticOverflow("source scan hint count"))?;
+
+    let mut merged = reserve_retained_vec(final_count, "source scan hints", budget)?;
+    previous_index = 0;
+    for replacement in replacements {
+        while previous_index < previous.len()
+            && previous[previous_index].coordinate < replacement.coordinate
+        {
+            push_cloned_scan_hint(&mut merged, &previous[previous_index], budget)?;
+            previous_index += 1;
+        }
+        if previous_index < previous.len()
+            && previous[previous_index].coordinate == replacement.coordinate
+        {
+            previous_index += 1;
+        }
+        merged.push(replacement);
+    }
+    while previous_index < previous.len() {
+        push_cloned_scan_hint(&mut merged, &previous[previous_index], budget)?;
+        previous_index += 1;
+    }
+    debug_assert_eq!(merged.len(), final_count);
+    Ok(merged)
+}
+
+fn push_cloned_scan_hint(
+    hints: &mut Vec<SourceScanHint>,
+    hint: &SourceScanHint,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), PipelineError> {
+    charge_retained_string(&hint.relative_path, "source scan hint path clone", budget)?;
+    hints.push(SourceScanHint {
+        coordinate: hint.coordinate,
+        relative_path: clone_precharged_string(&hint.relative_path, "source scan hint path clone")?,
+        source_length: hint.source_length,
+        source_modified_unix_ms: hint.source_modified_unix_ms,
+        metadata_length: hint.metadata_length,
+        metadata_modified_unix_ms: hint.metadata_modified_unix_ms,
+    });
+    Ok(())
+}
+
+fn charge_cached_analysis_clone(
+    analysis: &AssetAnalysis,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), PipelineError> {
+    let mut encoded = CountingWriter::default();
+    serde_json::to_writer(&mut encoded, analysis)?;
+    let clone_work = encoded
+        .bytes
+        .checked_mul(7)
+        .and_then(|bytes| bytes.checked_add(4 * 1024))
+        .ok_or(PipelineError::ArithmeticOverflow(
+            "cached analysis clone work",
+        ))?;
+    budget.consume_bytes(clone_work)?;
+    let entries = analysis
+        .references
+        .len()
+        .saturating_add(analysis.container_entries.len())
+        .saturating_add(analysis.diagnostics.len())
+        .saturating_add(analysis.truncations.len())
+        .saturating_add(analysis.search.hierarchy_paths.len())
+        .saturating_add(analysis.search.script_symbols.len())
+        .saturating_add(analysis.search.referenced_script_guids.len())
+        .saturating_add(analysis.graph_inputs.objects.len())
+        .saturating_add(1);
+    budget.consume_entries(
+        u64::try_from(entries)
+            .map_err(|_| PipelineError::ArithmeticOverflow("cached analysis clone entries"))?,
+    )?;
+    budget.consume_bytes(
+        u64::try_from(size_of::<AssetAnalysis>())
+            .map_err(|_| PipelineError::ArithmeticOverflow("cached analysis clone header"))?,
+    )?;
+    Ok(())
+}
+
+fn reserve_retained_vec<T>(
+    capacity: usize,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<T>, PipelineError> {
+    let members =
+        u64::try_from(capacity).map_err(|_| PipelineError::ArithmeticOverflow(resource))?;
+    let bytes = vec_allocation_bytes::<T>(capacity)
+        .map_err(|_| PipelineError::ArithmeticOverflow(resource))?;
+    budget.check_entries(members)?;
+    budget.check_members(members)?;
+    budget.check_bytes(bytes)?;
+    budget.consume_entries(members)?;
+    budget.consume_members(members)?;
+    budget.consume_bytes(bytes)?;
+
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|source| PipelineError::Allocation {
+            resource,
+            requested: capacity,
+            unit: "elements",
+            source,
+        })?;
+    Ok(values)
+}
+
+fn charge_retained_string(
+    value: &str,
+    resource: &'static str,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), PipelineError> {
+    let bytes = string_allocation_bytes(value.len())
+        .map_err(|_| PipelineError::ArithmeticOverflow(resource))?;
+    budget.check_bytes(bytes)?;
+    budget.consume_bytes(bytes)?;
+    Ok(())
+}
+
+fn clone_precharged_string(value: &str, resource: &'static str) -> Result<String, PipelineError> {
+    let mut cloned = String::new();
+    cloned
+        .try_reserve_exact(value.len())
+        .map_err(|source| PipelineError::Allocation {
+            resource,
+            requested: value.len(),
+            unit: "bytes",
+            source,
+        })?;
+    cloned.push_str(value);
+    Ok(cloned)
+}
+
+#[derive(Default)]
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let bytes = u64::try_from(buffer.len())
+            .map_err(|_| io::Error::other("encoded analysis length overflow"))?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes)
+            .ok_or_else(|| io::Error::other("encoded analysis length overflow"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn batch_matches_state(batch: &AssetAnalysisBatch, state: &SourceStateSnapshot) -> bool {
     batch.workspace == state.workspace()
         && batch.revision == state.revision()
         && batch.assets.as_slice() == state.assets()
+}
+
+fn retain_scan_hints_for_assets(
+    scan_hints: &mut Vec<SourceScanHint>,
+    sorted_assets: &[AssetAnalysis],
+) {
+    scan_hints.retain(|hint| {
+        sorted_assets
+            .binary_search_by_key(&hint.coordinate, |analysis| analysis.source.coordinate)
+            .is_ok()
+    });
+}
+
+fn canonical_transaction_ids(
+    receipts: &TransactionReceiptWindow,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<TransactionId>, PipelineError> {
+    let capacity = receipts.ids().len();
+    let mut transactions = reserve_retained_vec(capacity, "canonical transaction IDs", budget)?;
+    transactions.extend(receipts.ids());
+    transactions.sort_unstable();
+    Ok(transactions)
+}
+
+#[cfg(test)]
+mod tests {
+    use unity_asset::{SourceKind, WorkspaceId};
+    use unity_asset_search_core::SearchKind;
+
+    use super::*;
+    use crate::analysis::{AnalyzedSource, SearchFacts};
+
+    #[test]
+    fn workspace_candidate_retains_scan_hints_only_for_published_assets() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let first = test_analysis(workspace, 1);
+        let removed = test_analysis(workspace, 2);
+        let third = test_analysis(workspace, 3);
+        let expected = [first.source.coordinate, third.source.coordinate];
+        let mut hints = vec![
+            test_scan_hint(&first),
+            test_scan_hint(&removed),
+            test_scan_hint(&third),
+        ];
+
+        retain_scan_hints_for_assets(&mut hints, &[first, third]);
+
+        assert_eq!(
+            hints.iter().map(|hint| hint.coordinate).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
+    fn test_analysis(workspace: WorkspaceId, local: u128) -> AssetAnalysis {
+        let source = SourceId::new(workspace, SourceKind::Yaml, local).unwrap();
+        let relative_path = format!("Assets/{local}.asset");
+        AssetAnalysis::new(
+            AnalyzedSource {
+                coordinate: IndexedSourceCoordinate::workspace(source),
+                relative_path: relative_path.clone(),
+                content_digest: DigestV1::hash_bytes(relative_path.as_bytes()),
+                length: 1,
+                search_kind: SearchKind::Asset,
+                guid: None,
+                workspace_source: Some(source),
+                workspace_fingerprint: None,
+                locator: None,
+            },
+            SearchFacts::default(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        )
+    }
+
+    fn test_scan_hint(analysis: &AssetAnalysis) -> SourceScanHint {
+        SourceScanHint {
+            coordinate: analysis.source.coordinate,
+            relative_path: analysis.source.relative_path.clone(),
+            source_length: analysis.source.length,
+            source_modified_unix_ms: None,
+            metadata_length: None,
+            metadata_modified_unix_ms: None,
+        }
+    }
 }
