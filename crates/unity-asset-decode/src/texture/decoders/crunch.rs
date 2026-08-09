@@ -19,11 +19,10 @@ impl CrunchDecoder {
         texture: TextureDecodeInput<'_>,
         buffers: &mut TextureDecodeBuffers,
     ) -> Result<()> {
-        let width = texture.width();
-        let height = texture.height();
-
         #[cfg(feature = "texture-advanced")]
         {
+            let width = texture.width();
+            let height = texture.height();
             decode_word_output(
                 buffers,
                 "Crunch decompression",

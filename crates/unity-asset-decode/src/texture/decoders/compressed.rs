@@ -19,12 +19,11 @@ impl CompressedDecoder {
         texture: TextureDecodeInput<'_>,
         buffers: &mut TextureDecodeBuffers,
     ) -> Result<()> {
-        let width = texture.width();
-        let height = texture.height();
-
         #[cfg(feature = "texture-advanced")]
         {
             let data = texture.data();
+            let width = texture.width();
+            let height = texture.height();
             match texture.format() {
                 TextureFormat::DXT1 => decode_word_output(
                     buffers,
