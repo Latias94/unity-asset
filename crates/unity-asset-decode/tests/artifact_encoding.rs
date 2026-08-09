@@ -1,27 +1,45 @@
-#![cfg(all(feature = "audio", feature = "texture-advanced", feature = "sprite"))]
+#![cfg(feature = "audio")]
 
-use image::{GenericImageView, ImageFormat, RgbaImage};
-use std::io::{self, Cursor, Seek, SeekFrom, Write};
-use unity_asset_binary::BinaryError;
-use unity_asset_core::AssetLoadBudget;
-use unity_asset_decode::audio::{
-    AudioClip, AudioCompressionFormat, AudioExporter, AudioSourceError, DecodedAudio,
-    PreparedAudioSource, decode_audio_data,
+use indexmap::IndexMap;
+use unity_asset_binary::{
+    asset::{ObjectInfo, class_ids},
+    object::UnityObject,
 };
-use unity_asset_decode::media::BudgetedMediaBytes;
-use unity_asset_decode::sprite::{Sprite, SpriteProcessor};
-use unity_asset_decode::texture::{Texture2D, TextureDecoder, TextureExporter, TextureFormat};
-
-const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+use unity_asset_core::{AssetLoadBudget, UnityClass, UnityValue};
+use unity_asset_decode::audio::{
+    AudioClipLayout, AudioCompressionFormat, AudioSourceError, PreparedAudioSource,
+};
 const SHORT_VORBIS: &[u8] = include_bytes!("fixtures/short_vorbis.fsb");
 
 fn prepare_standard_source(
-    clip: &AudioClip,
+    format: AudioCompressionFormat,
     bytes: Vec<u8>,
 ) -> Result<PreparedAudioSource, AudioSourceError> {
+    let class = UnityClass::with_properties(
+        class_ids::AUDIO_CLIP,
+        "AudioClip".to_owned(),
+        "1".to_owned(),
+        IndexMap::from([
+            ("m_Name".to_owned(), UnityValue::String("Clip".to_owned())),
+            (
+                "m_CompressionFormat".to_owned(),
+                UnityValue::Integer(format as i64),
+            ),
+            ("m_SubsoundIndex".to_owned(), UnityValue::Integer(0)),
+            ("m_AudioData".to_owned(), UnityValue::Bytes(bytes)),
+        ]),
+    );
+    let info = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::AUDIO_CLIP).unwrap();
+    let object = UnityObject::from_info_and_class(info, class);
+    let layout = AudioClipLayout::inspect(&object).unwrap();
     let mut budget = AssetLoadBudget::default();
-    let source = BudgetedMediaBytes::from_vec(bytes, "test audio source", &mut budget)?;
-    AudioExporter::prepare_standard_source(clip, source, &mut budget)
+    let source = layout
+        .payload()
+        .embedded()
+        .expect("test AudioClip must select its embedded payload")
+        .materialize("test audio source", &mut budget)
+        .expect("default test budget must materialize the selected payload");
+    PreparedAudioSource::prepare(layout, source, &mut budget)
 }
 
 fn adts_frame(payload: &[u8], sampling_frequency_index: u8) -> Vec<u8> {
@@ -51,44 +69,9 @@ fn minimal_m4a() -> Vec<u8> {
 }
 
 #[test]
-fn audio_writers_encode_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    let audio = DecodedAudio::new(vec![-1.0, -0.25, 0.0, 0.5, 1.0, 0.125], 48_000, 2);
-
-    let mut wav_sink = Cursor::new(Vec::new());
-    AudioExporter::write_wav(&audio, &mut wav_sink)?;
-    let wav_bytes = wav_sink.into_inner();
-    assert_eq!(&wav_bytes[..4], b"RIFF");
-    assert_eq!(&wav_bytes[8..12], b"WAVE");
-
-    for bit_depth in [16, 32] {
-        let mut pcm_sink = Cursor::new(Vec::new());
-        AudioExporter::write_raw_pcm(&audio, &mut pcm_sink, bit_depth)?;
-        let bytes_per_sample = usize::from(bit_depth) / 8;
-        assert_eq!(
-            pcm_sink.into_inner().len(),
-            audio.samples.len() * bytes_per_sample
-        );
-    }
-
-    Ok(())
-}
-
-#[test]
-fn wav_rejects_incomplete_channel_frames_before_writing() {
-    let audio = DecodedAudio::new(vec![0.25], 48_000, 2);
-    let mut sink = Vec::new();
-
-    let error = AudioExporter::write_wav(&audio, &mut sink).unwrap_err();
-
-    assert!(matches!(error, BinaryError::InvalidData(_)));
-    assert!(sink.is_empty());
-}
-
-#[test]
 fn standard_audio_source_rejects_headerless_pcm_and_adpcm() {
     for format in [AudioCompressionFormat::PCM, AudioCompressionFormat::ADPCM] {
-        let clip = AudioClip::new("not-a-wave".into(), format);
-        let error = prepare_standard_source(&clip, vec![1, 2, 3, 4])
+        let error = prepare_standard_source(format, vec![1, 2, 3, 4])
             .err()
             .expect("headerless PCM-like bytes must not be published as WAV");
         assert!(matches!(error, AudioSourceError::InvalidData(_)));
@@ -113,8 +96,7 @@ fn standard_audio_source_rejects_header_only_containers() {
     ];
 
     for (format, bytes) in cases {
-        let clip = AudioClip::new("header-only".into(), format);
-        let Err(error) = prepare_standard_source(&clip, bytes.to_vec()) else {
+        let Err(error) = prepare_standard_source(format, bytes.to_vec()) else {
             panic!("a header without playable frames must be rejected");
         };
 
@@ -133,9 +115,7 @@ fn standard_audio_source_rejects_reserved_adts_sample_rates() {
             &[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C],
             sampling_frequency_index,
         );
-        let clip = AudioClip::new("reserved-adts-rate".into(), AudioCompressionFormat::AAC);
-
-        let result = prepare_standard_source(&clip, bytes);
+        let result = prepare_standard_source(AudioCompressionFormat::AAC, bytes);
 
         assert!(matches!(result, Err(AudioSourceError::InvalidData(_))));
     }
@@ -143,13 +123,12 @@ fn standard_audio_source_rejects_reserved_adts_sample_rates() {
 
 #[test]
 fn aac_passthrough_requires_complete_consistent_adts_framing() {
-    let clip = AudioClip::new("adts-framed".into(), AudioCompressionFormat::AAC);
     let payload = [0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C];
 
     let mut complete = adts_frame(&payload, 4);
     complete.extend_from_slice(&adts_frame(&payload, 4));
     let expected = complete.clone();
-    let prepared = prepare_standard_source(&clip, complete).unwrap();
+    let prepared = prepare_standard_source(AudioCompressionFormat::AAC, complete).unwrap();
     let mut output = Vec::new();
     prepared.write_to(&mut output).unwrap();
     assert_eq!(output, expected);
@@ -180,7 +159,7 @@ fn aac_passthrough_requires_complete_consistent_adts_framing() {
 
     for bytes in cases {
         assert!(matches!(
-            prepare_standard_source(&clip, bytes),
+            prepare_standard_source(AudioCompressionFormat::AAC, bytes),
             Err(AudioSourceError::InvalidData(_))
         ));
     }
@@ -188,9 +167,7 @@ fn aac_passthrough_requires_complete_consistent_adts_framing() {
 
 #[test]
 fn m4a_aac_is_an_unsupported_container_not_corrupt_aac() {
-    let clip = AudioClip::new("m4a".into(), AudioCompressionFormat::AAC);
-
-    let result = prepare_standard_source(&clip, minimal_m4a());
+    let result = prepare_standard_source(AudioCompressionFormat::AAC, minimal_m4a());
 
     assert!(matches!(
         result,
@@ -204,17 +181,14 @@ fn m4a_aac_is_an_unsupported_container_not_corrupt_aac() {
 #[test]
 fn standard_audio_source_rejects_adpcm_without_codec_extension() {
     let bytes = wave_fixture(0x11, 1, 8_000, 8_000, 4, 4, &[], &[0; 4]);
-    let clip = AudioClip::new("invalid-adpcm".into(), AudioCompressionFormat::ADPCM);
-
-    let result = prepare_standard_source(&clip, bytes.to_vec());
+    let result = prepare_standard_source(AudioCompressionFormat::ADPCM, bytes.to_vec());
 
     assert!(matches!(result, Err(AudioSourceError::InvalidData(_))));
 }
 
 #[test]
 fn standard_audio_source_accepts_complete_minimal_containers() {
-    let mut wav = Vec::new();
-    AudioExporter::write_wav(&DecodedAudio::new(vec![0.0], 8_000, 1), &mut wav).unwrap();
+    let wav = wave_fixture(1, 1, 8_000, 16_000, 2, 16, &[], &[0, 0]);
 
     let mut mp3 = vec![0_u8; 417];
     mp3[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
@@ -230,9 +204,8 @@ fn standard_audio_source_accepts_complete_minimal_containers() {
         (AudioCompressionFormat::MP3, mp3),
         (AudioCompressionFormat::AAC, aac),
     ] {
-        let clip = AudioClip::new("complete".into(), format);
         let expected = bytes.clone();
-        let prepared = prepare_standard_source(&clip, bytes).unwrap();
+        let prepared = prepare_standard_source(format, bytes).unwrap();
         let mut output = Vec::new();
         prepared.write_to(&mut output).unwrap();
         assert_eq!(output, expected);
@@ -271,13 +244,8 @@ fn wave_fixture(
 
 #[test]
 fn direct_ogg_requires_a_budgeted_setup_validator_before_passthrough() {
-    let clip = AudioClip::new("direct".into(), AudioCompressionFormat::Vorbis);
     let source = rebuilt_playable_ogg();
-    assert!(
-        decode_audio_data(AudioCompressionFormat::Vorbis, source.clone()).is_ok(),
-        "the direct Ogg fixture must be playable Vorbis"
-    );
-    let Err(error) = prepare_standard_source(&clip, source.clone()) else {
+    let Err(error) = prepare_standard_source(AudioCompressionFormat::Vorbis, source.clone()) else {
         panic!("direct Ogg passthrough must remain disabled without setup validation");
     };
     assert!(matches!(
@@ -290,7 +258,7 @@ fn direct_ogg_requires_a_budgeted_setup_validator_before_passthrough() {
 
     let mut corrupt = source;
     corrupt[22] ^= 0xff;
-    let Err(error) = prepare_standard_source(&clip, corrupt) else {
+    let Err(error) = prepare_standard_source(AudioCompressionFormat::Vorbis, corrupt) else {
         panic!("a corrupt Ogg checksum must not be published as a direct audio source");
     };
     assert!(matches!(error, AudioSourceError::InvalidData(_)));
@@ -298,9 +266,8 @@ fn direct_ogg_requires_a_budgeted_setup_validator_before_passthrough() {
 
 #[test]
 fn standard_audio_source_rejects_crc_correct_non_vorbis_ogg() {
-    let clip = AudioClip::new("not-vorbis".into(), AudioCompressionFormat::Vorbis);
     let source = crc_correct_non_vorbis_ogg();
-    let Err(error) = prepare_standard_source(&clip, source) else {
+    let Err(error) = prepare_standard_source(AudioCompressionFormat::Vorbis, source) else {
         panic!("a non-Vorbis Ogg container must not be accepted as direct audio");
     };
     assert!(matches!(
@@ -310,17 +277,6 @@ fn standard_audio_source_rejects_crc_correct_non_vorbis_ogg() {
             container: "Ogg Vorbis",
         }
     ));
-}
-
-#[test]
-fn rebuilt_fsb5_vorbis_decodes_to_its_declared_frame_count() {
-    let clip = AudioClip::new("short".into(), AudioCompressionFormat::Vorbis);
-    let prepared = prepare_standard_source(&clip, SHORT_VORBIS.to_vec()).unwrap();
-    let mut output = Vec::new();
-    prepared.write_to(&mut output).unwrap();
-
-    let decoded = decode_audio_data(AudioCompressionFormat::Vorbis, output).unwrap();
-    assert_eq!(decoded.frame_count(), 24_806);
 }
 
 #[test]
@@ -363,9 +319,8 @@ fn strict_fsb5_prepare_rejects_truncated_sections_and_damaged_lengths() {
         ("declared sample payload length", oversized_data),
     ];
 
-    let clip = AudioClip::new("invalid-fsb5".into(), AudioCompressionFormat::Vorbis);
     for (case, bytes) in cases {
-        let Err(error) = prepare_standard_source(&clip, bytes) else {
+        let Err(error) = prepare_standard_source(AudioCompressionFormat::Vorbis, bytes) else {
             panic!("{case} must fail strict FSB5 preparation");
         };
         assert!(
@@ -376,8 +331,8 @@ fn strict_fsb5_prepare_rejects_truncated_sections_and_damaged_lengths() {
 }
 
 fn rebuilt_playable_ogg() -> Vec<u8> {
-    let clip = AudioClip::new("short".into(), AudioCompressionFormat::Vorbis);
-    let prepared = prepare_standard_source(&clip, SHORT_VORBIS.to_vec()).unwrap();
+    let prepared =
+        prepare_standard_source(AudioCompressionFormat::Vorbis, SHORT_VORBIS.to_vec()).unwrap();
     let mut output = Vec::new();
     prepared.write_to(&mut output).unwrap();
     output
@@ -410,288 +365,4 @@ fn ogg_checksum(page: &[u8]) -> u32 {
         }
     }
     checksum
-}
-
-struct RejectingWriter;
-
-impl Write for RejectingWriter {
-    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-        Err(io::Error::other("fixture output failure"))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct RejectingSeekWriter;
-
-impl Write for RejectingSeekWriter {
-    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-        Err(io::Error::other("fixture output failure"))
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Seek for RejectingSeekWriter {
-    fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
-        Ok(0)
-    }
-}
-
-struct ThrottledWriter {
-    bytes: Vec<u8>,
-    max_write: usize,
-    fail_after: Option<usize>,
-    write_calls: usize,
-}
-
-impl ThrottledWriter {
-    fn new(max_write: usize) -> Self {
-        Self {
-            bytes: Vec::new(),
-            max_write,
-            fail_after: None,
-            write_calls: 0,
-        }
-    }
-
-    fn failing(max_write: usize, fail_after: usize) -> Self {
-        Self {
-            fail_after: Some(fail_after),
-            ..Self::new(max_write)
-        }
-    }
-}
-
-impl Write for ThrottledWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.is_empty() {
-            return Ok(0);
-        }
-        self.write_calls += 1;
-        std::thread::yield_now();
-
-        let remaining = self
-            .fail_after
-            .map_or(usize::MAX, |limit| limit.saturating_sub(self.bytes.len()));
-        if remaining == 0 {
-            return Err(io::Error::other("fixture output capacity exhausted"));
-        }
-
-        let written = bytes.len().min(self.max_write).min(remaining);
-        self.bytes.extend_from_slice(&bytes[..written]);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[test]
-fn texture_writers_encode_caller_owned_bytes() -> Result<(), Box<dyn std::error::Error>> {
-    let image = RgbaImage::from_raw(
-        2,
-        2,
-        vec![
-            255, 0, 0, 255, 0, 255, 0, 192, 0, 0, 255, 128, 255, 255, 255, 64,
-        ],
-    )
-    .expect("fixture dimensions must match its RGBA payload");
-
-    let mut png_sink = Cursor::new(Vec::new());
-    TextureExporter::write_png(&image, &mut png_sink)?;
-    let png_bytes = png_sink.into_inner();
-    assert_eq!(&png_bytes[..PNG_SIGNATURE.len()], PNG_SIGNATURE);
-    let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)?.to_rgba8();
-    assert_eq!(decoded.dimensions(), image.dimensions());
-    assert_eq!(decoded.as_raw(), image.as_raw());
-
-    let mut jpeg_sink = Cursor::new(Vec::new());
-    TextureExporter::write_jpeg(&image, &mut jpeg_sink, 90)?;
-    let jpeg_bytes = jpeg_sink.into_inner();
-    assert!(jpeg_bytes.starts_with(&[0xff, 0xd8]));
-    assert_eq!(
-        image::load_from_memory_with_format(&jpeg_bytes, ImageFormat::Jpeg)?.dimensions(),
-        image.dimensions()
-    );
-
-    let mut bmp_sink = Cursor::new(Vec::new());
-    TextureExporter::write_bmp(&image, &mut bmp_sink)?;
-    let bmp_bytes = bmp_sink.into_inner();
-    assert!(bmp_bytes.starts_with(b"BM"));
-    assert_eq!(
-        image::load_from_memory_with_format(&bmp_bytes, ImageFormat::Bmp)?.dimensions(),
-        image.dimensions()
-    );
-
-    let mut tiff_sink = Cursor::new(Vec::new());
-    TextureExporter::write_tiff(&image, &mut tiff_sink)?;
-    let tiff_bytes = tiff_sink.into_inner();
-    assert!(tiff_bytes.starts_with(b"II") || tiff_bytes.starts_with(b"MM"));
-    assert_eq!(
-        image::load_from_memory_with_format(&tiff_bytes, ImageFormat::Tiff)?.dimensions(),
-        image.dimensions()
-    );
-
-    Ok(())
-}
-
-#[test]
-fn texture_writers_reject_invalid_dimensions_before_writing() {
-    let empty = RgbaImage::new(0, 0);
-
-    for write in [
-        TextureExporter::write_png::<Vec<u8>>,
-        TextureExporter::write_bmp::<Vec<u8>>,
-    ] {
-        let mut sink = Vec::new();
-        assert!(matches!(
-            write(&empty, &mut sink),
-            Err(BinaryError::InvalidData(_))
-        ));
-        assert!(sink.is_empty());
-    }
-
-    let mut jpeg_sink = Vec::new();
-    assert!(matches!(
-        TextureExporter::write_jpeg(&empty, &mut jpeg_sink, 90),
-        Err(BinaryError::InvalidData(_))
-    ));
-    assert!(jpeg_sink.is_empty());
-
-    let mut tiff_sink = Cursor::new(Vec::new());
-    assert!(matches!(
-        TextureExporter::write_tiff(&empty, &mut tiff_sink),
-        Err(BinaryError::InvalidData(_))
-    ));
-    assert!(tiff_sink.into_inner().is_empty());
-
-    let too_wide = RgbaImage::new(u32::from(u16::MAX) + 1, 1);
-    let mut sink = Vec::new();
-    assert!(matches!(
-        TextureExporter::write_jpeg(&too_wide, &mut sink, 90),
-        Err(BinaryError::InvalidData(_))
-    ));
-    assert!(sink.is_empty());
-}
-
-#[test]
-fn texture_writers_preserve_caller_sink_errors() {
-    let image = RgbaImage::new(1, 1);
-
-    let error = TextureExporter::write_jpeg(&image, &mut RejectingWriter, 90).unwrap_err();
-    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
-
-    let error = TextureExporter::write_bmp(&image, &mut RejectingWriter).unwrap_err();
-    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
-
-    let error = TextureExporter::write_tiff(&image, &mut RejectingSeekWriter).unwrap_err();
-    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
-}
-
-#[test]
-fn sprite_png_writer_maps_unity_rects_to_top_left_pixels_once()
--> Result<(), Box<dyn std::error::Error>> {
-    let texture = Texture2D {
-        width: 2,
-        height: 2,
-        format: TextureFormat::RGBA32,
-        image_data: vec![
-            255, 0, 0, 255, 0, 255, 0, 192, 0, 0, 255, 128, 255, 255, 255, 64,
-        ],
-        ..Default::default()
-    };
-    let sprite = Sprite {
-        rect_width: 2.0,
-        rect_height: 1.0,
-        ..Default::default()
-    };
-    let processor = SpriteProcessor::new();
-
-    let mut png_sink = Cursor::new(Vec::new());
-    processor.write_sprite_png(&sprite, &texture, &mut png_sink)?;
-    let png_bytes = png_sink.into_inner();
-
-    assert_eq!(&png_bytes[..PNG_SIGNATURE.len()], PNG_SIGNATURE);
-    let decoded = image::load_from_memory_with_format(&png_bytes, ImageFormat::Png)?.to_rgba8();
-    assert_eq!(decoded.dimensions(), (2, 1));
-    assert_eq!(decoded.as_raw(), &[255, 0, 0, 255, 0, 255, 0, 192]);
-
-    let top_sprite = Sprite {
-        rect_y: 1.0,
-        rect_width: 2.0,
-        rect_height: 1.0,
-        ..Default::default()
-    };
-    let mut top_png_sink = Cursor::new(Vec::new());
-    processor.write_sprite_png(&top_sprite, &texture, &mut top_png_sink)?;
-    let top = image::load_from_memory_with_format(&top_png_sink.into_inner(), ImageFormat::Png)?
-        .to_rgba8();
-    assert_eq!(top.as_raw(), &[0, 0, 255, 128, 255, 255, 255, 64]);
-    Ok(())
-}
-
-#[test]
-fn codecs_bound_write_calls_and_propagate_partial_sink_failures() {
-    let samples = (0..16_384)
-        .map(|index| (index % 257) as f32 / 128.0 - 1.0)
-        .collect();
-    let audio = DecodedAudio::new(samples, 48_000, 2);
-
-    let mut wav_sink = ThrottledWriter::new(257);
-    AudioExporter::write_wav(&audio, &mut wav_sink).unwrap();
-    assert_eq!(wav_sink.bytes.len(), 44 + audio.samples.len() * 2);
-    assert_eq!(&wav_sink.bytes[..4], b"RIFF");
-    assert!(
-        wav_sink.write_calls > 100,
-        "fixture must exercise partial writes"
-    );
-
-    let mut pcm_sink = ThrottledWriter::new(usize::MAX);
-    AudioExporter::write_raw_pcm(&audio, &mut pcm_sink, 16).unwrap();
-    assert_eq!(pcm_sink.bytes.len(), audio.samples.len() * 2);
-    assert!(
-        pcm_sink.write_calls <= 16,
-        "PCM encoding must batch samples instead of writing each one"
-    );
-
-    let image = RgbaImage::from_fn(128, 128, |x, y| {
-        image::Rgba([
-            x.wrapping_mul(17) as u8,
-            y.wrapping_mul(29) as u8,
-            x.wrapping_mul(y) as u8,
-            255,
-        ])
-    });
-    let mut png_sink = ThrottledWriter::new(257);
-    TextureExporter::write_png(&image, &mut png_sink).unwrap();
-    assert!(png_sink.bytes.starts_with(PNG_SIGNATURE));
-    assert!(
-        png_sink.write_calls > 1,
-        "fixture must exercise partial writes"
-    );
-
-    let mut failing_audio = ThrottledWriter::failing(257, 1_024);
-    let error = AudioExporter::write_wav(&audio, &mut failing_audio).unwrap_err();
-    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
-
-    let mut failing_texture = ThrottledWriter::failing(31, 64);
-    let error = TextureExporter::write_png(&image, &mut failing_texture).unwrap_err();
-    assert!(matches!(error, BinaryError::Io(source) if source.kind() == io::ErrorKind::Other));
-}
-
-#[test]
-fn astc_6x6_is_advertised_with_its_decoder_geometry() {
-    let format = TextureFormat::ASTC_RGBA_6x6;
-    let info = format.info();
-
-    assert!(info.supported);
-    assert_eq!(info.block_size, (6, 6));
-    assert_eq!(format.calculate_data_size(492, 180), 39_360);
-    assert!(TextureDecoder::new().can_decode(format));
 }

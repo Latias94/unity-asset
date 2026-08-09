@@ -54,17 +54,11 @@ not require another source-breaking release.
 | Legacy dependency/session graph types | `ReferenceGraph` |
 | Legacy export manifest and export sessions | `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` |
 | `ExtractionExecutor::execute_with_manifest` and separate resume/manifest arguments | Build one `ExtractionRunOptions` value with `with_resume` and/or `with_manifest_path`, then call `ExtractionExecutor::execute` |
-| `TextureExporter::export_*`, `export_auto`, `export_validated`, and texture `ExportOptions` | Open and buffer the destination in the application, then call the explicit `TextureExporter::write_png`, `write_jpeg`, `write_bmp`, or `write_tiff` encoder |
-| `AudioExporter::export_*`, `export_auto`, `export_validated`, `AudioFormat`, and audio `ExportOptions` | Open and buffer the destination in the application, then call `AudioExporter::write_wav`, `write_raw_pcm`, or `write_standard_source` |
-| `TextureExporter::supported_formats` / `is_format_supported` and `AudioExporter::supported_formats` / `is_format_supported` | The concrete `write_*` methods are the encoder capability surface; decoder support remains available from `TextureProcessor` and `AudioProcessor` |
-| `TextureExporter::create_filename` / `AudioExporter::create_filename` | Output naming belongs to the application, or to `ExtractionPlanner` when using the extraction pipeline |
-| `TextureExporter::validate_for_export` / `AudioExporter::validate_for_export` | Call the selected `write_*` method; each writer validates the exact dimensions, frame shape, container, and codec constraints it requires before publishing bytes |
-| `texture::export_image` / `audio::export_audio` | Call the corresponding explicit `TextureExporter::write_*` or `AudioExporter::write_*` encoder |
-| `TextureProcessor::process_and_export` / `AudioProcessor::process_and_export` | `process_and_write_png` with a `MediaInspectionContext` derived from the owning `SerializedFile` and a caller-owned writer / `process_and_write_wav` with a caller-owned writer |
-| `SpriteProcessor::extract_sprite_image` and `process_sprite_with_texture` | `render_sprite` for an `RgbaImage`, or `write_sprite_png` for a caller-owned writer |
-| `SpriteResult`, `SpriteParser`, and `SpriteProcessor::parse_sprite` | Use strict `SpriteLayout::inspect` for extraction metadata; the unversioned raw fallback parser was removed |
-| `SpriteManager`, `SpriteConfig`, `SpriteAtlas`/`SpriteInfo`, `SpriteStats`, `create_*_manager`, `ProcessingOptions`, and Sprite feature/validation/statistics helpers | Use `SpriteLayout` for inspection or `SpriteProcessor` for rendering caller-owned `Sprite` data; the library no longer advertises unimplemented atlas, transform, mesh, physics, caching, or parallel-processing capabilities |
-| `SpriteProcessor::new(version)` | Call `new()` without a version; the prior parameter was ignored and did not provide version-aware parsing |
+| `TextureProcessor`, `Texture2DConverter`, owned `Texture2D`, generic `TextureExporter`, and context-free texture decode helpers | Inspect with `Texture2DLayout::inspect`, resolve the selected payload through the owning workspace when it is streamed, then call `PreparedTexturePng::prepare` and `write_to`. Use `ExtractionPlanner` for the complete revision-bound workflow. |
+| `AudioProcessor`, `AudioClipConverter`, owned `AudioClip`/`DecodedAudio`, `AudioDecoder`, and PCM transcode helpers | Inspect with `AudioClipLayout::inspect`, resolve the selected payload through the owning workspace, then call `PreparedAudioSource::prepare` and `write_to`. Container support is reported by `PreparedAudioSource::supports`. |
+| `SpriteProcessor`, owned `Sprite` DTOs, `SpriteResult`, and raw Sprite parsers | Inspect the Sprite and referenced Texture2D with `SpriteLayout`/`Texture2DLayout`, then use `PreparedSpritePng`; `ExtractionPlanner` owns dependency resolution and publication. |
+| Generic JPEG/BMP/TIFF conversion, channel swizzling, and arbitrary decoded-audio export | Use dedicated image/audio crates in application code after establishing the required provenance. `unity-asset-decode` now exposes only deterministic Unity representation preparation. |
+| Legacy media filename and destination helpers | Output naming belongs to the application, or to `ExtractionPlanner` for revision-bound extraction. |
 
 ## Loading Sources
 

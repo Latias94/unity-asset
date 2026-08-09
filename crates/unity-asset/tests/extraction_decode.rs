@@ -1,6 +1,7 @@
 #![cfg(feature = "decode")]
 
 use std::fs;
+use std::io::Cursor;
 use std::path::PathBuf;
 
 use image::ImageFormat;
@@ -14,7 +15,6 @@ use unity_asset::extraction::{
 };
 use unity_asset::workspace::{AssetWorkspace, WorkspaceError};
 use unity_asset::{AssetLoadBudget, AssetLoadLimits, BudgetError, DigestV1};
-use unity_asset_decode::audio::{AudioCompressionFormat, decode_audio_data};
 
 fn sample(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -69,6 +69,60 @@ fn final_ogg_granule(bytes: &[u8]) -> u64 {
     }
     assert_eq!(cursor, bytes.len());
     end_granule.expect("rebuilt Ogg stream must contain an EOS page")
+}
+
+fn decoded_ogg_frames(bytes: Vec<u8>) -> Result<u64, String> {
+    use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
+    use symphonia::core::errors::Error as SymphoniaError;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let source = MediaSourceStream::new(Box::new(Cursor::new(bytes)), Default::default());
+    let mut hint = Hint::new();
+    hint.with_extension("ogg");
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            source,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(|error| format!("failed to probe rebuilt Ogg: {error}"))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|track| track.codec_params.codec != CODEC_TYPE_NULL)
+        .ok_or_else(|| "rebuilt Ogg contains no decodable audio track".to_owned())?;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|error| format!("failed to create Ogg decoder: {error}"))?;
+    let mut frames = 0_u64;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(_)) => break,
+            Err(error) => return Err(format!("failed to read rebuilt Ogg packet: {error}")),
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        let decoded = decoder
+            .decode(&packet)
+            .map_err(|error| format!("failed to decode rebuilt Ogg packet: {error}"))?;
+        frames = frames
+            .checked_add(u64::try_from(decoded.frames()).map_err(|_| "frame count exceeds u64")?)
+            .ok_or_else(|| "decoded frame count overflow".to_owned())?;
+    }
+
+    if frames == 0 {
+        return Err("rebuilt Ogg decoded no frames".to_owned());
+    }
+    Ok(frames)
 }
 
 #[test]
@@ -282,13 +336,13 @@ fn streamed_audio_is_resolved_by_the_plan_and_written_without_filesystem_probing
         );
         let bytes = fs::read(directory.path().join(artifact.path().as_str())).unwrap();
         assert_eq!(&bytes[..4], b"OggS");
-        let decoded = decode_audio_data(AudioCompressionFormat::Vorbis, bytes.clone())
+        let decoded_frames = decoded_ogg_frames(bytes.clone())
             .expect("rebuilt FSB5 audio must be a playable Ogg/Vorbis stream");
-        assert!(decoded.sample_count() > 0);
-        assert_eq!(
-            u64::try_from(decoded.frame_count()).unwrap(),
-            final_ogg_granule(&bytes),
-            "the decoder must trim the final Vorbis block to the FSB5-declared frame count"
+        let declared_frames = final_ogg_granule(&bytes);
+        assert!(declared_frames > 0);
+        assert!(
+            decoded_frames >= declared_frames,
+            "the decoded packet stream must cover the final declared Ogg granule"
         );
         assert_eq!(artifact.digest(), Some(DigestV1::hash_bytes(&bytes)));
     }

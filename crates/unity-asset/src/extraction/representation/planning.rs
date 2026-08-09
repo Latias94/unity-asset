@@ -6,7 +6,7 @@ use unity_asset_core::RevisionedObjectHandle;
 use unity_asset_core::{AssetLoadBudget, ObjectAddress, SourceFingerprint};
 #[cfg(feature = "decode")]
 use unity_asset_decode::{
-    audio::{AudioClipLayout, AudioExporter, AudioSourceError},
+    audio::{AudioClipLayout, AudioSourceError, PreparedAudioSource},
     media::{BudgetedMediaBytes, EmbeddedMediaError, EmbeddedMediaRef, MediaInspectionError},
     sprite::{PreparedSpritePng, SpriteLayout, SpritePreparationError},
     texture::{PreparedTexturePng, Texture2DLayout, TexturePreparationError},
@@ -178,7 +178,7 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                     return unavailable_choice_with(address, self.policy, raw, reason, budget);
                 }
             };
-        if !AudioExporter::supports_standard_source(layout.compression_format()) {
+        if !PreparedAudioSource::supports(layout.compression_format()) {
             return unavailable_choice_with(
                 address,
                 self.policy,
@@ -208,7 +208,7 @@ impl<'view, 'source> RepresentationPlanner<'view, 'source> {
                 )?,
             )
         };
-        let prepared = match AudioExporter::prepare_layout(layout, bytes, budget) {
+        let prepared = match PreparedAudioSource::prepare(layout, bytes, budget) {
             Ok(prepared) => prepared,
             Err(AudioSourceError::Budget(error)) => return Err(error.into()),
             Err(AudioSourceError::Allocation {

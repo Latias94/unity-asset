@@ -9,7 +9,6 @@ use thiserror::Error;
 use unity_asset_core::{AssetLoadBudget, BudgetError};
 
 use super::decoders::{TextureDecodeFailure, TextureDecoder};
-use super::helpers::TextureSwizzler;
 use super::inspection::{Texture2DLayout, TextureStorageLayout};
 use crate::descriptor::{
     MediaDescriptor, MediaDescriptorError, MediaDimensions, MediaOutputEstimate,
@@ -100,7 +99,7 @@ impl PreparedTextureImage {
                 budget,
             )
             .map_err(map_decode_failure)?;
-        TextureSwizzler::normalize_top_left(&mut image);
+        normalize_top_left(&mut image);
 
         Ok(Self {
             source_length,
@@ -144,7 +143,7 @@ fn prepare_platform_source(
                 .map_err(|_| TexturePreparationError::LengthOverflow("Switch linear texture"))?;
             budget.consume_bytes(retained)?;
             linear.resize(requested, 0);
-            TextureSwizzler::deswizzle_switch_block_linear(
+            deswizzle_switch_block_linear(
                 &source,
                 &mut linear,
                 layout.width(),
@@ -157,6 +156,107 @@ fn prepare_platform_source(
             Ok(linear)
         }
     }
+}
+
+fn normalize_top_left(image: &mut RgbaImage) {
+    image::imageops::flip_vertical_in_place(image);
+}
+
+fn deswizzle_switch_block_linear(
+    source: &[u8],
+    output: &mut [u8],
+    width: u32,
+    height: u32,
+    block_width: u8,
+    block_height: u8,
+    gobs_per_block: u8,
+) -> Result<(), BinaryError> {
+    const GOB_WIDTH_UNITS: usize = 4;
+    const GOB_HEIGHT_UNITS: usize = 8;
+    const STORAGE_UNIT_BYTES: usize = 16;
+
+    let block_width = usize::from(block_width);
+    let block_height = usize::from(block_height);
+    let gobs_per_block = usize::from(gobs_per_block);
+    let width = usize::try_from(width)
+        .map_err(|_| BinaryError::invalid_data("Switch texture width exceeds usize"))?;
+    let height = usize::try_from(height)
+        .map_err(|_| BinaryError::invalid_data("Switch texture height exceeds usize"))?;
+    if block_width == 0 || block_height == 0 || gobs_per_block == 0 {
+        return Err(BinaryError::invalid_data(
+            "Switch texture storage geometry contains zero",
+        ));
+    }
+    if width % block_width != 0 || height % block_height != 0 {
+        return Err(BinaryError::invalid_data(
+            "Switch texture dimensions are not block aligned",
+        ));
+    }
+    let units_x = width / block_width;
+    let units_y = height / block_height;
+    let block_rows = GOB_HEIGHT_UNITS
+        .checked_mul(gobs_per_block)
+        .ok_or_else(|| BinaryError::invalid_data("Switch block height overflows usize"))?;
+    if units_x % GOB_WIDTH_UNITS != 0 || units_y % block_rows != 0 {
+        return Err(BinaryError::invalid_data(
+            "Switch texture is not aligned to complete GOB blocks",
+        ));
+    }
+    let expected = units_x
+        .checked_mul(units_y)
+        .and_then(|units| units.checked_mul(STORAGE_UNIT_BYTES))
+        .ok_or_else(|| BinaryError::invalid_data("Switch texture storage size overflows"))?;
+    if source.len() != expected || output.len() != expected {
+        return Err(BinaryError::invalid_data(
+            "Switch texture storage length does not match its geometry",
+        ));
+    }
+
+    let mut source_offset = 0_usize;
+    for block_y in 0..(units_y / block_rows) {
+        for block_x in 0..(units_x / GOB_WIDTH_UNITS) {
+            let base_x = block_x * GOB_WIDTH_UNITS;
+            for gob_y in 0..gobs_per_block {
+                let base_y = (block_y * gobs_per_block + gob_y) * GOB_HEIGHT_UNITS;
+                for ordinal in 0..32_usize {
+                    let local_x = ((ordinal >> 3) & 0b10) | ((ordinal >> 1) & 0b1);
+                    let local_y = ((ordinal >> 1) & 0b110) | (ordinal & 0b1);
+                    let destination = (base_y + local_y)
+                        .checked_mul(units_x)
+                        .and_then(|offset| offset.checked_add(base_x + local_x))
+                        .and_then(|offset| offset.checked_mul(STORAGE_UNIT_BYTES))
+                        .ok_or_else(|| {
+                            BinaryError::invalid_data("Switch destination offset overflows")
+                        })?;
+                    let source_end =
+                        source_offset
+                            .checked_add(STORAGE_UNIT_BYTES)
+                            .ok_or_else(|| {
+                                BinaryError::invalid_data("Switch source offset overflows")
+                            })?;
+                    let destination_end =
+                        destination.checked_add(STORAGE_UNIT_BYTES).ok_or_else(|| {
+                            BinaryError::invalid_data("Switch destination extent overflows")
+                        })?;
+                    output
+                        .get_mut(destination..destination_end)
+                        .ok_or_else(|| {
+                            BinaryError::invalid_data("Switch destination exceeds output")
+                        })?
+                        .copy_from_slice(source.get(source_offset..source_end).ok_or_else(
+                            || BinaryError::invalid_data("Switch source ends inside a GOB"),
+                        )?);
+                    source_offset = source_end;
+                }
+            }
+        }
+    }
+    if source_offset != source.len() {
+        return Err(BinaryError::invalid_data(
+            "Switch deswizzle did not consume the complete source",
+        ));
+    }
+    Ok(())
 }
 
 fn map_decode_failure(error: TextureDecodeFailure) -> TexturePreparationError {

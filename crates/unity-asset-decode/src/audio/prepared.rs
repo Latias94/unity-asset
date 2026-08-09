@@ -6,16 +6,13 @@ use super::formats::AudioCompressionFormat;
 use super::fsb5::{self, Fsb5Error, PreparedVorbisOgg};
 use super::inspection::AudioClipLayout;
 use super::ogg::final_ogg_granule;
-use super::types::{AudioClip, DecodedAudio};
 use crate::descriptor::{
     MediaDescriptor, MediaDescriptorError, MediaOutputEstimate, PreparedAudioSourceKind,
 };
 use crate::media::BudgetedMediaBytes;
 use std::collections::TryReserveError;
 use std::io::{self, Write};
-use std::mem::size_of;
 use thiserror::Error;
-use unity_asset_binary::{BinaryError, Result};
 use unity_asset_core::{AssetLoadBudget, BudgetError};
 
 /// A standard audio artifact with validated container framing and exact owned output bytes.
@@ -39,6 +36,33 @@ impl PreparedAudioOutput {
 }
 
 impl PreparedAudioSource {
+    /// Whether this build has a strict standard-container path for the encoding.
+    #[must_use]
+    pub const fn supports(compression_format: AudioCompressionFormat) -> bool {
+        matches!(
+            compression_format,
+            AudioCompressionFormat::PCM
+                | AudioCompressionFormat::Vorbis
+                | AudioCompressionFormat::ADPCM
+                | AudioCompressionFormat::MP3
+                | AudioCompressionFormat::AAC
+        )
+    }
+
+    /// Prepares one strictly inspected AudioClip and its already-resolved payload.
+    pub fn prepare(
+        layout: AudioClipLayout<'_>,
+        bytes: BudgetedMediaBytes,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<Self, AudioSourceError> {
+        Self::prepare_source(
+            layout.compression_format(),
+            layout.subsound_index(),
+            bytes,
+            budget,
+        )
+    }
+
     #[must_use]
     pub const fn descriptor(&self) -> &MediaDescriptor {
         &self.descriptor
@@ -104,55 +128,7 @@ impl AudioSourceError {
     }
 }
 
-/// Audio exporter utility
-///
-/// This struct provides methods for exporting decoded audio data to various formats.
-pub struct AudioExporter;
-
-impl AudioExporter {
-    /// Whether this build has a strict standard-container path for the encoding.
-    #[must_use]
-    pub const fn supports_standard_source(format: AudioCompressionFormat) -> bool {
-        matches!(
-            format,
-            AudioCompressionFormat::PCM
-                | AudioCompressionFormat::Vorbis
-                | AudioCompressionFormat::ADPCM
-                | AudioCompressionFormat::MP3
-                | AudioCompressionFormat::AAC
-        )
-    }
-
-    /// Prepares a strict TypeTree-backed AudioClip layout without materializing
-    /// the legacy owned AudioClip adapter.
-    pub fn prepare_layout(
-        layout: AudioClipLayout<'_>,
-        bytes: BudgetedMediaBytes,
-        budget: &mut AssetLoadBudget,
-    ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
-        Self::prepare_source(
-            layout.compression_format(),
-            layout.subsound_index(),
-            bytes,
-            budget,
-        )
-    }
-
-    /// Validate supported container framing and prepare a deterministic
-    /// standard-container export under the caller's load budget.
-    pub fn prepare_standard_source(
-        clip: &AudioClip,
-        bytes: BudgetedMediaBytes,
-        budget: &mut AssetLoadBudget,
-    ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
-        Self::prepare_source(
-            clip.compression_format(),
-            clip.subsound_index(),
-            bytes,
-            budget,
-        )
-    }
-
+impl PreparedAudioSource {
     fn prepare_source(
         compression_format: AudioCompressionFormat,
         subsound_index: i32,
@@ -223,7 +199,7 @@ impl AudioExporter {
             AudioCompressionFormat::AAC if is_adts_framed_aac(source) => {
                 (PreparedAudioSourceKind::AdtsAac, None)
             }
-            format if Self::supports_standard_source(format) => {
+            format if Self::supports(format) => {
                 return Err(AudioSourceError::InvalidData(
                     "audio bytes do not match the container declared by the AudioClip encoding"
                         .into(),
@@ -250,131 +226,6 @@ impl AudioExporter {
         );
         Ok(PreparedAudioSource { output, descriptor })
     }
-
-    /// Write a framing-validated standard-container representation from an AudioClip payload.
-    ///
-    /// Vorbis clips may carry an FSB5 bank instead of an Ogg stream. In that
-    /// case this method reconstructs the selected subsound as Ogg/Vorbis. It
-    /// rejects unknown Vorbis payloads rather than emitting FSB bytes with an
-    /// `.ogg` extension.
-    pub fn write_standard_source<W: Write + ?Sized>(
-        clip: &AudioClip,
-        bytes: BudgetedMediaBytes,
-        writer: &mut W,
-        budget: &mut AssetLoadBudget,
-    ) -> std::result::Result<(), AudioSourceError> {
-        Self::prepare_standard_source(clip, bytes, budget)?.write_to(writer)
-    }
-
-    /// Write WAV bytes to a caller-owned sink.
-    ///
-    /// The sink is not flushed. Callers that buffer output retain control over
-    /// the flush and durability policy.
-    pub fn write_wav<W: Write + ?Sized>(audio: &DecodedAudio, writer: &mut W) -> Result<()> {
-        if audio.sample_rate == 0 || audio.channels == 0 {
-            return Err(BinaryError::invalid_data(
-                "WAV sample rate and channel count must be non-zero",
-            ));
-        }
-        let channels = u16::try_from(audio.channels)
-            .map_err(|_| BinaryError::invalid_data("WAV channel count exceeds u16"))?;
-        if !audio.samples.len().is_multiple_of(usize::from(channels)) {
-            return Err(BinaryError::invalid_data(
-                "WAV sample count must contain complete channel frames",
-            ));
-        }
-        let block_align = channels
-            .checked_mul(2)
-            .ok_or_else(|| BinaryError::invalid_data("WAV block alignment overflow"))?;
-        let byte_rate = audio
-            .sample_rate
-            .checked_mul(u32::from(block_align))
-            .ok_or_else(|| BinaryError::invalid_data("WAV byte rate overflow"))?;
-        let data_size = audio
-            .samples
-            .len()
-            .checked_mul(size_of::<i16>())
-            .and_then(|size| u32::try_from(size).ok())
-            .ok_or_else(|| BinaryError::invalid_data("WAV sample data exceeds RIFF limits"))?;
-        let file_size = 36_u32
-            .checked_add(data_size)
-            .ok_or_else(|| BinaryError::invalid_data("WAV file size exceeds RIFF limits"))?;
-
-        // Write WAV header
-        writer.write_all(b"RIFF")?;
-        writer.write_all(&file_size.to_le_bytes())?;
-        writer.write_all(b"WAVE")?;
-
-        // Write format chunk
-        writer.write_all(b"fmt ")?;
-        writer.write_all(&16u32.to_le_bytes())?; // Chunk size
-        writer.write_all(&1u16.to_le_bytes())?; // Audio format (PCM)
-        writer.write_all(&channels.to_le_bytes())?;
-        writer.write_all(&audio.sample_rate.to_le_bytes())?;
-        writer.write_all(&byte_rate.to_le_bytes())?;
-        writer.write_all(&block_align.to_le_bytes())?;
-        writer.write_all(&16u16.to_le_bytes())?; // Bits per sample
-
-        // Write data chunk
-        writer.write_all(b"data")?;
-        writer.write_all(&data_size.to_le_bytes())?;
-
-        // Write sample data
-        write_i16_samples(&audio.samples, writer)?;
-
-        Ok(())
-    }
-
-    /// Write raw little-endian PCM bytes to a caller-owned sink.
-    ///
-    /// Supported bit depths are 16 and 32. The sink is not flushed.
-    pub fn write_raw_pcm<W: Write + ?Sized>(
-        audio: &DecodedAudio,
-        writer: &mut W,
-        bit_depth: u8,
-    ) -> Result<()> {
-        match bit_depth {
-            16 => {
-                write_i16_samples(&audio.samples, writer)?;
-            }
-            32 => {
-                write_i32_samples(&audio.samples, writer)?;
-            }
-            _ => {
-                return Err(BinaryError::invalid_data(
-                    "Unsupported bit depth for PCM export",
-                ));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-const PCM_CHUNK_SAMPLES: usize = 1_024;
-
-fn write_i16_samples<W: Write + ?Sized>(samples: &[f32], writer: &mut W) -> Result<()> {
-    let mut bytes = [0_u8; PCM_CHUNK_SAMPLES * size_of::<i16>()];
-    for samples in samples.chunks(PCM_CHUNK_SAMPLES) {
-        for (sample, output) in samples.iter().zip(bytes.chunks_exact_mut(size_of::<i16>())) {
-            let sample = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-            output.copy_from_slice(&sample.to_le_bytes());
-        }
-        writer.write_all(&bytes[..samples.len() * size_of::<i16>()])?;
-    }
-    Ok(())
-}
-
-fn write_i32_samples<W: Write + ?Sized>(samples: &[f32], writer: &mut W) -> Result<()> {
-    let mut bytes = [0_u8; PCM_CHUNK_SAMPLES * size_of::<i32>()];
-    for samples in samples.chunks(PCM_CHUNK_SAMPLES) {
-        for (sample, output) in samples.iter().zip(bytes.chunks_exact_mut(size_of::<i32>())) {
-            let sample = (sample.clamp(-1.0, 1.0) * i32::MAX as f32) as i32;
-            output.copy_from_slice(&sample.to_le_bytes());
-        }
-        writer.write_all(&bytes[..samples.len() * size_of::<i32>()])?;
-    }
-    Ok(())
 }
 
 fn is_wave(bytes: &[u8], compression: AudioCompressionFormat) -> bool {
@@ -849,21 +700,25 @@ mod tests {
     fn prepare_short_vorbis(
         budget: &mut AssetLoadBudget,
     ) -> std::result::Result<PreparedAudioSource, AudioSourceError> {
-        let clip = AudioClip::new("short".to_owned(), AudioCompressionFormat::Vorbis);
         let source =
             BudgetedMediaBytes::from_vec(SHORT_VORBIS.to_vec(), "test FSB5 source", budget)?;
-        AudioExporter::prepare_standard_source(&clip, source, budget)
+        PreparedAudioSource::prepare_source(AudioCompressionFormat::Vorbis, 0, source, budget)
     }
 
     #[test]
     fn audio_preparation_reuses_the_budgeted_source_allocation() {
-        let clip = AudioClip::new("budgeted".to_owned(), AudioCompressionFormat::MP3);
         let mut budget = AssetLoadBudget::default();
         let source =
             BudgetedMediaBytes::from_vec(minimal_mp3(), "test audio source", &mut budget).unwrap();
         let source_charge = budget.usage().bytes;
 
-        let prepared = AudioExporter::prepare_standard_source(&clip, source, &mut budget).unwrap();
+        let prepared = PreparedAudioSource::prepare_source(
+            AudioCompressionFormat::MP3,
+            0,
+            source,
+            &mut budget,
+        )
+        .unwrap();
 
         assert_eq!(budget.usage().bytes, source_charge);
         let mut output = Vec::new();
@@ -873,13 +728,14 @@ mod tests {
 
     #[test]
     fn audio_preparation_rejects_a_different_budget_domain() {
-        let clip = AudioClip::new("budgeted".to_owned(), AudioCompressionFormat::MP3);
         let mut owner = AssetLoadBudget::default();
         let source =
             BudgetedMediaBytes::from_vec(minimal_mp3(), "test audio source", &mut owner).unwrap();
         let mut other = AssetLoadBudget::default();
 
-        let Err(error) = AudioExporter::prepare_standard_source(&clip, source, &mut other) else {
+        let Err(error) =
+            PreparedAudioSource::prepare_source(AudioCompressionFormat::MP3, 0, source, &mut other)
+        else {
             panic!("a different budget domain must not consume media bytes");
         };
         assert!(matches!(

@@ -19,26 +19,15 @@ use self::compressed::CompressedDecoder;
 use self::crunch::CrunchDecoder;
 use self::mobile::MobileDecoder;
 use super::formats::TextureFormat;
-use super::helpers::TextureSwizzler;
-use super::types::Texture2D;
 use unity_asset_binary::{BinaryError, Result};
 
 /// Dispatches supported Unity texture encodings into one RGBA implementation.
-pub struct TextureDecoder;
+pub(crate) struct TextureDecoder;
 
 impl TextureDecoder {
     #[must_use]
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self
-    }
-
-    /// Decodes a Unity texture into canonical top-left RGBA pixels.
-    pub fn decode(&self, texture: &Texture2D) -> Result<RgbaImage> {
-        let mut image = self
-            .decode_with_budget(texture, None)
-            .map_err(TextureDecodeFailure::into_binary)?;
-        TextureSwizzler::normalize_top_left(&mut image);
-        Ok(image)
     }
 
     pub(crate) fn decode_prepared(
@@ -57,31 +46,6 @@ impl TextureDecoder {
                 data,
             },
             Some(budget),
-        )
-    }
-
-    fn decode_with_budget(
-        &self,
-        texture: &Texture2D,
-        budget: Option<&mut AssetLoadBudget>,
-    ) -> std::result::Result<RgbaImage, TextureDecodeFailure> {
-        texture
-            .validate()
-            .map_err(|error| TextureDecodeFailure::Decode(BinaryError::invalid_data(error)))?;
-        let width = u32::try_from(texture.width).map_err(|_| {
-            TextureDecodeFailure::Decode(BinaryError::invalid_data("invalid texture width"))
-        })?;
-        let height = u32::try_from(texture.height).map_err(|_| {
-            TextureDecodeFailure::Decode(BinaryError::invalid_data("invalid texture height"))
-        })?;
-        self.decode_input(
-            TextureDecodeInput {
-                width,
-                height,
-                format: texture.format,
-                data: &texture.image_data,
-            },
-            budget,
         )
     }
 
@@ -121,7 +85,7 @@ impl TextureDecoder {
 
     /// Returns whether this build has an implementation for the format.
     #[must_use]
-    pub const fn can_decode(&self, format: TextureFormat) -> bool {
+    pub(crate) const fn can_decode(&self, format: TextureFormat) -> bool {
         match format {
             TextureFormat::Alpha8
             | TextureFormat::RGB24
@@ -148,49 +112,6 @@ impl TextureDecoder {
             | TextureFormat::ETC2_RGBA8Crunched => true,
             _ => false,
         }
-    }
-
-    /// Returns the exact format inventory implemented by this build.
-    #[must_use]
-    pub fn supported_formats(&self) -> Vec<TextureFormat> {
-        vec![
-            TextureFormat::Alpha8,
-            TextureFormat::RGB24,
-            TextureFormat::RGBA32,
-            TextureFormat::ARGB32,
-            TextureFormat::BGRA32,
-            TextureFormat::RGBA4444,
-            TextureFormat::ARGB4444,
-            TextureFormat::RGB565,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::DXT1,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::DXT5,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::BC4,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::BC5,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::BC7,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC2_RGB,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC2_RGBA8,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ASTC_RGBA_4x4,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ASTC_RGBA_6x6,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ASTC_RGBA_8x8,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::DXT1Crunched,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::DXT5Crunched,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC_RGB4Crunched,
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC2_RGBA8Crunched,
-        ]
     }
 }
 
@@ -226,6 +147,7 @@ impl Default for TextureDecoder {
     }
 }
 
+#[derive(Debug)]
 pub(crate) enum TextureDecodeFailure {
     Decode(BinaryError),
     Budget(BudgetError),
@@ -234,20 +156,6 @@ pub(crate) enum TextureDecodeFailure {
         requested: usize,
         source: TryReserveError,
     },
-}
-
-impl TextureDecodeFailure {
-    fn into_binary(self) -> BinaryError {
-        match self {
-            Self::Decode(error) => error,
-            Self::Budget(error) => BinaryError::Budget(error),
-            Self::Allocation {
-                resource,
-                requested,
-                source,
-            } => BinaryError::allocation(resource, requested, source),
-        }
-    }
 }
 
 pub(super) struct TextureDecodeBuffers {
@@ -445,21 +353,5 @@ mod tests {
     fn texture2ddecoder_words_are_converted_from_bgra_to_rgba() {
         let pixel = u32::from_le_bytes([0x33, 0x22, 0x11, 0x44]);
         assert_eq!(decoder_bgra_to_rgba(pixel), [0x11, 0x22, 0x33, 0x44]);
-    }
-
-    #[test]
-    fn failed_reservation_reaches_binary_error_without_a_string_bridge() {
-        let error = reserve_fallible::<u8>(usize::MAX, "test allocation", None)
-            .unwrap_err()
-            .into_binary();
-
-        assert!(matches!(
-            error,
-            BinaryError::Allocation {
-                resource: "test allocation",
-                requested: usize::MAX,
-                ..
-            }
-        ));
     }
 }

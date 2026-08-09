@@ -90,7 +90,8 @@ impl CompressedDecoder {
 #[cfg(all(test, feature = "texture-advanced"))]
 mod tests {
     use super::*;
-    use crate::texture::{Texture2D, TextureDecoder};
+    use crate::texture::decoders::TextureDecoder;
+    use unity_asset_core::AssetLoadBudget;
 
     #[test]
     fn bc_decoders_preserve_red_and_green_channels() {
@@ -110,14 +111,9 @@ mod tests {
     }
 
     fn decode(format: TextureFormat, image_data: Vec<u8>) -> image::RgbaImage {
+        let mut budget = AssetLoadBudget::default();
         TextureDecoder::new()
-            .decode(&Texture2D {
-                width: 4,
-                height: 4,
-                format,
-                image_data,
-                ..Texture2D::default()
-            })
+            .decode_prepared(4, 4, format, &image_data, &mut budget)
             .unwrap()
     }
 }

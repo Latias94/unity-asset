@@ -175,11 +175,12 @@ cargo run -p unity-asset-binary --example sniff_kind -- D:\GameProject\game.bund
 cargo run -p unity-asset-binary --example load_and_list -- D:\GameProject\game.bundle
 cargo run -p unity-asset-binary --example scan_pptrs -- D:\GameProject\game.bundle -42 0
 cargo run -p unity-asset-binary --example typetree_registry_json -- D:\GameProject\game.bundle
-cargo run -p unity-asset-decode --example export_textures --features texture -- D:\GameProject\game.bundle D:\Exports
 ```
 
 Use these APIs when building a format adapter. Application workflows should prefer
-`AssetWorkspace`, because it owns identity, revision, budget, and publication invariants.
+`AssetWorkspace`, because it owns identity, revision, streamed-resource resolution, budget, and
+publication invariants. Media export belongs to the workspace extraction commands shown above;
+the decode crate intentionally has no partial filesystem-export example.
 
 ## Local Search
 

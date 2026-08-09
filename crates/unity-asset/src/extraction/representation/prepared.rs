@@ -10,7 +10,7 @@ use unity_asset_yaml::UnityYamlSerializer;
 
 #[cfg(feature = "decode")]
 use unity_asset_decode::{
-    audio::{AudioClipLayout, AudioExporter, AudioSourceError, PreparedAudioSource},
+    audio::{AudioClipLayout, AudioSourceError, PreparedAudioSource},
     media::{BudgetedMediaBytes, EmbeddedMediaError, MediaPayloadRef},
     sprite::{PreparedSpritePng, SpriteLayout, SpritePreparationError},
     texture::{PreparedTexturePng, Texture2DLayout, TexturePreparationError},
@@ -93,7 +93,7 @@ impl PreparedRepresentation {
                 let layout = AudioClipLayout::inspect(binary)
                     .map_err(|_| RepresentationPreparationError::InvalidContent)?;
                 let source = media_source_bytes(view, layout.payload(), stream.as_ref(), budget)?;
-                let media = AudioExporter::prepare_layout(layout, source, budget)
+                let media = PreparedAudioSource::prepare(layout, source, budget)
                     .map_err(map_audio_preparation_error)?;
                 validate_descriptor(descriptor, media.descriptor())?;
                 Ok(Self::media(

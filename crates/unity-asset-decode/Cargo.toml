@@ -11,7 +11,7 @@ homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-decode"
 keywords = ["unity", "assets", "decode", "export", "parser"]
 categories = ["parsing", "game-development"]
-include = ["src/**", "assets/**", "examples/**", "tests/**", "Cargo.toml"]
+include = ["src/**", "assets/**", "tests/**", "Cargo.toml"]
 
 [dependencies]
 unity-asset-binary = { workspace = true }
@@ -19,8 +19,6 @@ unity-asset-core = { workspace = true }
 serde = { workspace = true }
 image = { workspace = true, optional = true }
 crc32fast = { version = "1.5", optional = true }
-symphonia = { version = "0.5", features = ["all"], optional = true }
-hound = { version = "3.5", optional = true }
 texture2ddecoder = { version = "0.1", optional = true }
 indexmap = { workspace = true }
 base64 = { version = "0.22", optional = true }
@@ -35,10 +33,8 @@ texture = ["dep:crc32fast", "dep:image"]
 texture-advanced = ["texture", "dep:texture2ddecoder"]
 audio = [
     "dep:base64",
-    "dep:hound",
     "dep:ogg",
     "dep:serde_json",
-    "dep:symphonia",
 ]
 sprite = ["texture"]
 
@@ -48,21 +44,6 @@ full = ["texture", "texture-advanced", "audio", "sprite"]
 tempfile = { workspace = true }
 hex = "0.4"
 serde_json = { workspace = true }
-
-[[example]]
-name = "debug_texture_formats"
-path = "examples/debug_texture_formats.rs"
-required-features = ["texture"]
-
-[[example]]
-name = "texture_decoding_demo"
-path = "examples/texture_decoding_demo.rs"
-required-features = ["texture"]
-
-[[example]]
-name = "export_textures"
-path = "examples/export_textures.rs"
-required-features = ["texture"]
 
 [package.metadata.docs.rs]
 no-default-features = true

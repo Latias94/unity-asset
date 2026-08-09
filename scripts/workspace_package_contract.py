@@ -53,14 +53,6 @@ DOCUMENTED_FEATURE_PROFILES = (
         target_kind="dependency",
         target_name=None,
     ),
-    DocumentedFeatureProfile(
-        name="export-textures-example",
-        package="unity-asset-decode",
-        features=("texture",),
-        default_features=True,
-        target_kind="example",
-        target_name="export_textures",
-    ),
 )
 
 
@@ -75,7 +67,6 @@ class WorkspacePackage:
     feature_names: tuple[str, ...]
     library_target_name: str | None = None
     binary_target_names: tuple[str, ...] = ()
-    example_target_names: tuple[str, ...] = ()
 
     @property
     def directory(self) -> Path:
@@ -110,25 +101,14 @@ def validate_documented_feature_profiles(
             raise VerificationError(
                 f"documented feature profile {profile.name} must name features"
             )
-        if profile.target_kind == "dependency":
-            if profile.target_name is not None or not package.is_library:
-                raise VerificationError(
-                    f"documented dependency profile {profile.name} must target a library "
-                    "without a named Cargo target"
-                )
-        elif profile.target_kind == "example":
-            if (
-                profile.target_name is None
-                or profile.target_name not in package.example_target_names
-            ):
-                raise VerificationError(
-                    f"documented example profile {profile.name} targets a missing example: "
-                    f"{profile.target_name!r}"
-                )
-        else:
+        if (
+            profile.target_kind != "dependency"
+            or profile.target_name is not None
+            or not package.is_library
+        ):
             raise VerificationError(
-                f"documented feature profile {profile.name} has an invalid target kind: "
-                f"{profile.target_kind!r}"
+                f"documented feature profile {profile.name} must target a library "
+                "dependency without a named Cargo target"
             )
     return DOCUMENTED_FEATURE_PROFILES
 
@@ -214,15 +194,6 @@ def discover_workspace_packages(metadata_text: str) -> dict[str, WorkspacePackag
                     for target in targets
                     if isinstance(target.get("kind"), list)
                     and "bin" in target["kind"]
-                    and isinstance(target.get("name"), str)
-                )
-            ),
-            example_target_names=tuple(
-                sorted(
-                    target["name"]
-                    for target in targets
-                    if isinstance(target.get("kind"), list)
-                    and "example" in target["kind"]
                     and isinstance(target.get("name"), str)
                 )
             ),
