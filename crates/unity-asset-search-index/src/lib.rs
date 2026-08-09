@@ -17,6 +17,7 @@ mod analyzer;
 mod anchored_fs;
 mod config;
 mod generation;
+mod generation_authority;
 mod generation_store;
 mod path_semantics;
 mod pipeline;
@@ -50,14 +51,12 @@ use unity_asset_search_protocol::{
 };
 
 use generation::GenerationStamp as InternalGenerationStamp;
+use generation_authority::{ActiveGeneration, ActiveGenerationAuthority};
+#[cfg(test)]
+use generation_authority::{DesiredRevisionCommitCheckpoint, ScanValidationCheckpoint};
 #[cfg(test)]
 use generation_store::GenerationFailpoint;
-use pipeline::{
-    ActiveGeneration, ActiveGenerationAuthority, PipelineBuildOutput, PipelineError,
-    SearchGenerationPipeline,
-};
-#[cfg(test)]
-use pipeline::{DesiredRevisionCommitCheckpoint, ScanValidationCheckpoint};
+use pipeline::{PipelineBuildOutput, PipelineError, SearchGenerationPipeline};
 use reference_query::ReferenceQueryError;
 
 #[cfg(test)]

@@ -1708,7 +1708,7 @@ impl GenerationStore {
     }
 
     #[cfg(test)]
-    fn reconcile_abandoned_staging_with_failpoint(
+    pub(crate) fn reconcile_abandoned_staging_with_failpoint(
         &mut self,
         budget: &mut AssetLoadBudget,
         failpoint: GenerationFailpoint,

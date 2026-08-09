@@ -5,9 +5,11 @@ use std::fmt;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
+use unity_asset::DigestV1;
 use unity_asset::reference::{ReferenceGraphBuildOptions, ReferenceGraphError};
 use unity_asset::workspace::{
     AssetWorkspace, SourceAdmissionBatch, SourceAdmissionBatchAllocationError,
@@ -18,15 +20,17 @@ use unity_asset::workspace::{
 };
 use unity_asset::{
     AssetLoadBudget, BudgetError, ChangeSet, ContractError, Diagnostic, DiagnosticError,
-    DiagnosticSeverity, DigestV1, ObjectAddress, ObjectId, SourceAlias, SourceId, SourceLocator,
+    DiagnosticSeverity, ObjectAddress, ObjectId, SourceAlias, SourceId, SourceLocator,
     TransactionId, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_core::{string_allocation_bytes, vec_allocation_bytes};
-use unity_asset_search_core::{SearchKind, SearchRequest};
+use unity_asset_search_core::SearchKind;
+#[cfg(test)]
+use unity_asset_search_core::SearchRequest;
+use unity_asset_search_protocol::{ApiErrorCode, GenerationMaintenanceStatus};
+#[cfg(test)]
 use unity_asset_search_protocol::{
-    ApiErrorCode, GenerationMaintenanceState, GenerationMaintenanceStatus,
-    MAX_REINDEX_PUBLISH_WARNINGS, ReferenceRequest, ReferencesResponse, ReindexEvidence,
-    SearchResponse, SuggestResponse,
+    GenerationMaintenanceState, MAX_REINDEX_PUBLISH_WARNINGS, ReindexEvidence,
 };
 
 use crate::analysis::{
@@ -35,64 +39,35 @@ use crate::analysis::{
 };
 use crate::analyzer::{AnalysisError, AnalyzerLimits, AssetAnalyzer, WorkspaceAnalysisContext};
 use crate::config::{IndexPaths, SearchIndexOptions};
-use crate::generation::{
-    FilesystemReindexIntent, FilesystemReindexScope, GenerationManifestError,
-    GenerationProjectionDigests, GenerationProjectionSummary, GenerationStamp,
-    SearchGenerationIdentityV1, SearchGenerationManifestV1,
+use crate::generation::{FilesystemReindexIntent, FilesystemReindexScope, GenerationManifestError};
+use crate::generation_authority::{
+    ActiveGeneration, ActiveGenerationAuthority, GenerationAuthorityConfig,
+    GenerationPublicationInput, GenerationPublicationResult, SearchGenerationAuthority,
 };
+#[cfg(test)]
+use crate::generation_authority::{DesiredRevisionCommitCheckpoint, ScanValidationCheckpoint};
 #[cfg(test)]
 use crate::generation_store::GenerationFailpoint;
 use crate::generation_store::{
-    DesiredRevisionCommit, GenerationActivationEvidence, GenerationBuild, GenerationDiskEstimate,
-    GenerationPublishWarning, GenerationPublishWarningKind, GenerationRebuildBootstrap,
-    GenerationSnapshot, GenerationStore, GenerationStoreError, GenerationStoreOptions,
-    SourceScanHint, SourceStateError, SourceStateSnapshot, TransactionReceiptMembership,
-    TransactionReceiptWindow,
+    GenerationDiskEstimate, GenerationStoreError, SourceScanHint, SourceStateError,
+    SourceStateSnapshot, TransactionReceiptMembership, TransactionReceiptWindow,
 };
+#[cfg(test)]
+use crate::generation_store::{GenerationPublishWarning, GenerationPublishWarningKind};
 use crate::path_semantics::{ProjectPath, ProjectPathError, compare_portable_paths};
-use crate::projection::{
-    GenerationProjection, ProjectionCategory, ProjectionError, ProjectionLimits, ProjectionMetrics,
-    project_batch,
-};
-use crate::query::{QueryEngine, QuerySnapshot, SearchQueryFields};
-use crate::reference_query::{
-    ReferenceQueryCompleteness, ReferenceQueryCompletenessError, ReferenceQueryEngine,
-    ReferenceQueryError, ReferenceQuerySnapshot,
-};
+use crate::projection::ProjectionMetrics;
 use crate::scan::{
     FileHint, PathRejection, ProjectScanner, ProjectSourcePath, ReadSource, ScanDiagnostic,
-    ScanError, ScanIntent, ScanMetrics, ScanMode, ScanValidation, SourceHints, SourcePart,
+    ScanError, ScanIntent, ScanMetrics, ScanMode, SourceHints, SourcePart,
 };
-use crate::semantics::{AnalysisCacheIdentityV1, SearchSemantics};
+use crate::semantics::SearchSemantics;
 use crate::source_coordinate::IndexedSourceCoordinate;
-use crate::store::{ProjectionReaders, ProjectionStore, is_rebuildable_projection_schema_version};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PipelineBuildDisposition {
     Published,
     NoChange,
     AlreadyApplied,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceStateAvailability {
-    Reusable,
-    OpaqueLegacy,
-    IncompatibleSemantics,
-}
-
-impl SourceStateAvailability {
-    fn classify(snapshot: Option<&GenerationSnapshot>, semantic_layout_matches: bool) -> Self {
-        match snapshot {
-            Some(snapshot) if !snapshot.source_state_storage_current() => Self::OpaqueLegacy,
-            Some(_) if !semantic_layout_matches => Self::IncompatibleSemantics,
-            _ => Self::Reusable,
-        }
-    }
-
-    const fn is_reusable(self) -> bool {
-        matches!(self, Self::Reusable)
-    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -111,319 +86,6 @@ pub(crate) struct PipelineBuildMetrics {
     pub(crate) full_dependency_scan: bool,
 }
 
-#[derive(Clone)]
-pub(crate) struct ActiveGeneration {
-    snapshot: GenerationSnapshot,
-    stamp: GenerationStamp,
-    query: QueryEngine,
-    references: ReferenceQueryEngine,
-    indexed_assets: u64,
-    indexed_search_documents: u64,
-    indexed_reference_facts: u64,
-    incomplete_assets: u64,
-    projection_truncations: u64,
-}
-
-impl fmt::Debug for ActiveGeneration {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActiveGeneration")
-            .field("stamp", &self.stamp)
-            .field("directory", &self.snapshot.directory())
-            .field("indexed_assets", &self.indexed_assets)
-            .field("indexed_search_documents", &self.indexed_search_documents)
-            .field("indexed_reference_facts", &self.indexed_reference_facts)
-            .field("incomplete_assets", &self.incomplete_assets)
-            .field("projection_truncations", &self.projection_truncations)
-            .finish_non_exhaustive()
-    }
-}
-
-impl ActiveGeneration {
-    fn open(
-        snapshot: GenerationSnapshot,
-        source_state: &SourceStateSnapshot,
-        readers: &ProjectionReaders,
-        projection: Option<&GenerationProjection>,
-        options: SearchIndexOptions,
-        semantics_current: bool,
-        configuration_current: bool,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, PipelineError> {
-        let manifest = snapshot.manifest();
-        let generation_current = semantics_current && configuration_current;
-        let stamp = GenerationStamp::current(
-            snapshot.generation(),
-            manifest.workspace(),
-            manifest.revision(),
-        )
-        .with_desired_revision(snapshot.desired_revision())
-        .with_semantics_current(semantics_current)
-        .with_configuration_current(configuration_current);
-        let search_fields = SearchQueryFields::from_schema(&readers.search().index().schema())
-            .map_err(PipelineError::Query)?;
-        let query_snapshot = match projection {
-            Some(projection) => QuerySnapshot::new(
-                stamp.clone(),
-                readers.search().reader().clone(),
-                search_fields.clone(),
-                projection
-                    .search_documents
-                    .iter()
-                    .map(|document| document.path.as_str()),
-                budget,
-            ),
-            None if generation_current => QuerySnapshot::new(
-                stamp.clone(),
-                readers.search().reader().clone(),
-                search_fields.clone(),
-                suggestion_paths_from_state(source_state, options),
-                budget,
-            ),
-            None => {
-                let paths = readers
-                    .search()
-                    .stored_paths(budget)
-                    .map_err(PipelineError::Projection)?;
-                QuerySnapshot::new(
-                    stamp.clone(),
-                    readers.search().reader().clone(),
-                    search_fields,
-                    paths,
-                    budget,
-                )
-            }
-        };
-        let query = QueryEngine::new(Arc::new(query_snapshot.map_err(PipelineError::Query)?));
-
-        let analysis_complete = source_state
-            .assets()
-            .iter()
-            .all(|analysis| analysis.complete);
-        let projection_complete = projection.map_or_else(
-            || generation_current && projection_is_complete(source_state, options),
-            |projection| {
-                projection.truncations.iter().all(|truncation| {
-                    !matches!(&truncation.category, ProjectionCategory::References)
-                })
-            },
-        );
-        let completeness = match projection {
-            Some(projection) => ReferenceQueryCompleteness::new(
-                analysis_complete,
-                projection_complete,
-                projection.diagnostics.iter(),
-                budget,
-            ),
-            None => ReferenceQueryCompleteness::new(
-                analysis_complete,
-                projection_complete,
-                source_state
-                    .assets()
-                    .iter()
-                    .flat_map(|analysis| analysis.diagnostics.iter()),
-                budget,
-            ),
-        }
-        .map_err(|error| match error {
-            ReferenceQueryCompletenessError::Budget(error) => PipelineError::Budget(error),
-            error => PipelineError::Query(error.into()),
-        })?;
-        let reference_snapshot =
-            ReferenceQuerySnapshot::new(stamp.clone(), readers.references(), completeness);
-        let references = ReferenceQueryEngine::new(Arc::new(reference_snapshot));
-        let summary = snapshot.manifest().projection_summary();
-        validate_projection_summary(summary, source_state, readers)?;
-
-        Ok(Self {
-            snapshot,
-            stamp,
-            query,
-            references,
-            indexed_assets: summary.assets(),
-            indexed_search_documents: summary.search_documents(),
-            indexed_reference_facts: summary.reference_documents(),
-            incomplete_assets: summary.incomplete_assets(),
-            projection_truncations: summary.projection_truncations(),
-        })
-    }
-
-    fn open_projection_only(
-        snapshot: GenerationSnapshot,
-        readers: &ProjectionReaders,
-        semantics_current: bool,
-        configuration_current: bool,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<Self, PipelineError> {
-        let manifest = snapshot.manifest();
-        let stamp = GenerationStamp::current(
-            snapshot.generation(),
-            manifest.workspace(),
-            manifest.revision(),
-        )
-        .with_desired_revision(snapshot.desired_revision())
-        .with_semantics_current(semantics_current)
-        .with_configuration_current(configuration_current);
-        let search_fields = SearchQueryFields::from_schema(&readers.search().index().schema())
-            .map_err(PipelineError::Query)?;
-        let paths = readers
-            .search()
-            .stored_paths(budget)
-            .map_err(PipelineError::Projection)?;
-        let query_snapshot = QuerySnapshot::new(
-            stamp.clone(),
-            readers.search().reader().clone(),
-            search_fields,
-            paths,
-            budget,
-        )
-        .map_err(PipelineError::Query)?;
-        let completeness =
-            ReferenceQueryCompleteness::new(false, false, std::iter::empty(), budget).map_err(
-                |error| match error {
-                    ReferenceQueryCompletenessError::Budget(error) => PipelineError::Budget(error),
-                    error => PipelineError::Query(error.into()),
-                },
-            )?;
-        let references =
-            ReferenceQuerySnapshot::new(stamp.clone(), readers.references(), completeness);
-        validate_projection_summary_without_source_state(manifest.projection_summary(), readers)?;
-        let summary = manifest.projection_summary();
-        Ok(Self {
-            snapshot,
-            stamp,
-            query: QueryEngine::new(Arc::new(query_snapshot)),
-            references: ReferenceQueryEngine::new(Arc::new(references)),
-            indexed_assets: summary.assets(),
-            indexed_search_documents: summary.search_documents(),
-            indexed_reference_facts: summary.reference_documents(),
-            incomplete_assets: summary.incomplete_assets(),
-            projection_truncations: summary.projection_truncations(),
-        })
-    }
-
-    pub(crate) const fn stamp(&self) -> &GenerationStamp {
-        &self.stamp
-    }
-
-    pub(crate) const fn indexed_assets(&self) -> u64 {
-        self.indexed_assets
-    }
-
-    pub(crate) const fn indexed_search_documents(&self) -> u64 {
-        self.indexed_search_documents
-    }
-
-    pub(crate) const fn indexed_reference_facts(&self) -> u64 {
-        self.indexed_reference_facts
-    }
-
-    pub(crate) const fn incomplete_assets(&self) -> u64 {
-        self.incomplete_assets
-    }
-
-    pub(crate) const fn projection_truncations(&self) -> u64 {
-        self.projection_truncations
-    }
-
-    pub(crate) fn search(&self, request: SearchRequest) -> anyhow::Result<SearchResponse> {
-        let mut response = self.query.search(request)?;
-        response.generation = crate::wire::generation_stamp(&self.stamp);
-        Ok(response)
-    }
-
-    pub(crate) fn suggest(&self, prefix: &str, limit: usize) -> anyhow::Result<SuggestResponse> {
-        let mut response = self.query.suggest(prefix, limit)?;
-        response.generation = crate::wire::generation_stamp(&self.stamp);
-        Ok(response)
-    }
-
-    pub(crate) fn references(
-        &self,
-        request: ReferenceRequest,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<ReferencesResponse, ReferenceQueryError> {
-        let mut response = self.references.references(request, budget)?;
-        response.generation = crate::wire::generation_stamp(&self.stamp);
-        Ok(response)
-    }
-
-    fn install_committed_snapshot(
-        &mut self,
-        snapshot: GenerationSnapshot,
-    ) -> Result<(), PipelineError> {
-        if snapshot.generation() != self.snapshot.generation()
-            || snapshot.storage_contract() != self.snapshot.storage_contract()
-            || snapshot.manifest() != self.snapshot.manifest()
-            || snapshot.directory() != self.snapshot.directory()
-            || snapshot.activation_ordinal() < self.snapshot.activation_ordinal()
-        {
-            return Err(PipelineError::Invariant(
-                "desired-revision commit changed immutable active-generation identity",
-            ));
-        }
-        self.stamp = self
-            .stamp
-            .clone()
-            .with_desired_revision(snapshot.desired_revision());
-        self.snapshot = snapshot;
-        Ok(())
-    }
-}
-
-/// Shared in-process authority for the immutable generation used by queries and status.
-///
-/// The write guard is held across durable activation and the corresponding in-memory install, so
-/// readers cannot observe a disk-committed freshness transition with the previous public stamp.
-#[derive(Clone)]
-pub(crate) struct ActiveGenerationAuthority {
-    active: Arc<RwLock<Option<Arc<ActiveGeneration>>>>,
-}
-
-impl fmt::Debug for ActiveGenerationAuthority {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ActiveGenerationAuthority")
-            .field(
-                "active",
-                &self
-                    .snapshot()
-                    .ok()
-                    .flatten()
-                    .map(|generation| generation.stamp().clone()),
-            )
-            .finish()
-    }
-}
-
-impl ActiveGenerationAuthority {
-    fn new(active: Option<Arc<ActiveGeneration>>) -> Self {
-        Self {
-            active: Arc::new(RwLock::new(active)),
-        }
-    }
-
-    pub(crate) fn snapshot(&self) -> Result<Option<Arc<ActiveGeneration>>, PipelineError> {
-        self.with_snapshot(|active| active.cloned())
-    }
-
-    pub(crate) fn with_snapshot<R>(
-        &self,
-        inspect: impl FnOnce(Option<&Arc<ActiveGeneration>>) -> R,
-    ) -> Result<R, PipelineError> {
-        let active = self.active.read().map_err(|_| {
-            PipelineError::Invariant("active-generation authority lock is poisoned")
-        })?;
-        Ok(inspect(active.as_ref()))
-    }
-
-    fn write(&self) -> Result<RwLockWriteGuard<'_, Option<Arc<ActiveGeneration>>>, PipelineError> {
-        self.active
-            .write()
-            .map_err(|_| PipelineError::Invariant("active-generation authority lock is poisoned"))
-    }
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct PipelineBuildOutput {
     pub(crate) disposition: PipelineBuildDisposition,
@@ -436,71 +98,14 @@ pub(crate) struct PipelineBuildOutput {
     pub(crate) duration_ms: u128,
 }
 
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanValidationCheckpoint {
-    NoChangePreReturn,
-    ActivationPreCommit,
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DesiredRevisionCommitCheckpoint {
-    AfterStoreCommitBeforePublicInstall,
-}
-
-#[cfg(test)]
-struct OneShotCheckpointHook<C> {
-    checkpoint: C,
-    action: Box<dyn FnOnce() + Send + 'static>,
-}
-
-#[cfg(test)]
-type ScanValidationHook = OneShotCheckpointHook<ScanValidationCheckpoint>;
-
-#[cfg(test)]
-type DesiredRevisionCommitHook = OneShotCheckpointHook<DesiredRevisionCommitCheckpoint>;
-
-#[cfg(test)]
-impl<C: PartialEq> OneShotCheckpointHook<C> {
-    fn run(hook: &mut Option<Self>, checkpoint: C) {
-        let should_run = hook
-            .as_ref()
-            .is_some_and(|hook| hook.checkpoint == checkpoint);
-        if should_run {
-            let hook = hook
-                .take()
-                .expect("checkpoint hook disappeared after matching its checkpoint");
-            (hook.action)();
-        }
-    }
-}
-
 pub(crate) struct SearchGenerationPipeline {
     paths: IndexPaths,
     options: SearchIndexOptions,
-    options_digest: DigestV1,
-    semantics: SearchSemantics,
-    analysis_cache_identity: AnalysisCacheIdentityV1,
     scanner: ProjectScanner,
     workspace: AssetWorkspace,
     workspace_roots: WorkspaceRoots,
     workspace_hydrated: bool,
-    active_analysis_match: bool,
-    active_compatibility_match: bool,
-    rebuild_bootstrap: Option<GenerationRebuildBootstrap>,
-    store: GenerationStore,
-    source_state: Option<SourceStateSnapshot>,
-    active: ActiveGenerationAuthority,
-    generation_maintenance: GenerationMaintenanceStatus,
-    pending_publish_warnings: Vec<String>,
-    pending_publish_warnings_omitted: bool,
-    #[cfg(test)]
-    publish_failpoint: Option<GenerationFailpoint>,
-    #[cfg(test)]
-    scan_validation_hook: Option<ScanValidationHook>,
-    #[cfg(test)]
-    desired_revision_commit_hook: Option<DesiredRevisionCommitHook>,
+    generation: SearchGenerationAuthority,
 }
 
 impl fmt::Debug for SearchGenerationPipeline {
@@ -511,20 +116,7 @@ impl fmt::Debug for SearchGenerationPipeline {
             .field("options", &self.options)
             .field("workspace", &self.workspace)
             .field("workspace_hydrated", &self.workspace_hydrated)
-            .field("active_analysis_match", &self.active_analysis_match)
-            .field(
-                "active_compatibility_match",
-                &self.active_compatibility_match,
-            )
-            .field(
-                "active_generation",
-                &self
-                    .active
-                    .snapshot()
-                    .ok()
-                    .flatten()
-                    .map(|active| active.stamp().clone()),
-            )
+            .field("generation", &self.generation)
             .finish_non_exhaustive()
     }
 }
@@ -577,200 +169,46 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
         #[cfg(test)] startup_recovery_failpoint: Option<GenerationFailpoint>,
     ) -> Result<Self, PipelineError> {
-        let options = options.validate().map_err(PipelineError::Configuration)?;
-        let options_digest = paths
-            .logical_configuration_digest(options)
-            .map_err(PipelineError::Configuration)?;
-        let analysis_cache_identity = semantics
-            .analysis_cache_identity(options_digest)
-            .map_err(|error| PipelineError::Configuration(anyhow::Error::new(error)))?;
+        let authority_config = GenerationAuthorityConfig::new(&paths, options, semantics)?;
+        let options = authority_config.options();
         let scanner = ProjectScanner::new(&paths, options, options.scan_limits())
             .map_err(PipelineError::Configuration)?;
-        let store_options = GenerationStoreOptions {
-            retain_previous_generations: options.retain_previous_generations,
-        };
+        scanner
+            .validate_project_root_binding()
+            .map_err(|error| PipelineError::Scan(Box::new(error)))?;
         #[cfg(not(test))]
-        let opened = GenerationStore::open_private(
-            paths.private_index_root().clone(),
-            store_options,
-            budget,
-        )?;
+        let generation = SearchGenerationAuthority::open(authority_config, budget)?;
         #[cfg(test)]
-        let opened = match startup_recovery_failpoint {
-            Some(failpoint) => GenerationStore::open_private_with_startup_recovery_failpoint(
-                paths.private_index_root().clone(),
-                store_options,
-                budget,
+        let generation = match startup_recovery_failpoint {
+            Some(failpoint) => SearchGenerationAuthority::open_with_startup_recovery_failpoint(
+                authority_config,
                 failpoint,
-            )?,
-            None => GenerationStore::open_private(
-                paths.private_index_root().clone(),
-                store_options,
                 budget,
             )?,
-        };
-        let (store, staging_recovery, startup_disposition) = opened.into_parts();
-        let rebuild_bootstrap = startup_disposition
-            .rebuild_required()
-            .map(|required| required.bootstrap().clone());
-        let generation_maintenance = match staging_recovery {
-            Ok(report) => GenerationMaintenanceStatus {
-                state: GenerationMaintenanceState::Clean,
-                last_recovered_entries: report.removed_entries(),
-                last_cleanup_failure: None,
-            },
-            Err(error) => GenerationMaintenanceStatus {
-                state: GenerationMaintenanceState::RecoveryRequired,
-                last_recovered_entries: 0,
-                last_cleanup_failure: Some(crate::wire::bounded_error_message(error.to_string())),
-            },
+            None => SearchGenerationAuthority::open(authority_config, budget)?,
         };
         scanner
             .validate_project_root_binding()
             .map_err(|error| PipelineError::Scan(Box::new(error)))?;
-        let recovered = store.active().cloned();
-        let (active_semantics_match, active_configuration_match, active_source_state_layout_match) =
-            recovered.as_ref().map_or((true, true, true), |snapshot| {
-                let persisted_semantics = snapshot.manifest().semantics();
-                let configuration_match = snapshot.manifest().options_digest() == options_digest;
-                (
-                    persisted_semantics == semantics,
-                    configuration_match,
-                    persisted_semantics.source_state_layout_compatible_with(semantics),
-                )
-            });
-        let source_state_availability =
-            SourceStateAvailability::classify(recovered.as_ref(), active_source_state_layout_match);
-        // Physical storage and analysis semantics can each make source-state bytes opaque while
-        // leaving the independently attested projection queryable as stale.
-        let source_state = if source_state_availability.is_reusable() {
-            recovered
-                .as_ref()
-                .map(|snapshot| snapshot.load_source_state(budget))
-                .transpose()?
-        } else {
-            None
-        };
-        if let Some(source_state) = source_state.as_ref() {
-            source_state.validate_project_path_space(paths.project_path_space())?;
-        }
-        let workspace = source_state
-            .as_ref()
-            .map(SourceStateSnapshot::workspace)
-            .or_else(|| {
-                recovered
-                    .as_ref()
-                    .map(|snapshot| snapshot.manifest().workspace())
-            })
-            .or_else(|| {
-                rebuild_bootstrap
-                    .as_ref()
-                    .map(GenerationRebuildBootstrap::workspace)
-            })
+        let workspace = generation
+            .workspace_id_hint()
             .map_or_else(AssetWorkspace::new, |workspace| {
                 AssetWorkspace::with_workspace_id(workspace, WorkspaceOptions::lenient())
             })?;
-        let active_analysis_match = match (recovered.as_ref(), source_state.as_ref()) {
-            (Some(_), Some(state)) => state.analysis_cache_identity() == analysis_cache_identity,
-            (Some(_), None) => false,
-            (None, None) => true,
-            (None, Some(_)) => {
-                return Err(PipelineError::Invariant(
-                    "source state exists without an activated generation",
-                ));
-            }
-        };
-        let mut active_compatibility_match = if recovered.is_some() {
-            active_semantics_match
-                && active_configuration_match
-                && source_state_availability.is_reusable()
-        } else {
-            startup_disposition.rebuild_required().is_none()
-        };
-        let active = match (recovered, source_state.as_ref()) {
-            (Some(snapshot), Some(state)) => {
-                match ProjectionReaders::open(snapshot.directory(), budget) {
-                    Ok(readers) => Some(Arc::new(ActiveGeneration::open(
-                        snapshot,
-                        state,
-                        &readers,
-                        None,
-                        options,
-                        active_semantics_match && source_state_availability.is_reusable(),
-                        active_configuration_match,
-                        budget,
-                    )?)),
-                    Err(error) if is_rebuildable_projection_schema_version(&error) => {
-                        // The source-state snapshot remains authoritative enough to preserve the
-                        // workspace identity and incrementality baseline. Only this derived
-                        // projection layout is obsolete, so force the next request through a
-                        // complete current-format rebuild instead of treating recovery as a
-                        // corrupt store.
-                        active_compatibility_match = false;
-                        None
-                    }
-                    Err(error) => return Err(PipelineError::Projection(error)),
-                }
-            }
-            (Some(snapshot), None) if !source_state_availability.is_reusable() => {
-                match ProjectionReaders::open(snapshot.directory(), budget) {
-                    Ok(readers) => Some(Arc::new(ActiveGeneration::open_projection_only(
-                        snapshot,
-                        &readers,
-                        false,
-                        active_configuration_match,
-                        budget,
-                    )?)),
-                    Err(error) if is_rebuildable_projection_schema_version(&error) => {
-                        active_compatibility_match = false;
-                        None
-                    }
-                    Err(error) => return Err(PipelineError::Projection(error)),
-                }
-            }
-            (None, None) => None,
-            (Some(_), None) => {
-                return Err(PipelineError::Invariant(
-                    "compatible activated generation is missing its source state",
-                ));
-            }
-            (None, Some(_)) => {
-                return Err(PipelineError::Invariant(
-                    "source state exists without an activated generation",
-                ));
-            }
-        };
         Ok(Self {
             paths,
             options,
-            options_digest,
-            semantics,
-            analysis_cache_identity,
             scanner,
             workspace,
             workspace_roots: WorkspaceRoots::default(),
             workspace_hydrated: false,
-            active_analysis_match,
-            active_compatibility_match,
-            rebuild_bootstrap,
-            store,
-            source_state,
-            active: ActiveGenerationAuthority::new(active),
-            generation_maintenance,
-            pending_publish_warnings: Vec::new(),
-            pending_publish_warnings_omitted: false,
-            #[cfg(test)]
-            publish_failpoint: None,
-            #[cfg(test)]
-            scan_validation_hook: None,
-            #[cfg(test)]
-            desired_revision_commit_hook: None,
+            generation,
         })
     }
 
     #[cfg(test)]
     pub(crate) fn inject_publish_failpoint(&mut self, failpoint: GenerationFailpoint) {
-        self.publish_failpoint = Some(failpoint);
+        self.generation.inject_publish_failpoint(failpoint);
     }
 
     #[cfg(test)]
@@ -779,10 +217,8 @@ impl SearchGenerationPipeline {
         checkpoint: ScanValidationCheckpoint,
         action: impl FnOnce() + Send + 'static,
     ) {
-        self.scan_validation_hook = Some(ScanValidationHook {
-            checkpoint,
-            action: Box::new(action),
-        });
+        self.generation
+            .inject_scan_validation_hook(checkpoint, action);
     }
 
     #[cfg(test)]
@@ -791,38 +227,20 @@ impl SearchGenerationPipeline {
         checkpoint: DesiredRevisionCommitCheckpoint,
         action: impl FnOnce() + Send + 'static,
     ) {
-        self.desired_revision_commit_hook = Some(DesiredRevisionCommitHook {
-            checkpoint,
-            action: Box::new(action),
-        });
-    }
-
-    #[cfg(test)]
-    fn run_scan_validation_hook(
-        hook: &mut Option<ScanValidationHook>,
-        checkpoint: ScanValidationCheckpoint,
-    ) {
-        OneShotCheckpointHook::run(hook, checkpoint);
-    }
-
-    #[cfg(test)]
-    fn run_desired_revision_commit_hook(
-        hook: &mut Option<DesiredRevisionCommitHook>,
-        checkpoint: DesiredRevisionCommitCheckpoint,
-    ) {
-        OneShotCheckpointHook::run(hook, checkpoint);
+        self.generation
+            .inject_desired_revision_commit_hook(checkpoint, action);
     }
 
     pub(crate) fn active(&self) -> Result<Option<Arc<ActiveGeneration>>, PipelineError> {
-        self.active.snapshot()
+        self.generation.active()
     }
 
     pub(crate) fn active_authority(&self) -> ActiveGenerationAuthority {
-        self.active.clone()
+        self.generation.active_authority()
     }
 
     pub(crate) fn generation_maintenance(&self) -> GenerationMaintenanceStatus {
-        self.generation_maintenance.clone()
+        self.generation.maintenance()
     }
 
     pub(crate) fn reindex_filesystem(
@@ -831,7 +249,7 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let started = Instant::now();
-        self.ensure_store_operational()?;
+        self.generation.ensure_operational()?;
         let reconcile_staging = matches!(&intent.scope, FilesystemReindexScope::Reconcile);
         let requested = match intent.scope {
             FilesystemReindexScope::Full => ScanIntent::Full,
@@ -839,20 +257,11 @@ impl SearchGenerationPipeline {
             FilesystemReindexScope::ChangedPaths { paths } => ScanIntent::ChangedPaths(paths),
         };
         if reconcile_staging {
-            let mut cleanup_budget = AssetLoadBudget::default();
-            match self.store.reconcile_abandoned_staging(&mut cleanup_budget) {
-                Ok(report) => self.record_generation_recovery(report.removed_entries()),
-                Err(error) => {
-                    if error.requires_reopen() {
-                        *self.active.write()? = None;
-                    }
-                    self.record_generation_cleanup_failure(error.to_string());
-                    return Err(PipelineError::Store(Box::new(error)));
-                }
-            }
+            self.generation.recover()?;
         }
-        let discard_cached_analysis = !self.active_analysis_match;
-        let force_full = !self.workspace_hydrated || !self.active_compatibility_match;
+        let reuse = self.generation.reuse_view();
+        let discard_cached_analysis = !reuse.analysis_reusable();
+        let force_full = !self.workspace_hydrated || !reuse.incrementally_compatible();
         let scan_intent = if force_full {
             ScanIntent::Full
         } else {
@@ -874,13 +283,13 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let started = Instant::now();
-        self.ensure_store_operational()?;
-        if !self.active_compatibility_match {
+        self.generation.ensure_operational()?;
+        let reuse = self.generation.reuse_view();
+        if !reuse.incrementally_compatible() {
             return Err(PipelineError::FilesystemReindexRequired);
         }
-        let indexed = self
-            .source_state
-            .as_ref()
+        let indexed = reuse
+            .source_state()
             .map(|state| (state.workspace(), state.revision()));
         if let Some((workspace, revision)) = indexed {
             if workspace != changes.workspace() {
@@ -889,14 +298,7 @@ impl SearchGenerationPipeline {
                     actual: changes.workspace(),
                 });
             }
-            let receipts = self
-                .store
-                .active()
-                .ok_or(PipelineError::Invariant(
-                    "active generation disappeared during receipt lookup",
-                ))?
-                .transaction_receipts();
-            match receipts.membership(&changes, budget)? {
+            match self.generation.receipt_membership(&changes, budget)? {
                 TransactionReceiptMembership::Exact => {
                     return Ok(PipelineBuildOutput {
                         disposition: PipelineBuildDisposition::AlreadyApplied,
@@ -934,7 +336,8 @@ impl SearchGenerationPipeline {
                     budget,
                 );
             }
-            self.mark_desired_revision(changes.to_revision(), budget)?;
+            self.generation
+                .observe_desired_revision(changes.to_revision(), budget)?;
             validate_change_set_view(&changes, view)?;
         } else {
             validate_change_set_view(&changes, view)?;
@@ -955,7 +358,8 @@ impl SearchGenerationPipeline {
         changes: &ChangeSet,
         budget: &mut AssetLoadBudget,
     ) -> Result<PreparedBatch, PipelineError> {
-        let state = self.source_state.as_ref().ok_or(PipelineError::Invariant(
+        let reuse = self.generation.reuse_view();
+        let state = reuse.source_state().ok_or(PipelineError::Invariant(
             "observed transaction requires indexed source state",
         ))?;
         if state.workspace() != changes.workspace() || state.revision() != changes.to_revision() {
@@ -965,12 +369,11 @@ impl SearchGenerationPipeline {
         }
 
         let transaction_receipts = self
-            .store
-            .active()
+            .generation
+            .transaction_receipts()
             .ok_or(PipelineError::Invariant(
                 "active generation disappeared during reconciled receipt update",
             ))?
-            .transaction_receipts()
             .after_reconciled_target(state.workspace(), state.revision(), changes, budget)?;
 
         let mut assets = reserve_retained_vec(
@@ -1000,16 +403,15 @@ impl SearchGenerationPipeline {
             assets,
             AnalysisMetrics::default(),
         );
+        let publication =
+            GenerationPublicationInput::workspace(batch, scan_hints, transaction_receipts);
         Ok(PreparedBatch {
-            batch,
-            scan_hints,
+            publication,
             metrics: PipelineBuildMetrics {
                 reused_assets: saturating_usize_to_u64(state.assets().len()),
                 ..PipelineBuildMetrics::default()
             },
-            transaction_receipts,
             workspace: None,
-            filesystem_validation: None,
         })
     }
 
@@ -1026,7 +428,7 @@ impl SearchGenerationPipeline {
             self.clone_previous_assets(budget)?
         };
         let mut workspace = self.workspace.fork_candidate();
-        let known_paths = clone_known_paths(self.source_state.as_ref(), budget)?;
+        let known_paths = clone_known_paths(self.generation.reuse_view().source_state(), budget)?;
         let mut plan = self.scanner.plan(intent, &known_paths, budget).map_err(
             |error| match error {
                 ScanError::Budget(error) => PipelineError::Budget(error),
@@ -1383,12 +785,10 @@ impl SearchGenerationPipeline {
         let workspace_hydrated =
             was_hydrated || matches!(plan.mode, ScanMode::Full | ScanMode::Reconcile);
         let observed_revision = workspace.revision();
-        let actual_revision_unchanged = self
-            .store
-            .active()
-            .is_some_and(|active| active.manifest().revision() == observed_revision);
+        let actual_revision_unchanged = self.generation.actual_revision_is(observed_revision);
         if !actual_revision_unchanged {
-            self.mark_desired_revision(observed_revision, budget)?;
+            self.generation
+                .observe_desired_revision(observed_revision, budget)?;
         }
 
         let snapshot = workspace.snapshot();
@@ -1567,23 +967,9 @@ impl SearchGenerationPipeline {
         metrics.analysis.source_opens = metrics.scan.opened;
         metrics.analysis.source_bytes_read = metrics.scan.read_bytes;
 
-        let transaction_receipts = match self.store.active() {
-            Some(active) if active.manifest().workspace() == snapshot.workspace_id() => {
-                active.transaction_receipts().clone()
-            }
-            None if self
-                .rebuild_bootstrap
-                .as_ref()
-                .is_some_and(|bootstrap| bootstrap.workspace() == snapshot.workspace_id()) =>
-            {
-                self.rebuild_bootstrap
-                    .as_ref()
-                    .expect("matching rebuild bootstrap disappeared")
-                    .transaction_receipts()
-                    .clone()
-            }
-            Some(_) | None => TransactionReceiptWindow::empty(),
-        };
+        let transaction_receipts = self
+            .generation
+            .filesystem_transaction_receipts(snapshot.workspace_id());
         let transactions = canonical_transaction_ids(&transaction_receipts, budget)?;
         let batch = AssetAnalysisBatch::new(
             snapshot.workspace_id(),
@@ -1593,17 +979,20 @@ impl SearchGenerationPipeline {
             metrics.analysis,
         );
         let filesystem_validation = plan.into_validation();
-        Ok(PreparedBatch {
+        let publication = GenerationPublicationInput::filesystem(
             batch,
             scan_hints,
-            metrics,
             transaction_receipts,
+            filesystem_validation,
+        );
+        Ok(PreparedBatch {
+            publication,
+            metrics,
             workspace: Some(PreparedWorkspace {
                 workspace,
                 roots: workspace_roots,
                 hydrated: workspace_hydrated,
             }),
-            filesystem_validation: Some(filesystem_validation),
         })
     }
 
@@ -1613,20 +1002,22 @@ impl SearchGenerationPipeline {
         view: &dyn WorkspaceView,
         budget: &mut AssetLoadBudget,
     ) -> Result<PreparedBatch, PipelineError> {
-        let transaction_receipts = match (self.source_state.as_ref(), self.store.active()) {
-            (Some(state), Some(active)) => active.transaction_receipts().after_change_set(
-                state.workspace(),
-                state.revision(),
-                changes,
-                budget,
-            )?,
-            (None, None) => TransactionReceiptWindow::from_change_set(changes, budget)?,
-            _ => {
-                return Err(PipelineError::Invariant(
-                    "generation and source-state lifecycle diverged during receipt update",
-                ));
-            }
-        };
+        let reuse = self.generation.reuse_view();
+        let transaction_receipts =
+            match (reuse.source_state(), self.generation.transaction_receipts()) {
+                (Some(state), Some(receipts)) => receipts.after_change_set(
+                    state.workspace(),
+                    state.revision(),
+                    changes,
+                    budget,
+                )?,
+                (None, None) => TransactionReceiptWindow::from_change_set(changes, budget)?,
+                _ => {
+                    return Err(PipelineError::Invariant(
+                        "generation and source-state lifecycle diverged during receipt update",
+                    ));
+                }
+            };
         let mut cached = self.clone_previous_assets(budget)?;
         let mut sources = view.sources(budget)?;
         sources.sort_unstable_by_key(|source| source.id());
@@ -1875,17 +1266,16 @@ impl SearchGenerationPipeline {
         retain_scan_hints_for_assets(&mut scan_hints, &batch.assets);
         let workspace =
             AssetWorkspace::with_workspace_id(view.workspace_id(), WorkspaceOptions::lenient())?;
+        let publication =
+            GenerationPublicationInput::workspace(batch, scan_hints, transaction_receipts);
         Ok(PreparedBatch {
-            batch,
-            scan_hints,
+            publication,
             metrics,
-            transaction_receipts,
             workspace: Some(PreparedWorkspace {
                 workspace,
                 roots: WorkspaceRoots::default(),
                 hydrated: false,
             }),
-            filesystem_validation: None,
         })
     }
 
@@ -1898,239 +1288,45 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let PreparedBatch {
-            batch,
-            scan_hints,
+            publication,
             mut metrics,
-            transaction_receipts,
             workspace,
-            filesystem_validation,
         } = prepared;
-        if self.active_compatibility_match
-            && self
-                .source_state
-                .as_ref()
-                .is_some_and(|state| batch_matches_state(&batch, state))
-            && self.store.active().is_some_and(|active| {
-                active
-                    .transaction_receipts()
-                    .matches_canonical_ids(&batch.transactions)
-            })
-        {
-            if let Some(validation) = filesystem_validation.as_ref() {
-                #[cfg(test)]
-                Self::run_scan_validation_hook(
-                    &mut self.scan_validation_hook,
-                    ScanValidationCheckpoint::NoChangePreReturn,
-                );
-                self.scanner
-                    .validate_scan(validation)
-                    .map_err(|error| PipelineError::Scan(Box::new(error)))?;
-            }
-            self.active_compatibility_match = true;
-            self.install_workspace(workspace);
-            let warnings = self.take_pending_publish_warnings();
-            return Ok(PipelineBuildOutput {
-                disposition: PipelineBuildDisposition::NoChange,
-                active: self.active()?,
-                metrics,
-                disk_estimate: None,
-                warnings,
-                transaction,
-                target_revision,
-                duration_ms: started.elapsed().as_millis(),
-            });
-        }
-
-        let projection = project_batch(
-            &batch,
-            ProjectionLimits {
-                max_references_per_asset: self.options.max_references_per_asset,
-                max_container_entries_per_asset: if self.options.index_bundle_container_entries {
-                    self.options.max_bundle_container_entries_per_bundle
-                } else {
-                    0
-                },
-            },
-            budget,
-        )
-        .map_err(|error| match error {
-            ProjectionError::Budget(error) => PipelineError::Budget(error),
-            error => PipelineError::Projection(error.into()),
-        })?;
-        metrics.projection = projection.metrics;
-        let source_state =
-            SourceStateSnapshot::from_batch(batch, scan_hints, self.analysis_cache_identity)?;
-        let mut build = self.store.begin()?;
-        let staged = (|| -> Result<_, PipelineError> {
-            let projection_evidence = ProjectionStore::build(build.directory(), &projection)
-                .map_err(PipelineError::Projection)?;
-            build.write_source_state(&source_state)?;
-
-            {
-                let readers = ProjectionReaders::open(build.directory(), budget)
-                    .map_err(PipelineError::Projection)?;
-                SearchQueryFields::from_schema(&readers.search().index().schema())
-                    .map_err(PipelineError::Query)?;
-            }
-
-            let artifacts = self.store.measure_artifacts_with_budget(&build, budget)?;
-            let expected_artifacts =
-                projection_evidence.generation_artifacts(artifacts.source_state());
-            if artifacts != expected_artifacts {
-                return Err(PipelineError::Invariant(
-                    "projection evidence changed before generation publication",
-                ));
-            }
-            let projection_summary = GenerationProjectionSummary::new(
-                u64::try_from(source_state.assets().len())
-                    .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?,
-                projection.metrics.search_documents,
-                projection.metrics.reference_documents,
-                u64::try_from(projection.truncations.len()).map_err(|_| {
-                    PipelineError::ArithmeticOverflow("projection truncation count")
-                })?,
-                u64::try_from(
-                    source_state
-                        .assets()
-                        .iter()
-                        .filter(|analysis| !analysis.complete)
-                        .count(),
+        let publication = self
+            .generation
+            .publish(&self.scanner, publication, budget)?;
+        let (disposition, active, disk_estimate, warnings) = match publication {
+            GenerationPublicationResult::NoChange { active, warnings } => {
+                metrics.projection = ProjectionMetrics::default();
+                (
+                    PipelineBuildDisposition::NoChange,
+                    Some(active),
+                    None,
+                    warnings,
                 )
-                .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?,
-            )?;
-            let identity = SearchGenerationIdentityV1::new_with_semantics(
-                source_state.workspace(),
-                source_state.revision(),
-                GenerationProjectionDigests::new(
-                    projection_evidence.logical_digests().search(),
-                    projection_evidence.logical_digests().references(),
-                ),
-                projection_summary,
-                self.semantics,
-                self.options_digest,
-                source_state.logical_digest(),
-            )?;
-            let manifest = SearchGenerationManifestV1::new(identity, artifacts);
-            let desired_revision = self
-                .store
-                .active()
-                .filter(|active| active.manifest().revision() == manifest.revision())
-                .map(GenerationSnapshot::desired_revision)
-                .or_else(|| {
-                    self.rebuild_bootstrap
-                        .as_ref()
-                        .filter(|bootstrap| {
-                            bootstrap.workspace() == manifest.workspace()
-                                && bootstrap.actual_revision() == manifest.revision()
-                        })
-                        .map(GenerationRebuildBootstrap::desired_revision)
-                })
-                .unwrap_or_else(|| manifest.revision());
-            let disk_estimate = self.store.estimate_manifest_publish(&manifest, budget)?;
-            Ok((manifest, desired_revision, disk_estimate))
-        })();
-        let (manifest, desired_revision, disk_estimate) = match staged {
-            Ok(staged) => staged,
-            Err(primary) => return Err(self.abort_generation_build(&mut build, primary)),
-        };
-        let activation = GenerationActivationEvidence::new(
-            self.store.active().map(GenerationSnapshot::generation),
-            transaction_receipts,
-        );
-        #[cfg(test)]
-        let prepared_result = match self.publish_failpoint.take() {
-            Some(failpoint) => self
-                .store
-                .prepare_publish_with_desired_revision_failpoint_and_budget(
-                    &mut build,
-                    manifest,
-                    activation,
-                    desired_revision,
-                    budget,
-                    failpoint,
-                ),
-            None => self.store.prepare_publish_with_desired_revision_and_budget(
-                &mut build,
-                manifest,
-                activation,
-                desired_revision,
-                budget,
-            ),
-        };
-        #[cfg(not(test))]
-        let prepared_result = self.store.prepare_publish_with_desired_revision_and_budget(
-            &mut build,
-            manifest,
-            activation,
-            desired_revision,
-            budget,
-        );
-        let prepared = match prepared_result {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                let primary = PipelineError::Store(Box::new(error));
-                return Err(self.abort_generation_build(&mut build, primary));
+            }
+            GenerationPublicationResult::Published {
+                active,
+                projection_metrics,
+                disk_estimate,
+                warnings,
+            } => {
+                metrics.projection = projection_metrics;
+                (
+                    PipelineBuildDisposition::Published,
+                    Some(active),
+                    Some(disk_estimate),
+                    warnings,
+                )
             }
         };
-        let candidate_snapshot = prepared.snapshot().clone();
-        let readers = ProjectionReaders::open(candidate_snapshot.directory(), budget)
-            .map_err(PipelineError::Projection)?;
-        let active = Arc::new(ActiveGeneration::open(
-            candidate_snapshot,
-            &source_state,
-            &readers,
-            Some(&projection),
-            self.options,
-            true,
-            true,
-            budget,
-        )?);
-        if let Some(validation) = filesystem_validation.as_ref() {
-            #[cfg(test)]
-            Self::run_scan_validation_hook(
-                &mut self.scan_validation_hook,
-                ScanValidationCheckpoint::ActivationPreCommit,
-            );
-            self.scanner
-                .validate_scan(validation)
-                .map_err(|error| PipelineError::Scan(Box::new(error)))?;
-        }
-        let authority = self.active.clone();
-        let mut public_active = authority.write()?;
-        let report = match prepared.activate_with_budget(budget) {
-            Ok(report) => report,
-            Err(error) => {
-                if error.requires_reopen() {
-                    *public_active = None;
-                }
-                drop(public_active);
-                self.record_store_reopen_requirement(&error);
-                return Err(PipelineError::Store(Box::new(error)));
-            }
-        };
-        let mut active = active;
-        if let Err(error) =
-            Arc::make_mut(&mut active).install_committed_snapshot(report.active.clone())
-        {
-            *public_active = None;
-            drop(public_active);
-            return Err(error);
-        }
-        *public_active = Some(Arc::clone(&active));
-        drop(public_active);
-        self.append_pending_publish_warnings(report.warnings);
-        let warnings = self.take_pending_publish_warnings();
-        self.source_state = Some(source_state);
-        self.active_analysis_match = true;
-        self.active_compatibility_match = true;
-        self.rebuild_bootstrap = None;
         self.install_workspace(workspace);
 
         Ok(PipelineBuildOutput {
-            disposition: PipelineBuildDisposition::Published,
-            active: Some(active),
+            disposition,
+            active,
             metrics,
-            disk_estimate: Some(disk_estimate),
+            disk_estimate,
             warnings,
             transaction,
             target_revision,
@@ -2142,7 +1338,8 @@ impl SearchGenerationPipeline {
         &self,
         budget: &mut AssetLoadBudget,
     ) -> Result<CachedAssets, PipelineError> {
-        let Some(state) = &self.source_state else {
+        let reuse = self.generation.reuse_view();
+        let Some(state) = reuse.source_state() else {
             return Ok(CachedAssets {
                 entries: Vec::new(),
                 workspace_roots: Vec::new(),
@@ -2210,8 +1407,9 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<SourceScanHint>, PipelineError> {
         let previous = self
-            .source_state
-            .as_ref()
+            .generation
+            .reuse_view()
+            .source_state()
             .map_or(&[][..], |state| state.scan_hints());
         let update_count = deleted.len().checked_add(read_sources.len()).ok_or(
             PipelineError::ArithmeticOverflow("source scan hint update count"),
@@ -2301,8 +1499,9 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<SourceScanHint>, PipelineError> {
         let previous = self
-            .source_state
-            .as_ref()
+            .generation
+            .reuse_view()
+            .source_state()
             .map_or(&[][..], |state| state.scan_hints());
         replacements.sort_unstable_by_key(|hint| hint.coordinate);
         if replacements
@@ -2362,167 +1561,6 @@ impl SearchGenerationPipeline {
         Ok(merged)
     }
 
-    fn mark_desired_revision(
-        &mut self,
-        desired: WorkspaceRevision,
-        budget: &mut AssetLoadBudget,
-    ) -> Result<(), PipelineError> {
-        let authority = self.active.clone();
-        let mut public_active = authority.write()?;
-        let commit = match self.store.record_desired_revision(desired, budget) {
-            Ok(commit) => commit,
-            Err(error) => {
-                if error.requires_reopen() {
-                    *public_active = None;
-                }
-                drop(public_active);
-                self.record_store_reopen_requirement(&error);
-                return Err(PipelineError::Store(Box::new(error)));
-            }
-        };
-        #[cfg(test)]
-        Self::run_desired_revision_commit_hook(
-            &mut self.desired_revision_commit_hook,
-            DesiredRevisionCommitCheckpoint::AfterStoreCommitBeforePublicInstall,
-        );
-        let warnings = match commit {
-            DesiredRevisionCommit::NoActive => {
-                if public_active.is_some() {
-                    *public_active = None;
-                    drop(public_active);
-                    return Err(PipelineError::Invariant(
-                        "durable desired-revision result disagrees with public active generation",
-                    ));
-                }
-                Vec::new()
-            }
-            DesiredRevisionCommit::Unchanged => {
-                if public_active.is_none() {
-                    *public_active = None;
-                    drop(public_active);
-                    return Err(PipelineError::Invariant(
-                        "durable desired-revision result disagrees with public active generation",
-                    ));
-                }
-                Vec::new()
-            }
-            DesiredRevisionCommit::Committed(report) => {
-                let active = public_active.as_mut().ok_or(PipelineError::Invariant(
-                    "durable desired-revision result disagrees with public active generation",
-                ))?;
-                if let Err(error) = Arc::make_mut(active).install_committed_snapshot(report.active)
-                {
-                    *public_active = None;
-                    drop(public_active);
-                    return Err(error);
-                }
-                report.warnings
-            }
-        };
-        drop(public_active);
-        self.append_pending_publish_warnings(warnings);
-        Ok(())
-    }
-
-    fn take_pending_publish_warnings(&mut self) -> Vec<String> {
-        const OMITTED_WARNING: &str =
-            "additional publish warnings were omitted to satisfy the protocol budget";
-
-        let mut warnings = std::mem::take(&mut self.pending_publish_warnings);
-        let mut omitted = std::mem::take(&mut self.pending_publish_warnings_omitted);
-        while ReindexEvidence::validate_publish_warnings(&warnings).is_err() {
-            let _ = warnings.pop();
-            omitted = true;
-        }
-        if omitted {
-            loop {
-                warnings.push(OMITTED_WARNING.to_owned());
-                if ReindexEvidence::validate_publish_warnings(&warnings).is_ok() {
-                    break;
-                }
-                let _ = warnings.pop();
-                let _ = warnings.pop();
-            }
-        }
-        warnings
-    }
-
-    fn append_pending_publish_warnings(
-        &mut self,
-        warnings: impl IntoIterator<Item = GenerationPublishWarning>,
-    ) {
-        for warning in warnings {
-            let kind = warning.kind();
-            let message = warning.to_string();
-            if matches!(
-                kind,
-                GenerationPublishWarningKind::PreparationCleanup
-                    | GenerationPublishWarningKind::PostCommitCleanup
-            ) {
-                self.record_generation_cleanup_failure(message.clone());
-            }
-            if self.pending_publish_warnings.len() < MAX_REINDEX_PUBLISH_WARNINGS {
-                self.pending_publish_warnings
-                    .push(crate::wire::bounded_publish_warning(message));
-            } else {
-                self.pending_publish_warnings_omitted = true;
-            }
-        }
-    }
-
-    fn abort_generation_build(
-        &mut self,
-        build: &mut GenerationBuild,
-        primary: PipelineError,
-    ) -> PipelineError {
-        let mut cleanup_budget = AssetLoadBudget::default();
-        match build.abort_with_budget(&mut cleanup_budget) {
-            Ok(()) => primary,
-            Err(cleanup) => {
-                self.record_generation_cleanup_failure(cleanup.to_string());
-                PipelineError::StagingAbortFailed {
-                    primary: Box::new(primary),
-                    cleanup: Box::new(cleanup),
-                }
-            }
-        }
-    }
-
-    fn record_generation_cleanup_failure(&mut self, message: String) {
-        self.generation_maintenance = GenerationMaintenanceStatus {
-            state: GenerationMaintenanceState::RecoveryRequired,
-            last_recovered_entries: self.generation_maintenance.last_recovered_entries,
-            last_cleanup_failure: Some(crate::wire::bounded_error_message(message)),
-        };
-    }
-
-    fn record_store_reopen_requirement(&mut self, error: &GenerationStoreError) {
-        if error.requires_reopen() {
-            self.record_generation_cleanup_failure(error.to_string());
-        }
-    }
-
-    fn ensure_store_operational(&mut self) -> Result<(), PipelineError> {
-        match self.store.ensure_operational() {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if error.requires_reopen() {
-                    *self.active.write()? = None;
-                }
-                self.record_store_reopen_requirement(&error);
-                Err(PipelineError::Store(Box::new(error)))
-            }
-        }
-    }
-
-    fn record_generation_recovery(&mut self, removed_entries: u64) {
-        self.generation_maintenance = GenerationMaintenanceStatus {
-            state: GenerationMaintenanceState::Clean,
-            last_recovered_entries: removed_entries,
-            last_cleanup_failure: None,
-        };
-    }
-
     fn install_workspace(&mut self, prepared: Option<PreparedWorkspace>) {
         let Some(prepared) = prepared else {
             return;
@@ -2545,12 +1583,9 @@ fn retain_scan_hints_for_assets(
 }
 
 struct PreparedBatch {
-    batch: AssetAnalysisBatch,
-    scan_hints: Vec<SourceScanHint>,
+    publication: GenerationPublicationInput,
     metrics: PipelineBuildMetrics,
-    transaction_receipts: TransactionReceiptWindow,
     workspace: Option<PreparedWorkspace>,
-    filesystem_validation: Option<ScanValidation>,
 }
 
 struct ScannedSource {
@@ -2810,104 +1845,6 @@ impl CachedAssets {
             .into_iter()
             .filter_map(|entry| entry.analysis.map(|analysis| (entry.coordinate, analysis)))
     }
-}
-
-fn validate_projection_summary(
-    summary: GenerationProjectionSummary,
-    state: &SourceStateSnapshot,
-    readers: &ProjectionReaders,
-) -> Result<(), PipelineError> {
-    let actual_assets = u64::try_from(state.assets().len())
-        .map_err(|_| PipelineError::ArithmeticOverflow("indexed asset count"))?;
-    validate_summary_count("assets", summary.assets(), actual_assets)?;
-    validate_summary_count(
-        "search documents",
-        summary.search_documents(),
-        readers.search().reader().searcher().num_docs(),
-    )?;
-    validate_summary_count(
-        "reference documents",
-        summary.reference_documents(),
-        readers.references().reader().searcher().num_docs(),
-    )?;
-    let actual_incomplete = u64::try_from(
-        state
-            .assets()
-            .iter()
-            .filter(|analysis| !analysis.complete)
-            .count(),
-    )
-    .map_err(|_| PipelineError::ArithmeticOverflow("incomplete asset count"))?;
-    validate_summary_count(
-        "incomplete assets",
-        summary.incomplete_assets(),
-        actual_incomplete,
-    )
-}
-
-fn validate_projection_summary_without_source_state(
-    summary: GenerationProjectionSummary,
-    readers: &ProjectionReaders,
-) -> Result<(), PipelineError> {
-    validate_summary_count(
-        "search documents",
-        summary.search_documents(),
-        readers.search().reader().searcher().num_docs(),
-    )?;
-    validate_summary_count(
-        "reference documents",
-        summary.reference_documents(),
-        readers.references().reader().searcher().num_docs(),
-    )
-}
-
-fn validate_summary_count(
-    resource: &'static str,
-    manifest: u64,
-    actual: u64,
-) -> Result<(), PipelineError> {
-    if manifest == actual {
-        Ok(())
-    } else {
-        Err(PipelineError::GenerationSummaryMismatch {
-            resource,
-            manifest,
-            actual,
-        })
-    }
-}
-
-fn suggestion_paths_from_state(
-    state: &SourceStateSnapshot,
-    options: SearchIndexOptions,
-) -> impl Iterator<Item = &str> {
-    state.assets().iter().flat_map(move |analysis| {
-        let container_limit = if options.index_bundle_container_entries {
-            options.max_bundle_container_entries_per_bundle
-        } else {
-            0
-        };
-        std::iter::once(analysis.source.relative_path.as_str()).chain(
-            analysis
-                .container_entries
-                .iter()
-                .take(container_limit)
-                .map(|entry| entry.asset_path.as_str()),
-        )
-    })
-}
-
-fn projection_is_complete(state: &SourceStateSnapshot, options: SearchIndexOptions) -> bool {
-    state
-        .assets()
-        .iter()
-        .all(|analysis| analysis.references.len() <= options.max_references_per_asset)
-}
-
-fn batch_matches_state(batch: &AssetAnalysisBatch, state: &SourceStateSnapshot) -> bool {
-    batch.workspace == state.workspace()
-        && batch.revision == state.revision()
-        && batch.assets.as_slice() == state.assets()
 }
 
 fn canonical_transaction_ids(
@@ -4936,10 +3873,12 @@ mod tests {
             .unwrap();
         assert_eq!(first.disposition, PipelineBuildDisposition::Published);
 
-        pipeline.append_pending_publish_warnings([GenerationPublishWarning::new(
-            GenerationPublishWarningKind::PostCommitCleanup,
-            "committed head warning",
-        )]);
+        pipeline
+            .generation
+            .append_pending_warnings([GenerationPublishWarning::new(
+                GenerationPublishWarningKind::PostCommitCleanup,
+                "committed head warning",
+            )]);
         assert_eq!(
             pipeline.generation_maintenance().state,
             GenerationMaintenanceState::RecoveryRequired
@@ -4953,7 +3892,66 @@ mod tests {
 
         assert_eq!(unchanged.disposition, PipelineBuildDisposition::NoChange);
         assert_eq!(unchanged.warnings, ["committed head warning"]);
-        assert!(pipeline.pending_publish_warnings.is_empty());
+        assert_eq!(pipeline.generation.pending_warning_count(), 0);
+    }
+
+    #[test]
+    fn runtime_cleanup_failure_marks_generation_maintenance_recovery_required() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut pipeline = SearchGenerationPipeline::open(
+            paths.clone(),
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        pipeline
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let abandoned = paths
+            .index_root()
+            .join(".staging")
+            .join("build-00000000000000000042");
+        std::fs::create_dir(&abandoned).unwrap();
+
+        let error = pipeline
+            .generation
+            .recover_with_failpoint(GenerationFailpoint::StartupStagingCleanup)
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Store(source)
+                if matches!(
+                    *source,
+                    GenerationStoreError::InjectedFailure {
+                        checkpoint: GenerationFailpoint::StartupStagingCleanup
+                    }
+                )
+        ));
+        assert!(pipeline.active().unwrap().is_some());
+        let maintenance = pipeline.generation_maintenance();
+        assert_eq!(
+            maintenance.state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+        assert!(
+            maintenance
+                .last_cleanup_failure
+                .as_deref()
+                .is_some_and(|message| message.contains("StartupStagingCleanup"))
+        );
+        assert!(abandoned.is_dir());
     }
 
     #[test]
@@ -4979,7 +3977,7 @@ mod tests {
                 &mut AssetLoadBudget::default(),
             )
             .unwrap();
-        pipeline.store.poison_activation_outcome_for_test();
+        pipeline.generation.poison_for_test();
 
         let error = pipeline
             .reindex_filesystem(
@@ -5059,7 +4057,7 @@ mod tests {
                 &mut AssetLoadBudget::default(),
             )
             .unwrap();
-        pipeline.store.poison_activation_outcome_for_test();
+        pipeline.generation.poison_for_test();
 
         let error = pipeline
             .reindex_workspace(
@@ -5121,8 +4119,8 @@ mod tests {
         assert!(!stale.stamp.semantics_current);
         assert!(stale.stamp.configuration_current);
         assert!(stale.stamp.stale);
-        assert!(!reopened.active_analysis_match);
-        assert!(!reopened.active_compatibility_match);
+        assert!(!reopened.generation.reuse_view().analysis_reusable());
+        assert!(!reopened.generation.reuse_view().incrementally_compatible());
 
         let rebuilt = reopened
             .reindex_filesystem(
@@ -5198,8 +4196,8 @@ mod tests {
         assert_eq!(stale.snapshot.generation(), old_generation);
         assert!(stale.stamp.stale);
         assert!(!stale.stamp.semantics_current);
-        assert!(!reopened.active_analysis_match);
-        assert!(!reopened.active_compatibility_match);
+        assert!(!reopened.generation.reuse_view().analysis_reusable());
+        assert!(!reopened.generation.reuse_view().incrementally_compatible());
         let response = stale.search(SearchRequest::new("migration", 10)).unwrap();
         assert_eq!(response.returned_hits, 1);
         drop(stale);
@@ -5306,7 +4304,7 @@ mod tests {
                 .returned_hits
                 > 0
         );
-        assert!(reopened.source_state.is_none());
+        assert!(reopened.generation.reuse_view().source_state().is_none());
         drop(stale);
 
         let rebuilt = reopened
@@ -5410,10 +4408,10 @@ mod tests {
         assert_eq!(stale.snapshot.generation(), old_generation);
         assert!(stale.stamp.stale);
         assert!(!stale.stamp.semantics_current);
-        assert!(reopened.source_state.is_none());
+        assert!(reopened.generation.reuse_view().source_state().is_none());
         assert_eq!(reopened.workspace.workspace_id(), workspace);
-        assert!(!reopened.active_analysis_match);
-        assert!(!reopened.active_compatibility_match);
+        assert!(!reopened.generation.reuse_view().analysis_reusable());
+        assert!(!reopened.generation.reuse_view().incrementally_compatible());
         let response = stale.search(SearchRequest::new("semantic", 10)).unwrap();
         assert_eq!(response.returned_hits, 1);
 
@@ -5499,7 +4497,7 @@ mod tests {
         .unwrap();
         assert_eq!(interrupted.workspace.workspace_id(), workspace_id);
         assert!(interrupted.active().unwrap().is_none());
-        assert!(interrupted.rebuild_bootstrap.is_some());
+        assert!(interrupted.generation.rebuild_bootstrap().is_some());
         assert!(obsolete_activation.is_file());
         assert!(matches!(
             interrupted.reindex_workspace(
@@ -5517,7 +4515,7 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let bootstrap = reopened.rebuild_bootstrap.as_ref().unwrap();
+        let bootstrap = reopened.generation.rebuild_bootstrap().unwrap();
         assert_eq!(bootstrap.workspace(), workspace_id);
         assert_eq!(bootstrap.actual_revision(), empty_revision);
         assert_eq!(bootstrap.desired_revision(), target_revision);
@@ -5535,7 +4533,7 @@ mod tests {
         assert_eq!(rebuilt.snapshot.manifest().revision(), empty_revision);
         assert_eq!(rebuilt.snapshot.desired_revision(), target_revision);
         assert!(!obsolete_activation.exists());
-        assert!(reopened.rebuild_bootstrap.is_none());
+        assert!(reopened.generation.rebuild_bootstrap().is_none());
 
         let applied = reopened
             .reindex_workspace(
@@ -5551,10 +4549,9 @@ mod tests {
         assert_eq!(active.snapshot.desired_revision(), target_revision);
         assert_eq!(
             reopened
-                .store
-                .active()
-                .unwrap()
+                .generation
                 .transaction_receipts()
+                .unwrap()
                 .ids()
                 .collect::<Vec<_>>(),
             [transaction]
@@ -5685,12 +4682,13 @@ mod tests {
         assert!(stale.stamp.semantics_current);
         assert!(!stale.stamp.configuration_current);
         assert!(stale.stamp.stale);
-        assert!(!reopened.active_analysis_match);
-        assert!(!reopened.active_compatibility_match);
+        assert!(!reopened.generation.reuse_view().analysis_reusable());
+        assert!(!reopened.generation.reuse_view().incrementally_compatible());
         assert!(
             reopened
-                .source_state
-                .as_ref()
+                .generation
+                .reuse_view()
+                .source_state()
                 .unwrap()
                 .analysis("Packages/Removed.txt")
                 .is_some()
@@ -5707,8 +4705,9 @@ mod tests {
         assert!(rebuilt.metrics.forced_full_analysis);
         assert!(
             reopened
-                .source_state
-                .as_ref()
+                .generation
+                .reuse_view()
+                .source_state()
                 .unwrap()
                 .analysis("Packages/Removed.txt")
                 .is_none()
@@ -5737,17 +4736,17 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        pipeline.append_pending_publish_warnings((0..MAX_REINDEX_PUBLISH_WARNINGS + 8).map(
-            |ordinal| {
+        pipeline
+            .generation
+            .append_pending_warnings((0..MAX_REINDEX_PUBLISH_WARNINGS + 8).map(|ordinal| {
                 GenerationPublishWarning::new(
                     GenerationPublishWarningKind::PostCommitCleanup,
                     format!("warning-{ordinal}:{}", "x".repeat(4 * 1024)),
                 )
-            },
-        ));
+            }));
 
-        assert!(pipeline.pending_publish_warnings.len() <= MAX_REINDEX_PUBLISH_WARNINGS);
-        let warnings = pipeline.take_pending_publish_warnings();
+        assert!(pipeline.generation.pending_warning_count() <= MAX_REINDEX_PUBLISH_WARNINGS);
+        let warnings = pipeline.generation.take_pending_warnings_for_test();
 
         ReindexEvidence::validate_publish_warnings(&warnings).unwrap();
         assert!(
@@ -5755,8 +4754,8 @@ mod tests {
                 .last()
                 .is_some_and(|warning| warning.contains("were omitted"))
         );
-        assert!(pipeline.pending_publish_warnings.is_empty());
-        assert!(!pipeline.pending_publish_warnings_omitted);
+        assert_eq!(pipeline.generation.pending_warning_count(), 0);
+        assert!(!pipeline.generation.pending_warnings_omitted());
     }
 
     #[test]
@@ -5777,7 +4776,12 @@ mod tests {
         )
         .unwrap();
 
-        pipeline.record_store_reopen_requirement(&GenerationStoreError::ActivationOutcomeUnknown);
+        pipeline.generation.poison_for_test();
+        assert!(matches!(
+            pipeline.generation.ensure_operational(),
+            Err(PipelineError::Store(error))
+                if matches!(*error, GenerationStoreError::ActivationOutcomeUnknown)
+        ));
 
         assert_eq!(
             pipeline.generation_maintenance().state,
