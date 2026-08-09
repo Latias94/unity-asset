@@ -52,9 +52,12 @@ use unity_asset_search_protocol::{
 use generation::GenerationStamp as InternalGenerationStamp;
 #[cfg(test)]
 use generation_store::GenerationFailpoint;
+use pipeline::{
+    ActiveGeneration, ActiveGenerationAuthority, PipelineBuildOutput, PipelineError,
+    SearchGenerationPipeline,
+};
 #[cfg(test)]
-use pipeline::ScanValidationCheckpoint;
-use pipeline::{ActiveGeneration, PipelineBuildOutput, PipelineError, SearchGenerationPipeline};
+use pipeline::{DesiredRevisionCommitCheckpoint, ScanValidationCheckpoint};
 use reference_query::ReferenceQueryError;
 
 #[cfg(test)]
@@ -111,9 +114,9 @@ pub const MAX_SEARCH_LIMIT: usize = unity_asset_search_protocol::MAX_SEARCH_RESU
 
 /// A cloneable handle to one project search index.
 ///
-/// Builds hold the pipeline mutex but never the active-generation lock. Search, suggestion, and
-/// reference calls therefore continue reading the previous complete generation until publication
-/// succeeds.
+/// Long analysis phases hold the pipeline mutex but not the active-generation lock. Search,
+/// suggestion, and reference calls therefore continue reading the previous complete generation;
+/// only the short durable-commit/public-install window takes the active-generation write lock.
 #[derive(Clone)]
 pub struct SearchIndex {
     inner: Arc<SearchIndexInner>,
@@ -123,15 +126,12 @@ struct SearchIndexInner {
     paths: IndexPaths,
     options: SearchIndexOptions,
     pipeline: Mutex<SearchGenerationPipeline>,
-    status: RwLock<StatusObservation>,
+    active: ActiveGenerationAuthority,
+    status: RwLock<RuntimeStatus>,
     #[cfg(test)]
     status_commit_hook: Mutex<Option<StatusCommitHook>>,
-}
-
-#[derive(Clone)]
-struct StatusObservation {
-    active: Option<Arc<ActiveGeneration>>,
-    runtime: RuntimeStatus,
+    #[cfg(test)]
+    status_observation_hook: Mutex<Option<StatusCommitHook>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,21 +159,21 @@ impl StatusCommitHook {
 }
 
 struct RuntimeBuildGuard<'status> {
-    status: &'status RwLock<StatusObservation>,
+    status: &'status RwLock<RuntimeStatus>,
     armed: bool,
 }
 
 impl<'status> RuntimeBuildGuard<'status> {
     fn start(
-        status: &'status RwLock<StatusObservation>,
+        status: &'status RwLock<RuntimeStatus>,
         target_revision: Option<unity_asset_core::WorkspaceRevision>,
     ) -> Result<Self, SearchIndexError> {
         {
             let mut observation = status
                 .write()
                 .map_err(|_| SearchIndexError::internal("runtime status lock is poisoned"))?;
-            observation.runtime.indexing = true;
-            observation.runtime.building_revision = target_revision;
+            observation.indexing = true;
+            observation.building_revision = target_revision;
         }
         Ok(Self {
             status,
@@ -183,7 +183,6 @@ impl<'status> RuntimeBuildGuard<'status> {
 
     fn finish(
         mut self,
-        active: Option<Arc<ActiveGeneration>>,
         update: impl FnOnce(&mut RuntimeStatus),
         before_runtime_update: impl FnOnce(),
     ) -> Result<(), SearchIndexError> {
@@ -192,10 +191,9 @@ impl<'status> RuntimeBuildGuard<'status> {
                 .status
                 .write()
                 .map_err(|_| SearchIndexError::internal("runtime status lock is poisoned"))?;
-            observation.active = active;
             before_runtime_update();
-            clear_runtime_build(&mut observation.runtime);
-            update(&mut observation.runtime);
+            clear_runtime_build(&mut observation);
+            update(&mut observation);
         }
         self.armed = false;
         Ok(())
@@ -211,7 +209,7 @@ impl Drop for RuntimeBuildGuard<'_> {
             Ok(observation) => observation,
             Err(poisoned) => poisoned.into_inner(),
         };
-        clear_runtime_build(&mut observation.runtime);
+        clear_runtime_build(&mut observation);
     }
 }
 
@@ -276,22 +274,22 @@ impl SearchIndex {
         options: SearchIndexOptions,
         pipeline: SearchGenerationPipeline,
     ) -> Self {
-        let active = pipeline.active();
+        let active = pipeline.active_authority();
         let generation_maintenance = pipeline.generation_maintenance();
         Self {
             inner: Arc::new(SearchIndexInner {
                 paths,
                 options,
                 pipeline: Mutex::new(pipeline),
-                status: RwLock::new(StatusObservation {
-                    active,
-                    runtime: RuntimeStatus {
-                        generation_maintenance,
-                        ..RuntimeStatus::default()
-                    },
+                active,
+                status: RwLock::new(RuntimeStatus {
+                    generation_maintenance,
+                    ..RuntimeStatus::default()
                 }),
                 #[cfg(test)]
                 status_commit_hook: Mutex::new(None),
+                #[cfg(test)]
+                status_observation_hook: Mutex::new(None),
             }),
         }
     }
@@ -339,6 +337,20 @@ impl SearchIndex {
     }
 
     #[cfg(test)]
+    fn inject_desired_revision_commit_hook(
+        &self,
+        checkpoint: DesiredRevisionCommitCheckpoint,
+        action: impl FnOnce() + Send + 'static,
+    ) -> Result<(), SearchIndexError> {
+        self.inner
+            .pipeline
+            .lock()
+            .map_err(|_| SearchIndexError::internal("generation pipeline lock is poisoned"))?
+            .inject_desired_revision_commit_hook(checkpoint, action);
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn inject_status_commit_hook(
         &self,
         entered: std::sync::mpsc::SyncSender<()>,
@@ -350,6 +362,24 @@ impl SearchIndex {
     #[cfg(test)]
     fn wait_at_status_commit_hook(&self) {
         let hook = self.inner.status_commit_hook.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook.wait();
+        }
+    }
+
+    #[cfg(test)]
+    fn inject_status_observation_hook(
+        &self,
+        entered: std::sync::mpsc::SyncSender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.inner.status_observation_hook.lock().unwrap() =
+            Some(StatusCommitHook { entered, resume });
+    }
+
+    #[cfg(test)]
+    fn wait_at_status_observation_hook(&self) {
+        let hook = self.inner.status_observation_hook.lock().unwrap().take();
         if let Some(hook) = hook {
             hook.wait();
         }
@@ -412,12 +442,20 @@ impl SearchIndex {
     }
 
     pub fn status(&self) -> Result<StatusResponse, SearchIndexError> {
-        let (active, runtime) = self
+        let observation = self
             .inner
-            .status
-            .read()
-            .map_err(|_| SearchIndexError::internal("status observation lock is poisoned"))
-            .map(|observation| (observation.active.clone(), observation.runtime.clone()))?;
+            .active
+            .with_snapshot(|active| {
+                #[cfg(test)]
+                self.wait_at_status_observation_hook();
+                self.inner
+                    .status
+                    .read()
+                    .map(|runtime| (active.cloned(), runtime.clone()))
+                    .map_err(|_| SearchIndexError::internal("status observation lock is poisoned"))
+            })
+            .map_err(|error| SearchIndexError::from_pipeline(error, None))?;
+        let (active, runtime) = observation?;
 
         let project_root = wire::portable_path(self.inner.paths.project_root())
             .map_err(SearchIndexError::from_wire_projection)?;
@@ -490,14 +528,12 @@ impl SearchIndex {
         let runtime = RuntimeBuildGuard::start(&self.inner.status, target_revision)?;
 
         let result = build(&mut pipeline);
-        let pipeline_active = pipeline.active();
         let generation_maintenance = pipeline.generation_maintenance();
 
         let outcome = match result {
             Ok(output) => {
                 let receipt = wire::reindex_receipt(&output);
                 runtime.finish(
-                    pipeline_active.clone(),
                     |status| {
                         status.last_failure = None;
                         status.generation_maintenance = generation_maintenance;
@@ -512,6 +548,9 @@ impl SearchIndex {
                 Ok(receipt)
             }
             Err(error) => {
+                let pipeline_active = pipeline
+                    .active()
+                    .map_err(|error| SearchIndexError::from_pipeline(error, None))?;
                 let failure = SearchIndexError::from_pipeline(
                     error,
                     pipeline_active
@@ -526,7 +565,6 @@ impl SearchIndex {
                     desired_revision: target_revision,
                 };
                 runtime.finish(
-                    pipeline_active.clone(),
                     |status| {
                         status.last_failure = Some(recorded);
                         status.generation_maintenance = generation_maintenance;
@@ -545,11 +583,9 @@ impl SearchIndex {
 
     fn active_generation(&self) -> Result<Arc<ActiveGeneration>, SearchIndexError> {
         self.inner
-            .status
-            .read()
-            .map_err(|_| SearchIndexError::internal("status observation lock is poisoned"))?
             .active
-            .clone()
+            .snapshot()
+            .map_err(|error| SearchIndexError::from_pipeline(error, None))?
             .ok_or_else(SearchIndexError::generation_unavailable)
     }
 }
@@ -1234,13 +1270,14 @@ GameObject:
     }
 
     #[test]
-    fn staging_cleanup_failure_is_distinct_and_reconcile_clears_it() {
+    fn committed_staging_cleanup_requires_reopen_before_it_is_cleared() {
         let temporary = crate::secure_test_tempdir();
         let project = temporary.path().join("project");
         write_generation_fixture(&project);
         let paths =
             IndexPaths::for_project(project, Some(temporary.path().join("index")), None).unwrap();
-        let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        let index =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
         index
             .inject_generation_failpoint(GenerationFailpoint::ActivationCleanup)
             .unwrap();
@@ -1266,13 +1303,23 @@ GameObject:
                 .is_some()
         );
 
-        index
+        let error = index
             .reindex(
                 FilesystemReindexIntent::reconcile(),
                 &mut AssetLoadBudget::default(),
             )
-            .unwrap();
-        let recovered = index.status().unwrap();
+            .unwrap_err();
+        assert!(error.retryable());
+        let unavailable = index.status().unwrap();
+        assert!(unavailable.generation.active.is_none());
+        assert_eq!(
+            unavailable.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+        drop(index);
+
+        let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        let recovered = reopened.status().unwrap();
         assert_eq!(
             recovered.daemon.generation_maintenance.state,
             GenerationMaintenanceState::Clean
@@ -1281,16 +1328,10 @@ GameObject:
             recovered
                 .daemon
                 .generation_maintenance
-                .last_recovered_entries
-                >= 1
-        );
-        assert!(
-            recovered
-                .daemon
-                .generation_maintenance
                 .last_cleanup_failure
                 .is_none()
         );
+        assert!(recovered.generation.active.is_some());
         assert!(recovered.generation.last_failure.is_none());
     }
 
@@ -1379,10 +1420,7 @@ GameObject:
 
     #[test]
     fn runtime_build_guard_clears_building_state_during_unwind() {
-        let status = RwLock::new(StatusObservation {
-            active: None,
-            runtime: RuntimeStatus::default(),
-        });
+        let status = RwLock::new(RuntimeStatus::default());
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _guard = RuntimeBuildGuard::start(&status, None).unwrap();
@@ -1391,8 +1429,8 @@ GameObject:
 
         assert!(panic.is_err());
         let status = status.read().unwrap();
-        assert!(!status.runtime.indexing);
-        assert_eq!(status.runtime.building_revision, None);
+        assert!(!status.indexing);
+        assert_eq!(status.building_revision, None);
     }
 
     #[test]
@@ -1785,5 +1823,188 @@ GameObject:
         assert!(status.generation.building_revision.is_none());
         assert!(status.last_build_unix_ms.is_some());
         assert!(status.generation.last_failure.is_none());
+    }
+
+    #[test]
+    fn status_observation_cannot_mix_an_old_generation_with_finished_runtime_state() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project.clone(), Some(temporary.path().join("index")), None)
+                .unwrap();
+        let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+
+        fs::write(project.join(OWNER_PATH), OWNER_AFTER).unwrap();
+        let (activation_entered_tx, activation_entered_rx) = mpsc::sync_channel(0);
+        let (activation_resume_tx, activation_resume_rx) = mpsc::sync_channel(0);
+        index
+            .inject_scan_validation_hook(ScanValidationCheckpoint::ActivationPreCommit, move || {
+                activation_entered_tx.send(()).unwrap();
+                activation_resume_rx.recv().unwrap();
+            })
+            .unwrap();
+
+        let (observation_entered_tx, observation_entered_rx) = mpsc::sync_channel(0);
+        let (observation_resume_tx, observation_resume_rx) = mpsc::sync_channel(0);
+        index.inject_status_observation_hook(observation_entered_tx, observation_resume_rx);
+
+        let (build_tx, build_rx) = mpsc::channel();
+        let build_index = index.clone();
+        let build = thread::spawn(move || {
+            let intent = changed_intent(&build_index, [PathBuf::from(OWNER_PATH)]);
+            build_tx
+                .send(build_index.reindex(intent, &mut AssetLoadBudget::default()))
+                .unwrap();
+        });
+        activation_entered_rx.recv().unwrap();
+
+        let (status_tx, status_rx) = mpsc::sync_channel(0);
+        let status_index = index.clone();
+        let status_reader = thread::spawn(move || {
+            status_tx.send(status_index.status()).unwrap();
+        });
+        observation_entered_rx.recv().unwrap();
+
+        // The status reader still owns the active read lock. Releasing the build's validation
+        // checkpoint therefore cannot let publication finish until the observation is resumed.
+        activation_resume_tx.send(()).unwrap();
+        assert!(
+            build_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err()
+        );
+
+        observation_resume_tx.send(()).unwrap();
+        let status = status_rx.recv().unwrap().unwrap();
+        let result = build_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        build.join().unwrap();
+        status_reader.join().unwrap();
+
+        let observed = status.generation.active.expect("active generation");
+        assert_eq!(observed.generation, baseline.generation);
+        assert_eq!(observed.actual_revision, baseline.actual_revision);
+        assert_ne!(observed.desired_revision, observed.actual_revision);
+        assert!(observed.stale);
+        assert!(status.indexing);
+        assert!(status.generation.building_revision.is_none());
+        assert_ne!(result.generation.unwrap(), baseline);
+    }
+
+    #[test]
+    fn desired_revision_commit_is_linearized_with_public_queries() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project.clone(), Some(temporary.path().join("index")), None)
+                .unwrap();
+        let index = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+
+        fs::write(project.join(OWNER_PATH), OWNER_AFTER).unwrap();
+        let (desired_entered_tx, desired_entered_rx) = mpsc::sync_channel(0);
+        let (desired_resume_tx, desired_resume_rx) = mpsc::sync_channel(0);
+        index
+            .inject_desired_revision_commit_hook(
+                DesiredRevisionCommitCheckpoint::AfterStoreCommitBeforePublicInstall,
+                move || {
+                    desired_entered_tx.send(()).unwrap();
+                    desired_resume_rx.recv().unwrap();
+                },
+            )
+            .unwrap();
+        let (activation_entered_tx, activation_entered_rx) = mpsc::sync_channel(0);
+        let (activation_resume_tx, activation_resume_rx) = mpsc::sync_channel(0);
+        index
+            .inject_scan_validation_hook(ScanValidationCheckpoint::ActivationPreCommit, move || {
+                activation_entered_tx.send(()).unwrap();
+                activation_resume_rx.recv().unwrap();
+            })
+            .unwrap();
+
+        let build_index = index.clone();
+        let build = thread::spawn(move || {
+            let intent = changed_intent(&build_index, [PathBuf::from(OWNER_PATH)]);
+            build_index.reindex(intent, &mut AssetLoadBudget::default())
+        });
+        desired_entered_rx.recv().unwrap();
+
+        let (status_attempted_tx, status_attempted_rx) = mpsc::sync_channel(0);
+        let (status_tx, status_rx) = mpsc::sync_channel(0);
+        let status_index = index.clone();
+        let status_reader = thread::spawn(move || {
+            status_attempted_tx.send(()).unwrap();
+            status_tx.send(status_index.status()).unwrap();
+        });
+        let (search_attempted_tx, search_attempted_rx) = mpsc::sync_channel(0);
+        let (search_tx, search_rx) = mpsc::sync_channel(0);
+        let search_index = index.clone();
+        let search_reader = thread::spawn(move || {
+            search_attempted_tx.send(()).unwrap();
+            search_tx
+                .send(search_index.search(SearchRequest::new("Before", 20)))
+                .unwrap();
+        });
+        status_attempted_rx.recv().unwrap();
+        search_attempted_rx.recv().unwrap();
+        assert!(matches!(
+            status_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            search_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        desired_resume_tx.send(()).unwrap();
+        activation_entered_rx.recv().unwrap();
+
+        let status = status_rx.recv().unwrap().unwrap();
+        let stale = status
+            .generation
+            .active
+            .expect("desired commit must publish a stale generation stamp");
+        let search = search_rx.recv().unwrap().unwrap();
+        status_reader.join().unwrap();
+        search_reader.join().unwrap();
+        assert_eq!(stale.generation, baseline.generation);
+        assert_eq!(stale.actual_revision, baseline.actual_revision);
+        assert_ne!(stale.desired_revision, stale.actual_revision);
+        assert!(stale.stale);
+        assert!(status.indexing);
+        assert_eq!(search.generation, stale);
+        assert_eq!(
+            search
+                .hits
+                .into_iter()
+                .map(|hit| hit.path.to_string())
+                .collect::<Vec<_>>(),
+            vec![OWNER_PATH.to_owned()]
+        );
+
+        activation_resume_tx.send(()).unwrap();
+        let published = build.join().unwrap().unwrap().generation.unwrap();
+        assert_ne!(published.generation, baseline.generation);
+        assert!(!published.stale);
+        assert_eq!(search_paths(&index, "After"), vec![OWNER_PATH.to_owned()]);
     }
 }

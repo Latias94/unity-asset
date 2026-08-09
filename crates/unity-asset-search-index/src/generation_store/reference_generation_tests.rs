@@ -454,19 +454,31 @@ fn unsynced_desired_revision_head_recovers_after_the_final_link_is_lost() {
     let baseline = publish_generation(&mut store, "baseline", None);
     let desired = revision("desired");
 
-    let warnings = store
+    let error = store
         .record_desired_revision_with_failpoint(
             desired,
             &mut AssetLoadBudget::default(),
             Some(GenerationFailpoint::ActivationDirectorySync),
         )
-        .unwrap();
-    assert!(warnings.iter().any(|warning| {
-        warning.kind() == GenerationPublishWarningKind::PostCommitDurability
-            && warning.message().contains("ActivationDirectorySync")
-    }));
-
-    let ordinal = store.active().unwrap().activation_ordinal();
+        .unwrap_err();
+    let ordinal = match error {
+        GenerationStoreError::ActivationCommitRequiresReopen { ordinal, source }
+            if matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::ActivationDirectorySync
+                }
+            ) =>
+        {
+            ordinal
+        }
+        error => panic!("unexpected activation error: {error}"),
+    };
+    assert_eq!(store.active().unwrap().generation(), baseline);
+    assert_eq!(
+        store.active().unwrap().desired_revision(),
+        revision("baseline")
+    );
     let activation = temporary
         .path()
         .join(super::ACTIVATIONS_DIRECTORY)
@@ -487,6 +499,124 @@ fn unsynced_desired_revision_head_recovers_after_the_final_link_is_lost() {
     assert_eq!(active.manifest().revision(), revision("baseline"));
     assert_eq!(active.desired_revision(), desired);
     assert!(!recovery.exists());
+}
+
+#[test]
+fn startup_refuses_an_old_head_while_committed_recovery_is_unresolved() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let desired = revision("desired");
+
+    let error = store
+        .record_desired_revision_with_failpoint(
+            desired,
+            &mut AssetLoadBudget::default(),
+            Some(GenerationFailpoint::ActivationDirectorySync),
+        )
+        .unwrap_err();
+    let ordinal = match error {
+        GenerationStoreError::ActivationCommitRequiresReopen { ordinal, source }
+            if matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::ActivationDirectorySync
+                }
+            ) =>
+        {
+            ordinal
+        }
+        error => panic!("unexpected activation error: {error}"),
+    };
+    let activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(ordinal));
+    let recovery = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_recovery_file_name(ordinal));
+    drop(store);
+    fs::remove_file(&activation).unwrap();
+
+    let error = open_store_with_startup_failpoint(
+        temporary.path(),
+        options,
+        GenerationFailpoint::StartupStagingCleanup,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::InjectedFailure {
+            checkpoint: GenerationFailpoint::StartupStagingCleanup
+        }
+    ));
+    assert!(activation.is_file());
+    assert!(recovery.is_file());
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.generation(), baseline);
+    assert_eq!(active.manifest().revision(), revision("baseline"));
+    assert_eq!(active.desired_revision(), desired);
+    assert!(!recovery.exists());
+}
+
+#[test]
+fn runtime_recovery_that_changes_authority_requires_reopen() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let previous = store.active().cloned().unwrap();
+    let desired = revision("desired");
+
+    let error = store
+        .record_desired_revision_with_failpoint(
+            desired,
+            &mut AssetLoadBudget::default(),
+            Some(GenerationFailpoint::ActivationDirectorySync),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationCommitRequiresReopen { .. }
+    ));
+    store.activation_outcome_unknown = false;
+    store.active = Some(previous);
+
+    let error = store
+        .reconcile_abandoned_staging(&mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationAuthorityChangedReopenRequired
+    ));
+    assert!(error.requires_reopen());
+    assert_eq!(store.active().unwrap().generation(), baseline);
+    assert_eq!(
+        store.active().unwrap().desired_revision(),
+        revision("baseline")
+    );
+    assert!(matches!(
+        store.begin(),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+    assert!(matches!(
+        store.record_desired_revision(desired, &mut AssetLoadBudget::default()),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+    assert!(matches!(
+        store.reconcile_abandoned_staging(&mut AssetLoadBudget::default()),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+
+    drop(store);
+    let reopened = open_store(temporary.path(), options).unwrap();
+    let active = reopened.active().unwrap();
+    assert_eq!(active.generation(), baseline);
+    assert_eq!(active.desired_revision(), desired);
 }
 
 #[test]
@@ -1717,7 +1847,7 @@ fn activation_precommit_failure_cleans_staging_and_preserves_the_active_generati
 }
 
 #[test]
-fn activation_directory_sync_failure_returns_committed_generation_consistent_with_reopen() {
+fn activation_directory_sync_failure_requires_reopen_before_publication_is_observed() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions {
         retain_previous_generations: 1,
@@ -1729,36 +1859,38 @@ fn activation_directory_sync_failure_returns_committed_generation_consistent_wit
     let manifest = manifest_for(&store, &build, "sync-warning", Some(baseline));
     let candidate = manifest.generation_id();
 
-    let report = store
+    let prepared = store
         .prepare_publish_with_failpoint(
             &mut build,
             manifest,
             GenerationFailpoint::ActivationDirectorySync,
         )
-        .unwrap()
-        .activate()
         .unwrap();
-    let pending =
-        temporary
-            .path()
-            .join(super::STAGING_DIRECTORY)
-            .join(activation_pending_file_name(
-                report.active.activation_ordinal(),
-            ));
-    let recovery =
-        temporary
-            .path()
-            .join(super::STAGING_DIRECTORY)
-            .join(activation_recovery_file_name(
-                report.active.activation_ordinal(),
-            ));
+    let activation_ordinal = prepared.snapshot().activation_ordinal();
+    let error = prepared.activate().unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationCommitRequiresReopen {
+            ordinal,
+            source,
+        } if ordinal == activation_ordinal
+            && matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::ActivationDirectorySync
+                }
+            )
+    ));
+    let pending = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_pending_file_name(activation_ordinal));
+    let recovery = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_recovery_file_name(activation_ordinal));
 
-    assert_eq!(report.active.generation(), candidate);
-    assert_eq!(store.active().unwrap().generation(), candidate);
-    assert!(report.warnings.iter().any(|warning| {
-        warning.kind() == GenerationPublishWarningKind::PostCommitDurability
-            && warning.message().contains("ActivationDirectorySync")
-    }));
+    assert_eq!(store.active().unwrap().generation(), baseline);
     assert!(pending.is_file());
     assert!(recovery.is_file());
 
@@ -1782,45 +1914,46 @@ fn already_active_retry_confirms_durability_before_pruning_old_heads() {
     let mut first = store.begin().unwrap();
     write_artifacts(&first, "candidate");
     let manifest = manifest_for(&store, &first, "candidate", Some(baseline));
-    let first_report = store
+    let prepared = store
         .prepare_publish_with_failpoint(
             &mut first,
             manifest,
             GenerationFailpoint::ActivationDirectorySync,
         )
-        .unwrap()
-        .activate()
         .unwrap();
-    let candidate = first_report.active.generation();
+    let candidate = prepared.snapshot().generation();
+    assert!(matches!(
+        prepared.activate(),
+        Err(GenerationStoreError::ActivationCommitRequiresReopen { .. })
+    ));
     drop(first);
+    drop(store);
 
-    let mut refreshed = store.begin().unwrap();
-    write_artifacts(&refreshed, "candidate");
-    let manifest = manifest_for(&store, &refreshed, "candidate", Some(candidate));
-    store
-        .prepare_publish_with_failpoint(
-            &mut refreshed,
-            manifest,
-            GenerationFailpoint::ActivationDirectorySync,
-        )
-        .unwrap()
-        .activate()
-        .unwrap();
-    drop(refreshed);
+    let mut store = open_store(temporary.path(), options).unwrap();
 
     let active_ordinal = store.active().unwrap().activation_ordinal();
     assert_eq!(
         fs::read_dir(temporary.path().join(super::ACTIVATIONS_DIRECTORY))
             .unwrap()
             .count(),
-        3
+        2
     );
 
     let mut retry = store.begin().unwrap();
     write_artifacts(&retry, "candidate");
     let manifest = manifest_for(&store, &retry, "candidate", Some(candidate));
     let prepared = store.prepare_publish(&mut retry, manifest).unwrap();
-    assert_eq!(prepared.snapshot().activation_ordinal(), active_ordinal);
+    assert!(prepared.snapshot().activation_ordinal() > active_ordinal);
+    let committed_ordinal = prepared.activate().unwrap().active.activation_ordinal();
+    drop(retry);
+
+    let mut already_active = store.begin().unwrap();
+    write_artifacts(&already_active, "candidate");
+    let manifest = manifest_for(&store, &already_active, "candidate", Some(candidate));
+    let prepared = store
+        .prepare_publish(&mut already_active, manifest)
+        .unwrap();
+    assert_eq!(prepared.snapshot().activation_ordinal(), committed_ordinal);
     prepared.activate().unwrap();
 
     assert_eq!(
@@ -1977,7 +2110,7 @@ fn full_activation_capacity_compacts_before_rejecting_the_next_commit() {
 }
 
 #[test]
-fn repeated_activation_cleanup_failure_rejects_the_multiply_linked_head() {
+fn repeated_activation_cleanup_failure_blocks_head_selection_until_retry() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions::default();
     let mut store = open_store(temporary.path(), options).unwrap();
@@ -2004,12 +2137,22 @@ fn repeated_activation_cleanup_failure_rejects_the_multiply_linked_head() {
         GenerationFailpoint::StartupStagingCleanup,
     )
     .unwrap_err();
-    let GenerationStoreError::PersistedIdentityChanged { path } = error else {
-        panic!("unexpected multiply-linked activation error: {error:?}");
-    };
-    assert!(
-        matches!(path.file_name(), Some(name) if name == std::ffi::OsStr::new(&recovery) || name == std::ffi::OsStr::new(&pending))
+    assert!(matches!(
+        error,
+        GenerationStoreError::InjectedFailure {
+            checkpoint: GenerationFailpoint::StartupStagingCleanup
+        }
+    ));
+    assert!(temporary.path().join(".staging").join(&recovery).is_file());
+    assert!(temporary.path().join(".staging").join(&pending).is_file());
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert_eq!(
+        reopened.active().unwrap().generation(),
+        report.active.generation()
     );
+    assert!(!temporary.path().join(".staging").join(recovery).exists());
+    assert!(!temporary.path().join(".staging").join(pending).exists());
 }
 
 #[test]
@@ -2258,21 +2401,23 @@ fn activation_sync_failure_recovers_the_new_head_if_its_final_link_is_lost() {
     let mut build = store.begin().unwrap();
     write_artifacts(&build, "rebuilt-unsynced");
     let manifest = manifest_for(&store, &build, "rebuilt-unsynced", None);
-    let report = store
+    let rebuilt = manifest.generation_id();
+    let prepared = store
         .prepare_publish_with_failpoint(
             &mut build,
             manifest,
             GenerationFailpoint::ActivationDirectorySync,
         )
-        .unwrap()
-        .activate()
         .unwrap();
-    let rebuilt = report.active.generation();
-    let new_activation = activations.join(activation_file_name(report.active.activation_ordinal()));
-    assert!(report.warnings.iter().any(|warning| {
-        warning.kind() == GenerationPublishWarningKind::PostCommitDurability
-            && warning.message().contains("ActivationDirectorySync")
-    }));
+    let activation_ordinal = prepared.snapshot().activation_ordinal();
+    assert!(matches!(
+        prepared.activate(),
+        Err(GenerationStoreError::ActivationCommitRequiresReopen {
+            ordinal,
+            ..
+        }) if ordinal == activation_ordinal
+    ));
+    let new_activation = activations.join(activation_file_name(activation_ordinal));
     assert!(obsolete_activation.is_file());
     assert!(new_activation.is_file());
 
@@ -2312,16 +2457,18 @@ fn surviving_newer_current_head_supersedes_an_obsolete_bootstrap() {
     let mut build = store.begin().unwrap();
     write_artifacts(&build, "rebuilt-unsynced");
     let manifest = manifest_for(&store, &build, "rebuilt-unsynced", None);
-    let report = store
+    let rebuilt = manifest.generation_id();
+    let prepared = store
         .prepare_publish_with_failpoint(
             &mut build,
             manifest,
             GenerationFailpoint::ActivationDirectorySync,
         )
-        .unwrap()
-        .activate()
         .unwrap();
-    let rebuilt = report.active.generation();
+    assert!(matches!(
+        prepared.activate(),
+        Err(GenerationStoreError::ActivationCommitRequiresReopen { .. })
+    ));
     assert!(obsolete_activation.is_file());
 
     drop(build);

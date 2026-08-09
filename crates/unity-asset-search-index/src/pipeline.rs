@@ -5,7 +5,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::mem::size_of;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Instant;
 
 use unity_asset::reference::{ReferenceGraphBuildOptions, ReferenceGraphError};
@@ -43,7 +43,7 @@ use crate::generation::{
 #[cfg(test)]
 use crate::generation_store::GenerationFailpoint;
 use crate::generation_store::{
-    GenerationActivationEvidence, GenerationBuild, GenerationDiskEstimate,
+    DesiredRevisionCommit, GenerationActivationEvidence, GenerationBuild, GenerationDiskEstimate,
     GenerationPublishWarning, GenerationPublishWarningKind, GenerationRebuildBootstrap,
     GenerationSnapshot, GenerationStore, GenerationStoreError, GenerationStoreOptions,
     SourceScanHint, SourceStateError, SourceStateSnapshot, TransactionReceiptMembership,
@@ -348,8 +348,79 @@ impl ActiveGeneration {
         Ok(response)
     }
 
-    fn set_desired_revision(&mut self, revision: WorkspaceRevision) {
-        self.stamp = self.stamp.clone().with_desired_revision(revision);
+    fn install_committed_snapshot(
+        &mut self,
+        snapshot: GenerationSnapshot,
+    ) -> Result<(), PipelineError> {
+        if snapshot.generation() != self.snapshot.generation()
+            || snapshot.storage_contract() != self.snapshot.storage_contract()
+            || snapshot.manifest() != self.snapshot.manifest()
+            || snapshot.directory() != self.snapshot.directory()
+            || snapshot.activation_ordinal() < self.snapshot.activation_ordinal()
+        {
+            return Err(PipelineError::Invariant(
+                "desired-revision commit changed immutable active-generation identity",
+            ));
+        }
+        self.stamp = self
+            .stamp
+            .clone()
+            .with_desired_revision(snapshot.desired_revision());
+        self.snapshot = snapshot;
+        Ok(())
+    }
+}
+
+/// Shared in-process authority for the immutable generation used by queries and status.
+///
+/// The write guard is held across durable activation and the corresponding in-memory install, so
+/// readers cannot observe a disk-committed freshness transition with the previous public stamp.
+#[derive(Clone)]
+pub(crate) struct ActiveGenerationAuthority {
+    active: Arc<RwLock<Option<Arc<ActiveGeneration>>>>,
+}
+
+impl fmt::Debug for ActiveGenerationAuthority {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActiveGenerationAuthority")
+            .field(
+                "active",
+                &self
+                    .snapshot()
+                    .ok()
+                    .flatten()
+                    .map(|generation| generation.stamp().clone()),
+            )
+            .finish()
+    }
+}
+
+impl ActiveGenerationAuthority {
+    fn new(active: Option<Arc<ActiveGeneration>>) -> Self {
+        Self {
+            active: Arc::new(RwLock::new(active)),
+        }
+    }
+
+    pub(crate) fn snapshot(&self) -> Result<Option<Arc<ActiveGeneration>>, PipelineError> {
+        self.with_snapshot(|active| active.cloned())
+    }
+
+    pub(crate) fn with_snapshot<R>(
+        &self,
+        inspect: impl FnOnce(Option<&Arc<ActiveGeneration>>) -> R,
+    ) -> Result<R, PipelineError> {
+        let active = self.active.read().map_err(|_| {
+            PipelineError::Invariant("active-generation authority lock is poisoned")
+        })?;
+        Ok(inspect(active.as_ref()))
+    }
+
+    fn write(&self) -> Result<RwLockWriteGuard<'_, Option<Arc<ActiveGeneration>>>, PipelineError> {
+        self.active
+            .write()
+            .map_err(|_| PipelineError::Invariant("active-generation authority lock is poisoned"))
     }
 }
 
@@ -373,9 +444,36 @@ pub(crate) enum ScanValidationCheckpoint {
 }
 
 #[cfg(test)]
-struct ScanValidationHook {
-    checkpoint: ScanValidationCheckpoint,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DesiredRevisionCommitCheckpoint {
+    AfterStoreCommitBeforePublicInstall,
+}
+
+#[cfg(test)]
+struct OneShotCheckpointHook<C> {
+    checkpoint: C,
     action: Box<dyn FnOnce() + Send + 'static>,
+}
+
+#[cfg(test)]
+type ScanValidationHook = OneShotCheckpointHook<ScanValidationCheckpoint>;
+
+#[cfg(test)]
+type DesiredRevisionCommitHook = OneShotCheckpointHook<DesiredRevisionCommitCheckpoint>;
+
+#[cfg(test)]
+impl<C: PartialEq> OneShotCheckpointHook<C> {
+    fn run(hook: &mut Option<Self>, checkpoint: C) {
+        let should_run = hook
+            .as_ref()
+            .is_some_and(|hook| hook.checkpoint == checkpoint);
+        if should_run {
+            let hook = hook
+                .take()
+                .expect("checkpoint hook disappeared after matching its checkpoint");
+            (hook.action)();
+        }
+    }
 }
 
 pub(crate) struct SearchGenerationPipeline {
@@ -393,7 +491,7 @@ pub(crate) struct SearchGenerationPipeline {
     rebuild_bootstrap: Option<GenerationRebuildBootstrap>,
     store: GenerationStore,
     source_state: Option<SourceStateSnapshot>,
-    active: Option<Arc<ActiveGeneration>>,
+    active: ActiveGenerationAuthority,
     generation_maintenance: GenerationMaintenanceStatus,
     pending_publish_warnings: Vec<String>,
     pending_publish_warnings_omitted: bool,
@@ -401,6 +499,8 @@ pub(crate) struct SearchGenerationPipeline {
     publish_failpoint: Option<GenerationFailpoint>,
     #[cfg(test)]
     scan_validation_hook: Option<ScanValidationHook>,
+    #[cfg(test)]
+    desired_revision_commit_hook: Option<DesiredRevisionCommitHook>,
 }
 
 impl fmt::Debug for SearchGenerationPipeline {
@@ -418,7 +518,12 @@ impl fmt::Debug for SearchGenerationPipeline {
             )
             .field(
                 "active_generation",
-                &self.active.as_ref().map(|active| active.stamp()),
+                &self
+                    .active
+                    .snapshot()
+                    .ok()
+                    .flatten()
+                    .map(|active| active.stamp().clone()),
             )
             .finish_non_exhaustive()
     }
@@ -650,7 +755,7 @@ impl SearchGenerationPipeline {
             rebuild_bootstrap,
             store,
             source_state,
-            active,
+            active: ActiveGenerationAuthority::new(active),
             generation_maintenance,
             pending_publish_warnings: Vec::new(),
             pending_publish_warnings_omitted: false,
@@ -658,6 +763,8 @@ impl SearchGenerationPipeline {
             publish_failpoint: None,
             #[cfg(test)]
             scan_validation_hook: None,
+            #[cfg(test)]
+            desired_revision_commit_hook: None,
         })
     }
 
@@ -679,22 +786,38 @@ impl SearchGenerationPipeline {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_desired_revision_commit_hook(
+        &mut self,
+        checkpoint: DesiredRevisionCommitCheckpoint,
+        action: impl FnOnce() + Send + 'static,
+    ) {
+        self.desired_revision_commit_hook = Some(DesiredRevisionCommitHook {
+            checkpoint,
+            action: Box::new(action),
+        });
+    }
+
+    #[cfg(test)]
     fn run_scan_validation_hook(
         hook: &mut Option<ScanValidationHook>,
         checkpoint: ScanValidationCheckpoint,
     ) {
-        let should_run = hook
-            .as_ref()
-            .is_some_and(|hook| hook.checkpoint == checkpoint);
-        if should_run {
-            let hook = hook
-                .take()
-                .expect("scan validation hook disappeared after matching its checkpoint");
-            (hook.action)();
-        }
+        OneShotCheckpointHook::run(hook, checkpoint);
     }
 
-    pub(crate) fn active(&self) -> Option<Arc<ActiveGeneration>> {
+    #[cfg(test)]
+    fn run_desired_revision_commit_hook(
+        hook: &mut Option<DesiredRevisionCommitHook>,
+        checkpoint: DesiredRevisionCommitCheckpoint,
+    ) {
+        OneShotCheckpointHook::run(hook, checkpoint);
+    }
+
+    pub(crate) fn active(&self) -> Result<Option<Arc<ActiveGeneration>>, PipelineError> {
+        self.active.snapshot()
+    }
+
+    pub(crate) fn active_authority(&self) -> ActiveGenerationAuthority {
         self.active.clone()
     }
 
@@ -719,6 +842,9 @@ impl SearchGenerationPipeline {
             match self.store.reconcile_abandoned_staging(&mut cleanup_budget) {
                 Ok(report) => self.record_generation_recovery(report.removed_entries()),
                 Err(error) => {
+                    if error.requires_reopen() {
+                        *self.active.write()? = None;
+                    }
                     self.record_generation_cleanup_failure(error.to_string());
                     return Err(PipelineError::Store(Box::new(error)));
                 }
@@ -772,7 +898,7 @@ impl SearchGenerationPipeline {
                 TransactionReceiptMembership::Exact => {
                     return Ok(PipelineBuildOutput {
                         disposition: PipelineBuildDisposition::AlreadyApplied,
-                        active: self.active.clone(),
+                        active: self.active()?,
                         metrics: PipelineBuildMetrics::default(),
                         disk_estimate: None,
                         warnings: Vec::new(),
@@ -1803,7 +1929,7 @@ impl SearchGenerationPipeline {
             let warnings = self.take_pending_publish_warnings();
             return Ok(PipelineBuildOutput {
                 disposition: PipelineBuildDisposition::NoChange,
-                active: self.active.clone(),
+                active: self.active()?,
                 metrics,
                 disk_estimate: None,
                 warnings,
@@ -1967,17 +2093,32 @@ impl SearchGenerationPipeline {
                 .validate_scan(validation)
                 .map_err(|error| PipelineError::Scan(Box::new(error)))?;
         }
+        let authority = self.active.clone();
+        let mut public_active = authority.write()?;
         let report = match prepared.activate_with_budget(budget) {
             Ok(report) => report,
             Err(error) => {
+                if error.requires_reopen() {
+                    *public_active = None;
+                }
+                drop(public_active);
                 self.record_store_reopen_requirement(&error);
                 return Err(PipelineError::Store(Box::new(error)));
             }
         };
+        let mut active = active;
+        if let Err(error) =
+            Arc::make_mut(&mut active).install_committed_snapshot(report.active.clone())
+        {
+            *public_active = None;
+            drop(public_active);
+            return Err(error);
+        }
+        *public_active = Some(Arc::clone(&active));
+        drop(public_active);
         self.append_pending_publish_warnings(report.warnings);
         let warnings = self.take_pending_publish_warnings();
         self.source_state = Some(source_state);
-        self.active = Some(Arc::clone(&active));
         self.active_analysis_match = true;
         self.active_compatibility_match = true;
         self.rebuild_bootstrap = None;
@@ -2224,17 +2365,60 @@ impl SearchGenerationPipeline {
         desired: WorkspaceRevision,
         budget: &mut AssetLoadBudget,
     ) -> Result<(), PipelineError> {
-        let warnings = match self.store.record_desired_revision(desired, budget) {
-            Ok(warnings) => warnings,
+        let authority = self.active.clone();
+        let mut public_active = authority.write()?;
+        let commit = match self.store.record_desired_revision(desired, budget) {
+            Ok(commit) => commit,
             Err(error) => {
+                if error.requires_reopen() {
+                    *public_active = None;
+                }
+                drop(public_active);
                 self.record_store_reopen_requirement(&error);
                 return Err(PipelineError::Store(Box::new(error)));
             }
         };
+        #[cfg(test)]
+        Self::run_desired_revision_commit_hook(
+            &mut self.desired_revision_commit_hook,
+            DesiredRevisionCommitCheckpoint::AfterStoreCommitBeforePublicInstall,
+        );
+        let warnings = match commit {
+            DesiredRevisionCommit::NoActive => {
+                if public_active.is_some() {
+                    *public_active = None;
+                    drop(public_active);
+                    return Err(PipelineError::Invariant(
+                        "durable desired-revision result disagrees with public active generation",
+                    ));
+                }
+                Vec::new()
+            }
+            DesiredRevisionCommit::Unchanged => {
+                if public_active.is_none() {
+                    *public_active = None;
+                    drop(public_active);
+                    return Err(PipelineError::Invariant(
+                        "durable desired-revision result disagrees with public active generation",
+                    ));
+                }
+                Vec::new()
+            }
+            DesiredRevisionCommit::Committed(report) => {
+                let active = public_active.as_mut().ok_or(PipelineError::Invariant(
+                    "durable desired-revision result disagrees with public active generation",
+                ))?;
+                if let Err(error) = Arc::make_mut(active).install_committed_snapshot(report.active)
+                {
+                    *public_active = None;
+                    drop(public_active);
+                    return Err(error);
+                }
+                report.warnings
+            }
+        };
+        drop(public_active);
         self.append_pending_publish_warnings(warnings);
-        if let Some(active) = &mut self.active {
-            Arc::make_mut(active).set_desired_revision(desired);
-        }
         Ok(())
     }
 
@@ -2271,7 +2455,6 @@ impl SearchGenerationPipeline {
             if matches!(
                 kind,
                 GenerationPublishWarningKind::PreparationCleanup
-                    | GenerationPublishWarningKind::PostCommitDurability
                     | GenerationPublishWarningKind::PostCommitCleanup
             ) {
                 self.record_generation_cleanup_failure(message.clone());
@@ -4739,7 +4922,7 @@ mod tests {
         assert_eq!(first.disposition, PipelineBuildDisposition::Published);
 
         pipeline.append_pending_publish_warnings([GenerationPublishWarning::new(
-            GenerationPublishWarningKind::PostCommitDurability,
+            GenerationPublishWarningKind::PostCommitCleanup,
             "committed head warning",
         )]);
         assert_eq!(
@@ -4793,7 +4976,7 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let stale = reopened.active.as_ref().unwrap();
+        let stale = reopened.active().unwrap().unwrap();
         assert_eq!(stale.snapshot.generation(), old_generation);
         assert!(!stale.stamp.semantics_current);
         assert!(stale.stamp.configuration_current);
@@ -4871,7 +5054,7 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let stale = reopened.active.as_ref().unwrap();
+        let stale = reopened.active().unwrap().unwrap();
         assert_eq!(stale.snapshot.generation(), old_generation);
         assert!(stale.stamp.stale);
         assert!(!stale.stamp.semantics_current);
@@ -4879,6 +5062,7 @@ mod tests {
         assert!(!reopened.active_compatibility_match);
         let response = stale.search(SearchRequest::new("migration", 10)).unwrap();
         assert_eq!(response.returned_hits, 1);
+        drop(stale);
 
         let rebuilt = reopened
             .reindex_filesystem(
@@ -4904,8 +5088,8 @@ mod tests {
         .unwrap();
         assert!(
             reopened
-                .active
-                .as_ref()
+                .active()
+                .unwrap()
                 .unwrap()
                 .snapshot
                 .source_state_storage_current()
@@ -4971,7 +5155,7 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let stale = reopened.active.as_ref().unwrap();
+        let stale = reopened.active().unwrap().unwrap();
         assert_eq!(stale.snapshot.generation(), generation);
         assert!(!stale.snapshot.source_state_storage_current());
         assert!(stale.stamp.stale);
@@ -4983,6 +5167,7 @@ mod tests {
                 > 0
         );
         assert!(reopened.source_state.is_none());
+        drop(stale);
 
         let rebuilt = reopened
             .reindex_filesystem(
@@ -5003,8 +5188,8 @@ mod tests {
         .unwrap();
         assert!(
             reopened_after_cleanup
-                .active
-                .as_ref()
+                .active()
+                .unwrap()
                 .unwrap()
                 .snapshot
                 .source_state_storage_current()
@@ -5081,7 +5266,7 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let stale = reopened.active.as_ref().unwrap();
+        let stale = reopened.active().unwrap().unwrap();
         assert_eq!(stale.snapshot.generation(), old_generation);
         assert!(stale.stamp.stale);
         assert!(!stale.stamp.semantics_current);
@@ -5173,7 +5358,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(interrupted.workspace.workspace_id(), workspace_id);
-        assert!(interrupted.active.is_none());
+        assert!(interrupted.active().unwrap().is_none());
         assert!(interrupted.rebuild_bootstrap.is_some());
         assert!(obsolete_activation.is_file());
         assert!(matches!(
@@ -5355,7 +5540,7 @@ mod tests {
             &mut AssetLoadBudget::default(),
         )
         .unwrap();
-        let stale = reopened.active.as_ref().unwrap();
+        let stale = reopened.active().unwrap().unwrap();
         assert_eq!(stale.snapshot.generation(), old_generation);
         assert!(stale.stamp.semantics_current);
         assert!(!stale.stamp.configuration_current);
@@ -5415,7 +5600,7 @@ mod tests {
         pipeline.append_pending_publish_warnings((0..MAX_REINDEX_PUBLISH_WARNINGS + 8).map(
             |ordinal| {
                 GenerationPublishWarning::new(
-                    GenerationPublishWarningKind::PostCommitDurability,
+                    GenerationPublishWarningKind::PostCommitCleanup,
                     format!("warning-{ordinal}:{}", "x".repeat(4 * 1024)),
                 )
             },
