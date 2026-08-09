@@ -1230,6 +1230,8 @@ pub(crate) enum GenerationFailpoint {
     #[cfg(test)]
     StartupStagingDirectorySync,
     #[cfg(test)]
+    StartupActivationDirectorySync,
+    #[cfg(test)]
     StartupGenerationDirectorySync,
     Activation,
     ActivationPreCommit,
@@ -1598,14 +1600,18 @@ impl GenerationStore {
             #[cfg(test)]
             startup_recovery_failpoint,
         )?;
-        let mut staging_recovery = recover_disposable_staging(
+        let disposable_recovery = match recover_disposable_staging(
             &staging,
             &activations,
             &mut recovery_budget,
             #[cfg(test)]
             startup_recovery_failpoint,
-        );
-        staging_recovery = merge_recovery_results(Ok(committed_recovery), staging_recovery);
+        ) {
+            Err(error) if error.requires_reopen() => return Err(error),
+            recovery => recovery,
+        };
+        let mut staging_recovery =
+            merge_recovery_results(Ok(committed_recovery), disposable_recovery);
         let opened_generations =
             SecureReadDirectory::open(&generations, OpenPolicy::PersistedState).map_err(
                 |source| {
@@ -1694,7 +1700,28 @@ impl GenerationStore {
         &mut self,
         budget: &mut AssetLoadBudget,
     ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
-        self.ensure_activation_outcome_known()?;
+        self.reconcile_abandoned_staging_inner(
+            budget,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    fn reconcile_abandoned_staging_with_failpoint(
+        &mut self,
+        budget: &mut AssetLoadBudget,
+        failpoint: GenerationFailpoint,
+    ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
+        self.reconcile_abandoned_staging_inner(budget, Some(failpoint))
+    }
+
+    fn reconcile_abandoned_staging_inner(
+        &mut self,
+        budget: &mut AssetLoadBudget,
+        #[cfg(test)] failpoint: Option<GenerationFailpoint>,
+    ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
+        self.ensure_operational()?;
         if self.live_build.is_held() {
             return Err(GenerationStoreError::BuildAlreadyActive);
         }
@@ -1706,7 +1733,7 @@ impl GenerationStore {
             &self.activations,
             budget,
             #[cfg(test)]
-            None,
+            failpoint,
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -1728,7 +1755,7 @@ impl GenerationStore {
             &self.activations,
             budget,
             #[cfg(test)]
-            None,
+            failpoint,
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -1765,7 +1792,7 @@ impl GenerationStore {
         budget: &mut AssetLoadBudget,
         failpoint: Option<GenerationFailpoint>,
     ) -> Result<DesiredRevisionCommit, GenerationStoreError> {
-        self.ensure_activation_outcome_known()?;
+        self.ensure_operational()?;
         let Some(active) = self.active.as_ref() else {
             return Ok(DesiredRevisionCommit::NoActive);
         };
@@ -1788,7 +1815,7 @@ impl GenerationStore {
     }
 
     pub fn begin(&mut self) -> Result<GenerationBuild, GenerationStoreError> {
-        self.ensure_activation_outcome_known()?;
+        self.ensure_operational()?;
         self.revalidate_private_root("revalidate private index root before creating generation")?;
         let claim = self.live_build.acquire()?;
         loop {
@@ -2035,7 +2062,7 @@ impl GenerationStore {
         budget: &mut AssetLoadBudget,
         failpoint: Option<GenerationFailpoint>,
     ) -> Result<PreparedGenerationPublish<'_>, GenerationStoreError> {
-        self.ensure_activation_outcome_known()?;
+        self.ensure_operational()?;
         self.validate_build(build)?;
         activation
             .transaction_receipts()
@@ -2306,12 +2333,17 @@ impl GenerationStore {
         self.root_authority.revalidate(operation)
     }
 
-    fn ensure_activation_outcome_known(&self) -> Result<(), GenerationStoreError> {
+    pub(crate) fn ensure_operational(&self) -> Result<(), GenerationStoreError> {
         if self.activation_outcome_unknown {
             Err(GenerationStoreError::ActivationOutcomeUnknown)
         } else {
             Ok(())
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poison_activation_outcome_for_test(&mut self) {
+        self.activation_outcome_unknown = true;
     }
 
     fn validate_build(&self, build: &GenerationBuild) -> Result<(), GenerationStoreError> {
@@ -3070,7 +3102,7 @@ fn recover_disposable_staging(
     #[cfg(test)] failpoint: Option<GenerationFailpoint>,
 ) -> Result<GenerationStagingRecoveryReport, GenerationStoreError> {
     let mut removed_entries = 0_u64;
-    let mut activation_authority_changed = false;
+    let mut activation_authority_uncertain_or_changed = false;
     let recovery = visit_directory_entries_budgeted(staging, budget, |entry, budget| {
         let metadata = metadata_no_follow(&entry.path)?;
         let Some(name) = entry.file_name.to_str() else {
@@ -3100,11 +3132,19 @@ fn recover_disposable_staging(
             #[cfg(test)]
             inject_failure(failpoint, GenerationFailpoint::StartupStagingCleanup)?;
             let recovery_path = staging.join(activation_recovery_file_name(ordinal));
-            if path_exists_no_follow(&recovery_path)? {
+            let recovery_exists = path_exists_no_follow(&recovery_path)
+                .map_err(activation_recovery_requires_reopen)?;
+            if recovery_exists {
                 return Err(GenerationStoreError::ActivationAuthorityChangedReopenRequired);
             }
             let final_path = activations.join(activation_file_name(ordinal));
-            if path_exists_no_follow(&final_path)? {
+            let final_exists =
+                path_exists_no_follow(&final_path).map_err(activation_recovery_requires_reopen)?;
+            if final_exists {
+                // Once a matching ordinal is visible in the final namespace, even a failed alias
+                // check leaves this process unable to prove that its in-memory active handle still
+                // agrees with persisted authority.
+                activation_authority_uncertain_or_changed = true;
                 verify_activation_alias(
                     staging,
                     activations,
@@ -3121,7 +3161,11 @@ fn recover_disposable_staging(
                         source,
                     )
                 })?;
-                activation_authority_changed = true;
+                #[cfg(test)]
+                inject_failure(
+                    failpoint,
+                    GenerationFailpoint::StartupActivationDirectorySync,
+                )?;
                 sync_directory(activations)?;
             }
             fs::remove_file(&entry.path).map_err(|source| {
@@ -3165,7 +3209,7 @@ fn recover_disposable_staging(
         Ok(())
     });
     if let Err(error) = recovery {
-        return Err(if activation_authority_changed {
+        return Err(if activation_authority_uncertain_or_changed {
             activation_recovery_requires_reopen(error)
         } else {
             error
@@ -3174,7 +3218,7 @@ fn recover_disposable_staging(
     #[cfg(test)]
     if let Err(error) = inject_failure(failpoint, GenerationFailpoint::StartupStagingDirectorySync)
     {
-        return Err(if activation_authority_changed {
+        return Err(if activation_authority_uncertain_or_changed {
             activation_recovery_requires_reopen(error)
         } else {
             error
@@ -3183,7 +3227,7 @@ fn recover_disposable_staging(
     // A successful pass is the evidence used to clear RecoveryRequired. Sync even when the
     // namespace is already empty so a previous remove-then-sync failure cannot be forgotten.
     if let Err(error) = sync_directory(staging) {
-        return Err(if activation_authority_changed {
+        return Err(if activation_authority_uncertain_or_changed {
             activation_recovery_requires_reopen(error)
         } else {
             error
@@ -3191,7 +3235,7 @@ fn recover_disposable_staging(
     }
     Ok(GenerationStagingRecoveryReport {
         removed_entries,
-        activation_authority_changed,
+        activation_authority_changed: activation_authority_uncertain_or_changed,
     })
 }
 

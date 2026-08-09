@@ -831,6 +831,7 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let started = Instant::now();
+        self.ensure_store_operational()?;
         let reconcile_staging = matches!(&intent.scope, FilesystemReindexScope::Reconcile);
         let requested = match intent.scope {
             FilesystemReindexScope::Full => ScanIntent::Full,
@@ -873,6 +874,7 @@ impl SearchGenerationPipeline {
         budget: &mut AssetLoadBudget,
     ) -> Result<PipelineBuildOutput, PipelineError> {
         let started = Instant::now();
+        self.ensure_store_operational()?;
         if !self.active_compatibility_match {
             return Err(PipelineError::FilesystemReindexRequired);
         }
@@ -2497,6 +2499,19 @@ impl SearchGenerationPipeline {
     fn record_store_reopen_requirement(&mut self, error: &GenerationStoreError) {
         if error.requires_reopen() {
             self.record_generation_cleanup_failure(error.to_string());
+        }
+    }
+
+    fn ensure_store_operational(&mut self) -> Result<(), PipelineError> {
+        match self.store.ensure_operational() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if error.requires_reopen() {
+                    *self.active.write()? = None;
+                }
+                self.record_store_reopen_requirement(&error);
+                Err(PipelineError::Store(Box::new(error)))
+            }
         }
     }
 
@@ -4939,6 +4954,131 @@ mod tests {
         assert_eq!(unchanged.disposition, PipelineBuildDisposition::NoChange);
         assert_eq!(unchanged.warnings, ["committed head warning"]);
         assert!(pipeline.pending_publish_warnings.is_empty());
+    }
+
+    #[test]
+    fn poisoned_store_rejects_filesystem_no_change_fast_path() {
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut pipeline = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        pipeline
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        pipeline.store.poison_activation_outcome_for_test();
+
+        let error = pipeline
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Store(error)
+                if matches!(*error, GenerationStoreError::ActivationOutcomeUnknown)
+        ));
+        assert!(pipeline.active().unwrap().is_none());
+        assert_eq!(
+            pipeline.generation_maintenance().state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn poisoned_store_rejects_exact_workspace_transaction_replay() {
+        const SOURCE: &[u8] = b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Added\n";
+
+        let temporary = crate::secure_test_tempdir();
+        let project_root = temporary.path().join("project");
+        std::fs::create_dir_all(project_root.join("Assets")).unwrap();
+        let paths = IndexPaths::for_project(
+            project_root,
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
+        let mut pipeline = SearchGenerationPipeline::open(
+            paths,
+            SearchIndexOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        pipeline
+            .reindex_filesystem(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let workspace_id = pipeline.workspace.workspace_id();
+        let baseline_revision = pipeline.workspace.revision();
+        let source_path = temporary.path().join("external.prefab");
+        std::fs::write(&source_path, SOURCE).unwrap();
+        let mut target_workspace =
+            AssetWorkspace::with_workspace_id(workspace_id, WorkspaceOptions::lenient()).unwrap();
+        let source = target_workspace
+            .load_source_bytes(
+                SourceOpenRequest::new(
+                    source_path,
+                    SourceAlias::new("external.prefab".to_owned()).unwrap(),
+                )
+                .with_kind_hint(SourceKind::Yaml),
+                Arc::<[u8]>::from(SOURCE),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        let changes = ChangeSet::new(
+            TransactionId::new(DigestV1::hash_bytes(b"poisoned-replay")),
+            workspace_id,
+            baseline_revision,
+            target_workspace.revision(),
+            vec![source],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        pipeline
+            .reindex_workspace(
+                changes.clone(),
+                &target_workspace.snapshot(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        pipeline.store.poison_activation_outcome_for_test();
+
+        let error = pipeline
+            .reindex_workspace(
+                changes,
+                &target_workspace.snapshot(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            PipelineError::Store(error)
+                if matches!(*error, GenerationStoreError::ActivationOutcomeUnknown)
+        ));
+        assert!(pipeline.active().unwrap().is_none());
+        assert_eq!(
+            pipeline.generation_maintenance().state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
     }
 
     #[test]

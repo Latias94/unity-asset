@@ -674,13 +674,12 @@ fn failed_disposable_rollback_after_removing_a_final_head_requires_reopen() {
     let pending_path = staging.join(activation_pending_file_name(ordinal));
     fs::hard_link(&final_path, &pending_path).unwrap();
 
-    let error = super::recover_disposable_staging(
-        &staging,
-        &activations,
-        &mut AssetLoadBudget::default(),
-        Some(GenerationFailpoint::StartupStagingDirectorySync),
-    )
-    .unwrap_err();
+    let error = store
+        .reconcile_abandoned_staging_with_failpoint(
+            &mut AssetLoadBudget::default(),
+            GenerationFailpoint::StartupStagingDirectorySync,
+        )
+        .unwrap_err();
     assert!(matches!(
         error,
         GenerationStoreError::ActivationRecoveryRequiresReopen { source }
@@ -693,10 +692,93 @@ fn failed_disposable_rollback_after_removing_a_final_head_requires_reopen() {
     ));
     assert!(!final_path.exists());
     assert!(!pending_path.exists());
+    assert!(matches!(
+        store.begin(),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+    assert!(matches!(
+        store.record_desired_revision(revision("next"), &mut AssetLoadBudget::default()),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+    assert!(matches!(
+        store.reconcile_abandoned_staging(&mut AssetLoadBudget::default()),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
 
     drop(store);
     let reopened = open_store(temporary.path(), options).unwrap();
     assert!(reopened.active().is_none());
+}
+
+#[test]
+fn startup_activation_directory_sync_failure_requires_reopen() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    publish_generation(&mut store, "baseline", None);
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let final_path = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(ordinal));
+    let pending_path = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_pending_file_name(ordinal));
+    fs::hard_link(&final_path, &pending_path).unwrap();
+    drop(store);
+
+    let error = open_store_with_startup_failpoint(
+        temporary.path(),
+        options,
+        GenerationFailpoint::StartupActivationDirectorySync,
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationRecoveryRequiresReopen { source }
+            if matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::StartupActivationDirectorySync
+                }
+            )
+    ));
+    assert!(!final_path.exists());
+    assert!(pending_path.exists());
+}
+
+#[test]
+fn disposable_rollback_with_a_mismatched_final_head_poisons_the_store() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    publish_generation(&mut store, "baseline", None);
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let final_path = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(ordinal));
+    let pending_path = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_pending_file_name(ordinal));
+    fs::write(&pending_path, br#"{"foreign":true}"#).unwrap();
+
+    let error = store
+        .reconcile_abandoned_staging(&mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationRecoveryRequiresReopen { .. }
+    ));
+    assert!(error.requires_reopen());
+    assert!(final_path.exists());
+    assert!(pending_path.exists());
+    assert!(matches!(
+        store.begin(),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
 }
 
 #[test]
