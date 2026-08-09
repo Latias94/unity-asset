@@ -841,6 +841,79 @@ def check_documented_example(
     run_visible(command, cwd=cargo_cwd, env=environment)
 
 
+def verify_documented_example_standalone(
+    *,
+    cargo: str,
+    cargo_cwd: Path,
+    environment: Mapping[str, str],
+    repository_root: Path,
+    workspace_root: Path,
+    closure: Sequence[WorkspacePackage],
+    profile: DocumentedFeatureProfile,
+    archive_paths: Mapping[str, Path],
+    verified_unpacked_packages: Mapping[str, Path],
+    expected_versions: Mapping[str, str],
+    registry_source_root: Path,
+) -> None:
+    """Verify one packaged example in a dedicated archive workspace.
+
+    A package unpacked under the all-archives workspace is already a member of
+    that workspace. It cannot also become a member of a second consumer
+    workspace, so documented examples must unpack a dedicated target package.
+    Its dependency patches may safely reuse the already verified archive roots.
+    """
+
+    packages = {package.name: package for package in closure}
+    target = packages.get(profile.package)
+    if target is None:
+        raise VerificationError(
+            f"documented feature profile {profile.name} package is outside the release closure"
+        )
+    dependency_closure = production_closure([target.name], packages)
+    unpacked_packages: dict[str, Path] = {}
+    for dependency in dependency_closure:
+        if dependency.name == target.name:
+            continue
+        dependency_root = verified_unpacked_packages.get(dependency.name)
+        if dependency_root is None:
+            raise VerificationError(
+                f"documented feature profile {profile.name} has no verified "
+                f"archive root for {dependency.name}"
+            )
+        unpacked_packages[dependency.name] = dependency_root
+
+    package_root = workspace_root / "packages"
+    package_root.mkdir(parents=True)
+    unpacked_packages[target.name] = unpack_archive(
+        archive_paths[target.name], package_root, target
+    )
+    manifest, _, required_internal = create_documented_example_workspace(
+        workspace_root,
+        dependency_closure,
+        unpacked_packages,
+        profile,
+    )
+    verify_temporary_workspace(
+        cargo=cargo,
+        cargo_cwd=cargo_cwd,
+        environment=environment,
+        repository_root=repository_root,
+        workspace_manifest=manifest,
+        local_manifests={},
+        unpacked_packages=unpacked_packages,
+        expected_versions=expected_versions,
+        required_internal=required_internal,
+        registry_source_root=registry_source_root,
+    )
+    check_documented_example(
+        cargo=cargo,
+        cargo_cwd=cargo_cwd,
+        environment=environment,
+        workspace_manifest=manifest,
+        profile=profile,
+    )
+
+
 def verify_binary_package_standalone(
     *,
     cargo: str,
@@ -1108,30 +1181,16 @@ def run_full_verification(
                 )
                 continue
 
-            example_manifest, _, required_internal = (
-                create_documented_example_workspace(
-                    profile_root,
-                    closure,
-                    unpacked,
-                    profile,
-                )
-            )
-            verify_temporary_workspace(
+            verify_documented_example_standalone(
                 cargo=cargo,
                 cargo_cwd=cargo_cwd,
                 environment=verification_environment,
                 repository_root=workspace_root,
-                workspace_manifest=example_manifest,
-                local_manifests={},
-                unpacked_packages=unpacked,
-                expected_versions=versions,
-                required_internal=required_internal,
-                registry_source_root=cargo_home / "registry" / "src",
-            )
-            check_documented_example(
-                cargo=cargo,
-                cargo_cwd=cargo_cwd,
-                environment=verification_environment,
-                workspace_manifest=example_manifest,
+                workspace_root=profile_root,
+                closure=closure,
                 profile=profile,
+                archive_paths=archive_paths,
+                verified_unpacked_packages=unpacked,
+                expected_versions=versions,
+                registry_source_root=cargo_home / "registry" / "src",
             )
