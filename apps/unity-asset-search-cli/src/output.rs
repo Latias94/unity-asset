@@ -129,6 +129,12 @@ impl CliFailure {
     pub const fn exit_code(&self) -> i32 {
         self.category.exit_code()
     }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        self.error.retryable
+    }
 }
 
 #[derive(Debug, Serialize)]

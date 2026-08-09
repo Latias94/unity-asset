@@ -24,6 +24,8 @@ pub(super) struct Stream {
     inner: UnixStream,
 }
 
+pub(super) struct ReceivePrincipal;
+
 pub(super) fn bind(
     namespace: &EndpointNamespaceV1,
     _instance: DaemonInstanceId,
@@ -135,12 +137,19 @@ pub(super) async fn connect(
     Ok((Stream { inner }, peer))
 }
 
-pub(super) fn verify_received_message(
+pub(super) fn begin_receive(
+    _stream: &Stream,
+    _expected: SecurityContextIdV1,
+) -> Result<ReceivePrincipal, EndpointTransportError> {
+    Ok(ReceivePrincipal)
+}
+
+pub(super) fn finish_receive(
     stream: &Stream,
     expected: SecurityContextIdV1,
-) -> Result<(), EndpointTransportError> {
-    let _ = verify_peer(&stream.inner, expected)?;
-    Ok(())
+    _principal: ReceivePrincipal,
+) -> Result<ProcessIdentityV1, EndpointTransportError> {
+    verify_peer(&stream.inner, expected)
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), EndpointTransportError> {

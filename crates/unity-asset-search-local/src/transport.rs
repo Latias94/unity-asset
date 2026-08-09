@@ -30,6 +30,7 @@ mod platform {
 
     pub(super) struct Server;
     pub(super) struct Stream;
+    pub(super) struct ReceivePrincipal;
 
     pub(super) fn bind(
         _namespace: &EndpointNamespaceV1,
@@ -52,10 +53,18 @@ mod platform {
         Err(EndpointTransportError::UnsupportedPlatform)
     }
 
-    pub(super) fn verify_received_message(
+    pub(super) fn begin_receive(
         _stream: &Stream,
         _expected: SecurityContextIdV1,
-    ) -> Result<(), EndpointTransportError> {
+    ) -> Result<ReceivePrincipal, EndpointTransportError> {
+        Err(EndpointTransportError::UnsupportedPlatform)
+    }
+
+    pub(super) fn finish_receive(
+        _stream: &Stream,
+        _expected: SecurityContextIdV1,
+        _principal: ReceivePrincipal,
+    ) -> Result<ProcessIdentityV1, EndpointTransportError> {
         Err(EndpointTransportError::UnsupportedPlatform)
     }
 }
@@ -131,12 +140,15 @@ impl VerifiedFramedTransportV1 {
         self.peer_identity
     }
 
-    /// Reads one complete frame and verifies the peer principal before returning its bytes.
+    /// Reads one complete frame and verifies the latest platform-bound peer proof before returning
+    /// its bytes. On Windows, server reads use message-level client impersonation; client reads
+    /// revalidate the named-pipe server process and primary-token identity before receiving.
     pub async fn read_frame(
         &mut self,
         limits: FrameLimits,
         timeouts: FrameReadTimeoutsV1,
     ) -> Result<Option<Vec<u8>>, EndpointTransportError> {
+        let principal = platform::begin_receive(&self.inner, self.expected_security_context)?;
         let frame = read_frame_from(
             &mut self.inner,
             limits.max_encoded_bytes(),
@@ -145,7 +157,11 @@ impl VerifiedFramedTransportV1 {
         )
         .await?;
         if frame.is_some() {
-            platform::verify_received_message(&self.inner, self.expected_security_context)?;
+            let current_peer =
+                platform::finish_receive(&self.inner, self.expected_security_context, principal)?;
+            if current_peer != self.peer_identity {
+                return Err(EndpointTransportError::PeerIdentityMismatch);
+            }
         }
         Ok(frame)
     }
@@ -463,6 +479,8 @@ pub enum EndpointTransportError {
     PeerCredentialUnavailable,
     #[error("the connected peer has a different execution principal")]
     PeerContextMismatch,
+    #[error("the connected local IPC peer changed process identity")]
+    PeerIdentityMismatch,
     #[error("local IPC peer was rejected: {source}")]
     PeerRejected {
         #[source]

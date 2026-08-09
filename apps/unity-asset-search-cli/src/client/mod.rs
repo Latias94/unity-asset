@@ -125,14 +125,14 @@ pub async fn connect(
     loop {
         match connect_once(options, deadline).await {
             Ok(session) => return Ok((session, false)),
-            Err(error) if error.is_pre_spawn_publication_race() => {
+            Err(error) if error.is_verified_generation_change() => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(error.into_failure());
                 }
                 tokio::time::sleep(CONNECT_RETRY_DELAY.min(remaining)).await;
             }
-            Err(error) if start.is_some() && error.is_absent_or_stale() => break,
+            Err(error) if start.is_some() && error.is_startup_pending() => break,
             Err(error) => return Err(error.into_failure()),
         }
     }
@@ -185,7 +185,7 @@ pub async fn connect(
                 };
                 return Ok((session, started));
             }
-            Err(error) if error.is_transient_publication_race() => {
+            Err(error) if error.is_verified_generation_change() || error.is_startup_pending() => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if !remaining.is_zero() {
                     tokio::time::sleep(CONNECT_RETRY_DELAY.min(remaining)).await;
@@ -459,7 +459,22 @@ fn map_transport(error: EndpointTransportError) -> CliFailure {
         | EndpointTransportError::Store(
             EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged,
         ) => CliFailure::transport(message, true),
+        EndpointTransportError::PeerContextMismatch
+        | EndpointTransportError::PeerIdentityMismatch => CliFailure::transport(message, false),
         _ => CliFailure::transport(message, false),
+    }
+}
+
+fn map_store_failure(error: EndpointStoreError) -> CliFailure {
+    let message = format!("endpoint discovery failed: {error}");
+    match error {
+        EndpointStoreError::Descriptor(EndpointDescriptorError::BindingMismatch { .. }) => {
+            CliFailure::transport(message, false)
+        }
+        EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged => {
+            CliFailure::unavailable(message, true)
+        }
+        _ => CliFailure::unavailable(message, false),
     }
 }
 
@@ -486,35 +501,25 @@ enum ConnectError {
 }
 
 impl ConnectError {
-    fn is_absent_or_stale(&self) -> bool {
-        matches!(
-            self,
-            Self::Store(EndpointStoreError::DescriptorMissing)
-                | Self::Transport(EndpointTransportError::EndpointUnavailable)
-        )
-    }
-
-    fn is_pre_spawn_publication_race(&self) -> bool {
+    fn is_verified_generation_change(&self) -> bool {
         matches!(
             self,
             Self::Store(EndpointStoreError::EndpointChanged)
                 | Self::Transport(EndpointTransportError::Store(
-                    EndpointStoreError::EndpointChanged | EndpointStoreError::DescriptorMissing
+                    EndpointStoreError::EndpointChanged,
                 ))
         )
     }
 
-    fn is_transient_publication_race(&self) -> bool {
-        self.is_absent_or_stale()
-            || self.is_pre_spawn_publication_race()
-            || matches!(
-                self,
-                Self::Transport(EndpointTransportError::Descriptor(
-                    EndpointDescriptorError::BindingMismatch {
-                        field: "server_pid" | "process_start_identity" | "security_context_id"
-                    }
+    fn is_startup_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Store(EndpointStoreError::DescriptorMissing)
+                | Self::Transport(EndpointTransportError::EndpointUnavailable)
+                | Self::Transport(EndpointTransportError::Store(
+                    EndpointStoreError::DescriptorMissing,
                 ))
-            )
+        )
     }
 
     fn into_failure(self) -> CliFailure {
@@ -526,9 +531,7 @@ impl ConnectError {
                 format!("private local root validation failed: {error}"),
                 false,
             ),
-            Self::Store(error) => {
-                CliFailure::unavailable(format!("endpoint discovery failed: {error}"), true)
-            }
+            Self::Store(error) => map_store_failure(error),
             Self::Transport(error) => map_transport(error),
             Self::Framing(error) => {
                 CliFailure::protocol(format!("protocol framing failed: {error}"))
@@ -663,48 +666,86 @@ mod tests {
     }
 
     #[test]
-    fn only_absent_or_stale_endpoints_authorize_daemon_start() {
-        assert!(ConnectError::Store(EndpointStoreError::DescriptorMissing).is_absent_or_stale());
+    fn only_startup_pending_endpoints_authorize_daemon_start() {
+        assert!(ConnectError::Store(EndpointStoreError::DescriptorMissing).is_startup_pending());
         assert!(
             ConnectError::Transport(EndpointTransportError::EndpointUnavailable)
-                .is_absent_or_stale()
+                .is_startup_pending()
         );
         assert!(
             !ConnectError::Transport(EndpointTransportError::PeerContextMismatch)
-                .is_absent_or_stale()
+                .is_startup_pending()
         );
-        assert!(!ConnectError::Store(EndpointStoreError::EndpointChanged).is_absent_or_stale());
+        assert!(!ConnectError::Store(EndpointStoreError::EndpointChanged).is_startup_pending());
     }
 
     #[test]
-    fn publication_replacement_is_retryable_after_spawn() {
+    fn only_verified_generation_changes_are_retryable_after_spawn() {
         assert!(
             ConnectError::Store(EndpointStoreError::EndpointChanged)
-                .is_transient_publication_race()
+                .is_verified_generation_change()
         );
         assert!(
             ConnectError::Transport(EndpointTransportError::Store(
                 EndpointStoreError::EndpointChanged
             ))
-            .is_transient_publication_race()
+            .is_verified_generation_change()
         );
         assert!(
-            ConnectError::Transport(EndpointTransportError::Store(
-                EndpointStoreError::DescriptorMissing
+            !ConnectError::Transport(EndpointTransportError::Store(
+                EndpointStoreError::DescriptorMissing,
             ))
-            .is_transient_publication_race()
+            .is_verified_generation_change()
         );
         assert!(
-            ConnectError::Transport(EndpointTransportError::Descriptor(
-                EndpointDescriptorError::BindingMismatch {
-                    field: "server_pid"
-                }
-            ))
-            .is_transient_publication_race()
+            !ConnectError::Transport(EndpointTransportError::EndpointUnavailable)
+                .is_verified_generation_change()
         );
+        for field in [
+            "server_pid",
+            "process_start_identity",
+            "security_context_id",
+        ] {
+            assert!(
+                !ConnectError::Transport(EndpointTransportError::Descriptor(
+                    EndpointDescriptorError::BindingMismatch { field }
+                ))
+                .is_verified_generation_change()
+            );
+        }
         assert!(
             !ConnectError::Transport(EndpointTransportError::PeerContextMismatch)
-                .is_transient_publication_race()
+                .is_verified_generation_change()
         );
+        assert!(
+            !ConnectError::Transport(EndpointTransportError::PeerIdentityMismatch)
+                .is_verified_generation_change()
+        );
+    }
+
+    #[test]
+    fn startup_pending_states_are_not_generation_changes() {
+        for error in [
+            ConnectError::Store(EndpointStoreError::DescriptorMissing),
+            ConnectError::Transport(EndpointTransportError::EndpointUnavailable),
+            ConnectError::Transport(EndpointTransportError::Store(
+                EndpointStoreError::DescriptorMissing,
+            )),
+        ] {
+            assert!(error.is_startup_pending());
+            assert!(!error.is_verified_generation_change());
+        }
+        assert!(!ConnectError::Store(EndpointStoreError::EndpointChanged).is_startup_pending());
+    }
+
+    #[test]
+    fn descriptor_binding_mismatch_is_not_retryable_in_cli_output() {
+        let failure = ConnectError::Store(EndpointStoreError::Descriptor(
+            EndpointDescriptorError::BindingMismatch {
+                field: "project_id",
+            },
+        ))
+        .into_failure();
+        assert!(!failure.is_retryable());
     }
 }

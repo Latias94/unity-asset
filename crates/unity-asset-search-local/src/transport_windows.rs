@@ -43,12 +43,22 @@ pub(super) struct Server {
 
 pub(super) struct Stream {
     inner: PipeStream,
-    server_side: bool,
 }
 
 enum PipeStream {
     Server(NamedPipeServer),
     Client(NamedPipeClient),
+}
+
+#[derive(Clone, Copy)]
+enum PipePeerRole {
+    Client,
+    Server,
+}
+
+pub(super) enum ReceivePrincipal {
+    Server,
+    Client(ProcessIdentityV1),
 }
 
 impl Drop for Stream {
@@ -160,12 +170,15 @@ pub(super) async fn accept(
         ))
     })?;
 
-    let peer = inspect_connected_peer(&connected, server.security_context_id)
-        .map_err(EndpointTransportError::rejected_peer)?;
+    let peer = inspect_pipe_peer(
+        connected.as_raw_handle().cast(),
+        PipePeerRole::Client,
+        server.security_context_id,
+    )
+    .map_err(EndpointTransportError::rejected_peer)?;
     Ok((
         Stream {
             inner: PipeStream::Server(connected),
-            server_side: true,
         },
         peer,
     ))
@@ -203,7 +216,6 @@ pub(super) async fn connect(
                         return Ok((
                             Stream {
                                 inner: PipeStream::Client(client),
-                                server_side: false,
                             },
                             peer,
                         ));
@@ -273,11 +285,12 @@ async fn wait_for_rotation(
     Ok(())
 }
 
-fn inspect_connected_peer(
-    pipe: &NamedPipeServer,
+fn inspect_pipe_peer(
+    handle: HANDLE,
+    peer_role: PipePeerRole,
     expected_context: SecurityContextIdV1,
 ) -> Result<ProcessIdentityV1, EndpointTransportError> {
-    let process_id = named_pipe_process_id(pipe.as_raw_handle().cast(), true)?;
+    let process_id = named_pipe_process_id(handle, peer_role)?;
     let peer = ProcessIdentityV1::inspect(process_id)?;
     if peer.security_context_id() != expected_context {
         return Err(EndpointTransportError::PeerContextMismatch);
@@ -290,12 +303,12 @@ fn validate_connected_server(
     discovered: &DiscoveredEndpointV1,
     client: &NamedPipeClient,
 ) -> Result<ProcessIdentityV1, EndpointTransportError> {
-    let process_id = named_pipe_process_id(client.as_raw_handle().cast(), false)?;
-    let peer = ProcessIdentityV1::inspect(process_id)?;
+    let peer = inspect_pipe_peer(
+        client.as_raw_handle().cast(),
+        PipePeerRole::Server,
+        namespace.security_context_id(),
+    )?;
     discovered.descriptor().validate_server_process(peer)?;
-    if peer.security_context_id() != namespace.security_context_id() {
-        return Err(EndpointTransportError::PeerContextMismatch);
-    }
     discovered.ensure_unchanged(namespace)?;
     Ok(peer)
 }
@@ -359,32 +372,50 @@ fn pipe_slot_name(pipe_base: &str, slot_id: PipeSlotId) -> String {
     format!("{pipe_base}{}", hex::encode(slot_id.as_bytes()))
 }
 
-pub(super) fn verify_received_message(
+pub(super) fn begin_receive(
     stream: &Stream,
     expected: SecurityContextIdV1,
-) -> Result<(), EndpointTransportError> {
-    if !stream.server_side {
-        return Ok(());
+) -> Result<ReceivePrincipal, EndpointTransportError> {
+    match &stream.inner {
+        // Windows exposes the server process bound to a client handle, but not a server-side
+        // per-message token. Verify that process before reading the frame so a server that exits
+        // immediately after writing a response cannot turn a valid frame into an unverifiable one.
+        PipeStream::Client(pipe) => Ok(ReceivePrincipal::Client(inspect_pipe_peer(
+            pipe.as_raw_handle().cast(),
+            PipePeerRole::Server,
+            expected,
+        )?)),
+        PipeStream::Server(_) => Ok(ReceivePrincipal::Server),
     }
-    let PipeStream::Server(pipe) = &stream.inner else {
-        return Err(EndpointTransportError::PeerCredentialUnavailable);
-    };
-    let handle = pipe.as_raw_handle().cast::<std::ffi::c_void>();
-    // The caller invokes this only after one complete bounded message has been read, which is when
-    // Windows fixes the message principal used by ImpersonateNamedPipeClient.
-    if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
-        return Err(EndpointTransportError::io(
-            "impersonate Windows named-pipe message principal",
-            io::Error::last_os_error(),
-        ));
+}
+
+pub(super) fn finish_receive(
+    stream: &Stream,
+    expected: SecurityContextIdV1,
+    principal: ReceivePrincipal,
+) -> Result<ProcessIdentityV1, EndpointTransportError> {
+    match (&stream.inner, principal) {
+        (PipeStream::Client(_), ReceivePrincipal::Client(peer)) => Ok(peer),
+        (PipeStream::Server(pipe), ReceivePrincipal::Server) => {
+            // ImpersonateNamedPipeClient binds this proof to the complete message just read. The
+            // process identity check below additionally detects PID reuse or process replacement.
+            let handle = pipe.as_raw_handle().cast::<std::ffi::c_void>();
+            if unsafe { ImpersonateNamedPipeClient(handle) } == 0 {
+                return Err(EndpointTransportError::io(
+                    "impersonate Windows named-pipe message principal",
+                    io::Error::last_os_error(),
+                ));
+            }
+            let revert = RevertGuard { active: true };
+            let actual = SecurityContextIdV1::for_impersonated_thread()?;
+            revert.revert();
+            if actual != expected {
+                return Err(EndpointTransportError::PeerContextMismatch);
+            }
+            inspect_pipe_peer(handle, PipePeerRole::Client, expected)
+        }
+        _ => Err(EndpointTransportError::PeerCredentialUnavailable),
     }
-    let revert = RevertGuard { active: true };
-    let actual = SecurityContextIdV1::for_impersonated_thread()?;
-    revert.revert();
-    if actual != expected {
-        return Err(EndpointTransportError::PeerContextMismatch);
-    }
-    Ok(())
 }
 
 fn create_server_pipe(
@@ -453,12 +484,14 @@ fn open_client_pipe_with_access(
     unsafe { NamedPipeClient::from_raw_handle(handle.cast()) }
 }
 
-fn named_pipe_process_id(handle: HANDLE, client: bool) -> Result<u32, EndpointTransportError> {
+fn named_pipe_process_id(
+    handle: HANDLE,
+    peer_role: PipePeerRole,
+) -> Result<u32, EndpointTransportError> {
     let mut process_id = 0_u32;
-    let succeeded = if client {
-        unsafe { GetNamedPipeClientProcessId(handle, &raw mut process_id) }
-    } else {
-        unsafe { GetNamedPipeServerProcessId(handle, &raw mut process_id) }
+    let succeeded = match peer_role {
+        PipePeerRole::Client => unsafe { GetNamedPipeClientProcessId(handle, &raw mut process_id) },
+        PipePeerRole::Server => unsafe { GetNamedPipeServerProcessId(handle, &raw mut process_id) },
     };
     if succeeded == 0 {
         return Err(EndpointTransportError::io(

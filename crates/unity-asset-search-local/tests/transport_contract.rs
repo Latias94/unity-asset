@@ -41,47 +41,55 @@ async fn same_principal_connects_to_the_published_process() {
     assert_eq!(accepted.peer_identity().process_id(), std::process::id());
     assert_eq!(connected.peer_identity().process_id(), std::process::id());
 
-    let client_frame = [0, 0, 0, 4, b'p', b'i', b'n', b'g'];
-    connected
-        .write_frame(
-            &client_frame,
-            FrameLimits::bootstrap(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        accepted
-            .read_frame(
-                FrameLimits::bootstrap(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
-            )
-            .await
-            .unwrap()
-            .unwrap(),
-        client_frame
-    );
-
-    let server_frame = [0, 0, 0, 4, b'p', b'o', b'n', b'g'];
-    accepted
-        .write_frame(
-            &server_frame,
-            FrameLimits::bootstrap(),
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap();
-    assert_eq!(
+    for client_frame in [
+        [0, 0, 0, 4, b'p', b'i', b'n', b'g'],
+        [0, 0, 0, 4, b'n', b'e', b'x', b't'],
+    ] {
         connected
-            .read_frame(
+            .write_frame(
+                &client_frame,
                 FrameLimits::bootstrap(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+                Duration::from_secs(5),
             )
             .await
-            .unwrap()
-            .unwrap(),
-        server_frame
-    );
+            .unwrap();
+        assert_eq!(
+            accepted
+                .read_frame(
+                    FrameLimits::bootstrap(),
+                    FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            client_frame
+        );
+    }
+
+    for server_frame in [
+        [0, 0, 0, 4, b'p', b'o', b'n', b'g'],
+        [0, 0, 0, 4, b'd', b'o', b'n', b'e'],
+    ] {
+        accepted
+            .write_frame(
+                &server_frame,
+                FrameLimits::bootstrap(),
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            connected
+                .read_frame(
+                    FrameLimits::bootstrap(),
+                    FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+            server_frame
+        );
+    }
 
     drop(accepted);
     drop(connected);
