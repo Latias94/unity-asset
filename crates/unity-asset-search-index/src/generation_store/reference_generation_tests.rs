@@ -548,9 +548,13 @@ fn startup_refuses_an_old_head_while_committed_recovery_is_unresolved() {
     .unwrap_err();
     assert!(matches!(
         error,
-        GenerationStoreError::InjectedFailure {
-            checkpoint: GenerationFailpoint::StartupStagingCleanup
-        }
+        GenerationStoreError::ActivationRecoveryRequiresReopen { source }
+            if matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::StartupStagingCleanup
+                }
+            )
     ));
     assert!(activation.is_file());
     assert!(recovery.is_file());
@@ -617,6 +621,82 @@ fn runtime_recovery_that_changes_authority_requires_reopen() {
     let active = reopened.active().unwrap();
     assert_eq!(active.generation(), baseline);
     assert_eq!(active.desired_revision(), desired);
+}
+
+#[test]
+fn runtime_disposable_rollback_that_removes_a_final_head_requires_reopen() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let final_path = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(ordinal));
+    let pending_path = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_pending_file_name(ordinal));
+    fs::hard_link(&final_path, &pending_path).unwrap();
+
+    let error = store
+        .reconcile_abandoned_staging(&mut AssetLoadBudget::default())
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationAuthorityChangedReopenRequired
+    ));
+    assert!(error.requires_reopen());
+    assert_eq!(store.active().unwrap().generation(), baseline);
+    assert!(!final_path.exists());
+    assert!(!pending_path.exists());
+    assert!(matches!(
+        store.begin(),
+        Err(GenerationStoreError::ActivationOutcomeUnknown)
+    ));
+
+    drop(store);
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert!(reopened.active().is_none());
+}
+
+#[test]
+fn failed_disposable_rollback_after_removing_a_final_head_requires_reopen() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions::default();
+    let mut store = open_store(temporary.path(), options).unwrap();
+    publish_generation(&mut store, "baseline", None);
+    let ordinal = store.active().unwrap().activation_ordinal();
+    let activations = temporary.path().join(super::ACTIVATIONS_DIRECTORY);
+    let staging = temporary.path().join(super::STAGING_DIRECTORY);
+    let final_path = activations.join(activation_file_name(ordinal));
+    let pending_path = staging.join(activation_pending_file_name(ordinal));
+    fs::hard_link(&final_path, &pending_path).unwrap();
+
+    let error = super::recover_disposable_staging(
+        &staging,
+        &activations,
+        &mut AssetLoadBudget::default(),
+        Some(GenerationFailpoint::StartupStagingDirectorySync),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        GenerationStoreError::ActivationRecoveryRequiresReopen { source }
+            if matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::StartupStagingDirectorySync
+                }
+            )
+    ));
+    assert!(!final_path.exists());
+    assert!(!pending_path.exists());
+
+    drop(store);
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert!(reopened.active().is_none());
 }
 
 #[test]
@@ -2139,9 +2219,13 @@ fn repeated_activation_cleanup_failure_blocks_head_selection_until_retry() {
     .unwrap_err();
     assert!(matches!(
         error,
-        GenerationStoreError::InjectedFailure {
-            checkpoint: GenerationFailpoint::StartupStagingCleanup
-        }
+        GenerationStoreError::ActivationRecoveryRequiresReopen { source }
+            if matches!(
+                *source,
+                GenerationStoreError::InjectedFailure {
+                    checkpoint: GenerationFailpoint::StartupStagingCleanup
+                }
+            )
     ));
     assert!(temporary.path().join(".staging").join(&recovery).is_file());
     assert!(temporary.path().join(".staging").join(&pending).is_file());
