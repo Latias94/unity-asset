@@ -62,7 +62,7 @@ pub use source_admission::{
     SourceAdmissionError, SourceAdmissionErrorCategory, SourceAdmissionFailure,
     SourceAdmissionFailureSite, SourceAdmissionOperation, SourceAdmissionOperationLocation,
     SourceAdmissionOutcome, SourceAdmissionPolicy, SourceAdmissionRejection, SourceAdmissionReport,
-    SourceOpenRequest,
+    SourceCompanionRequest, SourceOpenRequest,
 };
 pub use source_catalog::SourceLocationKind;
 pub use source_loading::{SOURCE_RECOGNITION_PREFIX_LEN, SourceRecognition, recognize_source};

@@ -6,9 +6,12 @@ use unity_asset::workspace::{
     AssetWorkspace, SourceAdmissionBatch, SourceAdmissionBatchPhase, SourceAdmissionDisposition,
     SourceAdmissionErrorCategory, SourceAdmissionFailure, SourceAdmissionFailureSite,
     SourceAdmissionOperation, SourceAdmissionOperationLocation, SourceAdmissionPolicy,
-    SourceOpenRequest, WorkspaceLookup, WorkspaceView,
+    SourceCompanionRequest, SourceLocationKind, SourceOpenRequest, WorkspaceError, WorkspaceLookup,
+    WorkspaceView,
 };
-use unity_asset::{AssetLoadBudget, AssetLoadLimits, SourceAlias, SourceId, SourceKind};
+use unity_asset::{
+    AssetLoadBudget, AssetLoadLimits, SourceAlias, SourceId, SourceKind, SourceMemberId,
+};
 
 fn source_path(directory: &Path, name: &str, bytes: &[u8]) -> PathBuf {
     let path = directory.join(name);
@@ -63,6 +66,248 @@ fn source_batch(
             .expect("fill reserved batch");
     }
     batch
+}
+
+#[test]
+fn filesystem_companion_is_installed_with_its_root_in_one_revision() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let root = source_path(
+        directory.path(),
+        "scene.asset",
+        b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Scene\n",
+    );
+    let companion = source_path(directory.path(), "scene.resS", b"streamed-payload");
+    let canonical_companion = fs::canonicalize(&companion).expect("canonical companion path");
+    let member = SourceMemberId::new("scene.resS").expect("valid companion identity");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    let base_revision = workspace.revision();
+
+    let root_id = workspace
+        .load_source(
+            SourceOpenRequest::new(
+                root,
+                SourceAlias::new("Assets/scene.asset").expect("valid alias"),
+            )
+            .with_kind_hint(SourceKind::Yaml)
+            .with_companion(SourceCompanionRequest::new(companion, member.clone())),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("load root and companion");
+
+    assert_ne!(workspace.revision(), base_revision);
+    let sources = workspace
+        .snapshot()
+        .sources(&mut AssetLoadBudget::default())
+        .expect("list sources");
+    assert_eq!(sources.len(), 2);
+    let loaded_companion = sources
+        .iter()
+        .find(|source| source.location() == SourceLocationKind::Companion)
+        .expect("companion source");
+    assert_eq!(loaded_companion.parent(), Some(root_id));
+    assert_eq!(loaded_companion.kind(), SourceKind::StreamedResource);
+    assert_eq!(
+        loaded_companion
+            .locator()
+            .members()
+            .last()
+            .expect("companion locator member")
+            .member(),
+        &member
+    );
+    assert_eq!(
+        loaded_companion.physical_origin(),
+        Some(canonical_companion.as_path())
+    );
+}
+
+#[test]
+fn unchanged_root_admission_installs_a_new_explicit_companion() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let root = source_path(
+        directory.path(),
+        "scene.asset",
+        b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Scene\n",
+    );
+    let companion_bytes = vec![0x5a; 1024 * 1024];
+    let companion = source_path(directory.path(), "scene.resS", &companion_bytes);
+    let canonical_companion = fs::canonicalize(&companion).expect("canonical companion path");
+    let alias = SourceAlias::new("Assets/scene.asset").expect("valid alias");
+    let member = SourceMemberId::new("scene.resS").expect("valid companion identity");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+
+    let root_id = workspace
+        .load_source(
+            SourceOpenRequest::new(root.clone(), alias.clone()).with_kind_hint(SourceKind::Yaml),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("load root without companion");
+    let root_only_revision = workspace.revision();
+
+    let repeated_root = workspace
+        .load_source(
+            SourceOpenRequest::new(root.clone(), alias.clone())
+                .with_kind_hint(SourceKind::Yaml)
+                .with_companion(SourceCompanionRequest::new(
+                    companion.clone(),
+                    member.clone(),
+                )),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("attach companion to existing root");
+
+    assert_eq!(repeated_root, root_id);
+    assert_ne!(workspace.revision(), root_only_revision);
+    let companion_source = workspace
+        .snapshot()
+        .sources(&mut AssetLoadBudget::default())
+        .expect("list sources")
+        .into_iter()
+        .find(|source| source.location() == SourceLocationKind::Companion)
+        .expect("new companion source");
+    assert_eq!(companion_source.parent(), Some(root_id));
+    assert_eq!(
+        companion_source.physical_origin(),
+        Some(canonical_companion.as_path())
+    );
+
+    let complete_revision = workspace.revision();
+    let mut repeat_budget = AssetLoadBudget::default();
+    let repeated_again = workspace
+        .load_source(
+            SourceOpenRequest::new(root, alias)
+                .with_kind_hint(SourceKind::Yaml)
+                .with_companion(SourceCompanionRequest::new(companion, member)),
+            &mut repeat_budget,
+        )
+        .expect("repeat complete source tree");
+    assert_eq!(repeated_again, root_id);
+    assert_eq!(workspace.revision(), complete_revision);
+    assert!(
+        repeat_budget.usage().bytes
+            < u64::try_from(companion_bytes.len()).expect("companion length") * 2,
+        "repeat admission must verify the retained companion without allocating another full image"
+    );
+}
+
+#[test]
+fn repeated_companion_admission_rejects_changed_physical_bytes() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let root = source_path(
+        directory.path(),
+        "scene.asset",
+        b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Scene\n",
+    );
+    let companion = source_path(directory.path(), "scene.resS", b"original-payload");
+    let alias = SourceAlias::new("Assets/scene.asset").expect("valid alias");
+    let member = SourceMemberId::new("scene.resS").expect("valid companion identity");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    workspace
+        .load_source(
+            SourceOpenRequest::new(root.clone(), alias.clone())
+                .with_kind_hint(SourceKind::Yaml)
+                .with_companion(SourceCompanionRequest::new(
+                    companion.clone(),
+                    member.clone(),
+                )),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect("load root and companion");
+    let committed_revision = workspace.revision();
+    fs::write(&companion, b"replacement-payload").expect("replace companion bytes");
+
+    let error = workspace
+        .load_source(
+            SourceOpenRequest::new(root, alias)
+                .with_kind_hint(SourceKind::Yaml)
+                .with_companion(SourceCompanionRequest::new(companion, member)),
+            &mut AssetLoadBudget::default(),
+        )
+        .expect_err("changed companion must not reuse the retained backing");
+
+    assert!(matches!(error, WorkspaceError::SourceChanged { .. }));
+    assert_eq!(workspace.revision(), committed_revision);
+}
+
+#[test]
+fn caller_owned_root_bytes_cannot_attach_filesystem_companions() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let root = source_path(directory.path(), "scene.asset", b"ignored");
+    let companion = source_path(directory.path(), "scene.resS", b"streamed-payload");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    let base_revision = workspace.revision();
+    let mut budget = AssetLoadBudget::default();
+    let batch = source_batch(
+        vec![SourceAdmissionOperation::LoadBytes {
+            request: SourceOpenRequest::new(
+                root,
+                SourceAlias::new("Assets/scene.asset").expect("valid alias"),
+            )
+            .with_kind_hint(SourceKind::Yaml)
+            .with_companion(SourceCompanionRequest::new(
+                companion,
+                SourceMemberId::new("scene.resS").expect("valid companion identity"),
+            )),
+            image: Arc::from(
+                b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Scene\n"
+                    .as_slice(),
+            ),
+        }],
+        &mut budget,
+    );
+
+    let error = workspace
+        .admit_sources(batch, SourceAdmissionPolicy::Strict, &mut budget)
+        .expect_err("caller-owned root bytes must not mix with filesystem companions");
+
+    assert_eq!(error.category(), SourceAdmissionErrorCategory::Contract);
+    assert!(matches!(
+        error.failure(),
+        SourceAdmissionFailure::CompanionsRequireFilesystemLoad
+    ));
+    assert_eq!(workspace.revision(), base_revision);
+    assert_eq!(source_count(&workspace), 0);
+}
+
+#[test]
+fn companion_path_must_resolve_to_the_declared_root_sibling() {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let root = source_path(
+        directory.path(),
+        "scene.asset",
+        b"%YAML 1.1\n%TAG !u! tag:unity3d.com,2011:\n--- !u!1 &1\nGameObject:\n  m_Name: Scene\n",
+    );
+    source_path(directory.path(), "scene.resS", b"expected-payload");
+    let actual = source_path(directory.path(), "other.resS", b"streamed-payload");
+    let mut workspace = AssetWorkspace::new().expect("create workspace");
+    let base_revision = workspace.revision();
+    let mut budget = AssetLoadBudget::default();
+    let batch = source_batch(
+        vec![SourceAdmissionOperation::LoadPath(
+            SourceOpenRequest::new(
+                root,
+                SourceAlias::new("Assets/scene.asset").expect("valid alias"),
+            )
+            .with_kind_hint(SourceKind::Yaml)
+            .with_companion(SourceCompanionRequest::new(
+                actual,
+                SourceMemberId::new("scene.resS").expect("valid companion identity"),
+            )),
+        )],
+        &mut budget,
+    );
+
+    let error = workspace
+        .admit_sources(batch, SourceAdmissionPolicy::Strict, &mut budget)
+        .expect_err("companion path must be bound to the declared member");
+
+    assert_eq!(error.category(), SourceAdmissionErrorCategory::Identity);
+    assert!(matches!(
+        error.failure(),
+        SourceAdmissionFailure::CompanionPathMismatch { .. }
+    ));
+    assert_eq!(workspace.revision(), base_revision);
+    assert_eq!(source_count(&workspace), 0);
 }
 
 #[test]

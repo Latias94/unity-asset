@@ -11,9 +11,9 @@ use unity_asset::schema::{
 };
 use unity_asset::workspace::{
     AssetWorkspace, MutationPlanBuilder, MutationPlanError, MutationValue, PrepareOptions,
-    ReferenceTarget, SourceAdmissionBatch, SourceOpenRequest, WorkspaceError, WorkspaceLookup,
-    WorkspaceObjectValue, WorkspaceOptions, WorkspaceSourceContainer,
-    WorkspaceSourceMemberIdentityError, WorkspaceView,
+    ReferenceTarget, SourceAdmissionBatch, SourceAdmissionOperation, SourceOpenRequest,
+    WorkspaceError, WorkspaceLookup, WorkspaceObjectValue, WorkspaceOptions,
+    WorkspaceSourceContainer, WorkspaceSourceMemberIdentityError, WorkspaceView,
 };
 use unity_asset::{
     AssetLoadBudget, AssetLoadLimits, AssetLoadUsage, BinaryError, BudgetError, ContainmentKind,
@@ -1154,23 +1154,28 @@ fn yaml_archive_and_binary_budget_errors_keep_one_public_error_shape() {
 }
 
 #[test]
-fn root_descriptor_backing_is_budgeted_before_the_source_image() {
+fn root_admission_metadata_is_budgeted_before_the_source_image() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("descriptor.resource");
     fs::write(&path, b"payload").unwrap();
-    let canonical = fs::canonicalize(&path).unwrap();
     let alias = SourceAlias::new("budgeted/root/descriptor.resource").unwrap();
-    let retained_bytes =
-        u64::try_from(alias.retained_clone_bytes() + canonical.as_os_str().len()).unwrap();
     let request = SourceOpenRequest::new(path, alias);
     let mut batch_probe = AssetLoadBudget::default();
-    let batch = SourceAdmissionBatch::with_capacity(1, &mut batch_probe).unwrap();
+    let mut batch = SourceAdmissionBatch::with_capacity(1, &mut batch_probe).unwrap();
     let expected_usage = batch_probe.usage();
+    batch
+        .try_push(
+            SourceAdmissionOperation::LoadPath(request.clone()),
+            &mut batch_probe,
+        )
+        .unwrap();
+    let admission_bytes = batch_probe.usage().bytes;
     drop(batch);
+    assert!(admission_bytes > expected_usage.bytes);
     let mut workspace = workspace(0);
     let revision = workspace.revision();
     let mut budget = AssetLoadBudget::new(AssetLoadLimits {
-        max_bytes: retained_bytes - 1,
+        max_bytes: admission_bytes - 1,
         ..AssetLoadLimits::default()
     })
     .unwrap();

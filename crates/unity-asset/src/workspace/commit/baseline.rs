@@ -19,7 +19,9 @@ use super::super::inspection::{
 };
 use super::super::overlay::PreparedStateCore;
 use super::super::preflight::PreparedChange;
-use super::super::source_catalog::{CatalogError, PhysicalDomainChange, SourceDescriptor};
+use super::super::source_catalog::{
+    CatalogError, PhysicalDomainChange, PhysicalOrigin, SourceCatalogTransaction, SourceDescriptor,
+};
 use super::super::source_loading::{
     map_binary_adapter_error, map_yaml_error, promote_value_to_arc, validate_yaml_identities,
 };
@@ -235,6 +237,7 @@ impl<A: Write, B: Write> Write for TeeWriter<'_, A, B> {
 
 pub(crate) fn build(
     prepared: &PreparedChange,
+    committed_catalog: SourceCatalogTransaction,
     binary: &BinaryWorkspaceAdapter,
     expected_installation: WorkspaceInstallationDigest,
     images: &mut MaterializedImages,
@@ -244,9 +247,9 @@ pub(crate) fn build(
     let core: &PreparedStateCore = state.core().as_ref();
     let expected = Arc::clone(core.base().state());
     let base = expected.as_ref();
-    let mut transaction = WorkspaceStateTransaction::begin_with_catalog(
+    let mut transaction = WorkspaceStateTransaction::begin_with_catalog_transaction(
         Arc::clone(&expected),
-        core.catalog(),
+        committed_catalog,
         budget,
     )
     .map_err(BaselineBuildError::state)?;
@@ -350,6 +353,7 @@ pub(crate) fn build_from_journal_with_images(
                 }
             }
             JournalCatalogAction::AddCompanion { parent, member } => {
+                let origin = recovery_companion_origin(journal, source, budget)?;
                 let descriptor = SourceDescriptor::companion(*parent, member.clone())
                     .map_err(BaselineBuildError::catalog)?;
                 let actual = transaction
@@ -364,6 +368,9 @@ pub(crate) fn build_from_journal_with_images(
                         ),
                     });
                 }
+                transaction
+                    .bind_companion_origin(actual, origin, budget)
+                    .map_err(BaselineBuildError::state)?;
             }
             JournalCatalogAction::AddContainedSidecar { parent, member } => {
                 let descriptor = SourceDescriptor::sidecar(*parent, member.clone())
@@ -448,6 +455,42 @@ pub(crate) fn build_from_journal_with_images(
     Ok(PreparedBaseline {
         state: prepared_state,
     })
+}
+
+fn recovery_companion_origin(
+    journal: &Journal,
+    source: &JournalBaselineSource,
+    budget: &mut AssetLoadBudget,
+) -> Result<PhysicalOrigin, BaselineBuildError> {
+    let JournalBaselineImage::Published { artifact } = source.image() else {
+        return Err(BaselineBuildError::RecoveryBinding {
+            message: "a new companion baseline must reference its published artifact".to_owned(),
+        });
+    };
+    let index = usize::try_from(*artifact).map_err(|_| BaselineBuildError::RecoveryBinding {
+        message: "published companion artifact index overflowed".to_owned(),
+    })?;
+    let artifact = journal.manifest().artifacts().get(index).ok_or_else(|| {
+        BaselineBuildError::RecoveryBinding {
+            message: "published companion artifact index is out of range".to_owned(),
+        }
+    })?;
+    if artifact.source() != source.source() {
+        return Err(BaselineBuildError::RecoveryBinding {
+            message: "published companion artifact belongs to a different source".to_owned(),
+        });
+    }
+    let target = artifact
+        .target()
+        .join_root_budgeted(
+            journal.layout().parent(),
+            "recovery companion physical origin",
+            budget,
+        )
+        .map_err(map_journal_path_error)?;
+    PhysicalOrigin::from_verified_publication_path(target)
+        .map_err(CatalogError::from)
+        .map_err(BaselineBuildError::catalog)
 }
 
 fn validate_in_place_binding(

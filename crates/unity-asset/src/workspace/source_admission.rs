@@ -9,8 +9,8 @@ use std::sync::Arc;
 use thiserror::Error;
 use unity_asset_binary::error::BinaryError;
 use unity_asset_core::{
-    AssetLoadBudget, AssetLoadBudgetDomainToken, BudgetError, BudgetedSourceBytes, SourceAlias,
-    SourceId, SourceKind, WorkspaceRevision, vec_allocation_bytes,
+    AssetLoadBudget, AssetLoadBudgetDomainToken, BudgetError, BudgetedSourceBytes, ContainmentKind,
+    SourceAlias, SourceId, SourceKind, SourceMemberId, WorkspaceRevision, vec_allocation_bytes,
 };
 use unity_asset_yaml::BudgetedYamlError;
 
@@ -18,10 +18,53 @@ use super::adapter::archive::ArchiveLoadError;
 use super::interface::AssetWorkspace;
 use super::source_catalog::{
     CatalogError, PhysicalOrigin, PhysicalOriginError, RootAdmissionDecision, SourceDescriptor,
+    VerifiedPhysicalBinding,
 };
-use super::source_loading::{prepare_root, read_owned_image, reserve_budgeted_vec, usize_to_u64};
-use super::state::{PreparedSourceTree, WorkspaceStateInstallOutcome, WorkspaceStateTransaction};
+use super::source_loading::{
+    prepare_root, prepared_raw, read_owned_image, reserve_budgeted_vec, usize_to_u64,
+};
+use super::state::{
+    PreparedSourceChild, PreparedSourceRelation, PreparedSourceTree, WorkspaceStateInstallOutcome,
+    WorkspaceStateTransaction,
+};
 use super::view::{WorkspaceAllocationUnit, WorkspaceError};
+
+/// One explicit streamed-resource companion attached to a YAML or SerializedFile root.
+#[derive(Debug, Clone)]
+pub struct SourceCompanionRequest {
+    path: PathBuf,
+    member: SourceMemberId,
+}
+
+impl SourceCompanionRequest {
+    #[must_use]
+    pub fn new(path: impl Into<PathBuf>, member: SourceMemberId) -> Self {
+        Self {
+            path: path.into(),
+            member,
+        }
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[must_use]
+    pub const fn member(&self) -> &SourceMemberId {
+        &self.member
+    }
+
+    fn retained_admission_bytes(&self) -> Result<u64, BudgetError> {
+        self.path
+            .capacity()
+            .checked_add(self.member.retained_clone_bytes())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(BudgetError::ArithmeticOverflow {
+                resource: "source companion admission metadata",
+            })
+    }
+}
 
 /// One explicit filesystem source load.
 #[derive(Debug, Clone)]
@@ -29,6 +72,7 @@ pub struct SourceOpenRequest {
     path: PathBuf,
     alias: SourceAlias,
     kind_hint: Option<SourceKind>,
+    companions: Vec<SourceCompanionRequest>,
 }
 
 impl SourceOpenRequest {
@@ -38,6 +82,7 @@ impl SourceOpenRequest {
             path: path.into(),
             alias,
             kind_hint: None,
+            companions: Vec::new(),
         }
     }
 
@@ -61,6 +106,13 @@ impl SourceOpenRequest {
         self
     }
 
+    /// Attaches one caller-discovered companion without asking the workspace to scan a directory.
+    #[must_use]
+    pub fn with_companion(mut self, companion: SourceCompanionRequest) -> Self {
+        self.companions.push(companion);
+        self
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
@@ -76,14 +128,39 @@ impl SourceOpenRequest {
         self.kind_hint
     }
 
+    #[must_use]
+    pub fn companions(&self) -> &[SourceCompanionRequest] {
+        &self.companions
+    }
+
     fn retained_admission_bytes(&self) -> Result<u64, BudgetError> {
-        self.path
+        let root = self
+            .path
             .capacity()
             .checked_add(self.alias.retained_owned_bytes())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or(BudgetError::ArithmeticOverflow {
                 resource: "source admission operation metadata",
-            })
+            })?;
+        let companion_records = vec_allocation_bytes::<SourceCompanionRequest>(
+            self.companions.capacity(),
+        )
+        .map_err(|_| BudgetError::ArithmeticOverflow {
+            resource: "source admission operation metadata",
+        })?;
+        self.companions.iter().try_fold(
+            root.checked_add(companion_records)
+                .ok_or(BudgetError::ArithmeticOverflow {
+                    resource: "source admission operation metadata",
+                })?,
+            |total, companion| {
+                total
+                    .checked_add(companion.retained_admission_bytes()?)
+                    .ok_or(BudgetError::ArithmeticOverflow {
+                        resource: "source admission operation metadata",
+                    })
+            },
+        )
     }
 }
 
@@ -481,6 +558,19 @@ impl fmt::Display for SourceAdmissionFailureSite {
 pub enum SourceAdmissionFailure {
     #[error(transparent)]
     Workspace(Box<WorkspaceError>),
+    #[error("companion sources require a filesystem-backed LoadPath operation")]
+    CompanionsRequireFilesystemLoad,
+    #[error("source kind {actual:?} cannot own filesystem companion sources")]
+    InvalidCompanionParentKind { actual: SourceKind },
+    #[error(
+        "filesystem companion {member:?} uses same-name occurrence {same_name_occurrence}; filesystem companions require occurrence zero"
+    )]
+    InvalidCompanionOccurrence {
+        member: SourceMemberId,
+        same_name_occurrence: u32,
+    },
+    #[error("filesystem companion does not resolve to its declared sibling {expected:?}")]
+    CompanionPathMismatch { expected: PathBuf },
     #[error("source alias duplicates operation {first_operation}")]
     DuplicateAlias { first_operation: u64 },
     #[error("physical origin duplicates operation {first_operation}")]
@@ -502,6 +592,12 @@ impl SourceAdmissionFailure {
     pub fn category(&self) -> SourceAdmissionErrorCategory {
         match self {
             Self::Workspace(error) => classify_workspace_error(error),
+            Self::CompanionsRequireFilesystemLoad | Self::InvalidCompanionParentKind { .. } => {
+                SourceAdmissionErrorCategory::Contract
+            }
+            Self::InvalidCompanionOccurrence { .. } | Self::CompanionPathMismatch { .. } => {
+                SourceAdmissionErrorCategory::Identity
+            }
             Self::DuplicateAlias { .. } => SourceAdmissionErrorCategory::DuplicateAlias,
             Self::DuplicatePhysicalOrigin { .. } => {
                 SourceAdmissionErrorCategory::DuplicatePhysicalOrigin
@@ -515,7 +611,11 @@ impl SourceAdmissionFailure {
     #[must_use]
     pub const fn first_operation(&self) -> Option<u64> {
         match self {
-            Self::Workspace(_) => None,
+            Self::Workspace(_)
+            | Self::CompanionsRequireFilesystemLoad
+            | Self::InvalidCompanionParentKind { .. }
+            | Self::InvalidCompanionOccurrence { .. }
+            | Self::CompanionPathMismatch { .. } => None,
             Self::DuplicateAlias {
                 first_operation, ..
             }
@@ -1111,7 +1211,14 @@ impl AssetWorkspace {
             path,
             alias,
             kind_hint,
+            companions,
         } = request;
+        if !companions.is_empty() && !matches!(&image, SourceImageInput::Path) {
+            return Err(AdmissionOperationFailure::with_location(
+                SourceAdmissionOperationLocation::RequestPath(path),
+                SourceAdmissionFailure::CompanionsRequireFilesystemLoad,
+            ));
+        }
         let absolute = match absolute_path(path, budget) {
             Ok(absolute) => absolute,
             Err((path, error)) => {
@@ -1162,7 +1269,7 @@ impl AssetWorkspace {
                 image
             }
         };
-        let source = match prepare_root(
+        let mut source = match prepare_root(
             origin.path(),
             kind_hint,
             image,
@@ -1178,6 +1285,39 @@ impl AssetWorkspace {
                 ));
             }
         };
+        if !companions.is_empty() {
+            if !matches!(source.kind(), SourceKind::Yaml | SourceKind::SerializedFile) {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                    SourceAdmissionFailure::InvalidCompanionParentKind {
+                        actual: source.kind(),
+                    },
+                ));
+            }
+            let existing_root = match self.state().catalog().root_admission_decision(
+                &alias,
+                &origin,
+                source.fingerprint(),
+            ) {
+                Ok(RootAdmissionDecision::Unchanged(existing)) => Some(existing),
+                Ok(
+                    RootAdmissionDecision::Vacant
+                    | RootAdmissionDecision::AliasConflict { .. }
+                    | RootAdmissionDecision::PhysicalOriginConflict { .. },
+                ) => None,
+                Err(error) => {
+                    return Err(AdmissionOperationFailure::with_location(
+                        SourceAdmissionOperationLocation::PhysicalOrigin(
+                            origin.path().to_path_buf(),
+                        ),
+                        SourceAdmissionFailure::from(WorkspaceError::from(error)),
+                    ));
+                }
+            };
+            let prepared =
+                prepare_source_companions(self, &origin, existing_root, companions, budget)?;
+            source.attach_companions(prepared);
+        }
         Ok(PreparedAdmission::Load {
             ordinal,
             alias,
@@ -1385,7 +1525,9 @@ impl AssetWorkspace {
                         },
                         None => None,
                     };
-                    if let Some(existing) = existing {
+                    if let Some(existing) = existing
+                        && !source.has_children()
+                    {
                         if let Some(insertion) = insertion {
                             insertion.insert(ordinal, existing);
                         }
@@ -1397,19 +1539,25 @@ impl AssetWorkspace {
                         ));
                         continue;
                     }
-
                     let root_descriptor = SourceDescriptor::root(source.kind(), alias, origin);
-                    let root = transaction
-                        .register_tree(root_descriptor, *source, budget)
+                    let registration = transaction
+                        .reconcile_tree(root_descriptor, *source, budget)
                         .map_err(WorkspaceError::from)
                         .map_err(|error| admission_workspace_error(ordinal, error))?;
+                    let root = registration.source();
+                    debug_assert!(existing.is_none_or(|existing| existing == root));
                     if let Some(insertion) = insertion {
                         insertion.insert(ordinal, root);
                     }
-                    candidate_changed = true;
+                    let changed = registration.changed();
+                    candidate_changed |= changed;
                     outcomes.push(SourceAdmissionOutcome::new(
                         ordinal,
-                        SourceAdmissionDisposition::Loaded { source_id: root },
+                        if changed {
+                            SourceAdmissionDisposition::Loaded { source_id: root }
+                        } else {
+                            SourceAdmissionDisposition::Unchanged { source_id: root }
+                        },
                     ));
                 }
             }
@@ -1678,7 +1826,11 @@ fn located_admission_failure_to_workspace(
 ) -> WorkspaceError {
     match failure {
         SourceAdmissionFailure::Workspace(error) => *error,
-        failure @ SourceAdmissionFailure::DuplicateAlias { .. }
+        failure @ SourceAdmissionFailure::CompanionsRequireFilesystemLoad
+        | failure @ SourceAdmissionFailure::InvalidCompanionParentKind { .. }
+        | failure @ SourceAdmissionFailure::InvalidCompanionOccurrence { .. }
+        | failure @ SourceAdmissionFailure::CompanionPathMismatch { .. }
+        | failure @ SourceAdmissionFailure::DuplicateAlias { .. }
         | failure @ SourceAdmissionFailure::DuplicatePhysicalOrigin { .. }
         | failure @ SourceAdmissionFailure::AliasConflict { .. }
         | failure @ SourceAdmissionFailure::PhysicalOriginConflict { .. } => match location {
@@ -1698,6 +1850,184 @@ fn located_admission_failure_to_workspace(
             }
         },
     }
+}
+
+fn prepare_source_companions(
+    workspace: &AssetWorkspace,
+    root: &PhysicalOrigin,
+    existing_root: Option<SourceId>,
+    companions: Vec<SourceCompanionRequest>,
+    budget: &mut AssetLoadBudget,
+) -> Result<Vec<PreparedSourceChild>, AdmissionOperationFailure> {
+    let mut prepared = reserve_budgeted_vec::<PreparedSourceChild>(
+        companions.len(),
+        budget,
+        "source admission companions",
+    )
+    .map_err(|error| AdmissionOperationFailure {
+        location: None,
+        failure: Box::new(SourceAdmissionFailure::from(error)),
+    })?;
+
+    for companion in companions {
+        let SourceCompanionRequest { path, member } = companion;
+        let same_name_occurrence = member.same_name_occurrence();
+        if same_name_occurrence != 0 {
+            return Err(AdmissionOperationFailure::with_location(
+                SourceAdmissionOperationLocation::RequestPath(path),
+                SourceAdmissionFailure::InvalidCompanionOccurrence {
+                    member,
+                    same_name_occurrence,
+                },
+            ));
+        }
+
+        let absolute = match absolute_path(path, budget) {
+            Ok(absolute) => absolute,
+            Err((path, error)) => {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::RequestPath(path),
+                    SourceAdmissionFailure::from(*error),
+                ));
+            }
+        };
+        let origin = match PhysicalOrigin::from_existing_path_budgeted(&absolute, budget) {
+            Ok(origin) => origin,
+            Err(error) => {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::RequestPath(absolute),
+                    SourceAdmissionFailure::from(physical_origin_workspace_error(error)),
+                ));
+            }
+        };
+        drop(absolute);
+
+        let expected_path = budgeted_companion_path(root, &member, budget).map_err(|error| {
+            AdmissionOperationFailure::with_location(
+                SourceAdmissionOperationLocation::PhysicalOrigin(root.path().to_path_buf()),
+                SourceAdmissionFailure::from(error),
+            )
+        })?;
+        let expected = match PhysicalOrigin::from_existing_path_budgeted(&expected_path, budget) {
+            Ok(expected) => expected,
+            Err(error) => {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::RequestPath(expected_path),
+                    SourceAdmissionFailure::from(physical_origin_workspace_error(error)),
+                ));
+            }
+        };
+        if origin != expected {
+            return Err(AdmissionOperationFailure::with_location(
+                SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                SourceAdmissionFailure::CompanionPathMismatch {
+                    expected: expected.into_path(),
+                },
+            ));
+        }
+
+        let existing_companion = match existing_root {
+            Some(parent) => workspace
+                .state()
+                .catalog()
+                .child_by_member(parent, ContainmentKind::Companion, &member)
+                .map_err(|error| {
+                    AdmissionOperationFailure::with_location(
+                        SourceAdmissionOperationLocation::PhysicalOrigin(
+                            origin.path().to_path_buf(),
+                        ),
+                        SourceAdmissionFailure::from(WorkspaceError::from(error)),
+                    )
+                })?,
+            None => None,
+        };
+        if let Some(existing) = existing_companion {
+            let catalog = workspace.state().catalog();
+            let registered_origin = catalog.physical_origin(existing).map_err(|error| {
+                AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::PhysicalOrigin(origin.path().to_path_buf()),
+                    SourceAdmissionFailure::from(WorkspaceError::from(error)),
+                )
+            })?;
+            if registered_origin != &origin {
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                    SourceAdmissionFailure::PhysicalOriginConflict {
+                        existing_source: existing,
+                    },
+                ));
+            }
+            let expected_fingerprint = catalog.fingerprint(existing).map_err(|error| {
+                AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::PhysicalOrigin(origin.path().to_path_buf()),
+                    SourceAdmissionFailure::from(WorkspaceError::from(error)),
+                )
+            })?;
+            if let Err(error) = VerifiedPhysicalBinding::verify_existing(
+                SourceKind::StreamedResource,
+                origin.path(),
+                expected_fingerprint,
+                budget,
+            ) {
+                let error = companion_verification_workspace_error(origin.path(), error);
+                return Err(AdmissionOperationFailure::with_location(
+                    SourceAdmissionOperationLocation::PhysicalOrigin(origin.into_path()),
+                    SourceAdmissionFailure::from(error),
+                ));
+            }
+            continue;
+        }
+
+        let image = read_owned_image(&origin, budget).map_err(|error| {
+            AdmissionOperationFailure::with_location(
+                SourceAdmissionOperationLocation::PhysicalOrigin(origin.path().to_path_buf()),
+                SourceAdmissionFailure::from(error),
+            )
+        })?;
+        prepared.push(PreparedSourceChild::new(
+            PreparedSourceRelation::Companion(origin),
+            member,
+            prepared_raw(image),
+        ));
+    }
+    Ok(prepared)
+}
+
+fn budgeted_companion_path(
+    root: &PhysicalOrigin,
+    member: &SourceMemberId,
+    budget: &mut AssetLoadBudget,
+) -> Result<PathBuf, WorkspaceError> {
+    const RESOURCE: &str = "source admission companion path";
+
+    let parent = root
+        .path()
+        .parent()
+        .ok_or_else(|| WorkspaceError::InvalidSource {
+            path: root.path().to_path_buf(),
+            message: "the root physical origin has no parent directory".to_owned(),
+        })?;
+    let tail = Path::new(member.name());
+    let requested = parent
+        .as_os_str()
+        .len()
+        .checked_add(tail.as_os_str().len())
+        .and_then(|bytes| bytes.checked_add(1))
+        .ok_or(BudgetError::ArithmeticOverflow { resource: RESOURCE })?;
+    budget.check_bytes(usize_to_u64(requested, RESOURCE)?)?;
+    let mut path = PathBuf::new();
+    path.as_mut_os_string()
+        .try_reserve_exact(requested)
+        .map_err(|error| WorkspaceError::Allocation {
+            resource: RESOURCE,
+            requested,
+            unit: WorkspaceAllocationUnit::Bytes,
+            message: error.to_string(),
+        })?;
+    path.push(parent);
+    path.push(tail);
+    budget.consume_bytes(usize_to_u64(path.capacity(), RESOURCE)?)?;
+    Ok(path)
 }
 
 fn admission_workspace_error(ordinal: u64, error: WorkspaceError) -> SourceAdmissionError {
@@ -1758,6 +2088,27 @@ fn physical_origin_workspace_error(error: CatalogError) -> WorkspaceError {
         CatalogError::InvalidPhysicalOrigin(error) => {
             WorkspaceError::operation("physical-origin validation", error)
         }
+        error => WorkspaceError::from(error),
+    }
+}
+
+fn companion_verification_workspace_error(path: &Path, error: CatalogError) -> WorkspaceError {
+    match error {
+        CatalogError::VerifiedPhysicalBindingIo {
+            path,
+            kind,
+            message,
+        } => WorkspaceError::Io {
+            path,
+            kind,
+            message,
+        },
+        CatalogError::VerifiedPhysicalBindingChanged { path } => {
+            WorkspaceError::SourceChanged { path }
+        }
+        CatalogError::VerifiedFingerprintMismatch { .. } => WorkspaceError::SourceChanged {
+            path: path.to_path_buf(),
+        },
         error => WorkspaceError::from(error),
     }
 }

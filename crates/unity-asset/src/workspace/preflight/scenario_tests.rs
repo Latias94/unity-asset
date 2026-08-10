@@ -209,6 +209,41 @@ fn committed_yaml_reuses_the_prepared_document_authority() {
     assert!(Arc::ptr_eq(&proof_document, committed));
 }
 
+#[test]
+fn field_replace_commit_installs_the_prepared_catalog_without_a_companion() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(TARGET_ALIAS);
+    fs::write(&path, TARGET_YAML).unwrap();
+    let mut workspace = AssetWorkspace::new().unwrap();
+    workspace
+        .load_source(
+            SourceOpenRequest::new(&path, SourceAlias::new(TARGET_ALIAS).unwrap())
+                .with_kind_hint(SourceKind::Yaml),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    let base_revision = workspace.revision();
+    let prepared = workspace
+        .prepare(
+            plan(&workspace, vec![replacement("Before", "After")]),
+            PrepareOptions::default(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+    assert_eq!(prepared.publications().len(), 1);
+
+    workspace
+        .commit(
+            prepared,
+            PublicationTarget::in_place(directory.path()).unwrap(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+
+    assert_ne!(workspace.revision(), base_revision);
+    assert!(fs::read_to_string(path).unwrap().contains("m_Name: After"));
+}
+
 fn observe_prepared_destinations(prepared: &PreparedChange) -> DestinationProofSet {
     let destinations = prepared
         .publications()

@@ -5,7 +5,7 @@ use unity_asset_core::{
     SourceKind, WorkspaceId, WorkspaceRevision,
 };
 
-use super::source_catalog::{CatalogError, SourceCatalog};
+use super::source_catalog::{CatalogError, SourceCatalog, SourceLocationKind};
 
 mod store;
 mod transaction;
@@ -99,6 +99,11 @@ impl WorkspaceState {
         }
 
         for (source, descriptor) in catalog.iter() {
+            if descriptor.location_kind() == SourceLocationKind::Companion
+                && catalog.physical_origin_option(source)?.is_none()
+            {
+                return Err(WorkspaceStateError::MissingCompanionPhysicalOrigin(source));
+            }
             let entry = store
                 .get(source)
                 .ok_or(WorkspaceStateError::MissingSourceImage(source))?;
@@ -339,6 +344,8 @@ pub(crate) enum WorkspaceStateError {
     SourceCardinalityMismatch { catalog: usize, store: usize },
     #[error("source catalog has no image for {0:?}")]
     MissingSourceImage(SourceId),
+    #[error("companion source {0:?} has no authoritative physical origin")]
+    MissingCompanionPhysicalOrigin(SourceId),
     #[error("source store has no catalog record for {0:?}")]
     MissingCatalogRecord(SourceId),
     #[error("source {source_id:?} has catalog kind {catalog:?}, store kind {store:?}")]

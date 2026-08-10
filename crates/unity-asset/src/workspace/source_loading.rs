@@ -433,7 +433,7 @@ fn prepare_binary_payload(
                 true,
             )?,
         };
-        let relation = relation.ok_or_else(|| {
+        let relation = relation.clone().ok_or_else(|| {
             WorkspaceError::operation(
                 "binary member ownership",
                 std::io::Error::other("serialized files cannot own container members"),
@@ -502,7 +502,7 @@ fn prepare_member(
     }
 }
 
-fn prepared_raw(image: BudgetedSourceBytes) -> PreparedSourceTree {
+pub(super) fn prepared_raw(image: BudgetedSourceBytes) -> PreparedSourceTree {
     PreparedSourceTree::new(
         SourceKind::StreamedResource,
         image,

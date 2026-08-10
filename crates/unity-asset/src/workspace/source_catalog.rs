@@ -18,6 +18,21 @@ use unity_asset_core::{
 pub(crate) struct PhysicalOrigin(PathBuf);
 
 impl PhysicalOrigin {
+    /// Mints a canonical destination already proven by the publication protocol.
+    ///
+    /// The caller owns the path allocation and has verified its anchored parent. The destination
+    /// may still be absent because publication stages and proves bytes before the atomic move.
+    pub(crate) fn from_verified_publication_path(
+        path: PathBuf,
+    ) -> Result<Self, PhysicalOriginError> {
+        if !path.is_absolute() {
+            return Err(PhysicalOriginError::NotAbsolute(path));
+        }
+        #[cfg(windows)]
+        validate_windows_origin_path(&path)?;
+        Ok(Self(path))
+    }
+
     #[cfg(test)]
     pub(crate) fn from_existing_path(path: impl AsRef<Path>) -> Result<Self, PhysicalOriginError> {
         let requested = path.as_ref();
@@ -1066,6 +1081,68 @@ impl SourceCatalog {
         Ok(source)
     }
 
+    fn bind_companion_origin_impl(
+        &mut self,
+        source: SourceId,
+        origin: PhysicalOrigin,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), CatalogError> {
+        self.ensure_workspace(source)?;
+        let record = Arc::clone(
+            self.by_id
+                .get(&source)
+                .ok_or(CatalogError::UnknownSource(source))?,
+        );
+        if !matches!(
+            record.descriptor.placement,
+            SourcePlacement::Companion { .. }
+        ) {
+            return Err(CatalogError::PhysicalOriginRequiresCompanion { source_id: source });
+        }
+        if let Some(existing) = &record.physical_origin {
+            return if existing.as_ref() == &origin {
+                Ok(())
+            } else {
+                Err(CatalogError::PhysicalOriginChanged { source_id: source })
+            };
+        }
+        self.ensure_physical_available(source, &origin)?;
+
+        let retained_bytes = checked_byte_add(
+            checked_record_clone_bytes(&record.descriptor)?,
+            checked_byte_add(
+                checked_arc_allocation_bytes::<PhysicalOrigin>()?,
+                checked_hash_map_growth_bytes(
+                    &self.physical_bindings,
+                    1,
+                    "source catalog companion physical-binding index",
+                )?,
+            )?,
+        )?;
+        budget.check_bytes(retained_bytes)?;
+        self.physical_bindings
+            .try_reserve(1)
+            .map_err(|error| CatalogError::AllocationFailed {
+                resource: "source catalog companion physical-binding index",
+                requested: 1,
+                unit: CatalogAllocationUnit::Slots,
+                message: error.to_string(),
+            })?;
+
+        let origin = Arc::new(origin);
+        let replacement = Arc::new(SourceRecord {
+            descriptor: record.descriptor.clone(),
+            fingerprint: record.fingerprint,
+            source_locator: Arc::clone(&record.source_locator),
+            physical_origin: Some(Arc::clone(&origin)),
+            canonical_key: Arc::clone(&record.canonical_key),
+        });
+        budget.consume_bytes(retained_bytes)?;
+        self.physical_bindings.insert(origin, source);
+        self.by_id.insert(source, replacement);
+        Ok(())
+    }
+
     fn existing_source_for_descriptor(
         &self,
         descriptor: &SourceDescriptor,
@@ -1084,7 +1161,7 @@ impl SourceCatalog {
         Ok(existing.filter(|source| source.kind() == descriptor.kind))
     }
 
-    fn root_admission_decision(
+    pub(crate) fn root_admission_decision(
         &self,
         alias: &SourceAlias,
         origin: &PhysicalOrigin,
@@ -1717,7 +1794,6 @@ impl SourceCatalog {
             .copied())
     }
 
-    #[cfg(test)]
     pub(crate) fn child_by_member(
         &self,
         parent: SourceId,
@@ -2666,6 +2742,14 @@ pub(crate) struct SourceCatalogTransaction {
 }
 
 impl SourceCatalogTransaction {
+    /// Borrows the fallible candidate without converting it into authoritative state.
+    ///
+    /// Publication preflight uses this view to derive durable installation evidence before the
+    /// candidate is moved into the workspace-state transaction for joint catalog/store validation.
+    pub(in crate::workspace) fn candidate(&self) -> &SourceCatalog {
+        &self.candidate
+    }
+
     pub(crate) fn root_admission_decision(
         &mut self,
         alias: &SourceAlias,
@@ -2708,6 +2792,25 @@ impl SourceCatalogTransaction {
             .register_impl(descriptor, fingerprint, Some(budget))
         {
             Ok(source) => Ok(source),
+            Err(error) => {
+                self.failed = true;
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn bind_companion_origin(
+        &mut self,
+        source: SourceId,
+        origin: PhysicalOrigin,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), CatalogError> {
+        self.ensure_active()?;
+        match self
+            .candidate
+            .bind_companion_origin_impl(source, origin, budget)
+        {
+            Ok(()) => Ok(()),
             Err(error) => {
                 self.failed = true;
                 Err(error)
@@ -3010,6 +3113,8 @@ pub(crate) enum CatalogError {
     },
     #[error("source {source_id:?} is already bound to a different physical origin")]
     PhysicalOriginChanged { source_id: SourceId },
+    #[error("source {source_id:?} is not a companion and cannot receive a companion origin")]
+    PhysicalOriginRequiresCompanion { source_id: SourceId },
     #[error(
         "physical domain {collection} sources must be strictly ordered: {previous:?} precedes {current:?}"
     )]
@@ -4794,6 +4899,71 @@ mod tests {
         assert!(removed.contains(&companion));
         assert!(candidate.is_empty());
         candidate.validate().unwrap();
+    }
+
+    #[test]
+    fn companion_physical_binding_is_exact_budgeted_atomic_and_indexed() {
+        let workspace = WorkspaceId::from_u128(1).unwrap();
+        let mut catalog = SourceCatalog::new(workspace);
+        let root = catalog
+            .register(
+                root_descriptor(SourceKind::SerializedFile, "main.assets", b"asset"),
+                fingerprint(SourceKind::SerializedFile, b"asset"),
+            )
+            .unwrap();
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut registration = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut registration_budget = AssetLoadBudget::default();
+        let companion = registration
+            .register_companion(
+                root,
+                SourceMemberId::new("main.resS").unwrap(),
+                fingerprint(SourceKind::StreamedResource, b"resource"),
+                &mut registration_budget,
+            )
+            .unwrap();
+        catalog = registration.commit(&mut registration_budget).unwrap();
+        let origin = physical_origin("main.resS", b"resource");
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut measured = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut measurement_budget = AssetLoadBudget::default();
+        measured
+            .bind_companion_origin(companion, origin.clone(), &mut measurement_budget)
+            .unwrap();
+        let usage = measurement_budget.usage();
+        let measured = measured.commit(&mut measurement_budget).unwrap();
+        assert_eq!(measured.find_physical(&origin), Some(companion));
+        assert_eq!(measured.physical_origin(companion).unwrap(), &origin);
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut rejected = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut one_short = budget_with(usage.bytes - 1, usage.entries);
+        assert!(matches!(
+            rejected.bind_companion_origin(companion, origin.clone(), &mut one_short),
+            Err(CatalogError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+        assert_eq!(one_short.usage().bytes, 0);
+        assert_eq!(one_short.usage().entries, 0);
+        assert!(matches!(
+            rejected.commit(&mut one_short),
+            Err(CatalogError::TransactionAborted)
+        ));
+        assert_eq!(catalog.physical_origin_option(companion).unwrap(), None);
+
+        let mut begin_budget = AssetLoadBudget::default();
+        let mut exact = catalog.begin_transaction(&mut begin_budget).unwrap();
+        let mut exact_budget = budget_with(usage.bytes, usage.entries);
+        exact
+            .bind_companion_origin(companion, origin.clone(), &mut exact_budget)
+            .unwrap();
+        let exact = exact.commit(&mut exact_budget).unwrap();
+        assert_eq!(exact_budget.usage(), usage);
+        assert_eq!(exact.find_physical(&origin), Some(companion));
+        exact.validate().unwrap();
     }
 
     #[test]

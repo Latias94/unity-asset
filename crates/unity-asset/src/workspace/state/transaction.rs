@@ -9,14 +9,16 @@ use super::store::{FrozenSourceParse, SourceStore};
 use super::{WorkspaceState, WorkspaceStateError};
 use crate::workspace::inspection::WorkspaceSourceFormatInspection;
 use crate::workspace::source_catalog::{
-    PhysicalDomainChange, PhysicalOrigin, RootAdmissionDecision, SourceCatalog, SourceDescriptor,
+    PhysicalDomainChange, PhysicalOrigin, RootAdmissionDecision, SourceCatalogTransaction,
+    SourceDescriptor,
 };
 
 /// Containment relation used to derive a child descriptor after its parent is registered.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) enum PreparedSourceRelation {
     Archive,
     Bundle,
+    Companion(PhysicalOrigin),
     WebFile,
 }
 
@@ -55,6 +57,25 @@ pub(crate) struct PreparedSourceTree {
     children: Vec<PreparedSourceChild>,
 }
 
+/// Result of reconciling one complete prepared source tree into a candidate state.
+#[derive(Debug)]
+pub(crate) struct SourceTreeReconciliation {
+    source: SourceId,
+    changed: bool,
+}
+
+impl SourceTreeReconciliation {
+    #[must_use]
+    pub(crate) const fn source(&self) -> SourceId {
+        self.source
+    }
+
+    #[must_use]
+    pub(crate) const fn changed(&self) -> bool {
+        self.changed
+    }
+}
+
 impl PreparedSourceTree {
     pub(crate) fn new(
         kind: SourceKind,
@@ -79,6 +100,20 @@ impl PreparedSourceTree {
     #[must_use]
     pub(crate) const fn fingerprint(&self) -> SourceFingerprint {
         self.image.fingerprint()
+    }
+
+    pub(crate) fn attach_companions(&mut self, companions: Vec<PreparedSourceChild>) {
+        debug_assert!(matches!(
+            self.kind(),
+            SourceKind::Yaml | SourceKind::SerializedFile
+        ));
+        debug_assert!(self.children.is_empty());
+        self.children = companions;
+    }
+
+    #[must_use]
+    pub(crate) fn has_children(&self) -> bool {
+        !self.children.is_empty()
     }
 }
 
@@ -171,12 +206,11 @@ impl WorkspaceStateTransaction {
         Self::from_catalog_transaction(expected, catalog, budget)
     }
 
-    pub(crate) fn begin_with_catalog(
+    pub(crate) fn begin_with_catalog_transaction(
         expected: Arc<WorkspaceState>,
-        catalog: &SourceCatalog,
+        catalog: SourceCatalogTransaction,
         budget: &mut AssetLoadBudget,
     ) -> Result<Self, WorkspaceStateError> {
-        let catalog = catalog.begin_state_transaction(budget)?;
         Self::from_catalog_transaction(expected, catalog, budget)
     }
 
@@ -211,15 +245,30 @@ impl WorkspaceStateTransaction {
         self.catalog.is_root(source).map_err(Into::into)
     }
 
+    #[cfg(test)]
     pub(crate) fn register_tree(
         &mut self,
         descriptor: SourceDescriptor,
         tree: PreparedSourceTree,
         budget: &mut AssetLoadBudget,
     ) -> Result<SourceId, WorkspaceStateError> {
+        self.reconcile_tree(descriptor, tree, budget)
+            .map(|registration| registration.source())
+    }
+
+    pub(crate) fn reconcile_tree(
+        &mut self,
+        descriptor: SourceDescriptor,
+        tree: PreparedSourceTree,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceTreeReconciliation, WorkspaceStateError> {
         self.ensure_active()?;
+        let source_count = self.store.len();
         match self.register_tree_inner(descriptor, tree, budget) {
-            Ok(source) => Ok(source),
+            Ok(source) => Ok(SourceTreeReconciliation {
+                source,
+                changed: self.store.len() != source_count,
+            }),
             Err(error) => {
                 self.failed = true;
                 Err(error)
@@ -295,6 +344,22 @@ impl WorkspaceStateTransaction {
         self.insert_content(content, budget).map(|_| ())
     }
 
+    pub(crate) fn bind_companion_origin(
+        &mut self,
+        source: SourceId,
+        origin: PhysicalOrigin,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<(), WorkspaceStateError> {
+        self.ensure_active()?;
+        match self.catalog.bind_companion_origin(source, origin, budget) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failed = true;
+                Err(error.into())
+            }
+        }
+    }
+
     #[must_use]
     pub(crate) fn content_fingerprint(&self, source: SourceId) -> Option<SourceFingerprint> {
         self.store
@@ -358,9 +423,18 @@ impl WorkspaceStateTransaction {
         self.insert_content(content, budget)?;
 
         for child in children {
-            let descriptor =
-                child_descriptor(source, child.relation, child.source.kind(), child.identity)?;
-            self.register_tree_inner(descriptor, child.source, budget)?;
+            let PreparedSourceChild {
+                relation,
+                identity,
+                source: child_source,
+            } = child;
+            let (descriptor, companion_origin) =
+                child_descriptor(source, relation, child_source.kind(), identity)?;
+            let child_id = self.register_tree_inner(descriptor, child_source, budget)?;
+            if let Some(origin) = companion_origin {
+                self.catalog
+                    .bind_companion_origin(child_id, origin, budget)?;
+            }
         }
         Ok(source)
     }
@@ -399,16 +473,32 @@ fn child_descriptor(
     relation: PreparedSourceRelation,
     kind: SourceKind,
     identity: SourceMemberId,
-) -> Result<SourceDescriptor, WorkspaceStateError> {
-    if kind == SourceKind::StreamedResource {
-        return SourceDescriptor::sidecar(parent, identity).map_err(Into::into);
+) -> Result<(SourceDescriptor, Option<PhysicalOrigin>), WorkspaceStateError> {
+    match (relation, kind) {
+        (PreparedSourceRelation::Companion(origin), _) => Ok((
+            SourceDescriptor::companion(parent, identity).map_err(WorkspaceStateError::from)?,
+            Some(origin),
+        )),
+        (_, SourceKind::StreamedResource) => Ok((
+            SourceDescriptor::sidecar(parent, identity).map_err(WorkspaceStateError::from)?,
+            None,
+        )),
+        (PreparedSourceRelation::Archive, _) => Ok((
+            SourceDescriptor::archive_member(parent, kind, identity)
+                .map_err(WorkspaceStateError::from)?,
+            None,
+        )),
+        (PreparedSourceRelation::Bundle, _) => Ok((
+            SourceDescriptor::bundle_member(parent, kind, identity)
+                .map_err(WorkspaceStateError::from)?,
+            None,
+        )),
+        (PreparedSourceRelation::WebFile, _) => Ok((
+            SourceDescriptor::webfile_member(parent, kind, identity)
+                .map_err(WorkspaceStateError::from)?,
+            None,
+        )),
     }
-    match relation {
-        PreparedSourceRelation::Archive => SourceDescriptor::archive_member(parent, kind, identity),
-        PreparedSourceRelation::Bundle => SourceDescriptor::bundle_member(parent, kind, identity),
-        PreparedSourceRelation::WebFile => SourceDescriptor::webfile_member(parent, kind, identity),
-    }
-    .map_err(Into::into)
 }
 
 #[cfg(test)]

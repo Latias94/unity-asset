@@ -795,9 +795,11 @@ impl JournalBaseline {
                     if source.source.kind() != SourceKind::StreamedResource
                         || parent.workspace() != workspace
                         || !matches!(parent.kind(), SourceKind::Yaml | SourceKind::SerializedFile)
+                        || !matches!(source.image(), JournalBaselineImage::Published { .. })
                     {
                         return Err(JournalError::InvalidManifest(
-                            "baseline companion declaration has invalid ownership".to_owned(),
+                            "baseline companion declaration has invalid ownership or image"
+                                .to_owned(),
                         ));
                     }
                 }
@@ -808,9 +810,10 @@ impl JournalBaseline {
                             parent.kind(),
                             SourceKind::Archive | SourceKind::AssetBundle | SourceKind::WebFile
                         )
+                        || !matches!(source.image(), JournalBaselineImage::Blob { .. })
                     {
                         return Err(JournalError::InvalidManifest(
-                            "baseline contained-sidecar declaration has invalid ownership"
+                            "baseline contained-sidecar declaration has invalid ownership or image"
                                 .to_owned(),
                         ));
                     }

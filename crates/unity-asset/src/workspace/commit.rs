@@ -21,7 +21,9 @@ use super::portable_path::{PortablePathError, slash_key};
 use super::preflight::PreparedInputProofError;
 use super::preflight::destination::{DestinationProofError, DestinationState};
 use super::preflight::source_proof::PhysicalDependencyProofError;
-use super::source_catalog::CatalogError;
+use super::source_catalog::{
+    CatalogError, PhysicalOrigin, SourceCatalog, SourceCatalogTransaction, SourceLocationKind,
+};
 use super::{AssetWorkspace, PreparedChange, WorkspaceInstallationDigest};
 
 use self::baseline::{MaterializedImages, PreparedBaseline};
@@ -684,6 +686,7 @@ struct VerificationCharge {
 
 struct CommitPreflight {
     publications: Vec<PreparedPublication>,
+    committed_catalog: SourceCatalogTransaction,
     atomicity: CommitAtomicity,
     transaction: TransactionId,
     base_installation: WorkspaceInstallationDigest,
@@ -705,11 +708,6 @@ fn preflight_commit(
 
     let core = prepared.state().core();
     let base_installation = core.base().state().installation();
-    let committed_installation = core
-        .base()
-        .state()
-        .installation_for_catalog(core.catalog())
-        .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
     let mut publications = budgeted_vec(
         prepared.publications().len(),
         "commit publication bindings",
@@ -756,6 +754,14 @@ fn preflight_commit(
             bytes: artifact.len(),
         });
     }
+
+    let committed_catalog =
+        bind_companion_publication_origins(core.catalog(), &publications, budget)?;
+    let committed_installation = core
+        .base()
+        .state()
+        .installation_for_catalog(committed_catalog.candidate())
+        .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
 
     let logical_changes = prepared.logical_changes();
     let mut changed_sources = budgeted_vec(
@@ -862,6 +868,7 @@ fn preflight_commit(
     }
     Ok(CommitPreflight {
         publications,
+        committed_catalog,
         atomicity: CommitAtomicity::PerArtifactRecoverable,
         transaction,
         base_installation,
@@ -870,6 +877,50 @@ fn preflight_commit(
         artifacts,
         recovery_baseline,
     })
+}
+
+fn bind_companion_publication_origins(
+    catalog: &SourceCatalog,
+    publications: &[PreparedPublication],
+    budget: &mut AssetLoadBudget,
+) -> Result<SourceCatalogTransaction, CommitPreflightError> {
+    let mut transaction = catalog
+        .begin_state_transaction(budget)
+        .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
+    for publication in publications {
+        let descriptor = catalog
+            .resolve(publication.source)
+            .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
+        if descriptor.location_kind() != SourceLocationKind::Companion {
+            continue;
+        }
+        if let Some(existing) = catalog
+            .physical_origin_option(publication.source)
+            .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?
+        {
+            if existing.path() == publication.target {
+                continue;
+            }
+            return Err(CommitPreflightError::Ownership(
+                CatalogError::PhysicalOriginChanged {
+                    source_id: publication.source,
+                }
+                .to_string(),
+            ));
+        }
+        let path = budgeted_path_copy(
+            &publication.target,
+            "committed companion physical origin",
+            budget,
+        )?;
+        let origin = PhysicalOrigin::from_verified_publication_path(path)
+            .map_err(CatalogError::from)
+            .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
+        transaction
+            .bind_companion_origin(publication.source, origin, budget)
+            .map_err(|error| CommitPreflightError::Ownership(error.to_string()))?;
+    }
+    Ok(transaction)
 }
 
 fn relative_target(
@@ -1170,6 +1221,7 @@ impl AssetWorkspace {
         let preflight = preflight_commit(prepared, target, budget).map_err(map_preflight_error)?;
         let CommitPreflight {
             mut publications,
+            committed_catalog,
             atomicity,
             transaction,
             base_installation,
@@ -1400,6 +1452,7 @@ impl AssetWorkspace {
             }
             let baseline = baseline::build(
                 prepared,
+                committed_catalog,
                 self.binary_adapter(),
                 report.committed_installation(),
                 &mut images,
