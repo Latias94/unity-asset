@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
@@ -28,6 +29,29 @@ internal static class LiveDaemonConformance
         ProjectId projectId = ProjectId.Parse(args[1]);
         DaemonInstanceId daemonInstanceId = DaemonInstanceId.Parse(args[2]);
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        await AssertBootstrapRejectedAsync(
+            relayPort,
+            DifferentProjectId(projectId),
+            daemonInstanceId,
+            new[] { ProtocolConstants.BusinessProtocolRevision },
+            "project_mismatch",
+            cancellation.Token).ConfigureAwait(false);
+        await AssertBootstrapRejectedAsync(
+            relayPort,
+            projectId,
+            DifferentDaemonInstanceId(daemonInstanceId),
+            new[] { ProtocolConstants.BusinessProtocolRevision },
+            "instance_mismatch",
+            cancellation.Token).ConfigureAwait(false);
+        await AssertBootstrapRejectedAsync(
+            relayPort,
+            projectId,
+            daemonInstanceId,
+            new[] { checked((ushort)(ProtocolConstants.BusinessProtocolRevision - 1)) },
+            "no_common_revision",
+            cancellation.Token).ConfigureAwait(false);
+
         using ProtocolSession session = await ProtocolSession.ConnectAsync(
             new LoopbackProtocolTransportAdapter(relayPort),
             projectId,
@@ -141,6 +165,90 @@ internal static class LiveDaemonConformance
             observedOperations.Count == ExpectedOperations.Length
                 && observedOperations.SetEquals(ExpectedOperations),
             "Public C# session did not reach every real daemon operation exactly once.");
+    }
+
+    private static async Task AssertBootstrapRejectedAsync(
+        int relayPort,
+        ProjectId projectId,
+        DaemonInstanceId daemonInstanceId,
+        IReadOnlyList<ushort> supportedRevisions,
+        string expectedCode,
+        CancellationToken cancellationToken)
+    {
+        using Stream stream = await new LoopbackProtocolTransportAdapter(relayPort)
+            .ConnectAsync(cancellationToken).ConfigureAwait(false);
+        var hello = new BootstrapHelloV2(
+            ProtocolConstants.BootstrapVersion,
+            projectId,
+            daemonInstanceId,
+            supportedRevisions);
+        byte[] request = FrameCodec.EncodeBootstrapHello(hello);
+        await stream.WriteAsync(request, 0, request.Length, cancellationToken).ConfigureAwait(false);
+        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+        byte[] replyFrame = await ReadFrameAsync(
+            stream,
+            FrameLimits.BootstrapMaxEncodedBytes,
+            cancellationToken).ConfigureAwait(false);
+        BootstrapReplyV2 reply = FrameCodec.DecodeBootstrapReply(replyFrame);
+        BootstrapCodec.ValidateReplyFor(reply, hello);
+        Require(
+            reply is BootstrapRejectedV2 rejected
+                && string.Equals(rejected.Code, expectedCode, StringComparison.Ordinal),
+            $"Real daemon did not reject Bootstrap with {expectedCode}.");
+    }
+
+    private static async Task<byte[]> ReadFrameAsync(
+        Stream stream,
+        int maximumEncodedBytes,
+        CancellationToken cancellationToken)
+    {
+        var header = new byte[4];
+        await ReadExactlyAsync(stream, header, cancellationToken).ConfigureAwait(false);
+        uint declared = BinaryPrimitives.ReadUInt32BigEndian(header);
+        Require(declared <= maximumEncodedBytes, "Real daemon returned an oversized Bootstrap frame.");
+        var frame = new byte[checked((int)declared + header.Length)];
+        Buffer.BlockCopy(header, 0, frame, 0, header.Length);
+        if (declared > 0)
+        {
+            var payload = new byte[checked((int)declared)];
+            await ReadExactlyAsync(stream, payload, cancellationToken).ConfigureAwait(false);
+            Buffer.BlockCopy(payload, 0, frame, header.Length, payload.Length);
+        }
+        return frame;
+    }
+
+    private static async Task ReadExactlyAsync(
+        Stream stream,
+        byte[] buffer,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await stream.ReadExactlyAsync(buffer, cancellationToken).ConfigureAwait(false);
+        }
+        catch (EndOfStreamException error)
+        {
+            throw new EndOfStreamException(
+                "Real daemon closed before completing Bootstrap.",
+                error);
+        }
+    }
+
+    private static ProjectId DifferentProjectId(ProjectId projectId)
+    {
+        return ProjectId.Parse(DifferentFixedId(projectId.ToString()));
+    }
+
+    private static DaemonInstanceId DifferentDaemonInstanceId(DaemonInstanceId daemonInstanceId)
+    {
+        return DaemonInstanceId.Parse(DifferentFixedId(daemonInstanceId.ToString()));
+    }
+
+    private static string DifferentFixedId(string value)
+    {
+        char replacement = value[value.Length - 1] == '0' ? '1' : '0';
+        return value.Substring(0, value.Length - 1) + replacement;
     }
 
     private static bool ArrayContainsString(JsonElement array, string expected)

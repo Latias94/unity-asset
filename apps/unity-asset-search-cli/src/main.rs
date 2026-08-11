@@ -1,3 +1,4 @@
+mod build_identity;
 mod client;
 mod command;
 mod json_input;

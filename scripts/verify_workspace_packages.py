@@ -21,7 +21,7 @@ from workspace_package_verification import (
     configuration_clean_cargo_cwd,
     isolated_cargo_environment,
     run_captured,
-    run_full_verification,
+    run_verification,
 )
 
 
@@ -33,27 +33,26 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument(
-        "--workspace-root",
-        type=Path,
-        default=Path(__file__).resolve().parent.parent,
-        help="Workspace root containing Cargo.toml (default: repository root).",
-    )
-    parser.add_argument(
         "--cargo",
         default=os.environ.get("CARGO", "cargo"),
         help="Cargo executable to invoke (default: CARGO or cargo).",
     )
     parser.add_argument(
-        "--preflight-only",
-        action="store_true",
-        help="Run Cargo metadata and dependency-policy checks without packaging.",
+        "--mode",
+        choices=("preflight", "packages", "full"),
+        default="packages",
+        help=(
+            "Verification depth: preflight checks policy only; packages mode also "
+            "proves unpacked archives and external consumers; full additionally "
+            "installs and probes published binaries (default: packages)."
+        ),
     )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    workspace_root = args.workspace_root.resolve()
+    workspace_root = Path(__file__).resolve().parent.parent
     root_manifest = workspace_root / "Cargo.toml"
     root_document = load_toml(root_manifest)
     reject_root_source_overrides(root_document, root_manifest)
@@ -86,17 +85,19 @@ def main() -> int:
 
     names = ", ".join(package.name for package in closure)
     print(f"preflight passed; package order: {names}")
-    if args.preflight_only:
+    if args.mode == "preflight":
         return 0
 
-    run_full_verification(
+    run_verification(
         cargo=args.cargo,
         workspace_root=workspace_root,
         closure=closure,
+        verify_binaries=args.mode == "full",
     )
     print(
-        "workspace package verification passed: every publishable archive and "
-        "consumer resolved only from unpacked internal archives and crates.io"
+        f"workspace package verification ({args.mode}) passed: every publishable "
+        "archive and consumer resolved only from unpacked internal archives and "
+        "crates.io"
     )
     return 0
 

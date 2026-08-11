@@ -9,6 +9,7 @@ use unity_asset_search_index::{
 };
 use unity_asset_search_local::{PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id};
 
+mod build_identity;
 mod coordinator;
 mod ipc;
 mod lifecycle;
@@ -51,7 +52,10 @@ fn secure_test_tempdir() -> tempfile::TempDir {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "unity-asset-search-daemon")]
+#[command(
+    name = "unity-asset-search-daemon",
+    version = crate::build_identity::VERSION_REPORT
+)]
 struct Args {
     #[arg(long)]
     project_root: PathBuf,

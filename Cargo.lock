@@ -2738,6 +2738,7 @@ dependencies = [
  "futures",
  "notify",
  "rand 0.9.2",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.16",

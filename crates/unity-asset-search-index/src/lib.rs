@@ -322,6 +322,19 @@ impl SearchIndex {
     }
 
     #[cfg(test)]
+    fn inject_desired_revision_failpoint(
+        &self,
+        failpoint: GenerationFailpoint,
+    ) -> Result<(), SearchIndexError> {
+        self.inner
+            .pipeline
+            .lock()
+            .map_err(|_| SearchIndexError::internal("generation pipeline lock is poisoned"))?
+            .inject_desired_revision_failpoint(failpoint);
+        Ok(())
+    }
+
+    #[cfg(test)]
     fn inject_scan_validation_hook(
         &self,
         checkpoint: ScanValidationCheckpoint,
@@ -1442,6 +1455,105 @@ GameObject:
         ] {
             assert_publish_failpoint_is_atomic(failpoint);
         }
+    }
+
+    #[test]
+    fn desired_revision_sync_failure_requires_reopen_and_recovers_a_stale_head() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("project");
+        write_generation_fixture(&project);
+        let paths =
+            IndexPaths::for_project(project.clone(), Some(temporary.path().join("index")), None)
+                .unwrap();
+        let index =
+            SearchIndex::open_or_create(paths.clone(), &mut AssetLoadBudget::default()).unwrap();
+        let baseline = index
+            .reindex(
+                FilesystemReindexIntent::full(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+        let activation_directory = paths.index_root().join("activations");
+        let activation_files = || {
+            let mut files = fs::read_dir(&activation_directory)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| {
+                    path.extension().and_then(|extension| extension.to_str()) == Some("json")
+                })
+                .collect::<Vec<_>>();
+            files.sort_unstable();
+            files
+        };
+        let baseline_activations = activation_files();
+
+        fs::write(project.join(OWNER_PATH), OWNER_AFTER).unwrap();
+        index
+            .inject_desired_revision_failpoint(GenerationFailpoint::ActivationDirectorySync)
+            .unwrap();
+        let failure = index
+            .reindex(
+                changed_intent(&index, [PathBuf::from(OWNER_PATH)]),
+                &mut AssetLoadBudget::default(),
+            )
+            .expect_err("an unconfirmed desired-revision head must require reopen");
+        assert_eq!(failure.code(), ApiErrorCode::IndexBuildFailed);
+        assert!(failure.retryable());
+
+        let failed_status = index.status().unwrap();
+        assert!(failed_status.generation.active.is_none());
+        assert_eq!(
+            failed_status.daemon.generation_maintenance.state,
+            GenerationMaintenanceState::RecoveryRequired
+        );
+        let query_failure = index.search(SearchRequest::new("Before", 20)).unwrap_err();
+        assert_eq!(query_failure.code(), ApiErrorCode::NotReady);
+        assert!(query_failure.retryable());
+
+        let uncertain_activations = activation_files()
+            .into_iter()
+            .filter(|path| !baseline_activations.contains(path))
+            .collect::<Vec<_>>();
+        assert_eq!(uncertain_activations.len(), 1);
+        drop(index);
+        fs::remove_file(&uncertain_activations[0]).unwrap();
+
+        let reopened = SearchIndex::open_or_create(paths, &mut AssetLoadBudget::default()).unwrap();
+        let stale = reopened
+            .status()
+            .unwrap()
+            .generation
+            .active
+            .expect("reopen must recover the durable desired revision");
+        assert_eq!(stale.generation, baseline.generation);
+        assert_eq!(stale.actual_revision, baseline.actual_revision);
+        assert_ne!(stale.desired_revision, stale.actual_revision);
+        assert!(stale.stale);
+        assert_eq!(
+            search_paths(&reopened, "Before"),
+            vec![OWNER_PATH.to_owned()]
+        );
+        assert!(search_paths(&reopened, "After").is_empty());
+
+        let recovered = reopened
+            .reindex(
+                FilesystemReindexIntent::reconcile(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap()
+            .generation
+            .unwrap();
+        assert_eq!(recovered.actual_revision, stale.desired_revision);
+        assert_eq!(recovered.desired_revision, stale.desired_revision);
+        assert!(!recovered.stale);
+        assert_ne!(recovered.generation, baseline.generation);
+        assert_eq!(
+            search_paths(&reopened, "After"),
+            vec![OWNER_PATH.to_owned()]
+        );
+        assert!(search_paths(&reopened, "Before").is_empty());
     }
 
     #[test]

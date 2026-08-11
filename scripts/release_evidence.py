@@ -14,7 +14,7 @@ from protocol_sdk_bundle import (
     BUNDLE_METADATA_SCHEMA,
     MAX_BUNDLE_BYTES,
 )
-from release_contract import PUBLISHABLE_PACKAGE_NAMES
+from release_contract import GIT_OBJECT_PATTERN, PUBLISHABLE_PACKAGE_NAMES
 from release_metadata import ReleaseMetadataError, validate_metadata_evidence_shape
 from release_path_safety import (
     ReleasePathSafetyError,
@@ -28,7 +28,6 @@ EVIDENCE_SCHEMA = "unity-asset.release-evidence.v3"
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
 TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 SEMVER_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
-GIT_OBJECT_PATTERN = re.compile(r"[0-9a-f]{40}")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
 ROOT_KEYS = {

@@ -1786,6 +1786,16 @@ impl GenerationStore {
         self.record_desired_revision_with_failpoint(desired_revision, budget, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn record_desired_revision_with_test_failpoint(
+        &mut self,
+        desired_revision: WorkspaceRevision,
+        budget: &mut AssetLoadBudget,
+        failpoint: GenerationFailpoint,
+    ) -> Result<DesiredRevisionCommit, GenerationStoreError> {
+        self.record_desired_revision_with_failpoint(desired_revision, budget, Some(failpoint))
+    }
+
     fn record_desired_revision_with_failpoint(
         &mut self,
         desired_revision: WorkspaceRevision,

@@ -682,8 +682,9 @@ mod tests {
 
     use super::{
         CONTROL_RESERVED_CONNECTIONS, ConnectionCapacity, DispatchCapacity, DispatchClass,
-        Dispatcher, MAX_LOCAL_IPC_CONNECTIONS_V1, ORDINARY_CONNECTIONS, ServeEvent, SessionError,
-        SessionLane, drain_sessions, next_serve_event, session,
+        Dispatcher, MAX_CONTROL_IN_FLIGHT, MAX_LOCAL_IPC_CONNECTIONS_V1, MAX_WAIT_IN_FLIGHT,
+        MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS, ServeEvent, SessionError, SessionLane,
+        drain_sessions, next_serve_event, session,
     };
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
@@ -714,6 +715,24 @@ mod tests {
 
         let _work = capacity.try_acquire(DispatchClass::Work).unwrap();
         assert!(capacity.try_acquire(DispatchClass::Work).is_err());
+    }
+
+    #[test]
+    fn production_dispatch_capacity_enforces_each_declared_limit() {
+        let capacity = DispatchCapacity::production();
+
+        for (class, maximum) in [
+            (DispatchClass::Work, MAX_WORK_IN_FLIGHT),
+            (DispatchClass::Wait, MAX_WAIT_IN_FLIGHT),
+            (DispatchClass::Control, MAX_CONTROL_IN_FLIGHT),
+        ] {
+            let permits = (0..maximum)
+                .map(|_| capacity.try_acquire(class).unwrap())
+                .collect::<Vec<_>>();
+            assert!(capacity.try_acquire(class).is_err());
+            drop(permits);
+            assert!(capacity.try_acquire(class).is_ok());
+        }
     }
 
     #[tokio::test]
@@ -749,6 +768,40 @@ mod tests {
         assert_eq!(reclaimed.lane(), SessionLane::ControlReserved);
         drop(reclaimed);
         drop(ordinary);
+    }
+
+    #[tokio::test]
+    async fn production_connection_capacity_reserves_the_declared_control_lane() {
+        let capacity = ConnectionCapacity::production();
+        let mut ordinary = Vec::with_capacity(ORDINARY_CONNECTIONS);
+        let mut control_reserved = Vec::with_capacity(CONTROL_RESERVED_CONNECTIONS);
+
+        for _ in 0..ORDINARY_CONNECTIONS {
+            let lease = capacity.acquire().await;
+            assert_eq!(lease.lane(), SessionLane::Ordinary);
+            ordinary.push(lease);
+        }
+        for _ in 0..CONTROL_RESERVED_CONNECTIONS {
+            let lease = capacity.acquire().await;
+            assert_eq!(lease.lane(), SessionLane::ControlReserved);
+            control_reserved.push(lease);
+        }
+
+        assert_eq!(
+            ordinary.len() + control_reserved.len(),
+            MAX_LOCAL_IPC_CONNECTIONS_V1
+        );
+        assert_eq!(capacity.ordinary.available_permits(), 0);
+        assert_eq!(capacity.control_reserved.available_permits(), 0);
+
+        drop(control_reserved.pop().unwrap());
+        let reclaimed_control = capacity.acquire().await;
+        assert_eq!(reclaimed_control.lane(), SessionLane::ControlReserved);
+        drop(reclaimed_control);
+
+        drop(ordinary.pop().unwrap());
+        let reclaimed_ordinary = capacity.acquire().await;
+        assert_eq!(reclaimed_ordinary.lane(), SessionLane::Ordinary);
     }
 
     #[tokio::test]

@@ -19,7 +19,11 @@ const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
 #[derive(Debug, Parser)]
-#[command(name = "unity-asset-search-cli", version, about)]
+#[command(
+    name = "unity-asset-search-cli",
+    version = crate::build_identity::VERSION_REPORT,
+    about
+)]
 pub struct Args {
     #[arg(long, global = true, value_name = "UNITY_PROJECT")]
     project_root: Option<PathBuf>,

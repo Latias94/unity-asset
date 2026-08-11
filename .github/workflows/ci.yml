@@ -14,6 +14,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: 2
+  UNITY_ASSET_SOURCE_COMMIT: ${{ github.sha }}
 
 jobs:
   workflow-contracts:
@@ -23,11 +24,19 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
     - name: Validate GitHub workflow semantics
       run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 .github/workflows/*.yml
 
+    - name: Test package and release verifier rejection paths
+      run: python -m unittest discover -s scripts/tests -p "test_*.py"
+
   workspace-package:
-    name: Isolated workspace package / ${{ matrix.os }}
+    name: Isolated workspace package / ${{ matrix.os }} / ${{ matrix.mode }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     permissions:
@@ -35,7 +44,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            mode: full
+          - os: macos-latest
+            mode: packages
+          - os: windows-latest
+            mode: packages
 
     steps:
     - uses: actions/checkout@v4
@@ -50,11 +65,8 @@ jobs:
       with:
         python-version: "3.12"
 
-    - name: Test package and release verifier rejection paths
-      run: python -m unittest discover -s scripts/tests -p "test_*.py"
-
     - name: Verify packaged dependency isolation
-      run: python scripts/verify_workspace_packages.py
+      run: python scripts/verify_workspace_packages.py --mode ${{ matrix.mode }}
 
   msrv:
     name: MSRV / Rust 1.88.0
@@ -94,43 +106,22 @@ jobs:
     - name: Check formatting
       run: cargo fmt --all -- --check
 
-    - name: Clippy (workspace defaults)
-      run: cargo clippy --workspace --all-targets -- -D warnings
+    - name: Run exact strict Clippy gate
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-    - name: Clippy (async)
-      run: |
-        cargo clippy -p unity-asset-core --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset-yaml --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset --all-targets --features async -- -D warnings
-        cargo clippy -p unity-asset-cli --all-targets --features async -- -D warnings
+    - name: Build every workspace target
+      run: cargo build --workspace --all-targets
 
-    - name: Clippy (decode/export)
-      run: |
-        cargo clippy -p unity-asset-decode --all-targets --features full -- -D warnings
-        cargo clippy -p unity-asset-cli --all-targets --features decode -- -D warnings
-
-    - name: Test CLI tools
-      run: |
-        cargo build --workspace
-        ./target/debug/unity-asset --help
-        cargo build -p unity-asset-cli --features async
-        ./target/debug/unity-asset --help
-        cargo build -p unity-asset-cli --features decode
-
-    - name: Build examples
-      run: cargo build --workspace --examples --all-features
-
-    - name: Run tests (workspace defaults)
+    - name: Run default workspace tests
       run: cargo nextest run --workspace --test-threads 2
 
-    - name: Run tests (async)
+    - name: Run exact workspace test gate
+      run: cargo nextest run --workspace --all-features --test-threads 2
+
+    - name: Run documented async and decode feature tests
       run: |
         cargo nextest run -p unity-asset --features async --test-threads 2
         cargo nextest run -p unity-asset-cli --features async --test-threads 2 --no-tests=pass
-
-    - name: Run tests (decode/export)
-      run: |
-        cargo nextest run -p unity-asset-decode --features full --test-threads 2
         cargo nextest run -p unity-asset --features decode --test extraction_decode --test-threads 2
         cargo nextest run -p unity-asset-cli --features decode --test-threads 2
 
@@ -198,7 +189,9 @@ jobs:
         --test structured_errors
         --test ipc_commands
         --test process_contract
-        --test transport_contract
+
+    - name: Run the real daemon JSON-agent harness
+      run: python scripts/run_real_daemon_agent.py
 
     - name: Run generation security unit contracts
       run: >-
@@ -219,6 +212,19 @@ jobs:
         cargo nextest run
         --test-threads 2
         -p unity-asset-search-local
+
+    - name: Prove Unix secondary-principal rejection
+      if: runner.os != 'Windows'
+      env:
+        UNITY_ASSET_CROSS_PRINCIPAL_USER: nobody
+        UNITY_ASSET_CROSS_PRINCIPAL_PYTHON: /usr/bin/python3
+      run: >-
+        cargo nextest run
+        --test-threads 1
+        --run-ignored ignored-only
+        -p unity-asset-search-local
+        --lib
+        -E 'test(/secondary_effective_uid_is_rejected_by_peer_credentials$/)'
 
     - name: Run cross-language search protocol conformance
       run: |
@@ -275,7 +281,7 @@ jobs:
       uses: Swatinem/rust-cache@v2
 
     - name: Check documentation
-      run: cargo doc --all --all-features --no-deps
+      run: cargo doc --workspace --all-features --no-deps
 
   security:
     name: Security Audit

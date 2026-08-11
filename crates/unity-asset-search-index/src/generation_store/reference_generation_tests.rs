@@ -2009,6 +2009,79 @@ fn activation_precommit_failure_cleans_staging_and_preserves_the_active_generati
 }
 
 #[test]
+fn recovery_sync_crash_rolls_back_a_candidate_when_recovery_authority_is_lost() {
+    let temporary = TempDir::new().unwrap();
+    let options = GenerationStoreOptions {
+        retain_previous_generations: 2,
+    };
+    let mut store = open_store(temporary.path(), options).unwrap();
+    let baseline = publish_generation(&mut store, "baseline", None);
+    let mut build = store.begin().unwrap();
+    write_artifacts(&build, "candidate-before-commit");
+    let manifest = manifest_for(&store, &build, "candidate-before-commit", Some(baseline));
+    let candidate = manifest.generation_id();
+    let prepared = store
+        .prepare_publish_with_failpoint(
+            &mut build,
+            manifest,
+            GenerationFailpoint::ActivationRecoverySyncAndRollbackCleanup,
+        )
+        .unwrap();
+    let activation_ordinal = prepared.snapshot().activation_ordinal();
+
+    assert!(matches!(
+        prepared.activate(),
+        Err(GenerationStoreError::ActivationRollbackFailed {
+            primary,
+            cleanup,
+        }) if matches!(
+            *primary,
+            GenerationStoreError::InjectedFailure {
+                checkpoint: GenerationFailpoint::ActivationRecoveryDirectorySync,
+            }
+        ) && matches!(
+            *cleanup,
+            GenerationStoreError::InjectedFailure {
+                checkpoint: GenerationFailpoint::ActivationRollbackCleanup,
+            }
+        )
+    ));
+
+    let activation = temporary
+        .path()
+        .join(super::ACTIVATIONS_DIRECTORY)
+        .join(activation_file_name(activation_ordinal));
+    let pending = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_pending_file_name(activation_ordinal));
+    let recovery = temporary
+        .path()
+        .join(super::STAGING_DIRECTORY)
+        .join(activation_recovery_file_name(activation_ordinal));
+    let candidate_directory = store.generation_directory(candidate);
+    assert!(activation.is_file());
+    assert!(pending.is_file());
+    assert!(recovery.is_file());
+    assert!(candidate_directory.is_dir());
+    assert_eq!(store.active().unwrap().generation(), baseline);
+
+    drop(build);
+    drop(store);
+    // The recovery link's parent sync failed, so a crash may lose that entry while the already
+    // durable pending alias and the unsynced final alias survive. Startup must treat this as an
+    // interrupted pre-commit publication and roll the final alias back.
+    fs::remove_file(&recovery).unwrap();
+
+    let reopened = open_store(temporary.path(), options).unwrap();
+    assert_eq!(reopened.active().unwrap().generation(), baseline);
+    assert!(!activation.exists());
+    assert!(!pending.exists());
+    assert!(!recovery.exists());
+    assert!(candidate_directory.is_dir());
+}
+
+#[test]
 fn activation_directory_sync_failure_requires_reopen_before_publication_is_observed() {
     let temporary = TempDir::new().unwrap();
     let options = GenerationStoreOptions {

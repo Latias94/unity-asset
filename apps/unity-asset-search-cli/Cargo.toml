@@ -11,6 +11,7 @@ homepage.workspace = true
 documentation = "https://github.com/Latias94/unity-asset"
 keywords = ["unity", "search", "cli"]
 categories = ["command-line-utilities", "game-development"]
+exclude = ["tests/real_daemon_agent.rs"]
 
 [dependencies]
 clap.workspace = true
@@ -25,6 +26,9 @@ unity-asset-search-protocol = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

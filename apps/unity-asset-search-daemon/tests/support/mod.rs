@@ -48,6 +48,10 @@ impl SearchDaemonFixture {
         self.project_root().join("Assets")
     }
 
+    pub fn index_directory(&self) -> &Path {
+        &self.index_directory
+    }
+
     pub const fn project(&self) -> &ProjectLocatorV1 {
         &self.project
     }
@@ -67,7 +71,7 @@ impl SearchDaemonFixture {
     }
 
     pub fn spawn_daemon(&self) -> DaemonChild {
-        DaemonChild::spawn(self.project_root(), &self.index_directory)
+        DaemonChild::spawn(self.project_root(), self.index_directory())
     }
 
     pub async fn wait_for_endpoint(&self, daemon: &mut DaemonChild) -> DiscoveredEndpointV1 {
@@ -112,7 +116,7 @@ pub struct DaemonChild {
 
 impl DaemonChild {
     fn spawn(project_root: &Path, index_directory: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_unity-asset-search-daemon"))
+        let child = Command::new(daemon_executable())
             .arg("--project-root")
             .arg(project_root)
             .arg("--index-dir")
@@ -158,6 +162,30 @@ impl DaemonChild {
         }
         output
     }
+}
+
+fn daemon_executable() -> PathBuf {
+    if let Some(path) = std::env::var_os("UNITY_ASSET_SEARCH_DAEMON") {
+        return path.into();
+    }
+    if let Some(path) = option_env!("CARGO_BIN_EXE_unity-asset-search-daemon") {
+        return path.into();
+    }
+
+    let cli = option_env!("CARGO_BIN_EXE_unity-asset-search-cli")
+        .map(PathBuf::from)
+        .expect("the shared process harness requires a Cargo-built daemon or CLI binary");
+    let daemon = cli.with_file_name(if cfg!(windows) {
+        "unity-asset-search-daemon.exe"
+    } else {
+        "unity-asset-search-daemon"
+    });
+    assert!(
+        daemon.is_file(),
+        "real daemon binary is not available beside the CLI at {}; build both search applications before running the cross-package conformance test",
+        daemon.display()
+    );
+    daemon
 }
 
 impl Drop for DaemonChild {

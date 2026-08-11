@@ -10,12 +10,12 @@ use unity_asset_search_local::{
 };
 use unity_asset_search_protocol::{
     ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
-    CapabilitiesRequest, DaemonLifecycleState, FilesystemReindexIntent, FrameLimits, QueryPolicyId,
-    ReferenceRequest, ReindexAdmitRequest, ReindexCancelRequest, ReindexOperationState,
-    ReindexStatusRequest, ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation,
-    ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest, ShutdownRequest,
-    StatusRequest, SuggestRequest, decode_response_frame, decode_validated_frame, encode_frame,
-    encode_request_frame,
+    CapabilitiesRequest, DaemonLifecycleState, FilesystemReindexIntent, FrameLimits, OperationId,
+    QueryPolicyId, ReferenceRequest, ReindexAdmitRequest, ReindexCancelRequest,
+    ReindexOperationState, ReindexStatusRequest, ReindexWaitRequest, RequestEnvelope, RequestId,
+    RequestOperation, ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest,
+    ShutdownRequest, StatusRequest, SuggestRequest, decode_response_frame, decode_validated_frame,
+    encode_frame, encode_request_frame,
 };
 
 const OWNER_ONE_GUID: &str = "11111111111111111111111111111111";
@@ -233,6 +233,48 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
     };
     assert_eq!(stale.code, ApiErrorCode::StaleCursor);
 
+    fs::write(fixture.assets().join("OwnerOne.prefab"), OWNER_ONE)
+        .expect("prepare a reindex that outlives its admitting connection");
+    let disconnected_operation = admit_reindex(&mut client, "process-contract-disconnect").await;
+    drop(client);
+
+    let rediscovered = namespace
+        .discover_endpoint()
+        .expect("rediscover the still-running daemon");
+    let reconnected_stream = rediscovered
+        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
+        .await
+        .expect("reconnect after dropping the admitting connection");
+    let mut client = ProcessClient::bootstrap(
+        reconnected_stream,
+        project.project_id(),
+        descriptor.daemon_instance_id(),
+    )
+    .await;
+    let retried_operation = admit_reindex(&mut client, "process-contract-disconnect").await;
+    assert_eq!(retried_operation, disconnected_operation);
+    let status = client
+        .exchange(RequestOperation::ReindexStatus(ReindexStatusRequest {
+            operation_id: disconnected_operation,
+        }))
+        .await;
+    let ResponseOperation::ReindexStatus(status) = status else {
+        panic!("reconnected client received a non-reindex-status response");
+    };
+    assert_eq!(status.operation_id, disconnected_operation);
+    assert_ne!(status.state, ReindexOperationState::Lost);
+    assert!(status.admission.is_some());
+    let completed = client
+        .exchange(RequestOperation::ReindexWait(ReindexWaitRequest {
+            operation_id: disconnected_operation,
+            timeout_ms: 20_000,
+        }))
+        .await;
+    let ResponseOperation::ReindexWait(completed) = completed else {
+        panic!("reconnected client received a non-reindex-wait response");
+    };
+    assert_eq!(completed.state, ReindexOperationState::Succeeded);
+
     shutdown(&mut client).await;
     drop(client);
 
@@ -272,6 +314,20 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
         replacement_descriptor.daemon_instance_id(),
     )
     .await;
+    let lost = replacement_client
+        .exchange(RequestOperation::ReindexStatus(ReindexStatusRequest {
+            operation_id: disconnected_operation,
+        }))
+        .await;
+    let ResponseOperation::ReindexStatus(lost) = lost else {
+        panic!("replacement daemon returned a non-reindex-status response");
+    };
+    assert_eq!(lost.operation_id, disconnected_operation);
+    assert_eq!(lost.state, ReindexOperationState::Lost);
+    assert!(lost.admission.is_none());
+    assert!(lost.completion.is_none());
+    assert!(lost.status.is_none());
+    assert!(lost.error.is_none());
     shutdown(&mut replacement_client).await;
     drop(replacement_client);
     assert!(replacement.wait_for_exit().await.success());
@@ -282,24 +338,16 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
 }
 
 async fn complete_reindex(client: &mut ProcessClient, idempotency_key: &str) {
-    let admitted = client
-        .exchange(RequestOperation::ReindexAdmit(ReindexAdmitRequest {
-            intent: FilesystemReindexIntent::full(),
-            idempotency_key: Some(idempotency_key.to_owned()),
-        }))
-        .await;
-    let ResponseOperation::ReindexAdmit(admitted) = admitted else {
-        panic!("real daemon returned a non-reindex-admission response");
-    };
+    let operation_id = admit_reindex(client, idempotency_key).await;
     let status = client
         .exchange(RequestOperation::ReindexStatus(ReindexStatusRequest {
-            operation_id: admitted.operation_id,
+            operation_id,
         }))
         .await;
     let ResponseOperation::ReindexStatus(status) = status else {
         panic!("real daemon returned a non-reindex-status response");
     };
-    assert_eq!(status.operation_id, admitted.operation_id);
+    assert_eq!(status.operation_id, operation_id);
     assert!(matches!(
         status.state,
         ReindexOperationState::Queued
@@ -311,7 +359,7 @@ async fn complete_reindex(client: &mut ProcessClient, idempotency_key: &str) {
 
     let completed = client
         .exchange(RequestOperation::ReindexWait(ReindexWaitRequest {
-            operation_id: admitted.operation_id,
+            operation_id,
             timeout_ms: 20_000,
         }))
         .await;
@@ -324,7 +372,7 @@ async fn complete_reindex(client: &mut ProcessClient, idempotency_key: &str) {
 
     let cancelled = client
         .exchange(RequestOperation::ReindexCancel(ReindexCancelRequest {
-            operation_id: admitted.operation_id,
+            operation_id,
         }))
         .await;
     let ResponseOperation::ReindexCancel(cancelled) = cancelled else {
@@ -332,6 +380,19 @@ async fn complete_reindex(client: &mut ProcessClient, idempotency_key: &str) {
     };
     assert_eq!(cancelled.state, ReindexOperationState::Succeeded);
     assert!(!cancelled.cancelled);
+}
+
+async fn admit_reindex(client: &mut ProcessClient, idempotency_key: &str) -> OperationId {
+    let admitted = client
+        .exchange(RequestOperation::ReindexAdmit(ReindexAdmitRequest {
+            intent: FilesystemReindexIntent::full(),
+            idempotency_key: Some(idempotency_key.to_owned()),
+        }))
+        .await;
+    let ResponseOperation::ReindexAdmit(admitted) = admitted else {
+        panic!("real daemon returned a non-reindex-admission response");
+    };
+    admitted.operation_id
 }
 
 async fn shutdown(client: &mut ProcessClient) {

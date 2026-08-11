@@ -17,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS_ROOT))
 
 import workspace_package_contract as contract
 import workspace_package_verification as verifier
+import verify_workspace_packages as entrypoint
 
 
 class PackageVerifierRejectionTests(unittest.TestCase):
@@ -104,7 +105,34 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 ):
                     contract.published_production_closure(packages)
 
-    def test_consumer_uses_the_metadata_library_target_name(self) -> None:
+    def test_consumer_loads_the_exact_reviewed_public_api_fixture(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture_root = Path(temporary)
+            fixture = fixture_root / "renamed-library-package" / "default.rs"
+            fixture.parent.mkdir()
+            fixture.write_text(
+                "pub use custom_public_api::PromisedType;\n", encoding="utf-8"
+            )
+            package = contract.WorkspacePackage(
+                name="renamed-library-package",
+                version="1.0.0",
+                manifest_path=Path("Cargo.toml"),
+                dependencies=(),
+                publish=None,
+                is_library=True,
+                feature_names=(),
+                library_target_name="custom_public_api",
+            )
+
+            source = verifier.consumer_source(
+                package,
+                "default",
+                fixture_root=fixture_root,
+            )
+
+            self.assertEqual(source, "pub use custom_public_api::PromisedType;\n")
+
+    def test_consumer_rejects_a_missing_public_api_fixture(self) -> None:
         package = contract.WorkspacePackage(
             name="renamed-library-package",
             version="1.0.0",
@@ -115,7 +143,15 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             feature_names=(),
             library_target_name="custom_public_api",
         )
-        self.assertIn("use custom_public_api as _;", verifier.consumer_source(package))
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                contract.VerificationError, "missing public API consumer fixture"
+            ):
+                verifier.consumer_source(
+                    package,
+                    "default",
+                    fixture_root=Path(temporary),
+                )
 
     def test_documented_readme_feature_profile_is_explicit_and_validated(self) -> None:
         decode = contract.WorkspacePackage(
@@ -188,25 +224,21 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 feature_names=("audio", "texture", "texture-advanced"),
                 library_target_name="unity_asset_decode",
             )
-            unpacked = {package.name: root / "unpacked" / package.name}
             profile = next(
                 profile
                 for profile in contract.DOCUMENTED_FEATURE_PROFILES
                 if profile.name == "readme-decode-media"
             )
 
-            workspace, consumers, required = (
-                verifier.create_documented_feature_consumer_workspace(
-                    root / "consumer-workspace",
-                    (package,),
-                    unpacked,
-                    profile,
-                )
+            _, manifest_path = verifier.create_consumer(
+                root / "consumer",
+                package,
+                profile.name,
+                profile.features,
+                default_features=profile.default_features,
             )
 
-            self.assertTrue(workspace.is_file())
-            self.assertEqual(required, {"unity-asset-decode"})
-            manifest = next(iter(consumers.values())).read_text(encoding="utf-8")
+            manifest = manifest_path.read_text(encoding="utf-8")
             self.assertIn('default-features = true', manifest)
             self.assertIn('features = ["audio", "texture-advanced"]', manifest)
             self.assertNotIn('"texture"', manifest)
@@ -229,17 +261,139 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 for profile in contract.DOCUMENTED_FEATURE_PROFILES
                 if profile.name == "workspace-decode"
             )
-            _, consumers, _ = verifier.create_documented_feature_consumer_workspace(
-                root / "consumer-workspace",
-                (package,),
-                {package.name: root / "unpacked" / package.name},
-                profile,
+            _, manifest_path = verifier.create_consumer(
+                root / "consumer",
+                package,
+                profile.name,
+                profile.features,
+                default_features=profile.default_features,
             )
 
-            manifest = next(iter(consumers.values())).read_text(encoding="utf-8")
+            manifest = manifest_path.read_text(encoding="utf-8")
             self.assertIn('features = ["decode"]', manifest)
             self.assertNotIn('"async"', manifest)
             self.assertNotIn('"mmap"', manifest)
+
+    def test_consumer_suite_batches_positive_and_removed_api_probes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            decode = contract.WorkspacePackage(
+                name="unity-asset-decode",
+                version="0.4.0",
+                manifest_path=root / "source" / "Cargo.toml",
+                dependencies=(),
+                publish=None,
+                is_library=True,
+                feature_names=("audio", "texture", "texture-advanced", "full"),
+                library_target_name="unity_asset_decode",
+            )
+            workspace_package = contract.WorkspacePackage(
+                name="unity-asset",
+                version="0.4.0",
+                manifest_path=root / "workspace" / "Cargo.toml",
+                dependencies=(),
+                publish=None,
+                is_library=True,
+                feature_names=("async", "decode", "mmap"),
+                library_target_name="unity_asset",
+            )
+            packages = (decode, workspace_package)
+            unpacked = {
+                package.name: root / "unpacked" / package.name
+                for package in packages
+            }
+
+            workspace, consumers, positive, removed, required = (
+                verifier.create_consumer_suite(
+                    root / "consumers", packages, unpacked
+                )
+            )
+
+            self.assertTrue(workspace.is_file())
+            self.assertEqual(len(positive), 4)
+            self.assertEqual(len(consumers), 5)
+            self.assertTrue(removed.isdisjoint(positive))
+            self.assertTrue(removed.issubset(consumers))
+            self.assertEqual(len(removed), 1)
+            self.assertEqual(required, {"unity-asset-decode", "unity-asset"})
+            removed_name = next(iter(removed))
+            removed_manifest = consumers[removed_name].read_text(encoding="utf-8")
+            self.assertIn('default-features = false', removed_manifest)
+            self.assertIn('features = ["full"]', removed_manifest)
+            self.assertEqual(
+                (consumers[removed_name].parent / "src" / "lib.rs").read_text(
+                    encoding="utf-8"
+                ),
+                "".join(
+                    f"use unity_asset_decode::{path};\n"
+                    for path in verifier.REMOVED_DECODE_API_PATHS
+                )
+            )
+
+    def test_removed_api_probe_accepts_any_compile_failure(self) -> None:
+        result = mock.Mock(
+            returncode=101,
+            stdout="",
+            stderr="compile failed",
+        )
+
+        with mock.patch.object(verifier.subprocess, "run", return_value=result) as run:
+            verifier.check_removed_api_consumers(
+                cargo="cargo",
+                cargo_cwd=Path("clean-cwd"),
+                environment={"CARGO_HOME": "isolated"},
+                workspace_manifest=Path("consumer-workspace") / "Cargo.toml",
+                consumer_names=("removed-decode",),
+            )
+
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "cargo",
+                "check",
+                "--manifest-path",
+                str(Path("consumer-workspace") / "Cargo.toml"),
+                "--package",
+                "removed-decode",
+                "--lib",
+                "--locked",
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs,
+            {
+                "cwd": Path("clean-cwd"),
+                "env": {"CARGO_HOME": "isolated"},
+                "check": False,
+                "capture_output": True,
+                "text": True,
+                "timeout": verifier.CARGO_COMMAND_TIMEOUT_SECONDS,
+            },
+        )
+
+    def test_removed_api_probe_rejects_a_reintroduced_symbol(self) -> None:
+        result = mock.Mock(returncode=0, stdout="", stderr="")
+        with (
+            mock.patch.object(verifier.subprocess, "run", return_value=result),
+            self.assertRaisesRegex(
+                contract.VerificationError,
+                "unexpectedly compiled.*removed-decode",
+            ),
+        ):
+            verifier.check_removed_api_consumers(
+                cargo="cargo",
+                cargo_cwd=Path("clean-cwd"),
+                environment={},
+                workspace_manifest=Path("consumer-workspace") / "Cargo.toml",
+                consumer_names=("removed-decode",),
+            )
+
+    def test_package_mode_is_the_safe_local_default(self) -> None:
+        with mock.patch.object(sys, "argv", ["verify_workspace_packages.py"]):
+            args = entrypoint.parse_args()
+
+        self.assertEqual(args.mode, "packages")
+        self.assertFalse(hasattr(args, "workspace_root"))
 
     def test_rejects_root_source_overrides(self) -> None:
         cases = {
@@ -311,39 +465,53 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                     with self.assertRaisesRegex(contract.VerificationError, message):
                         verifier.validate_packaged_manifest(root, expected)
 
-    def test_rejects_untrusted_consumer_lock_entries(self) -> None:
-        valid_checksum = "a" * 64
-        cases = {
-            "git_source": (
-                'source = "git+https://example.invalid/repository"\n'
-                f'checksum = "{valid_checksum}"\n',
-                "non-crates.io source",
-            ),
-            "bad_checksum": (
-                        f'source = "{contract.CRATES_IO_SOURCE}"\n'
-                'checksum = "not-a-checksum"\n',
-                "invalid checksum",
-            ),
-            "missing_checksum": (
-                        f'source = "{contract.CRATES_IO_SOURCE}"\n',
-                "invalid checksum",
-            ),
-        }
-
+    def test_package_vcs_info_binds_archive_to_source_commit(self) -> None:
+        source_commit = "a" * 40
         with tempfile.TemporaryDirectory() as temporary:
-            lock_path = Path(temporary) / "Cargo.lock"
-            for name, (source_lines, message) in cases.items():
+            root = Path(temporary)
+            vcs_info = root / ".cargo_vcs_info.json"
+            vcs_info.write_text(
+                json.dumps({"git": {"sha1": source_commit}}),
+                encoding="utf-8",
+            )
+
+            verifier.validate_package_vcs_info(
+                root,
+                expected_source_commit=source_commit,
+            )
+
+            cases = {
+                "mismatch": (
+                    {"git": {"sha1": "b" * 40}},
+                    "does not match source commit",
+                ),
+                "dirty": (
+                    {"git": {"sha1": source_commit, "dirty": True}},
+                    "marks the package dirty",
+                ),
+                "invalid_dirty": (
+                    {"git": {"sha1": source_commit, "dirty": "true"}},
+                    "invalid git.dirty",
+                ),
+            }
+            for name, (document, message) in cases.items():
                 with self.subTest(name=name):
-                    lock_path.write_text(
-                        "version = 4\n\n"
-                        "[[package]]\n"
-                        'name = "untrusted-package"\n'
-                        'version = "1.0.0"\n'
-                        f"{source_lines}",
-                        encoding="utf-8",
-                    )
+                    vcs_info.write_text(json.dumps(document), encoding="utf-8")
                     with self.assertRaisesRegex(contract.VerificationError, message):
-                        verifier.validate_consumer_lock(lock_path, {})
+                        verifier.validate_package_vcs_info(
+                            root,
+                            expected_source_commit=source_commit,
+                        )
+
+    def test_package_vcs_info_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(
+                contract.VerificationError, "missing package VCS identity"
+            ):
+                verifier.validate_package_vcs_info(
+                    Path(temporary),
+                    expected_source_commit="a" * 40,
+                )
 
     def test_rejects_resolved_graph_that_leaks_the_repository_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -383,15 +551,13 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             }
 
             with self.assertRaisesRegex(
-                contract.VerificationError, "leaked a repository checkout path"
+                contract.VerificationError, "did not resolve from its unpacked archive"
             ):
                 verifier.validate_resolved_workspace(
                     json.dumps(metadata),
-                    workspace_root,
                     {consumer_name: consumer_manifest},
                     {target_name: unpacked_target},
                     {target_name: "1.2.3"},
-                    set(),
                     registry_source_root,
                     {target_name},
                 )
@@ -421,11 +587,9 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             ):
                 verifier.validate_resolved_workspace(
                     json.dumps(metadata),
-                    root / "repository",
                     {consumer_name: consumer_manifest},
                     {target_name: root / "unpacked" / target_name},
                     {target_name: "1.0.0"},
-                    set(),
                     root / "cargo-home" / "registry" / "src",
                     {target_name},
                 )
@@ -474,127 +638,141 @@ class PackageVerifierRejectionTests(unittest.TestCase):
         for call in run_visible.call_args_list:
             self.assertEqual(call.kwargs, {"cwd": cargo_cwd, "env": environment})
 
-    def test_binary_verification_uses_a_dedicated_archive_closure(self) -> None:
-        temporary = tempfile.TemporaryDirectory(
-            prefix="unity-asset-package-verifier-test-"
-        )
-        self.addCleanup(temporary.cleanup)
-        test_root = Path(temporary.name)
-        clean_cargo_cwd = test_root / "clean-cargo-cwd"
-        standalone_root = test_root / "poisoned-ancestor" / "standalone"
-        dependency = contract.WorkspacePackage(
-            name="example-core",
-            version="1.2.3",
-            manifest_path=Path("source-core") / "Cargo.toml",
-            dependencies=(),
-            publish=None,
-            is_library=True,
-            feature_names=(),
-        )
-        package = contract.WorkspacePackage(
-            name="example-package",
-            version="1.2.3",
-            manifest_path=Path("source") / "Cargo.toml",
-            dependencies=(),
-            publish=None,
-            is_library=False,
-            feature_names=(),
-            binary_target_names=("example-tool",),
-        )
-        archive_paths = {
-            dependency.name: test_root / "archives" / "example-core-1.2.3.crate",
-            package.name: test_root / "archives" / "example-package-1.2.3.crate",
-        }
-        dedicated_paths = {
-            dependency.name: standalone_root / "packages" / "example-core-1.2.3",
-            package.name: standalone_root / "packages" / "example-package-1.2.3",
-        }
-
-        def unpack(
-            _archive_path: Path,
-            _unpack_root: Path,
-            unpacked_package: contract.WorkspacePackage,
-        ) -> Path:
-            return dedicated_paths[unpacked_package.name]
+    def test_metadata_proves_the_isolated_resolve_graph(self) -> None:
+        cargo_cwd = Path("clean-cargo-cwd")
+        manifest = Path("consumer-workspace") / "Cargo.toml"
+        environment = {"CARGO_HOME": "isolated"}
+        metadata = '{"packages": [], "resolve": {"nodes": []}}'
 
         with (
+            mock.patch.object(verifier, "run_captured", return_value=metadata) as run,
             mock.patch.object(
-                verifier, "unpack_archive", side_effect=unpack
-            ) as unpack_archive,
-            mock.patch.object(
-                verifier,
-                "write_workspace_manifest",
-                return_value=standalone_root / "Cargo.toml",
-            ) as write_workspace_manifest,
-            mock.patch.object(
-                verifier,
-                "production_closure",
-                return_value=(dependency, package),
-            ),
-            mock.patch.object(
-                verifier, "verify_temporary_workspace"
-            ) as verify_temporary_workspace,
-            mock.patch.object(
-                verifier, "check_temporary_workspace"
-            ) as check_temporary_workspace,
+                verifier, "validate_resolved_workspace"
+            ) as validate_resolved,
             mock.patch.object(verifier, "run_visible") as run_visible,
         ):
-            verifier.verify_binary_package_standalone(
+            verifier.verify_temporary_workspace(
                 cargo="cargo",
-                cargo_cwd=clean_cargo_cwd,
-                environment={"CARGO_HOME": "isolated"},
-                repository_root=Path("repository"),
-                workspace_root=standalone_root,
-                package=package,
-                packages={
-                    dependency.name: dependency,
-                    package.name: package,
-                },
-                archive_paths=archive_paths,
-                expected_versions={
-                    dependency.name: dependency.version,
-                    package.name: package.version,
-                },
-                registry_source_root=Path("cargo-home") / "registry" / "src",
+                cargo_cwd=cargo_cwd,
+                environment=environment,
+                workspace_manifest=manifest,
+                local_manifests={},
+                unpacked_packages={},
+                expected_versions={},
+                required_internal=set(),
+                registry_source_root=Path("registry"),
+                all_features=True,
             )
 
-        self.assertEqual(
-            unpack_archive.call_args_list,
+        run_visible.assert_not_called()
+        run.assert_called_once_with(
             [
-                mock.call(
-                    archive_paths[dependency.name],
-                    standalone_root / "packages",
-                    dependency,
-                ),
-                mock.call(
-                    archive_paths[package.name],
-                    standalone_root / "packages",
-                    package,
-                ),
+                "cargo",
+                "metadata",
+                "--manifest-path",
+                str(manifest),
+                "--format-version",
+                "1",
+                "--all-features",
             ],
+            cwd=cargo_cwd,
+            env=environment,
         )
-        write_workspace_manifest.assert_called_once_with(
-            standalone_root,
-            [dedicated_paths[package.name]],
-            dedicated_paths,
-        )
-        self.assertEqual(verify_temporary_workspace.call_count, 2)
-        self.assertFalse(
-            verify_temporary_workspace.call_args_list[0].kwargs["all_features"]
-        )
-        self.assertTrue(
-            verify_temporary_workspace.call_args_list[1].kwargs["all_features"]
-        )
-        for call in verify_temporary_workspace.call_args_list:
-            self.assertEqual(call.kwargs["required_internal"], {package.name})
-        self.assertEqual(check_temporary_workspace.call_count, 2)
-        for call in check_temporary_workspace.call_args_list:
-            self.assertEqual(call.kwargs["target_arguments"], ("--bins",))
-        self.assertEqual(run_visible.call_count, 1)
-        self.assertEqual(run_visible.call_args.kwargs["cwd"], clean_cargo_cwd)
-        self.assertIn(
-            str(dedicated_paths[package.name]), run_visible.call_args.args[0]
-        )
+        validate_resolved.assert_called_once()
+
+    def test_binary_verification_uses_archives_and_rejects_wrong_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            standalone_root = root / "standalone"
+            dependency = contract.WorkspacePackage(
+                name="example-core",
+                version="1.2.3",
+                manifest_path=root / "source-core" / "Cargo.toml",
+                dependencies=(),
+                publish=None,
+                is_library=True,
+                feature_names=(),
+            )
+            package = contract.WorkspacePackage(
+                name="example-package",
+                version="1.2.3",
+                manifest_path=root / "source" / "Cargo.toml",
+                dependencies=(),
+                publish=None,
+                is_library=False,
+                feature_names=(),
+                binary_target_names=("example-tool",),
+            )
+            packages = {item.name: item for item in (dependency, package)}
+            archives = {
+                name: root / "archives" / f"{name}-1.2.3.crate" for name in packages
+            }
+            unpacked = {
+                name: standalone_root / "packages" / f"{name}-1.2.3"
+                for name in packages
+            }
+            executable = standalone_root / "install-root" / "bin" / (
+                "example-tool.exe" if sys.platform == "win32" else "example-tool"
+            )
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"test binary")
+
+            def unpack(
+                _archive: Path,
+                _root: Path,
+                item: contract.WorkspacePackage,
+            ) -> Path:
+                return unpacked[item.name]
+
+            with (
+                mock.patch.object(
+                    verifier, "unpack_archive", side_effect=unpack
+                ) as unpack_archive,
+                mock.patch.object(
+                    verifier,
+                    "write_workspace_manifest",
+                    return_value=standalone_root / "Cargo.toml",
+                ),
+                mock.patch.object(
+                    verifier,
+                    "production_closure",
+                    return_value=(dependency, package),
+                ),
+                mock.patch.object(verifier, "verify_temporary_workspace") as verify,
+                mock.patch.object(verifier, "run_visible") as install,
+                mock.patch.object(
+                    verifier, "run_captured", return_value="wrong identity\n"
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    contract.VerificationError, "unexpected build identity"
+                ):
+                    verifier.verify_binary_packages_standalone(
+                        cargo="cargo",
+                        cargo_cwd=root,
+                        environment={"CARGO_HOME": "isolated"},
+                        workspace_root=standalone_root,
+                        packages=packages,
+                        archive_paths=archives,
+                        expected_versions={name: "1.2.3" for name in packages},
+                        expected_source_commit="a" * 40,
+                        expected_build_target="x86_64-pc-windows-msvc",
+                        registry_source_root=root / "cargo-home" / "registry" / "src",
+                    )
+
+            self.assertEqual(
+                {call.args[0] for call in unpack_archive.call_args_list},
+                set(archives.values()),
+            )
+            self.assertEqual(
+                set(verify.call_args.kwargs["unpacked_packages"].values()),
+                set(unpacked.values()),
+            )
+            install_path = install.call_args.args[0]
+            self.assertEqual(
+                install_path[install_path.index("--path") + 1],
+                str(unpacked[package.name]),
+            )
 
 
 if __name__ == "__main__":

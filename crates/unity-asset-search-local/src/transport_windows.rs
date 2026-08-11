@@ -583,21 +583,100 @@ impl tokio::io::AsyncWrite for Stream {
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
     use std::time::{Duration, Instant};
 
-    use tokio::io::AsyncReadExt as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::windows::named_pipe::ServerOptions;
     use unity_asset_search_protocol::{FrameLimits, ProjectId};
     use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, DuplicateToken, SID_AND_ATTRIBUTES, SecurityImpersonation,
+        TOKEN_DUPLICATE, TOKEN_QUERY,
+    };
     use windows_sys::Win32::Storage::FileSystem::WRITE_DAC;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcessToken, SetThreadToken,
+    };
 
     use super::{
-        WINDOWS_NAMED_PIPE_CLIENT_ACCESS, accept, bind, create_server_pipe, open_client_pipe,
-        open_client_pipe_with_access, pipe_base_name, pipe_slot_name,
+        RevertGuard, WINDOWS_NAMED_PIPE_CLIENT_ACCESS, accept, bind, create_server_pipe,
+        open_client_pipe, open_client_pipe_with_access, pipe_base_name, pipe_slot_name,
     };
     use crate::pipe_rendezvous::discover;
     use crate::security_context::CurrentSecurityContextSnapshot;
-    use crate::{EndpointDescriptorV1, PrivateRootsV1, generate_daemon_instance_id};
+    use crate::{
+        EndpointDescriptorV1, EndpointTransportError, FrameReadTimeoutsV1, PrivateRootsV1,
+        SecurityContextIdV1, VerifiedFramedTransportV1, generate_daemon_instance_id,
+    };
+
+    fn restricted_impersonation_token(context: &CurrentSecurityContextSnapshot) -> OwnedHandle {
+        let mut process_token = std::ptr::null_mut();
+        assert_ne!(
+            // SAFETY: the pseudo process handle is valid and the output pointer is writable.
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &raw mut process_token,
+                )
+            },
+            0,
+            "open current process token: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: OpenProcessToken succeeded and transferred one owned, non-null handle.
+        let process_token = unsafe { OwnedHandle::from_raw_handle(process_token) };
+
+        let restricting_sid = SID_AND_ATTRIBUTES {
+            // The pipe DACL grants the current logon SID. Restricting by that same SID preserves
+            // the minimum connect right while still changing the effective token identity that
+            // per-message verification binds into `SecurityContextIdV1`.
+            Sid: context.windows_logon_sid().as_ptr().cast_mut().cast(),
+            Attributes: 0,
+        };
+        let mut restricted_token = std::ptr::null_mut();
+        assert_ne!(
+            // SAFETY: the input token and SID remain valid for the complete call, all unused
+            // arrays have zero counts, and the output pointer is writable.
+            unsafe {
+                CreateRestrictedToken(
+                    process_token.as_raw_handle(),
+                    0,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    1,
+                    &raw const restricting_sid,
+                    &raw mut restricted_token,
+                )
+            },
+            0,
+            "create restricted token: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: CreateRestrictedToken succeeded and transferred one owned, non-null handle.
+        let restricted_token = unsafe { OwnedHandle::from_raw_handle(restricted_token) };
+
+        let mut impersonation_token = std::ptr::null_mut();
+        assert_ne!(
+            // SAFETY: the restricted token is valid, no optional attributes are supplied, and the
+            // output pointer is writable.
+            unsafe {
+                DuplicateToken(
+                    restricted_token.as_raw_handle(),
+                    SecurityImpersonation,
+                    &raw mut impersonation_token,
+                )
+            },
+            0,
+            "duplicate restricted impersonation token: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: DuplicateToken succeeded and transferred one owned, non-null handle.
+        unsafe { OwnedHandle::from_raw_handle(impersonation_token) }
+    }
 
     fn unique_project_id() -> ProjectId {
         let mut bytes = rand::random::<[u8; 32]>();
@@ -653,6 +732,76 @@ mod tests {
         );
 
         drop(pipe);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn restricted_message_principal_is_rejected_before_frame_delivery() {
+        let roots = PrivateRootsV1::discover_for_current_context().unwrap();
+        let namespace = roots
+            .runtime()
+            .endpoint_namespace(unique_project_id())
+            .unwrap();
+        let cleanup_path = namespace.path().to_path_buf();
+        let lease = namespace.acquire_daemon_lease().unwrap();
+        let instance = generate_daemon_instance_id().unwrap();
+        let mut server = bind(&namespace, instance).unwrap();
+        let descriptor =
+            EndpointDescriptorV1::for_current_process(namespace.project_id(), instance).unwrap();
+        let publication = namespace.publish_endpoint(&lease, descriptor).unwrap();
+        let rendezvous = discover(&namespace, descriptor).unwrap();
+        let pipe_name = pipe_slot_name(&pipe_base_name(&namespace, instance), rendezvous.slot_id());
+
+        let context = CurrentSecurityContextSnapshot::current().unwrap();
+        let restricted_token = restricted_impersonation_token(&context);
+        assert_ne!(
+            // SAFETY: the token is a live impersonation token and a null thread pointer selects
+            // the current test thread.
+            unsafe { SetThreadToken(std::ptr::null(), restricted_token.as_raw_handle()) },
+            0,
+            "install restricted thread token: {}",
+            io::Error::last_os_error()
+        );
+        let revert = RevertGuard { active: true };
+        let restricted_context = SecurityContextIdV1::for_impersonated_thread().unwrap();
+        assert_ne!(restricted_context, namespace.security_context_id());
+
+        // CreateFile captures the client token because production does not request dynamic
+        // security-context tracking. Revert before any await so unrelated Tokio work never runs
+        // under the restricted token.
+        let mut connected = open_client_pipe(&pipe_name).unwrap();
+        revert.revert();
+        drop(restricted_token);
+
+        let request = [0, 0, 0, 4, b'p', b'i', b'n', b'g'];
+        connected.write_all(&request).await.unwrap();
+
+        let (inner, peer_identity) =
+            tokio::time::timeout(Duration::from_secs(5), accept(&mut server))
+                .await
+                .unwrap()
+                .unwrap();
+        let mut accepted = VerifiedFramedTransportV1 {
+            inner,
+            peer_identity,
+            expected_security_context: namespace.security_context_id(),
+        };
+        let error = accepted
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, EndpointTransportError::PeerContextMismatch));
+
+        drop(accepted);
+        drop(connected);
+        drop(server);
+        publication.remove().unwrap();
+        drop(lease);
+        drop(namespace);
+        drop(roots);
+        cleanup_namespace(&cleanup_path);
     }
 
     #[tokio::test(flavor = "current_thread")]

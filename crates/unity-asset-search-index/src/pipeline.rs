@@ -212,6 +212,11 @@ impl SearchGenerationPipeline {
     }
 
     #[cfg(test)]
+    pub(crate) fn inject_desired_revision_failpoint(&mut self, failpoint: GenerationFailpoint) {
+        self.generation.inject_desired_revision_failpoint(failpoint);
+    }
+
+    #[cfg(test)]
     pub(crate) fn inject_scan_validation_hook(
         &mut self,
         checkpoint: ScanValidationCheckpoint,

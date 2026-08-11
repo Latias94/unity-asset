@@ -13,7 +13,10 @@ use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
     EndpointStoreError, FrameReadTimeoutsV1, VerifiedFramedTransportV1,
 };
-use unity_asset_search_protocol::{FrameLimits, OperationKind, decode_request_frame};
+use unity_asset_search_protocol::{
+    BootstrapErrorCode, BootstrapReplyV2, FrameLimits, OperationKind, decode_request_frame,
+    decode_validated_frame,
+};
 
 const OWNER_GUID: &str = "11111111111111111111111111111111";
 const TARGET_GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -70,6 +73,35 @@ async fn public_csharp_session_reaches_every_real_daemon_operation_through_verif
     let output = child.wait_with_output();
     tokio::pin!(output);
 
+    for expected in [
+        BootstrapErrorCode::ProjectMismatch,
+        BootstrapErrorCode::InstanceMismatch,
+        BootstrapErrorCode::NoCommonRevision,
+    ] {
+        let (relay_stream, _) = tokio::time::timeout(TEST_TIMEOUT, listener.accept())
+            .await
+            .expect("C# negative Bootstrap did not connect to the relay")
+            .expect("accept C# negative Bootstrap relay connection");
+        let daemon_stream = discovered
+            .connect_verified(fixture.namespace(), Instant::now() + TEST_TIMEOUT)
+            .await
+            .expect("connect verified negative Bootstrap relay to real daemon");
+        let reply = tokio::time::timeout(
+            TEST_TIMEOUT,
+            relay_bootstrap_only(relay_stream, daemon_stream),
+        )
+        .await
+        .expect("C# negative Bootstrap relay timed out")
+        .expect("C# negative Bootstrap relay failed");
+        assert_eq!(
+            reply,
+            BootstrapReplyV2::Rejected {
+                bootstrap_version: unity_asset_search_protocol::BOOTSTRAP_VERSION,
+                code: expected,
+            }
+        );
+    }
+
     let (relay_stream, _) = tokio::select! {
         accepted = listener.accept() => accepted.expect("accept C# relay connection"),
         early = &mut output => {
@@ -122,22 +154,11 @@ async fn public_csharp_session_reaches_every_real_daemon_operation_through_verif
 
 async fn relay_session(mut relay: TcpStream, mut daemon: VerifiedFramedTransportV1) -> Result<()> {
     relay.set_nodelay(true).context("configure C# relay")?;
-    let hello = read_relay_frame(&mut relay, FrameLimits::bootstrap())
-        .await?
-        .ok_or_else(|| anyhow!("C# relay closed before Bootstrap"))?;
-    daemon
-        .write_frame(&hello, FrameLimits::bootstrap(), TEST_TIMEOUT)
-        .await
-        .context("forward C# Bootstrap to daemon")?;
-    let reply = daemon
-        .read_frame(
-            FrameLimits::bootstrap(),
-            FrameReadTimeoutsV1::uniform(TEST_TIMEOUT),
-        )
-        .await
-        .context("read daemon Bootstrap reply")?
-        .ok_or_else(|| anyhow!("daemon closed before Bootstrap reply"))?;
-    write_relay_frame(&mut relay, &reply).await?;
+    let reply = relay_bootstrap(&mut relay, &mut daemon).await?;
+    ensure!(
+        matches!(reply, BootstrapReplyV2::Accepted { .. }),
+        "real daemon rejected the positive C# Bootstrap: {reply:?}"
+    );
 
     loop {
         let request_frame = read_relay_frame(&mut relay, FrameLimits::request_envelope())
@@ -168,6 +189,39 @@ async fn relay_session(mut relay: TcpStream, mut daemon: VerifiedFramedTransport
             return Ok(());
         }
     }
+}
+
+async fn relay_bootstrap_only(
+    mut relay: TcpStream,
+    mut daemon: VerifiedFramedTransportV1,
+) -> Result<BootstrapReplyV2> {
+    relay.set_nodelay(true).context("configure C# relay")?;
+    relay_bootstrap(&mut relay, &mut daemon).await
+}
+
+async fn relay_bootstrap(
+    relay: &mut TcpStream,
+    daemon: &mut VerifiedFramedTransportV1,
+) -> Result<BootstrapReplyV2> {
+    let hello = read_relay_frame(relay, FrameLimits::bootstrap())
+        .await?
+        .ok_or_else(|| anyhow!("C# relay closed before Bootstrap"))?;
+    daemon
+        .write_frame(&hello, FrameLimits::bootstrap(), TEST_TIMEOUT)
+        .await
+        .context("forward C# Bootstrap to daemon")?;
+    let reply = daemon
+        .read_frame(
+            FrameLimits::bootstrap(),
+            FrameReadTimeoutsV1::uniform(TEST_TIMEOUT),
+        )
+        .await
+        .context("read daemon Bootstrap reply")?
+        .ok_or_else(|| anyhow!("daemon closed before Bootstrap reply"))?;
+    write_relay_frame(relay, &reply).await?;
+    let mut budget = AssetLoadBudget::default();
+    decode_validated_frame(&reply, &mut budget, FrameLimits::bootstrap())
+        .context("decode real daemon Bootstrap reply")
 }
 
 async fn read_relay_frame(stream: &mut TcpStream, limits: FrameLimits) -> Result<Option<Vec<u8>>> {

@@ -25,7 +25,7 @@ verifier = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = verifier
 SPEC.loader.exec_module(verifier)
 
-from release_evidence_support import make_release_evidence  # noqa: E402
+from release_evidence_support import make_dist_plan, make_release_evidence  # noqa: E402
 
 
 def run_git(repository: Path, *arguments: str) -> str:
@@ -41,48 +41,7 @@ def run_git(repository: Path, *arguments: str) -> str:
 
 
 def valid_dist_plan() -> dict[str, object]:
-    targets = (
-        "aarch64-apple-darwin",
-        "x86_64-apple-darwin",
-        "x86_64-pc-windows-msvc",
-        "x86_64-unknown-linux-musl",
-    )
-    applications = ("unity-asset-search-cli", "unity-asset-search-daemon")
-    artifacts: dict[str, object] = {}
-    releases: list[dict[str, object]] = []
-    for application in applications:
-        release_artifacts: list[str] = []
-        for target in targets:
-            extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
-            name = f"{application}-{target}{extension}"
-            checksum = f"{name}.sha256"
-            artifacts[name] = {
-                "name": name,
-                "kind": "executable-zip",
-                "target_triples": [target],
-                "checksum": checksum,
-            }
-            artifacts[checksum] = {
-                "name": checksum,
-                "kind": "checksum",
-                "target_triples": [target],
-            }
-            release_artifacts.extend((name, checksum))
-        releases.append(
-            {
-                "app_name": application,
-                "app_version": "1.2.3",
-                "artifacts": release_artifacts,
-            }
-        )
-    return {
-        "dist_version": "0.30.3",
-        "announcement_tag": "v1.2.3",
-        "announcement_tag_is_implicit": False,
-        "announcement_is_prerelease": False,
-        "artifacts": artifacts,
-        "releases": releases,
-    }
+    return make_dist_plan()
 
 
 class ReleaseSourceVerifierTests(unittest.TestCase):

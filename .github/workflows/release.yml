@@ -188,6 +188,8 @@ jobs:
     runs-on: ubuntu-latest
     needs: validate
     timeout-minutes: 60
+    env:
+      UNITY_ASSET_SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
     steps:
       - name: Checkout verified commit
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
@@ -215,19 +217,27 @@ jobs:
 
       - name: Run strict Clippy
         run: >-
-          cargo clippy --workspace --all-targets --locked
+          cargo clippy --workspace --all-targets --all-features --locked
           -- -D warnings
+
+      - name: Run exact workspace tests
+        run: cargo nextest run --workspace --all-features --locked --test-threads 2
 
       - name: Run default workspace tests
         run: cargo nextest run --workspace --locked --test-threads 2
 
-      - name: Run async and decode feature tests
+      - name: Run documented async and decode feature tests
         run: |
           cargo nextest run -p unity-asset --features async --locked --test-threads 2
           cargo nextest run -p unity-asset-cli --features async --locked --test-threads 2 --no-tests=pass
-          cargo nextest run -p unity-asset-decode --features full --locked --test-threads 2
           cargo nextest run -p unity-asset --features decode --locked --test extraction_decode --test-threads 2
           cargo nextest run -p unity-asset-cli --features decode --locked --test-threads 2
+
+      - name: Build every workspace target
+        run: cargo build --workspace --all-targets --locked
+
+      - name: Build exact workspace documentation
+        run: cargo doc --workspace --all-features --no-deps --locked
 
       - name: Run binary loader feature contracts
         run: |
@@ -258,7 +268,7 @@ jobs:
           toolchain: ${{ needs.validate.outputs.release_toolchain }}
 
       - name: Package and build isolated archive consumers before credentials exist
-        run: python scripts/verify_workspace_packages.py
+        run: python scripts/verify_workspace_packages.py --mode full
 
   platform-contracts:
     name: Local transport and protocol contracts / ${{ matrix.os }}
@@ -319,13 +329,29 @@ jobs:
           --test structured_errors
           --test ipc_commands
           --test process_contract
-          --test transport_contract
+
+      - name: Run the real daemon JSON-agent harness
+        run: python scripts/run_real_daemon_agent.py
 
       - name: Run search generation, daemon lifecycle, and local identity contracts
         run: |
           cargo nextest run -p unity-asset-search-index --lib --locked --test-threads 2
           cargo nextest run -p unity-asset-search-daemon --bin unity-asset-search-daemon --locked --test-threads 2
           cargo nextest run -p unity-asset-search-local --locked --test-threads 2
+
+      - name: Prove Unix secondary-principal rejection
+        if: runner.os != 'Windows'
+        env:
+          UNITY_ASSET_CROSS_PRINCIPAL_USER: nobody
+          UNITY_ASSET_CROSS_PRINCIPAL_PYTHON: /usr/bin/python3
+        run: >-
+          cargo nextest run
+          --locked
+          --test-threads 1
+          --run-ignored ignored-only
+          -p unity-asset-search-local
+          --lib
+          -E 'test(/secondary_effective_uid_is_rejected_by_peer_credentials$/)'
 
       - name: Run cross-language search protocol conformance
         run: |
@@ -456,6 +482,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     needs: [validate, msrv, test, package, platform-contracts]
     timeout-minutes: 90
+    env:
+      UNITY_ASSET_SOURCE_COMMIT: ${{ needs.validate.outputs.commit }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.validate.outputs.dist_matrix) }}
@@ -493,20 +521,33 @@ jobs:
           sudo apt-get install -y musl-tools
           rustup target add x86_64-unknown-linux-musl
 
-      - name: Install macOS targets
-        if: runner.os == 'macOS'
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
       - name: Build archives from the locked source graph
         shell: bash
         run: |
           set -euo pipefail
           git diff --exit-code -- Cargo.lock
-          IFS=',' read -r -a targets <<< "${{ matrix.targets }}"
-          for target in "${targets[@]}"; do
-            dist build --artifacts=local --tag "$RELEASE_TAG" --target "$target"
-          done
+          dist build --artifacts=local --tag "$RELEASE_TAG" --target "${{ matrix.target }}"
           git diff --exit-code -- Cargo.lock
+
+      - name: Execute native release binaries and verify build identities
+        shell: bash
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          suffix=""
+          if [[ "$target" == *-windows-msvc ]]; then
+            suffix=".exe"
+          fi
+          for application in ${{ matrix.applications }}; do
+            executable="target/$target/release/$application$suffix"
+            test -f "$executable"
+            stderr_file="$application-version.stderr"
+            actual="$("$executable" --version 2>"$stderr_file")"
+            test ! -s "$stderr_file"
+            rm -f "$stderr_file"
+            expected="$application unity-asset.build-identity.v1{version=${{ needs.validate.outputs.version }};source-commit=${{ needs.validate.outputs.commit }};package=$application;target=$target}"
+            test "$actual" = "$expected"
+          done
 
       - name: Upload dist artifacts
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -562,6 +603,15 @@ jobs:
           --expected-dist-plan-sha256 "${{ needs.validate.outputs.dist_plan_sha256 }}"
           --protocol-sdk-bundle "release-evidence/${{ needs.validate.outputs.protocol_sdk_artifact }}"
           --output release-assets
+
+      - name: Verify packaged binary source identities
+        run: >-
+          python scripts/verify_release_bundle.py
+          --assets release-assets
+          --tag "$RELEASE_TAG"
+          --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
+          --release-title release-evidence/release-title.txt
+          --release-body release-evidence/release-notes.md
 
       - name: Upload assembled release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

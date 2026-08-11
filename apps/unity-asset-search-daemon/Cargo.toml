@@ -31,6 +31,9 @@ unity-asset-search-protocol = { workspace = true }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
+[build-dependencies]
+serde_json.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
 

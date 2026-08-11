@@ -4,9 +4,58 @@ import hashlib
 from typing import Any, Mapping, Sequence
 
 from protocol_sdk_bundle import ProtocolSdkBundleMetadata
-from release_contract import PUBLISHABLE_PACKAGE_NAMES
+from release_contract import (
+    CARGO_DIST_VERSION,
+    DISTRIBUTED_APPLICATION_NAMES,
+    DISTRIBUTION_TARGET_TRIPLES,
+    PUBLISHABLE_PACKAGE_NAMES,
+)
 from release_evidence import EVIDENCE_SCHEMA, expected_feature_profiles
 from release_metadata import ReleaseMetadata
+
+
+def dist_artifact_name(application: str, target: str) -> str:
+    extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
+    return f"{application}-{target}{extension}"
+
+
+def make_dist_plan(
+    *, tag: str = "v1.2.3", version: str = "1.2.3"
+) -> dict[str, object]:
+    artifacts: dict[str, object] = {}
+    releases: list[dict[str, object]] = []
+    for application in DISTRIBUTED_APPLICATION_NAMES:
+        release_artifacts: list[str] = []
+        for target in DISTRIBUTION_TARGET_TRIPLES:
+            archive = dist_artifact_name(application, target)
+            checksum = f"{archive}.sha256"
+            artifacts[archive] = {
+                "name": archive,
+                "kind": "executable-zip",
+                "target_triples": [target],
+                "checksum": checksum,
+            }
+            artifacts[checksum] = {
+                "name": checksum,
+                "kind": "checksum",
+                "target_triples": [target],
+            }
+            release_artifacts.extend((archive, checksum))
+        releases.append(
+            {
+                "app_name": application,
+                "app_version": version,
+                "artifacts": release_artifacts,
+            }
+        )
+    return {
+        "dist_version": CARGO_DIST_VERSION,
+        "announcement_tag": tag,
+        "announcement_tag_is_implicit": False,
+        "announcement_is_prerelease": False,
+        "artifacts": artifacts,
+        "releases": releases,
+    }
 
 
 def make_release_evidence(

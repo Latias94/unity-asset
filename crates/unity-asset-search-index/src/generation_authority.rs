@@ -818,6 +818,8 @@ pub(crate) struct SearchGenerationAuthority {
     #[cfg(test)]
     publish_failpoint: Option<GenerationFailpoint>,
     #[cfg(test)]
+    desired_revision_failpoint: Option<GenerationFailpoint>,
+    #[cfg(test)]
     scan_validation_hook: Option<OneShotCheckpointHook<ScanValidationCheckpoint>>,
     #[cfg(test)]
     desired_revision_commit_hook: Option<OneShotCheckpointHook<DesiredRevisionCommitCheckpoint>>,
@@ -1019,6 +1021,8 @@ impl SearchGenerationAuthority {
             pending_warnings_omitted: false,
             #[cfg(test)]
             publish_failpoint: None,
+            #[cfg(test)]
+            desired_revision_failpoint: None,
             #[cfg(test)]
             scan_validation_hook: None,
             #[cfg(test)]
@@ -1364,7 +1368,16 @@ impl SearchGenerationAuthority {
     ) -> Result<(), PipelineError> {
         let active_authority = self.active.clone();
         let mut public_active = active_authority.write()?;
-        let commit = match self.store.record_desired_revision(desired, budget) {
+        #[cfg(not(test))]
+        let commit = self.store.record_desired_revision(desired, budget);
+        #[cfg(test)]
+        let commit = match self.desired_revision_failpoint.take() {
+            Some(failpoint) => self
+                .store
+                .record_desired_revision_with_test_failpoint(desired, budget, failpoint),
+            None => self.store.record_desired_revision(desired, budget),
+        };
+        let commit = match commit {
             Ok(commit) => commit,
             Err(error) => {
                 if error.requires_reopen() {
@@ -1753,6 +1766,11 @@ impl SearchGenerationAuthority {
     #[cfg(test)]
     pub(crate) fn inject_publish_failpoint(&mut self, failpoint: GenerationFailpoint) {
         self.publish_failpoint = Some(failpoint);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_desired_revision_failpoint(&mut self, failpoint: GenerationFailpoint) {
+        self.desired_revision_failpoint = Some(failpoint);
     }
 
     #[cfg(test)]

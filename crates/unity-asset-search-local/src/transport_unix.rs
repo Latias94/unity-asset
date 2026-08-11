@@ -292,3 +292,97 @@ impl tokio::io::AsyncWrite for Stream {
         std::pin::Pin::new(&mut self.inner).poll_shutdown(context)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use tokio::net::UnixListener;
+
+    use super::{EndpointTransportError, verify_peer};
+    use crate::SecurityContextIdV1;
+
+    const SECONDARY_USER_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_USER";
+    const PYTHON_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_PYTHON";
+    const SECONDARY_CLIENT: &str = r#"
+import os
+import socket
+import sys
+
+parent_uid = int(sys.argv[2])
+actual_uid = os.geteuid()
+if actual_uid == parent_uid:
+    raise SystemExit("secondary process retained the parent effective UID")
+
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(sys.argv[1])
+print(f"peer-euid={actual_uid}", flush=True)
+if client.recv(1):
+    raise SystemExit("rejected peer received unexpected endpoint data")
+"#;
+
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "requires passwordless sudo and a secondary Unix account; exercised by platform CI"]
+    async fn secondary_effective_uid_is_rejected_by_peer_credentials() {
+        let parent_uid = rustix::process::geteuid().as_raw();
+        let expected_context = SecurityContextIdV1::current().unwrap();
+        let temporary = tempfile::Builder::new()
+            .prefix("uas-cross-principal-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let socket_path = temporary.path().join("peer.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        // Production endpoints remain owner-only. This isolated test socket deliberately permits
+        // traversal so the inner SO_PEERCRED authorization boundary is exercised directly.
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let secondary_user = std::env::var(SECONDARY_USER_ENV)
+            .unwrap_or_else(|_| panic!("{SECONDARY_USER_ENV} must name a secondary Unix account"));
+        let python = std::env::var(PYTHON_ENV)
+            .unwrap_or_else(|_| panic!("{PYTHON_ENV} must name an absolute Python executable"));
+        let mut command = tokio::process::Command::new("sudo");
+        command
+            .arg("-n")
+            .arg("-u")
+            .arg(&secondary_user)
+            .arg("--")
+            .arg(&python)
+            .arg("-c")
+            .arg(SECONDARY_CLIENT)
+            .arg(&socket_path)
+            .arg(parent_uid.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .unwrap_or_else(|_| panic!("secondary Unix user {secondary_user} did not connect"))
+            .unwrap();
+        let error = verify_peer(&stream, expected_context).unwrap_err();
+        assert!(matches!(error, EndpointTransportError::PeerContextMismatch));
+        drop(stream);
+        drop(listener);
+
+        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+            .await
+            .expect("secondary Unix client did not exit")
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "secondary Unix client failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("peer-euid="),
+            "secondary Unix client did not report its effective UID"
+        );
+    }
+}

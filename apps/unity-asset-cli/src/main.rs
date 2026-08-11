@@ -8,6 +8,7 @@ use serde_json::Value;
 use std::io::Write as _;
 use std::process::ExitCode;
 
+mod build_identity;
 mod cli;
 mod cli_error;
 mod commands;

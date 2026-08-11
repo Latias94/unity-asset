@@ -8,23 +8,24 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 import tarfile
 import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from release_path_safety import (
     ReleasePathSafetyError,
     portable_path_alias_key,
-    portable_path_component_key,
 )
+from release_binary_identity import version_report
+from release_contract import GIT_OBJECT_PATTERN
 from workspace_package_contract import (
     CRATES_IO_SOURCE,
-    DocumentedFeatureProfile,
     VerificationError,
     WorkspacePackage,
     dependency_tables,
@@ -38,6 +39,20 @@ from workspace_package_contract import (
 CONSUMER_PACKAGE_PREFIX = "unity-asset-package-consumer"
 CARGO_CONFIG_NAMES = ("config.toml", "config")
 CARGO_COMMAND_TIMEOUT_SECONDS = 1_200
+BUILD_TARGET_PATTERN = re.compile(r"[A-Za-z0-9_.-]+")
+PACKAGE_CONSUMER_FIXTURE_ROOT = (
+    Path(__file__).resolve().parent.parent / "integration" / "package-consumers"
+)
+PUBLIC_API_FIXTURE_ROOT = PACKAGE_CONSUMER_FIXTURE_ROOT / "public-api"
+REMOVED_DECODE_API_PATHS = (
+    "audio::AudioProcessor",
+    "audio::AudioClipConverter",
+    "audio::AudioClip",
+    "texture::TextureProcessor",
+    "texture::Texture2DConverter",
+    "texture::Texture2D",
+    "texture::TextureSwizzler",
+)
 
 
 def command_text(command: Sequence[str]) -> str:
@@ -103,6 +118,35 @@ def run_captured(
     if result.stderr.strip():
         print(result.stderr.rstrip(), file=sys.stderr)
     return result.stdout
+
+
+def repository_source_commit(
+    repository_root: Path, *, cwd: Path, environment: Mapping[str, str]
+) -> str:
+    """Return the exact source commit embedded into verified binary packages."""
+
+    commit = run_captured(
+        ["git", "-C", str(repository_root), "rev-parse", "--verify", "HEAD"],
+        cwd=cwd,
+        env=environment,
+    ).strip()
+    if GIT_OBJECT_PATTERN.fullmatch(commit) is None:
+        raise VerificationError(
+            f"repository HEAD is not a full lowercase Git commit ID: {commit!r}"
+        )
+    return commit
+
+
+def cargo_host_target(
+    cargo: str, *, cwd: Path, environment: Mapping[str, str]
+) -> str:
+    """Return the host target used by configuration-isolated binary installs."""
+
+    version = run_captured([cargo, "-vV"], cwd=cwd, env=environment)
+    hosts = [line.removeprefix("host: ") for line in version.splitlines() if line.startswith("host: ")]
+    if len(hosts) != 1 or BUILD_TARGET_PATTERN.fullmatch(hosts[0]) is None:
+        raise VerificationError(f"cargo -vV returned an invalid host target: {version!r}")
+    return hosts[0]
 
 
 def proxy_without_credentials(value: str) -> str | None:
@@ -218,7 +262,7 @@ def validate_archive_member(
     archive_path: Path,
     member: tarfile.TarInfo,
     expected_root_name: str,
-) -> PurePosixPath:
+) -> tuple[str, ...]:
     name = member.name[:-1] if member.isdir() and member.name.endswith("/") else member.name
     if "\\" in name:
         raise VerificationError(
@@ -234,18 +278,16 @@ def validate_archive_member(
             f"{archive_path}: archive member escapes expected root "
             f"{expected_root_name}: {member.name}"
         )
-    for component in parts:
-        try:
-            portable_path_component_key(component, "archive member")
-        except ReleasePathSafetyError as error:
-            raise VerificationError(
-                f"{archive_path}: archive member is not portable: {member.name}"
-            ) from error
     if not (member.isdir() or member.isfile()):
         raise VerificationError(
             f"{archive_path}: links and special files are forbidden: {member.name}"
         )
-    return PurePosixPath(*parts)
+    try:
+        return portable_path_alias_key(parts, "archive member")
+    except ReleasePathSafetyError as error:
+        raise VerificationError(
+            f"{archive_path}: archive member is not portable: {member.name}"
+        ) from error
 
 def unpack_archive(archive_path: Path, unpack_root: Path, package: WorkspacePackage) -> Path:
     expected_root_name = f"{package.name}-{package.version}"
@@ -255,17 +297,9 @@ def unpack_archive(archive_path: Path, unpack_root: Path, package: WorkspacePack
             members = archive.getmembers()
             portable_paths: set[tuple[str, ...]] = set()
             for member in members:
-                relative = validate_archive_member(
+                portable_key = validate_archive_member(
                     archive_path, member, expected_root_name
                 )
-                try:
-                    portable_key = portable_path_alias_key(
-                        relative.parts, "archive member"
-                    )
-                except ReleasePathSafetyError as error:
-                    raise VerificationError(
-                        f"{archive_path}: archive member is not portable: {member.name}"
-                    ) from error
                 if portable_key in portable_paths:
                     raise VerificationError(
                         f"{archive_path}: archive contains a portable path alias: "
@@ -339,8 +373,61 @@ def validate_packaged_manifest(package_root: Path, expected: WorkspacePackage) -
             )
 
 
+def validate_package_vcs_info(
+    package_root: Path,
+    *,
+    expected_source_commit: str,
+) -> None:
+    """Bind an unpacked Cargo archive to the repository commit that produced it."""
+
+    vcs_path = package_root / ".cargo_vcs_info.json"
+    try:
+        document = json.loads(vcs_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise VerificationError(
+            f"{vcs_path}: missing package VCS identity"
+        ) from error
+    except (OSError, json.JSONDecodeError) as error:
+        raise VerificationError(f"{vcs_path}: invalid package VCS identity: {error}") from error
+
+    git = document.get("git") if isinstance(document, dict) else None
+    if not isinstance(git, dict):
+        raise VerificationError(f"{vcs_path}: package VCS identity has no git object")
+    source_commit = git.get("sha1")
+    if not isinstance(source_commit, str) or GIT_OBJECT_PATTERN.fullmatch(source_commit) is None:
+        raise VerificationError(f"{vcs_path}: invalid git.sha1 in package VCS identity")
+    if source_commit != expected_source_commit:
+        raise VerificationError(
+            f"{vcs_path}: package commit {source_commit} does not match source commit "
+            f"{expected_source_commit}"
+        )
+    dirty = git.get("dirty", False)
+    if not isinstance(dirty, bool):
+        raise VerificationError(f"{vcs_path}: invalid git.dirty in package VCS identity")
+    if dirty:
+        raise VerificationError(f"{vcs_path}: package VCS identity marks the package dirty")
+
+
 def toml_string(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
+
+
+def render_consumer_dependency(
+    version: str,
+    feature_names: Sequence[str],
+    *,
+    default_features: bool = True,
+) -> str:
+    if not feature_names and default_features:
+        return toml_string("=" + version)
+    rendered_features = ", ".join(toml_string(feature) for feature in feature_names)
+    return (
+        "{ "
+        f"version = {toml_string('=' + version)}, "
+        f"default-features = {'true' if default_features else 'false'}, "
+        f"features = [{rendered_features}] "
+        "}"
+    )
 
 
 def relative_toml_path(path: Path, root: Path) -> str:
@@ -380,34 +467,40 @@ def consumer_package_name(target: WorkspacePackage, profile: str) -> str:
     return f"{CONSUMER_PACKAGE_PREFIX}-{profile}-{target.name}"
 
 
-def consumer_source(target: WorkspacePackage) -> str:
-    crate_name = target.library_target_name
-    if crate_name is None:
-        raise VerificationError(f"{target.name} has no library target for a consumer")
-    return f"//! External package-consumer compilation probe.\n\nuse {crate_name} as _;\n"
-
-
-def create_consumer(
-    consumer_root: Path,
+def consumer_source(
     target: WorkspacePackage,
     profile: str,
-    feature_names: Sequence[str],
     *,
-    default_features: bool = True,
-) -> tuple[str, Path]:
+    fixture_root: Path = PUBLIC_API_FIXTURE_ROOT,
+) -> str:
+    if target.library_target_name is None:
+        raise VerificationError(f"{target.name} has no library target for a consumer")
+    fixture_path = fixture_root / target.name / f"{profile}.rs"
+    try:
+        source = fixture_path.read_text(encoding="utf-8")
+    except OSError as error:
+        raise VerificationError(
+            f"missing public API consumer fixture for {target.name}/{profile}: "
+            f"{fixture_path}"
+        ) from error
+    if not source.strip():
+        raise VerificationError(
+            f"public API consumer fixture is empty for {target.name}/{profile}: "
+            f"{fixture_path}"
+        )
+    return source
+
+
+def write_consumer_package(
+    consumer_root: Path,
+    *,
+    name: str,
+    dependency_name: str,
+    dependency: str,
+    source: str,
+) -> Path:
     source_root = consumer_root / "src"
     source_root.mkdir(parents=True)
-    name = consumer_package_name(target, profile)
-    dependency = toml_string("=" + target.version)
-    if feature_names or not default_features:
-        rendered_features = ", ".join(toml_string(feature) for feature in feature_names)
-        dependency = (
-            "{ "
-            f"version = {toml_string('=' + target.version)}, "
-            f"default-features = {'true' if default_features else 'false'}, "
-            f"features = [{rendered_features}] "
-            "}"
-        )
     manifest = "\n".join(
         [
             "[package]",
@@ -417,100 +510,146 @@ def create_consumer(
             "publish = false",
             "",
             "[dependencies]",
-            f"{target.name} = {dependency}",
+            f"{dependency_name} = {dependency}",
             "",
         ]
     )
     manifest_path = consumer_root / "Cargo.toml"
     manifest_path.write_text(manifest, encoding="utf-8", newline="\n")
     (source_root / "lib.rs").write_text(
-        consumer_source(target),
+        source,
         encoding="utf-8",
         newline="\n",
+    )
+    return manifest_path
+
+
+def create_consumer(
+    consumer_root: Path,
+    target: WorkspacePackage,
+    profile: str,
+    feature_names: Sequence[str],
+    *,
+    default_features: bool = True,
+    fixture_root: Path = PUBLIC_API_FIXTURE_ROOT,
+) -> tuple[str, Path]:
+    name = consumer_package_name(target, profile)
+    manifest_path = write_consumer_package(
+        consumer_root,
+        name=name,
+        dependency_name=target.name,
+        dependency=render_consumer_dependency(
+            target.version,
+            feature_names,
+            default_features=default_features,
+        ),
+        source=consumer_source(target, profile, fixture_root=fixture_root),
     )
     return name, manifest_path
 
 
-def create_consumer_workspace(
+def create_consumer_suite(
     workspace_root: Path,
     closure: Sequence[WorkspacePackage],
     unpacked_packages: Mapping[str, Path],
-    profile: str,
-) -> tuple[Path, dict[str, Path], set[str]]:
-    consumers: dict[str, Path] = {}
+) -> tuple[
+    Path,
+    dict[str, Path],
+    set[str],
+    set[str],
+    set[str],
+]:
+    """Create one resolver graph while preserving per-consumer feature checks."""
+
+    packages = {package.name: package for package in closure}
+    consumer_manifests: dict[str, Path] = {}
+    positive_names: set[str] = set()
     required_internal: set[str] = set()
     for target in closure:
         if not target.is_library:
             continue
-        feature_names = target.feature_names if profile == "all-features" else ()
-        if profile == "all-features" and not feature_names:
-            continue
-        consumer_name = consumer_package_name(target, profile)
+        consumer_name = consumer_package_name(target, "default")
         name, manifest_path = create_consumer(
             workspace_root / consumer_name,
             target,
-            profile,
-            feature_names,
-            default_features=profile != "all-features",
+            "default",
+            (),
         )
-        consumers[name] = manifest_path
+        consumer_manifests[name] = manifest_path
+        positive_names.add(name)
         required_internal.add(target.name)
-    if not consumers:
-        raise VerificationError(f"consumer profile {profile} has no library targets")
-    manifest_path = write_workspace_manifest(
-        workspace_root,
-        [path.parent for path in consumers.values()],
-        unpacked_packages,
-    )
-    return manifest_path, consumers, required_internal
 
+    if not positive_names:
+        raise VerificationError("default consumer suite has no library targets")
 
-def create_documented_feature_consumer_workspace(
-    workspace_root: Path,
-    closure: Sequence[WorkspacePackage],
-    unpacked_packages: Mapping[str, Path],
-    profile: DocumentedFeatureProfile,
-) -> tuple[Path, dict[str, Path], set[str]]:
-    """Create one isolated consumer for an exact documented feature profile."""
-
-    packages = {package.name: package for package in closure}
-    target = packages.get(profile.package)
-    if target is None:
-        raise VerificationError(
-            f"documented feature profile {profile.name} package is outside the release closure"
+    for profile in validate_documented_feature_profiles(packages):
+        target = packages.get(profile.package)
+        if target is None:
+            raise VerificationError(
+                f"documented feature profile {profile.name} package is outside "
+                "the release closure"
+            )
+        consumer_name = consumer_package_name(target, profile.name)
+        name, manifest_path = create_consumer(
+            workspace_root / consumer_name,
+            target,
+            profile.name,
+            profile.features,
+            default_features=profile.default_features,
         )
-    consumer_name = consumer_package_name(target, profile.name)
-    name, manifest_path = create_consumer(
-        workspace_root / consumer_name,
-        target,
-        profile.name,
-        profile.features,
-        default_features=profile.default_features,
+        consumer_manifests[name] = manifest_path
+        positive_names.add(name)
+        required_internal.add(target.name)
+
+    target = packages.get("unity-asset-decode")
+    if target is None or not target.is_library or "full" not in target.feature_names:
+        raise VerificationError(
+            "removed decode API probes require the published unity-asset-decode/full surface"
+        )
+
+    removed_dependency = render_consumer_dependency(
+        target.version,
+        ("full",),
+        default_features=False,
     )
-    consumers = {name: manifest_path}
+    removed_name = f"{CONSUMER_PACKAGE_PREFIX}-removed-decode"
+    consumer_manifests[removed_name] = write_consumer_package(
+        workspace_root / removed_name,
+        name=removed_name,
+        dependency_name=target.name,
+        dependency=removed_dependency,
+        source="".join(
+            f"use unity_asset_decode::{symbol};\n"
+            for symbol in REMOVED_DECODE_API_PATHS
+        ),
+    )
+    removed_names = {removed_name}
+    required_internal.add(target.name)
+
+    required_packages = {
+        package.name: unpacked_packages[package.name]
+        for package in production_closure(sorted(required_internal), packages)
+    }
+
     workspace_manifest = write_workspace_manifest(
         workspace_root,
-        [manifest_path.parent],
-        unpacked_packages,
+        [path.parent for path in consumer_manifests.values()],
+        required_packages,
     )
-    return workspace_manifest, consumers, {target.name}
-
-
-def is_sha256_checksum(value: object) -> bool:
     return (
-        isinstance(value, str)
-        and len(value) == 64
-        and all(character in "0123456789abcdef" for character in value)
+        workspace_manifest,
+        consumer_manifests,
+        positive_names,
+        removed_names,
+        required_internal,
     )
 
 
 def validate_resolved_workspace(
     metadata_text: str,
-    repository_root: Path,
     local_manifests: Mapping[str, Path],
     unpacked_packages: Mapping[str, Path],
     expected_versions: Mapping[str, str],
-    locked_registry_packages: set[tuple[str, str, str]],
     registry_source_root: Path,
     required_internal: set[str],
 ) -> None:
@@ -533,6 +672,13 @@ def validate_resolved_workspace(
             raise VerificationError("cargo metadata contains an invalid resolve node")
         package_ids.add(node["id"])
 
+    resolved_local_manifests = {
+        name: path.resolve() for name, path in local_manifests.items()
+    }
+    resolved_unpacked_packages = {
+        name: path.resolve() for name, path in unpacked_packages.items()
+    }
+    resolved_registry_source_root = registry_source_root.resolve()
     seen_internal: set[str] = set()
     seen_local: set[str] = set()
     for package_id in package_ids:
@@ -549,23 +695,19 @@ def validate_resolved_workspace(
             raise VerificationError(f"missing manifest path for {package_id}")
         manifest_path = Path(raw_manifest_path).resolve()
 
-        if manifest_path.is_relative_to(repository_root):
-            raise VerificationError(
-                f"resolved graph leaked a repository checkout path: {manifest_path}"
-            )
         if name == "ignore":
             raise VerificationError("resolved graph contains forbidden package 'ignore'")
 
-        local_manifest = local_manifests.get(name)
+        local_manifest = resolved_local_manifests.get(name)
         if local_manifest is not None:
-            if manifest_path != local_manifest.resolve() or source is not None:
+            if manifest_path != local_manifest or source is not None:
                 raise VerificationError(
                     f"local verification package {name} did not resolve from its temp root"
                 )
             seen_local.add(name)
             continue
 
-        unpacked = unpacked_packages.get(name)
+        unpacked = resolved_unpacked_packages.get(name)
         if unpacked is not None:
             expected_version = expected_versions[name]
             if version != expected_version:
@@ -573,7 +715,7 @@ def validate_resolved_workspace(
                     f"internal package {name} resolved as {version}, expected "
                     f"{expected_version}"
                 )
-            if source is not None or not manifest_path.is_relative_to(unpacked.resolve()):
+            if source is not None or not manifest_path.is_relative_to(unpacked):
                 raise VerificationError(
                     f"internal package {name} did not resolve from its unpacked archive: "
                     f"{manifest_path} ({source})"
@@ -581,21 +723,12 @@ def validate_resolved_workspace(
             seen_internal.add(name)
             continue
 
-        if name == "globset" and source != CRATES_IO_SOURCE:
-            raise VerificationError(
-                f"globset resolved from a patch or path source: {source or manifest_path}"
-            )
         if source != CRATES_IO_SOURCE:
             raise VerificationError(
                 f"third-party package {name} {version} did not resolve from crates.io: "
                 f"{source or manifest_path}"
             )
-        if (name, version, source) not in locked_registry_packages:
-            raise VerificationError(
-                f"cargo metadata contains an unlocked registry package: "
-                f"{name} {version} ({source})"
-            )
-        if not manifest_path.is_relative_to(registry_source_root.resolve()):
+        if not manifest_path.is_relative_to(resolved_registry_source_root):
             raise VerificationError(
                 f"registry package {name} {version} resolved outside the isolated "
                 f"Cargo home: {manifest_path}"
@@ -613,66 +746,11 @@ def validate_resolved_workspace(
         )
 
 
-def validate_consumer_lock(
-    lock_path: Path,
-    internal_versions: Mapping[str, str],
-    local_package_names: set[str] | None = None,
-) -> set[tuple[str, str, str]]:
-    local_package_names = local_package_names or set()
-    document = load_toml(lock_path)
-    packages = document.get("package")
-    if not isinstance(packages, list):
-        raise VerificationError(f"{lock_path}: Cargo.lock contains no packages")
-
-    registry_packages: set[tuple[str, str, str]] = set()
-    for package in packages:
-        if not isinstance(package, dict):
-            raise VerificationError(f"{lock_path}: invalid package entry")
-        name = package.get("name")
-        version = package.get("version")
-        source = package.get("source")
-        checksum = package.get("checksum")
-        if not isinstance(name, str) or not isinstance(version, str):
-            raise VerificationError(f"{lock_path}: invalid package identity")
-        if name == "ignore":
-            raise VerificationError(f"{lock_path}: forbidden package 'ignore' was resolved")
-
-        if name in local_package_names:
-            if source is not None:
-                raise VerificationError(
-                    f"{lock_path}: local verification package {name} unexpectedly has a source"
-                )
-            continue
-
-        if name in internal_versions:
-            if version != internal_versions[name] or source is not None:
-                raise VerificationError(
-                    f"{lock_path}: internal package {name} must come from the unpacked "
-                    "archive at the expected version"
-                )
-            continue
-
-        if name == "globset" and source != CRATES_IO_SOURCE:
-            raise VerificationError(f"{lock_path}: globset resolved from a patch")
-        if source != CRATES_IO_SOURCE:
-            raise VerificationError(
-                f"{lock_path}: third-party package {name} {version} has non-crates.io "
-                f"source {source}"
-            )
-        if not is_sha256_checksum(checksum):
-            raise VerificationError(
-                f"{lock_path}: registry package {name} {version} has an invalid checksum"
-            )
-        registry_packages.add((name, version, source))
-    return registry_packages
-
-
 def verify_temporary_workspace(
     *,
     cargo: str,
     cargo_cwd: Path,
     environment: Mapping[str, str],
-    repository_root: Path,
     workspace_manifest: Path,
     local_manifests: Mapping[str, Path],
     unpacked_packages: Mapping[str, Path],
@@ -681,16 +759,6 @@ def verify_temporary_workspace(
     registry_source_root: Path,
     all_features: bool = False,
 ) -> None:
-    run_visible(
-        [cargo, "generate-lockfile", "--manifest-path", str(workspace_manifest)],
-        cwd=cargo_cwd,
-        env=environment,
-    )
-    locked_registry_packages = validate_consumer_lock(
-        workspace_manifest.parent / "Cargo.lock",
-        expected_versions,
-        set(local_manifests),
-    )
     metadata_command = [
         cargo,
         "metadata",
@@ -698,7 +766,6 @@ def verify_temporary_workspace(
         str(workspace_manifest),
         "--format-version",
         "1",
-        "--locked",
     ]
     if all_features:
         metadata_command.append("--all-features")
@@ -709,11 +776,9 @@ def verify_temporary_workspace(
     )
     validate_resolved_workspace(
         metadata_text,
-        repository_root,
         local_manifests,
         unpacked_packages,
         expected_versions,
-        locked_registry_packages,
         registry_source_root,
         required_internal,
     )
@@ -767,20 +832,70 @@ def check_consumer_packages(
         )
 
 
-def verify_binary_package_standalone(
+def check_removed_api_consumers(
     *,
     cargo: str,
     cargo_cwd: Path,
     environment: Mapping[str, str],
-    repository_root: Path,
+    workspace_manifest: Path,
+    consumer_names: Sequence[str],
+) -> None:
+    """Require every dedicated removed-API consumer to fail compilation."""
+
+    for consumer_name in sorted(consumer_names):
+        command = [
+            cargo,
+            "check",
+            "--manifest-path",
+            str(workspace_manifest),
+            "--package",
+            consumer_name,
+            "--lib",
+            "--locked",
+        ]
+        print(f"$ {command_text(command)}", flush=True)
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cargo_cwd,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=CARGO_COMMAND_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise VerificationError(
+                f"removed API probe timed out after {CARGO_COMMAND_TIMEOUT_SECONDS}s: "
+                f"{consumer_name}"
+            ) from error
+        if result.returncode == 0:
+            raise VerificationError(
+                f"removed API consumer unexpectedly compiled: {consumer_name}"
+            )
+
+
+def verify_binary_packages_standalone(
+    *,
+    cargo: str,
+    cargo_cwd: Path,
+    environment: Mapping[str, str],
     workspace_root: Path,
-    package: WorkspacePackage,
     packages: Mapping[str, WorkspacePackage],
     archive_paths: Mapping[str, Path],
     expected_versions: Mapping[str, str],
+    expected_source_commit: str,
+    expected_build_target: str,
     registry_source_root: Path,
 ) -> None:
-    closure = production_closure([package.name], packages)
+    binary_packages = tuple(
+        package for package in packages.values() if package.binary_target_names
+    )
+    if not binary_packages:
+        raise VerificationError("release closure has no binary packages")
+    closure = production_closure(
+        [package.name for package in binary_packages], packages
+    )
     package_root = workspace_root / "packages"
     package_root.mkdir(parents=True)
     unpacked_packages = {
@@ -791,90 +906,75 @@ def verify_binary_package_standalone(
     }
     manifest = write_workspace_manifest(
         workspace_root,
-        [unpacked_packages[package.name]],
+        [unpacked_packages[package.name] for package in binary_packages],
         unpacked_packages,
     )
-    required_internal = {package.name}
     verify_temporary_workspace(
         cargo=cargo,
         cargo_cwd=cargo_cwd,
         environment=environment,
-        repository_root=repository_root,
         workspace_manifest=manifest,
         local_manifests={},
         unpacked_packages=unpacked_packages,
         expected_versions=expected_versions,
-        required_internal=required_internal,
+        required_internal=set(unpacked_packages),
         registry_source_root=registry_source_root,
         all_features=False,
     )
-    verify_temporary_workspace(
-        cargo=cargo,
-        cargo_cwd=cargo_cwd,
-        environment=environment,
-        repository_root=repository_root,
-        workspace_manifest=manifest,
-        local_manifests={},
-        unpacked_packages=unpacked_packages,
-        expected_versions=expected_versions,
-        required_internal=required_internal,
-        registry_source_root=registry_source_root,
-        all_features=True,
-    )
-    check_temporary_workspace(
-        cargo=cargo,
-        cargo_cwd=cargo_cwd,
-        environment=environment,
-        workspace_manifest=manifest,
-        all_features=False,
-        target_arguments=("--bins",),
-    )
-    check_temporary_workspace(
-        cargo=cargo,
-        cargo_cwd=cargo_cwd,
-        environment=environment,
-        workspace_manifest=manifest,
-        all_features=True,
-        target_arguments=("--bins",),
-    )
-    run_visible(
-        [
-            cargo,
-            "install",
-            "--path",
-            str(unpacked_packages[package.name]),
-            "--root",
-            str(workspace_root / "install-root"),
-            "--locked",
-            "--force",
-        ],
-        cwd=cargo_cwd,
-        env=environment,
-    )
+    install_root = workspace_root / "install-root"
+    executable_suffix = ".exe" if os.name == "nt" else ""
+    for package in binary_packages:
+        run_visible(
+            [
+                cargo,
+                "install",
+                "--path",
+                str(unpacked_packages[package.name]),
+                "--root",
+                str(install_root),
+                "--locked",
+            ],
+            cwd=cargo_cwd,
+            env=environment,
+        )
+        for target_name in package.binary_target_names:
+            executable = install_root / "bin" / f"{target_name}{executable_suffix}"
+            if executable.is_symlink() or not executable.is_file():
+                raise VerificationError(
+                    "installed binary target is missing or not a regular file: "
+                    f"{executable}"
+                )
+            actual = run_captured(
+                [str(executable), "--version"], cwd=cargo_cwd, env=environment
+            )
+            expected = (
+                f"{target_name} "
+                f"{version_report(package.name, package.version, expected_source_commit, expected_build_target)}\n"
+            )
+            if actual != expected:
+                raise VerificationError(
+                    f"installed binary {target_name} reported unexpected build identity: "
+                    f"expected {expected.strip()!r}, got {actual.strip()!r}"
+                )
 
 
-def run_full_verification(
+def run_verification(
     *,
     cargo: str,
     workspace_root: Path,
     closure: Sequence[WorkspacePackage],
+    verify_binaries: bool,
 ) -> None:
     cargo_cwd = configuration_clean_cargo_cwd(workspace_root)
     with tempfile.TemporaryDirectory(
         prefix="unity-asset-workspace-package-", ignore_cleanup_errors=True
-    ) as temporary, tempfile.TemporaryDirectory(
-        prefix="unity-asset-binary-package-", ignore_cleanup_errors=True
-    ) as binary_temporary:
+    ) as temporary:
         temporary_root = Path(temporary).resolve()
-        binary_temporary_root = Path(binary_temporary).resolve()
         cargo_home = temporary_root / "cargo-home"
         package_target = temporary_root / "package-target"
         archive_workspace_root = temporary_root / "archives"
         unpack_root = archive_workspace_root / "packages"
         consumer_workspace_root = temporary_root / "consumers"
-        # `cargo install --path` discovers configuration from the package path,
-        # so binary probes need a root outside the deliberately poisoned tree.
-        standalone_workspace_root = binary_temporary_root / "standalone"
         verification_target = temporary_root / "verification-target"
         cargo_home.mkdir()
         unpack_root.mkdir(parents=True)
@@ -888,6 +988,13 @@ def run_full_verification(
         )
 
         package_environment = isolated_cargo_environment(cargo_home, package_target)
+        source_commit = (
+            repository_source_commit(
+                workspace_root, cwd=cargo_cwd, environment=package_environment
+            )
+            if verify_binaries
+            else None
+        )
         archive_paths: dict[str, Path] = {}
         unpacked: dict[str, Path] = {}
         source_packages = {package.name: package for package in closure}
@@ -901,14 +1008,20 @@ def run_full_verification(
                 package.name,
                 "--locked",
                 "--no-verify",
-                "--allow-dirty",
             ]
-            for name in sorted(unpacked):
-                source_root = source_packages[name].directory.resolve()
+            if not verify_binaries:
+                command.append("--allow-dirty")
+            package_dependencies = production_closure(
+                [package.name], source_packages
+            )
+            for dependency in package_dependencies:
+                if dependency.name == package.name:
+                    continue
+                source_root = dependency.directory.resolve()
                 command.extend(
                     [
                         "--config",
-                        f"patch.crates-io.{name}.path="
+                        f"patch.crates-io.{dependency.name}.path="
                         f"{toml_string(source_root.as_posix())}",
                     ]
                 )
@@ -920,6 +1033,11 @@ def run_full_verification(
             archive_path = locate_archive(package_target, package)
             package_root = unpack_archive(archive_path, unpack_root, package)
             validate_packaged_manifest(package_root, package)
+            if source_commit is not None:
+                validate_package_vcs_info(
+                    package_root,
+                    expected_source_commit=source_commit,
+                )
             archive_paths[package.name] = archive_path
             unpacked[package.name] = package_root
 
@@ -936,20 +1054,13 @@ def run_full_verification(
             cargo=cargo,
             cargo_cwd=cargo_cwd,
             environment=verification_environment,
-            repository_root=workspace_root,
             workspace_manifest=archive_manifest,
             local_manifests={},
             unpacked_packages=unpacked,
             expected_versions=versions,
             required_internal=set(unpacked),
             registry_source_root=cargo_home / "registry" / "src",
-        )
-        check_temporary_workspace(
-            cargo=cargo,
-            cargo_cwd=cargo_cwd,
-            environment=verification_environment,
-            workspace_manifest=archive_manifest,
-            all_features=False,
+            all_features=True,
         )
         check_temporary_workspace(
             cargo=cargo,
@@ -959,75 +1070,63 @@ def run_full_verification(
             all_features=True,
         )
 
-        for package in closure:
-            if not package.binary_target_names:
-                continue
-            verify_binary_package_standalone(
-                cargo=cargo,
-                cargo_cwd=cargo_cwd,
-                environment=verification_environment,
-                repository_root=workspace_root,
-                workspace_root=standalone_workspace_root / package.name,
-                package=package,
-                packages=source_packages,
-                archive_paths=archive_paths,
-                expected_versions=versions,
-                registry_source_root=cargo_home / "registry" / "src",
-            )
-
-        for profile in ("default", "all-features"):
-            consumer_manifest, consumers, required_internal = create_consumer_workspace(
-                consumer_workspace_root / profile,
-                closure,
-                unpacked,
-                profile,
-            )
-            verify_temporary_workspace(
-                cargo=cargo,
-                cargo_cwd=cargo_cwd,
-                environment=verification_environment,
-                repository_root=workspace_root,
-                workspace_manifest=consumer_manifest,
-                local_manifests=consumers,
-                unpacked_packages=unpacked,
-                expected_versions=versions,
-                required_internal=required_internal,
-                registry_source_root=cargo_home / "registry" / "src",
-            )
-            check_consumer_packages(
-                cargo=cargo,
-                cargo_cwd=cargo_cwd,
-                environment=verification_environment,
-                workspace_manifest=consumer_manifest,
-                consumer_names=tuple(consumers),
-            )
-
-        for profile in validate_documented_feature_profiles(source_packages):
-            profile_root = consumer_workspace_root / profile.name
-            consumer_manifest, consumers, required_internal = (
-                create_documented_feature_consumer_workspace(
-                    profile_root,
-                    closure,
-                    unpacked,
-                    profile,
+        if source_commit is not None:
+            # `cargo install --path` discovers configuration from the package path,
+            # so binary probes need a root outside the deliberately poisoned tree.
+            with tempfile.TemporaryDirectory(
+                prefix="unity-asset-binary-package-", ignore_cleanup_errors=True
+            ) as binary_temporary:
+                verify_binary_packages_standalone(
+                    cargo=cargo,
+                    cargo_cwd=cargo_cwd,
+                    environment=verification_environment,
+                    workspace_root=Path(binary_temporary).resolve() / "standalone",
+                    packages=source_packages,
+                    archive_paths=archive_paths,
+                    expected_versions=versions,
+                    expected_source_commit=source_commit,
+                    expected_build_target=cargo_host_target(
+                        cargo,
+                        cwd=cargo_cwd,
+                        environment=verification_environment,
+                    ),
+                    registry_source_root=cargo_home / "registry" / "src",
                 )
-            )
-            verify_temporary_workspace(
+
+        (
+            consumer_manifest,
+            consumer_manifests,
+            positive_names,
+            removed_names,
+            required_internal,
+        ) = create_consumer_suite(
+            consumer_workspace_root,
+            closure,
+            unpacked,
+        )
+        verify_temporary_workspace(
+            cargo=cargo,
+            cargo_cwd=cargo_cwd,
+            environment=verification_environment,
+            workspace_manifest=consumer_manifest,
+            local_manifests=consumer_manifests,
+            unpacked_packages=unpacked,
+            expected_versions=versions,
+            required_internal=required_internal,
+            registry_source_root=cargo_home / "registry" / "src",
+        )
+        check_consumer_packages(
+            cargo=cargo,
+            cargo_cwd=cargo_cwd,
+            environment=verification_environment,
+            workspace_manifest=consumer_manifest,
+            consumer_names=tuple(positive_names),
+        )
+        if verify_binaries:
+            check_removed_api_consumers(
                 cargo=cargo,
                 cargo_cwd=cargo_cwd,
                 environment=verification_environment,
-                repository_root=workspace_root,
                 workspace_manifest=consumer_manifest,
-                local_manifests=consumers,
-                unpacked_packages=unpacked,
-                expected_versions=versions,
-                required_internal=required_internal,
-                registry_source_root=cargo_home / "registry" / "src",
-            )
-            check_consumer_packages(
-                cargo=cargo,
-                cargo_cwd=cargo_cwd,
-                environment=verification_environment,
-                workspace_manifest=consumer_manifest,
-                consumer_names=tuple(consumers),
+                consumer_names=tuple(removed_names),
             )

@@ -4,9 +4,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use unity_asset::extraction::{ExistingOutputPolicy, ExtractionFailurePolicy};
 
 #[derive(Parser)]
-#[command(name = "unity_asset")]
+#[command(name = "unity-asset")]
 #[command(about = "Typed Unity asset workspace and extraction tools")]
-#[command(version)]
+#[command(version = crate::build_identity::VERSION_REPORT)]
 pub(crate) struct Cli {
     /// Fail-fast TypeTree parsing.
     #[arg(long)]

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -30,18 +31,16 @@ DISTRIBUTED_APPLICATION_NAMES = (
     "unity-asset-search-daemon",
 )
 
-DISTRIBUTION_TARGET_TRIPLES = (
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "x86_64-unknown-linux-musl",
-)
-
 DISTRIBUTION_RUNNER_TARGETS = (
-    ("ubuntu-latest", ("x86_64-unknown-linux-musl",)),
-    ("windows-latest", ("x86_64-pc-windows-msvc",)),
-    ("macos-latest", ("aarch64-apple-darwin", "x86_64-apple-darwin")),
+    ("ubuntu-latest", "x86_64-unknown-linux-musl"),
+    ("windows-latest", "x86_64-pc-windows-msvc"),
+    ("macos-latest", "aarch64-apple-darwin"),
+    ("macos-15-intel", "x86_64-apple-darwin"),
 )
+DISTRIBUTION_TARGET_TRIPLES = tuple(
+    target for _, target in DISTRIBUTION_RUNNER_TARGETS
+)
+GIT_OBJECT_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
 class ReleaseContractError(RuntimeError):
@@ -61,21 +60,14 @@ class DistributionArtifactPair:
 def github_distribution_matrix() -> Mapping[str, Any]:
     """Return the workflow matrix derived from the reviewed target inventory."""
 
-    flattened = tuple(
-        target
-        for _, targets in DISTRIBUTION_RUNNER_TARGETS
-        for target in targets
-    )
-    if set(flattened) != set(DISTRIBUTION_TARGET_TRIPLES) or len(flattened) != len(
-        DISTRIBUTION_TARGET_TRIPLES
-    ):
-        raise ReleaseContractError(
-            "distribution runner matrix does not exactly cover the target inventory"
-        )
     return {
         "include": [
-            {"os": runner, "targets": ",".join(targets)}
-            for runner, targets in DISTRIBUTION_RUNNER_TARGETS
+            {
+                "os": runner,
+                "target": target,
+                "applications": " ".join(DISTRIBUTED_APPLICATION_NAMES),
+            }
+            for runner, target in DISTRIBUTION_RUNNER_TARGETS
         ]
     }
 

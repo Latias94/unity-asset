@@ -130,7 +130,7 @@ impl Dispatcher {
         let response = match operation {
             RequestOperation::Capabilities(_) => {
                 Ok(ResponseOperation::Capabilities(CapabilitiesResponse {
-                    daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    daemon_version: crate::build_identity::VERSION_REPORT.to_owned(),
                     capabilities: SearchCapabilities::current(),
                 }))
             }

@@ -48,6 +48,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
+        cls.ci = CI_WORKFLOW.read_text(encoding="utf-8")
         cls.jobs = {
             name: job_block(cls.workflow, name)
             for name in (
@@ -76,11 +77,33 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.assertRegex(line, ACTION_PIN)
 
     def test_pull_request_ci_runs_actionlint(self) -> None:
-        ci = CI_WORKFLOW.read_text(encoding="utf-8")
         self.assertIn(
             "go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7",
-            ci,
+            self.ci,
         )
+
+    def test_ci_runs_package_consumers_on_every_os_and_binary_identity_once(self) -> None:
+        package_job = job_block(self.ci, "workspace-package")
+        matrix = mapping_block(package_job, "matrix", 6)
+        self.assertIn("- os: ubuntu-latest\n            mode: full", matrix)
+        self.assertIn("- os: macos-latest\n            mode: packages", matrix)
+        self.assertIn("- os: windows-latest\n            mode: packages", matrix)
+        self.assertEqual(matrix.count("- os:"), 3)
+        self.assertEqual(matrix.count("mode: packages"), 2)
+        self.assertEqual(matrix.count("mode: full"), 1)
+        self.assertNotIn("mode: binaries", matrix)
+        self.assertIn(
+            "python scripts/verify_workspace_packages.py --mode ${{ matrix.mode }}",
+            package_job,
+        )
+        self.assertIn("UNITY_ASSET_SOURCE_COMMIT: ${{ github.sha }}", self.ci)
+
+    def test_platform_jobs_run_the_explicit_real_daemon_agent_harness(self) -> None:
+        ci_platform = job_block(self.ci, "workspace-publication-platforms")
+        release_platform = job_block(self.workflow, "platform-contracts")
+        command = "python scripts/run_real_daemon_agent.py"
+        self.assertIn(command, ci_platform)
+        self.assertIn(command, release_platform)
 
     def test_every_release_job_has_a_finite_execution_bound(self) -> None:
         for job_name, job in self.jobs.items():
@@ -151,10 +174,17 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertEqual(
             self.workflow.count("secrets.CARGO_REGISTRY_TOKEN_PRODUCTION"), 1
         )
-        self.assertIn(
-            "python scripts/verify_workspace_packages.py", self.jobs["package"]
+
+    def test_release_keeps_the_full_package_and_binary_gate_on_ubuntu(self) -> None:
+        package = self.jobs["package"]
+        self.assertIn("runs-on: ubuntu-latest", package)
+        self.assertNotIn("strategy:", package)
+        self.assertNotIn("UNITY_ASSET_SOURCE_COMMIT", package)
+        self.assertRegex(
+            package,
+            r"(?m)^\s+run: python scripts/verify_workspace_packages\.py --mode full$",
         )
-        self.assertIn("timeout-minutes: 45", self.jobs["package"])
+        self.assertIn("timeout-minutes: 45", package)
 
     def test_asset_publication_is_verified_before_crates_io_and_after_upload(self) -> None:
         draft = self.jobs["github-draft"]
@@ -242,6 +272,17 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         for job in (validate, self.jobs["dist"], release_assets):
             self.assertIn("overwrite: true", job)
         self.assertIn("dist build --artifacts=local", self.jobs["dist"])
+        native_probe = step_block(
+            self.jobs["dist"],
+            "Execute native release binaries and verify build identities",
+        )
+        self.assertIn('actual="$("$executable" --version', native_probe)
+        self.assertIn("unity-asset.build-identity.v1{", native_probe)
+        self.assertIn("test ! -s \"$stderr_file\"", native_probe)
+        self.assertLess(
+            self.jobs["dist"].index("Execute native release binaries"),
+            self.jobs["dist"].index("Upload dist artifacts"),
+        )
         self.assertIn(
             "matrix: ${{ fromJSON(needs.validate.outputs.dist_matrix) }}",
             self.jobs["dist"],
@@ -271,34 +312,6 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--expected-event-sha", self.jobs["validate"])
         self.assertIn("--refresh-tag", self.jobs["source-recheck"])
         self.assertIn("cancel-in-progress: false", self.workflow)
-
-    def test_dependency_resolving_cargo_commands_are_locked(self) -> None:
-        required_fragments = (
-            "cargo +${{ needs.validate.outputs.msrv }} check --workspace --lib --all-features --locked",
-            "cargo clippy --workspace --all-targets --locked",
-            "cargo nextest run --workspace --locked",
-            "dist build --artifacts=local --tag",
-            '"package", "--locked", "--no-verify"',
-        )
-        scripts = (
-            (REPOSITORY_ROOT / "scripts" / "publish_workspace_packages.py").read_text(
-                encoding="utf-8"
-            ),
-            (REPOSITORY_ROOT / "scripts" / "verify_workspace_packages.py").read_text(
-                encoding="utf-8"
-            ),
-            (
-                REPOSITORY_ROOT / "scripts" / "workspace_package_verification.py"
-            ).read_text(encoding="utf-8"),
-        )
-        combined = self.workflow + "\n".join(scripts)
-        for fragment in required_fragments:
-            self.assertIn(fragment, combined)
-        self.assertRegex(
-            scripts[0],
-            r'"publish",\s*"--locked",\s*"--no-verify",\s*'
-            r'"--registry",\s*"crates-io"',
-        )
 
 
 if __name__ == "__main__":

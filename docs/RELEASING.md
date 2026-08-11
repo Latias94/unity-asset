@@ -40,15 +40,22 @@ step.
 
    ```text
    cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets --locked -- -D warnings
+   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
    cargo nextest run --workspace --locked
-   python scripts/verify_workspace_packages.py
+   cargo nextest run --workspace --all-features --locked
+   cargo build --workspace --all-targets --locked
+   cargo doc --workspace --all-features --no-deps --locked
+   python scripts/run_real_daemon_agent.py
+   python scripts/verify_workspace_packages.py --mode packages
    ```
 
-   The package verifier intentionally takes longer than an ordinary build: it
-   packages every publishable crate, unpacks the archives, and builds isolated
-   consumers for default, all-feature, and explicitly documented feature
-   profiles that may use only those archives and crates.io dependencies.
+   Package mode packages every publishable crate, unpacks the archives, and
+   builds isolated consumers for default and explicitly documented feature
+   profiles. CI runs that platform-sensitive proof on macOS and Windows; Ubuntu
+   additionally installs each published binary from the same archive closure.
+   `--mode full` is reserved for a clean commit because its binary source identity
+   must describe the exact packaged bytes. Use `--mode preflight` for the fast
+   metadata and dependency-policy check.
 5. Commit the release source. Do not modify the commit after tagging it.
 6. Create and push the signed tag. The tag push is deliberately inert and
    cannot publish crates or a GitHub Release:

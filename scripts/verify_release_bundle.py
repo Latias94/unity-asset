@@ -12,8 +12,12 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from protocol_sdk_bundle import ProtocolSdkBundleError, verify_protocol_sdk_bundle
-from release_contract import ReleaseContractError, validate_local_dist_plan
-from release_evidence import ReleaseEvidenceError, load_release_evidence
+from release_binary_identity import (
+    ReleaseBinaryIdentityError,
+    verify_release_binary_identity,
+)
+from release_contract import ReleaseContractError, validate_local_dist_plan_matrix
+from release_evidence import ReleaseEvidenceError, TAG_PATTERN, load_release_evidence
 from release_metadata import ReleaseMetadataError, verify_metadata_files
 from release_path_safety import (
     ReleasePathSafetyError,
@@ -22,7 +26,6 @@ from release_path_safety import (
 )
 
 
-TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 CHECKSUM_LINE_PATTERN = re.compile(r"([0-9a-f]{64})  ([^\r\n]+)\n")
 
 
@@ -86,7 +89,9 @@ def read_json(path: Path, label: str) -> Mapping[str, Any]:
     return document
 
 
-def verify_checksum_manifest(files: Mapping[str, Path]) -> None:
+def verify_checksum_manifest(
+    files: Mapping[str, Path], digests: Mapping[str, str]
+) -> None:
     manifest = files.get("SHA256SUMS")
     if manifest is None:
         raise ReleaseBundleError("release bundle omitted SHA256SUMS")
@@ -104,11 +109,15 @@ def verify_checksum_manifest(files: Mapping[str, Path]) -> None:
     if set(entries) != expected_names:
         raise ReleaseBundleError("SHA256SUMS inventory does not match release assets")
     for name, expected_digest in entries.items():
-        if sha256_file(files[name]) != expected_digest:
+        if digests[name] != expected_digest:
             raise ReleaseBundleError(f"SHA256SUMS digest mismatch for {name}")
 
 
-def verify_sidecars(files: Mapping[str, Path], dist_artifacts: Sequence[str]) -> None:
+def verify_sidecars(
+    files: Mapping[str, Path],
+    dist_artifacts: Sequence[str],
+    digests: Mapping[str, str],
+) -> None:
     for checksum_name in sorted(
         name for name in dist_artifacts if name.endswith(".sha256")
     ):
@@ -119,7 +128,7 @@ def verify_sidecars(files: Mapping[str, Path], dist_artifacts: Sequence[str]) ->
             raise ReleaseBundleError(
                 f"cannot read dist checksum sidecar {checksum_name}: {error}"
             ) from error
-        expected = f"{sha256_file(files[archive_name])}  {archive_name}\n"
+        expected = f"{digests[archive_name]}  {archive_name}\n"
         if encoded != expected:
             raise ReleaseBundleError(
                 f"dist checksum sidecar does not match {archive_name}"
@@ -139,6 +148,11 @@ def verify_release_bundle(
         raise ReleaseBundleError(f"invalid stable release tag: {tag!r}")
     version = ".".join(match.groups())
     files = regular_files(assets)
+    digests = {
+        name: sha256_file(path)
+        for name, path in files.items()
+        if name != "SHA256SUMS"
+    }
     required = {"release-evidence.json", "release-dist-plan.json", "SHA256SUMS"}
     if not required.issubset(files):
         raise ReleaseBundleError(
@@ -157,13 +171,22 @@ def verify_release_bundle(
         raise ReleaseBundleError(f"invalid release evidence: {error}") from error
 
     dist_plan_path = files["release-dist-plan.json"]
-    if sha256_file(dist_plan_path) != evidence.dist_plan_sha256:
+    if digests["release-dist-plan.json"] != evidence.dist_plan_sha256:
         raise ReleaseBundleError("release dist plan digest does not match release evidence")
     dist_plan = read_json(dist_plan_path, "release dist plan")
     try:
-        dist_artifacts = validate_local_dist_plan(dist_plan, tag=tag, version=version)
+        dist_matrix = validate_local_dist_plan_matrix(
+            dist_plan, tag=tag, version=version
+        )
     except ReleaseContractError as error:
         raise ReleaseBundleError(f"invalid release dist plan: {error}") from error
+    dist_artifacts = tuple(
+        sorted(
+            name
+            for pair in dist_matrix
+            for name in (pair.archive_name, pair.checksum_name)
+        )
+    )
     if evidence.dist_artifacts != tuple(dist_artifacts):
         raise ReleaseBundleError("release evidence does not bind the dist inventory")
 
@@ -208,8 +231,19 @@ def verify_release_bundle(
     }
     if set(files) != expected_names:
         raise ReleaseBundleError("release bundle inventory does not match release evidence")
-    verify_sidecars(files, dist_artifacts)
-    verify_checksum_manifest(files)
+    verify_sidecars(files, dist_artifacts, digests)
+    verify_checksum_manifest(files, digests)
+    for pair in dist_matrix:
+        try:
+            verify_release_binary_identity(
+                files[pair.archive_name],
+                application=pair.application,
+                target=pair.target,
+                version=evidence.version,
+                source_commit=evidence.commit,
+            )
+        except ReleaseBinaryIdentityError as error:
+            raise ReleaseBundleError(str(error)) from error
 
 
 def main(argv: Sequence[str] | None = None) -> int:

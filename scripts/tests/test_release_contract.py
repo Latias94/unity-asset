@@ -10,58 +10,26 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_ROOT = REPOSITORY_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from release_contract import (  # noqa: E402
     CARGO_DIST_VERSION,
     DISTRIBUTED_APPLICATION_NAMES,
+    DISTRIBUTION_RUNNER_TARGETS,
     DISTRIBUTION_TARGET_TRIPLES,
     PUBLISHABLE_PACKAGE_NAMES,
     ReleaseContractError,
     github_distribution_matrix,
     validate_local_dist_plan,
 )
-
-
-def artifact_name(application: str, target: str) -> str:
-    extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
-    return f"{application}-{target}{extension}"
+from release_evidence_support import (  # noqa: E402
+    dist_artifact_name as artifact_name,
+    make_dist_plan,
+)
 
 
 def valid_dist_plan() -> dict[str, object]:
-    artifacts: dict[str, object] = {}
-    releases: list[dict[str, object]] = []
-    for application in DISTRIBUTED_APPLICATION_NAMES:
-        release_artifacts: list[str] = []
-        for target in DISTRIBUTION_TARGET_TRIPLES:
-            name = artifact_name(application, target)
-            checksum = f"{name}.sha256"
-            artifacts[name] = {
-                "name": name,
-                "kind": "executable-zip",
-                "target_triples": [target],
-                "checksum": checksum,
-            }
-            artifacts[checksum] = {
-                "name": checksum,
-                "kind": "checksum",
-                "target_triples": [target],
-            }
-            release_artifacts.extend((name, checksum))
-        releases.append(
-            {
-                "app_name": application,
-                "app_version": "0.4.0",
-                "artifacts": release_artifacts,
-            }
-        )
-    return {
-        "dist_version": CARGO_DIST_VERSION,
-        "announcement_tag": "v0.4.0",
-        "announcement_tag_is_implicit": False,
-        "announcement_is_prerelease": False,
-        "artifacts": artifacts,
-        "releases": releases,
-    }
+    return make_dist_plan(tag="v0.4.0", version="0.4.0")
 
 
 class ReleaseContractTests(unittest.TestCase):
@@ -101,13 +69,18 @@ class ReleaseContractTests(unittest.TestCase):
 
     def test_github_runner_matrix_exactly_covers_the_target_inventory(self) -> None:
         matrix = github_distribution_matrix()
-        targets = [
-            target
-            for entry in matrix["include"]
-            for target in entry["targets"].split(",")
-        ]
+        targets = [entry["target"] for entry in matrix["include"]]
         self.assertEqual(set(targets), set(DISTRIBUTION_TARGET_TRIPLES))
         self.assertEqual(len(targets), len(DISTRIBUTION_TARGET_TRIPLES))
+        self.assertTrue(
+            all(
+                entry["applications"].split()
+                == list(DISTRIBUTED_APPLICATION_NAMES)
+                for entry in matrix["include"]
+            )
+        )
+        self.assertIn(("macos-latest", "aarch64-apple-darwin"), DISTRIBUTION_RUNNER_TARGETS)
+        self.assertIn(("macos-15-intel", "x86_64-apple-darwin"), DISTRIBUTION_RUNNER_TARGETS)
 
     def test_rejects_implicit_release_tags(self) -> None:
         plan = valid_dist_plan()
