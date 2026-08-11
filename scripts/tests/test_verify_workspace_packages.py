@@ -311,24 +311,29 @@ class PackageVerifierRejectionTests(unittest.TestCase):
 
             self.assertTrue(workspace.is_file())
             self.assertEqual(len(positive), 4)
-            self.assertEqual(len(consumers), 5)
+            self.assertEqual(
+                len(consumers), 4 + len(verifier.REMOVED_DECODE_API_PATHS)
+            )
             self.assertTrue(removed.isdisjoint(positive))
             self.assertTrue(removed.issubset(consumers))
-            self.assertEqual(len(removed), 1)
+            self.assertEqual(len(removed), len(verifier.REMOVED_DECODE_API_PATHS))
             self.assertEqual(required, {"unity-asset-decode", "unity-asset"})
-            removed_name = next(iter(removed))
-            removed_manifest = consumers[removed_name].read_text(encoding="utf-8")
-            self.assertIn('default-features = false', removed_manifest)
-            self.assertIn('features = ["full"]', removed_manifest)
             self.assertEqual(
-                (consumers[removed_name].parent / "src" / "lib.rs").read_text(
-                    encoding="utf-8"
-                ),
-                "".join(
+                {
+                    (
+                        consumers[name].parent / "src" / "lib.rs"
+                    ).read_text(encoding="utf-8")
+                    for name in removed
+                },
+                {
                     f"use unity_asset_decode::{path};\n"
                     for path in verifier.REMOVED_DECODE_API_PATHS
-                )
+                },
             )
+            for name in removed:
+                removed_manifest = consumers[name].read_text(encoding="utf-8")
+                self.assertIn('default-features = false', removed_manifest)
+                self.assertIn('features = ["full"]', removed_manifest)
 
     def test_removed_api_probe_accepts_any_compile_failure(self) -> None:
         result = mock.Mock(

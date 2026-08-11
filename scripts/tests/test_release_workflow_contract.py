@@ -276,9 +276,15 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.jobs["dist"],
             "Execute native release binaries and verify build identities",
         )
+        self.assertIn(
+            'archive="target/distrib/$application-$target$extension"', native_probe
+        )
+        self.assertIn("shutil.unpack_archive", native_probe)
+        self.assertIn('test "$executable_count" -eq 1', native_probe)
         self.assertIn('actual="$("$executable" --version', native_probe)
         self.assertIn("unity-asset.build-identity.v1{", native_probe)
         self.assertIn("test ! -s \"$stderr_file\"", native_probe)
+        self.assertNotIn('target/$target/release/$application', native_probe)
         self.assertLess(
             self.jobs["dist"].index("Execute native release binaries"),
             self.jobs["dist"].index("Upload dist artifacts"),

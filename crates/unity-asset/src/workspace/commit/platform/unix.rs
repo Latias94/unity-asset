@@ -97,9 +97,15 @@ pub(super) const DIRECTORY_VISIT_SETUP_BYTES: u64 = 0;
 )))]
 pub(super) const DIRECTORY_VISIT_ENTRY_BYTES: u64 = 0;
 
-const DIRECTORY_FLAGS: OFlags =
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-const REGULAR_FILE_FLAGS: OFlags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+const DIRECTORY_FLAGS: OFlags = OFlags::from_bits_retain(
+    OFlags::RDONLY.bits()
+        | OFlags::DIRECTORY.bits()
+        | OFlags::NOFOLLOW.bits()
+        | OFlags::CLOEXEC.bits(),
+);
+const REGULAR_FILE_FLAGS: OFlags = OFlags::from_bits_retain(
+    OFlags::RDONLY.bits() | OFlags::NOFOLLOW.bits() | OFlags::CLOEXEC.bits(),
+);
 
 /// Stable Unix identity captured from an opened publication source.
 ///
@@ -1760,7 +1766,7 @@ fn atomic_replace_verified_opened(
             AtFlags::SYMLINK_NOFOLLOW,
         )
         .map_err(io::Error::from)?;
-        if identity(&promoted) != expected_source {
+        if identity(&promoted) != *expected_source {
             return Err(io::Error::new(
                 io::ErrorKind::Interrupted,
                 "atomic publication destination does not match the promoted source identity",

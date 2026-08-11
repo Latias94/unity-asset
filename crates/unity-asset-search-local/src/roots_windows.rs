@@ -550,10 +550,10 @@ pub(super) fn discover(
             }
         })?;
     stable_parent_security
-        .verify_owner_controlled_parent(base.raw())
+        .verify_trusted_ancestor(base.raw())
         .map_err(|source| PrivateRootsError::Filesystem {
             kind: super::PrivateRootKind::Runtime,
-            operation: "validate LocalAppData ownership and DACL",
+            operation: "validate LocalAppData trust boundary",
             path: base_path.clone(),
             source,
         })?;
@@ -1273,25 +1273,6 @@ impl PrivateSecurityDescriptor {
 
     pub(crate) fn verify_handle(&self, handle: HANDLE) -> io::Result<()> {
         self.verify(handle)
-    }
-
-    fn verify_owner_controlled_parent(&self, handle: HANDLE) -> io::Result<()> {
-        let snapshot = SecuritySnapshot::capture(handle)?;
-        let view = snapshot.view()?;
-        // SAFETY: both SIDs are validated and retained by their respective allocations.
-        if unsafe { EqualSid(view.owner, self.owner_sid()) } == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Windows directory is not owned by the effective user",
-            ));
-        }
-        verify_parent_dacl(
-            &snapshot,
-            &view,
-            self.owner_sid(),
-            self.principal_sid(),
-            self.trusted_installer_sid(),
-        )
     }
 
     fn verify_trusted_ancestor(&self, handle: HANDLE) -> io::Result<()> {

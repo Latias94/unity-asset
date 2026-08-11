@@ -612,18 +612,17 @@ def create_consumer_suite(
         ("full",),
         default_features=False,
     )
-    removed_name = f"{CONSUMER_PACKAGE_PREFIX}-removed-decode"
-    consumer_manifests[removed_name] = write_consumer_package(
-        workspace_root / removed_name,
-        name=removed_name,
-        dependency_name=target.name,
-        dependency=removed_dependency,
-        source="".join(
-            f"use unity_asset_decode::{symbol};\n"
-            for symbol in REMOVED_DECODE_API_PATHS
-        ),
-    )
-    removed_names = {removed_name}
+    removed_names = set()
+    for index, symbol in enumerate(REMOVED_DECODE_API_PATHS, start=1):
+        removed_name = f"{CONSUMER_PACKAGE_PREFIX}-removed-decode-{index}"
+        consumer_manifests[removed_name] = write_consumer_package(
+            workspace_root / removed_name,
+            name=removed_name,
+            dependency_name=target.name,
+            dependency=removed_dependency,
+            source=f"use unity_asset_decode::{symbol};\n",
+        )
+        removed_names.add(removed_name)
     required_internal.add(target.name)
 
     required_packages = {
