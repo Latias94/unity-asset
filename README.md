@@ -179,7 +179,7 @@ their own trust and ignore policy, then call `load_source` with a stable `Source
 selected root source. The CLI provides a budgeted directory-discovery policy for command-line
 use.
 
-External JSON or TPK TypeTree registries are immutable workspace options:
+External JSON, TPK, or AssetRipper `InfoJson` TypeTree registries are immutable workspace options:
 
 ```rust,no_run
 use unity_asset::AssetLoadBudget;
@@ -188,7 +188,10 @@ use unity_asset::workspace::{AssetWorkspace, WorkspaceOptions};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut budget = AssetLoadBudget::default();
     let options = WorkspaceOptions::lenient()
-        .with_type_tree_registry_paths(&["typetree.json", "unity.tpk"], &mut budget)?;
+        .with_type_tree_registry_paths(
+            &["typetree.json", "unity.tpk", "AssetRipper/InfoJson"],
+            &mut budget,
+        )?;
     let mut workspace = AssetWorkspace::with_options(options)?;
     workspace.load_path("game.bundle", &mut budget)?;
     Ok(())
@@ -337,7 +340,8 @@ unity-asset \
 - Unity formats are versioned and not fully documented. Unsupported layouts fail explicitly.
 - Write support targets existing supported schemas and containers; arbitrary asset authoring is
   out of scope.
-- Runtime TypeTree callbacks are not accepted. Use immutable, budgeted JSON or TPK registries.
+- Runtime TypeTree callbacks are not accepted. Use immutable, budgeted JSON, TPK, or AssetRipper
+  `InfoJson` registries.
 - Decoding is best effort and feature-gated. Raw extraction remains available when a codec is
   unavailable.
 - Publication does not promise cross-file atomic visibility. Each replacement is atomic and the

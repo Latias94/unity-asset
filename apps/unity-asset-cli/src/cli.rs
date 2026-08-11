@@ -16,7 +16,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) show_warnings: bool,
 
-    /// External TypeTree registry JSON/TPK. Earlier registries take precedence.
+    /// External TypeTree registry JSON, TPK, or AssetRipper InfoJson directory.
     #[arg(long)]
     pub(crate) typetree_registry: Vec<PathBuf>,
 

@@ -5,6 +5,7 @@
 //!
 //! This module provides an injectable registry abstraction and a simple JSON-backed implementation.
 
+use crate::asset::{BuildTarget, SerializedObjectContext};
 use crate::typetree::{TypeTree, TypeTreeNode};
 use crate::{error::BinaryError, error::Result};
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -18,6 +19,25 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use unity_asset_core::{AssetLoadBudget, BudgetError, DigestV1};
 
+/// Selects the TypeTree variant used to deserialize an object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TypeTreeSerializationMode {
+    #[default]
+    Release,
+    Editor,
+}
+
+impl TypeTreeSerializationMode {
+    /// Derives the serialization variant from file-owned target-platform evidence.
+    #[must_use]
+    pub const fn from_object_context(context: SerializedObjectContext) -> Self {
+        match context.target_platform().target() {
+            Some(BuildTarget::NO_TARGET) => Self::Editor,
+            Some(_) | None => Self::Release,
+        }
+    }
+}
+
 pub trait TypeTreeRegistry: Send + Sync + std::fmt::Debug {
     fn resolve(&self, unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>>;
 
@@ -28,6 +48,19 @@ pub trait TypeTreeRegistry: Send + Sync + std::fmt::Debug {
     /// digest, so a snapshot never depends on unidentifiable external state.
     fn semantic_digest(&self) -> Option<DigestV1> {
         None
+    }
+
+    /// Resolve a TypeTree for the requested serialization mode.
+    ///
+    /// Registries that only contain one representation can keep implementing
+    /// [`Self::resolve`]; their tree is valid for both modes.
+    fn resolve_with_mode(
+        &self,
+        unity_version: &str,
+        class_id: i32,
+        _mode: TypeTreeSerializationMode,
+    ) -> Option<Arc<TypeTree>> {
+        self.resolve(unity_version, class_id)
     }
 
     /// Resolve a script type tree (e.g. MonoBehaviour) using the script's 16-byte ID.
@@ -58,10 +91,11 @@ impl CompositeTypeTreeRegistry {
 
     /// Loads registry files in priority order under one caller-owned budget.
     ///
-    /// `.tpk` paths use [`super::tpk::TpkTypeTreeRegistry`]; every other path uses the
-    /// strict JSON registry format. Empty and single-path inputs avoid a composite allocation.
-    /// Multiple paths account for the priority table, each concrete `Arc` allocation, and the
-    /// final composite `Arc` before allocating them.
+    /// Directories use [`super::assetripper_typetree::AssetRipperTypeTreeRegistry`], `.tpk`
+    /// paths use [`super::tpk::TpkTypeTreeRegistry`], and every other path uses the strict JSON
+    /// registry format. Empty and single-path inputs avoid a composite allocation. Multiple paths
+    /// account for the priority table, each concrete `Arc` allocation, and the final composite
+    /// `Arc` before allocating them.
     pub fn from_paths<P: AsRef<Path>>(
         paths: &[P],
         budget: &mut AssetLoadBudget,
@@ -147,6 +181,13 @@ fn load_type_tree_registry_path(
     path: &Path,
     budget: &mut AssetLoadBudget,
 ) -> Result<Arc<dyn TypeTreeRegistry>> {
+    if path.is_dir() {
+        let registry =
+            super::assetripper_typetree::AssetRipperTypeTreeRegistry::new_from_path(path, budget)?;
+        consume_arc_allocation::<super::assetripper_typetree::AssetRipperTypeTreeRegistry>(budget)?;
+        return Ok(Arc::new(registry));
+    }
+
     let is_tpk = path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -167,6 +208,20 @@ impl TypeTreeRegistry for CompositeTypeTreeRegistry {
         for r in &self.registries {
             if let Some(t) = r.resolve(unity_version, class_id) {
                 return Some(t);
+            }
+        }
+        None
+    }
+
+    fn resolve_with_mode(
+        &self,
+        unity_version: &str,
+        class_id: i32,
+        mode: TypeTreeSerializationMode,
+    ) -> Option<Arc<TypeTree>> {
+        for registry in &self.registries {
+            if let Some(tree) = registry.resolve_with_mode(unity_version, class_id, mode) {
+                return Some(tree);
             }
         }
         None
@@ -1974,6 +2029,38 @@ mod tests {
             .unwrap();
             assert!(registry.resolve("2020.3.0f1", 28).is_some());
         }
+    }
+
+    #[test]
+    fn registry_path_factory_loads_assetripper_info_json_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let info_json = temp.path().join("InfoJson");
+        std::fs::create_dir(&info_json).unwrap();
+        std::fs::write(
+            info_json.join("2022.3.0f1.json"),
+            r#"{
+                "Version":"2022.3.0f1",
+                "Classes":[{
+                    "TypeID":28,
+                    "EditorRootNode":null,
+                    "ReleaseRootNode":{
+                        "TypeName":"Texture2D","Name":"Base","Level":0,"ByteSize":-1,
+                        "Index":0,"Version":1,"TypeFlags":0,"MetaFlag":0,"SubNodes":[]
+                    }
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let registry = CompositeTypeTreeRegistry::from_paths(
+            std::slice::from_ref(&temp.path()),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let tree = registry.resolve("2022.3.0f1", 28).unwrap();
+
+        assert_eq!(tree.nodes[0].type_name, "Texture2D");
     }
 
     #[test]

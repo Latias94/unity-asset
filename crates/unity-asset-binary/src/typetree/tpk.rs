@@ -1,19 +1,19 @@
 //! TPK (Type Package) support for external TypeTree registries.
 //!
-//! UnityPy ships a `uncompressed.tpk` registry which maps `(class_id, unity_version)` to a
-//! release TypeTree root node. This module implements a compatible reader so we can provide a
-//! UnityPy-like fallback when SerializedFile TypeTrees are stripped.
+//! UnityPy ships a `uncompressed.tpk` registry which maps `(class_id, unity_version)` to editor
+//! and release TypeTree root nodes. This module implements a compatible reader so we can provide
+//! a UnityPy-like fallback when SerializedFile TypeTrees are stripped.
 
 use crate::compression::{self, CompressionType};
 use crate::error::{BinaryError, Result};
-use crate::typetree::{TypeTree, TypeTreeNode, TypeTreeRegistry};
+use crate::typetree::{TypeTree, TypeTreeNode, TypeTreeRegistry, TypeTreeSerializationMode};
 use std::io::Read;
 use std::mem::size_of;
 use std::path::Path;
 use std::sync::Arc;
 use unity_asset_core::AssetLoadBudget;
 
-type ResolvedClassMap = Vec<(i32, Vec<(u64, VersionedTree)>)>;
+type ResolvedClassMap = Vec<(i32, Vec<(u64, VersionedTrees)>)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i8)]
@@ -94,7 +94,6 @@ struct TpkUnityClass {
     base: u16,
     #[allow(dead_code)]
     flags: u8,
-    #[allow(dead_code)]
     editor_root_node: Option<u16>,
     release_root_node: Option<u16>,
 }
@@ -371,15 +370,41 @@ fn parse_unity_version_key(version: &str) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 enum VersionedTree {
-    /// The class is absent for this version or has no release TypeTree.
+    /// The class is absent for this version or has no TypeTree for this serialization mode.
     Unavailable,
     Available(Arc<TypeTree>),
 }
 
-fn select_versioned_tree(version: u64, classes: &[(u64, VersionedTree)]) -> Option<Arc<TypeTree>> {
+#[derive(Debug, Clone)]
+struct VersionedTrees {
+    release: VersionedTree,
+    editor: VersionedTree,
+}
+
+impl VersionedTrees {
+    fn unavailable() -> Self {
+        Self {
+            release: VersionedTree::Unavailable,
+            editor: VersionedTree::Unavailable,
+        }
+    }
+
+    fn for_mode(&self, mode: TypeTreeSerializationMode) -> &VersionedTree {
+        match mode {
+            TypeTreeSerializationMode::Release => &self.release,
+            TypeTreeSerializationMode::Editor => &self.editor,
+        }
+    }
+}
+
+fn select_versioned_tree(
+    version: u64,
+    classes: &[(u64, VersionedTrees)],
+    mode: TypeTreeSerializationMode,
+) -> Option<Arc<TypeTree>> {
     let upper_bound = classes.partition_point(|(candidate, _)| *candidate <= version);
     let (_, selected) = classes.get(upper_bound.checked_sub(1)?)?;
-    match selected {
+    match selected.for_mode(mode) {
         VersionedTree::Unavailable => None,
         VersionedTree::Available(tree) => Some(tree.clone()),
     }
@@ -841,6 +866,26 @@ fn prebuild_registry(
     blob: &TpkTypeTreeBlob,
     budget: &mut AssetLoadBudget,
 ) -> Result<ResolvedClassMap> {
+    fn prebuild_root(
+        blob: &TpkTypeTreeBlob,
+        root_id: Option<u16>,
+        trees_by_root: &mut [Option<Arc<TypeTree>>],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<VersionedTree> {
+        let Some(root_id) = root_id.map(usize::from) else {
+            return Ok(VersionedTree::Unavailable);
+        };
+        if let Some(tree) = &trees_by_root[root_id] {
+            return Ok(VersionedTree::Available(tree.clone()));
+        }
+
+        let tree = build_tree_from_blob(blob, root_id, budget)?;
+        charge_arc_storage::<TypeTree>("TPK prebuilt TypeTree Arc", budget)?;
+        let tree = Arc::new(tree);
+        trees_by_root[root_id] = Some(tree.clone());
+        Ok(VersionedTree::Available(tree))
+    }
+
     let mut trees_by_root = Vec::new();
     reserve_vec_exact(
         &mut trees_by_root,
@@ -874,27 +919,24 @@ fn prebuild_registry(
                 )));
             }
             previous_version = Some(*version);
-            let tree = match class {
-                None => VersionedTree::Unavailable,
-                Some(class) => {
-                    let Some(root_id) = class.release_root_node.map(usize::from) else {
-                        versions.push((*version, VersionedTree::Unavailable));
-                        continue;
-                    };
-                    let tree = match &trees_by_root[root_id] {
-                        Some(tree) => tree.clone(),
-                        None => {
-                            let tree = build_tree_from_blob(blob, root_id, budget)?;
-                            charge_arc_storage::<TypeTree>("TPK prebuilt TypeTree Arc", budget)?;
-                            let tree = Arc::new(tree);
-                            trees_by_root[root_id] = Some(tree.clone());
-                            tree
-                        }
-                    };
-                    VersionedTree::Available(tree)
-                }
+            let trees = match class {
+                None => VersionedTrees::unavailable(),
+                Some(class) => VersionedTrees {
+                    release: prebuild_root(
+                        blob,
+                        class.release_root_node,
+                        &mut trees_by_root,
+                        budget,
+                    )?,
+                    editor: prebuild_root(
+                        blob,
+                        class.editor_root_node,
+                        &mut trees_by_root,
+                        budget,
+                    )?,
+                },
             };
-            versions.push((*version, tree));
+            versions.push((*version, trees));
         }
         resolved.push((class_id, versions));
     }
@@ -986,12 +1028,21 @@ impl TpkTypeTreeRegistry {
 
 impl TypeTreeRegistry for TpkTypeTreeRegistry {
     fn resolve(&self, unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>> {
+        self.resolve_with_mode(unity_version, class_id, TypeTreeSerializationMode::Release)
+    }
+
+    fn resolve_with_mode(
+        &self,
+        unity_version: &str,
+        class_id: i32,
+        mode: TypeTreeSerializationMode,
+    ) -> Option<Arc<TypeTree>> {
         let encoded = parse_unity_version_key(unity_version)?;
         let index = self
             .classes
             .binary_search_by_key(&class_id, |(existing, _)| *existing)
             .ok()?;
-        select_versioned_tree(encoded, &self.classes[index].1)
+        select_versioned_tree(encoded, &self.classes[index].1, mode)
     }
 }
 
@@ -1024,8 +1075,14 @@ pub(crate) mod tests {
 
     #[derive(Debug, Clone, Copy)]
     enum TestClassRecord {
-        Present { version: u64, release_root: u16 },
-        Missing { version: u64 },
+        Present {
+            version: u64,
+            editor_root: Option<u16>,
+            release_root: Option<u16>,
+        },
+        Missing {
+            version: u64,
+        },
     }
 
     fn build_typetree_blob_with_graph(
@@ -1047,14 +1104,27 @@ pub(crate) mod tests {
             match record {
                 TestClassRecord::Present {
                     version,
+                    editor_root,
                     release_root,
                 } => {
                     blob.extend_from_slice(&version.to_le_bytes());
                     blob.push(1u8);
                     blob.extend_from_slice(&(0u16).to_le_bytes()); // name
                     blob.extend_from_slice(&(0u16).to_le_bytes()); // base
-                    blob.push(TpkUnityClassFlags::HasReleaseRootNode as u8);
-                    blob.extend_from_slice(&release_root.to_le_bytes());
+                    let mut flags = 0_u8;
+                    if editor_root.is_some() {
+                        flags |= TpkUnityClassFlags::HasEditorRootNode as u8;
+                    }
+                    if release_root.is_some() {
+                        flags |= TpkUnityClassFlags::HasReleaseRootNode as u8;
+                    }
+                    blob.push(flags);
+                    if let Some(editor_root) = editor_root {
+                        blob.extend_from_slice(&editor_root.to_le_bytes());
+                    }
+                    if let Some(release_root) = release_root {
+                        blob.extend_from_slice(&release_root.to_le_bytes());
+                    }
                 }
                 TestClassRecord::Missing { version } => {
                     blob.extend_from_slice(&version.to_le_bytes());
@@ -1109,7 +1179,8 @@ pub(crate) mod tests {
             &[version],
             &[TestClassRecord::Present {
                 version,
-                release_root: 0,
+                editor_root: None,
+                release_root: Some(0),
             }],
             &sub_nodes,
         )
@@ -1130,7 +1201,8 @@ pub(crate) mod tests {
             &[version],
             &[TestClassRecord::Present {
                 version,
-                release_root: 0,
+                editor_root: None,
+                release_root: Some(0),
             }],
             &sub_nodes,
         )
@@ -1253,6 +1325,129 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tpk_registry_resolves_distinct_editor_and_release_roots() {
+        let version = parse_unity_version_key("2020.3.0f1").unwrap();
+        let blob = build_typetree_blob_with_graph(
+            &[version],
+            &[TestClassRecord::Present {
+                version,
+                editor_root: Some(1),
+                release_root: Some(0),
+            }],
+            &[Vec::new(), Vec::new()],
+        );
+        let tpk = wrap_tpk_blob(&blob, TpkCompressionType::None);
+        let mut budget = AssetLoadBudget::default();
+        let registry = TpkTypeTreeRegistry::from_bytes(&tpk, &mut budget).unwrap();
+        let usage_after_ingestion = budget.usage();
+
+        let default_tree = registry.resolve("2020.3.0f1", 28).unwrap();
+        let release_tree = registry
+            .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Release)
+            .unwrap();
+        let editor_tree = registry
+            .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Editor)
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&default_tree, &release_tree));
+        assert!(!Arc::ptr_eq(&release_tree, &editor_tree));
+        assert_eq!(release_tree.nodes.first().unwrap().name, "Base");
+        assert_eq!(editor_tree.nodes.first().unwrap().name, "m_Name");
+        assert_eq!(budget.usage(), usage_after_ingestion);
+    }
+
+    #[test]
+    fn tpk_registry_does_not_fallback_between_serialization_modes() {
+        let editor_only = parse_unity_version_key("2020.3.0f1").unwrap();
+        let release_only = parse_unity_version_key("2020.3.1f1").unwrap();
+        let blob = build_typetree_blob_with_graph(
+            &[editor_only, release_only],
+            &[
+                TestClassRecord::Present {
+                    version: editor_only,
+                    editor_root: Some(0),
+                    release_root: None,
+                },
+                TestClassRecord::Present {
+                    version: release_only,
+                    editor_root: None,
+                    release_root: Some(1),
+                },
+            ],
+            &[Vec::new(), Vec::new()],
+        );
+        let tpk = wrap_tpk_blob(&blob, TpkCompressionType::None);
+        let mut budget = AssetLoadBudget::default();
+        let registry = TpkTypeTreeRegistry::from_bytes(&tpk, &mut budget).unwrap();
+
+        assert!(registry.resolve("2020.3.0f1", 28).is_none());
+        assert!(
+            registry
+                .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Release,)
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Editor)
+                .is_some()
+        );
+        assert!(registry.resolve("2020.3.1f1", 28).is_some());
+        assert!(
+            registry
+                .resolve_with_mode("2020.3.1f1", 28, TypeTreeSerializationMode::Editor)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn tpk_registry_deduplicates_a_root_shared_by_both_modes() {
+        let version = parse_unity_version_key("2020.3.0f1").unwrap();
+        let release_only_blob = build_typetree_blob_with_graph(
+            &[version],
+            &[TestClassRecord::Present {
+                version,
+                editor_root: None,
+                release_root: Some(0),
+            }],
+            &[Vec::new()],
+        );
+        let shared_blob = build_typetree_blob_with_graph(
+            &[version],
+            &[TestClassRecord::Present {
+                version,
+                editor_root: Some(0),
+                release_root: Some(0),
+            }],
+            &[Vec::new()],
+        );
+        let release_only_tpk = wrap_tpk_blob(&release_only_blob, TpkCompressionType::None);
+        let shared_tpk = wrap_tpk_blob(&shared_blob, TpkCompressionType::None);
+
+        let mut release_only_budget = AssetLoadBudget::default();
+        TpkTypeTreeRegistry::from_bytes(&release_only_tpk, &mut release_only_budget).unwrap();
+        let mut shared_budget = AssetLoadBudget::default();
+        let registry = TpkTypeTreeRegistry::from_bytes(&shared_tpk, &mut shared_budget).unwrap();
+
+        let release_tree = registry
+            .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Release)
+            .unwrap();
+        let editor_tree = registry
+            .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Editor)
+            .unwrap();
+        assert!(Arc::ptr_eq(&release_tree, &editor_tree));
+
+        let release_only_usage = release_only_budget.usage();
+        let shared_usage = shared_budget.usage();
+        assert_eq!(shared_usage.entries, release_only_usage.entries);
+        assert_eq!(shared_usage.members, release_only_usage.members);
+        assert_eq!(
+            shared_usage.max_observed_depth,
+            release_only_usage.max_observed_depth
+        );
+        assert_eq!(shared_usage.bytes, release_only_usage.bytes + 2);
+    }
+
+    #[test]
     fn tpk_registry_treats_missing_class_records_as_tombstones() {
         let introduced = parse_unity_version_key("2020.3.0f1").unwrap();
         let removed = parse_unity_version_key("2020.3.1f1").unwrap();
@@ -1262,12 +1457,14 @@ pub(crate) mod tests {
             &[
                 TestClassRecord::Present {
                     version: introduced,
-                    release_root: 0,
+                    editor_root: Some(0),
+                    release_root: Some(0),
                 },
                 TestClassRecord::Missing { version: removed },
                 TestClassRecord::Present {
                     version: restored,
-                    release_root: 0,
+                    editor_root: Some(0),
+                    release_root: Some(0),
                 },
             ],
             &[Vec::new()],
@@ -1276,11 +1473,29 @@ pub(crate) mod tests {
         let mut budget = AssetLoadBudget::default();
         let registry = TpkTypeTreeRegistry::from_bytes(&tpk, &mut budget).unwrap();
 
-        let initial = registry.resolve("2020.3.0f1", 28).unwrap();
+        let initial_release = registry.resolve("2020.3.0f1", 28).unwrap();
+        let initial_editor = registry
+            .resolve_with_mode("2020.3.0f1", 28, TypeTreeSerializationMode::Editor)
+            .unwrap();
+        assert!(Arc::ptr_eq(&initial_release, &initial_editor));
         assert!(registry.resolve("2020.3.1f1", 28).is_none());
         assert!(registry.resolve("2020.3.1p1", 28).is_none());
-        let reintroduced = registry.resolve("2020.3.2f1", 28).unwrap();
-        assert!(Arc::ptr_eq(&initial, &reintroduced));
+        assert!(
+            registry
+                .resolve_with_mode("2020.3.1f1", 28, TypeTreeSerializationMode::Editor)
+                .is_none()
+        );
+        assert!(
+            registry
+                .resolve_with_mode("2020.3.1p1", 28, TypeTreeSerializationMode::Editor)
+                .is_none()
+        );
+        let reintroduced_release = registry.resolve("2020.3.2f1", 28).unwrap();
+        let reintroduced_editor = registry
+            .resolve_with_mode("2020.3.2f1", 28, TypeTreeSerializationMode::Editor)
+            .unwrap();
+        assert!(Arc::ptr_eq(&initial_release, &reintroduced_release));
+        assert!(Arc::ptr_eq(&initial_editor, &reintroduced_editor));
     }
 
     #[test]
@@ -1433,7 +1648,8 @@ pub(crate) mod tests {
             &[version],
             &[TestClassRecord::Present {
                 version,
-                release_root: 0,
+                editor_root: None,
+                release_root: Some(0),
             }],
             &[vec![1], vec![0]],
         );

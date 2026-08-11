@@ -9,6 +9,7 @@ use unity_asset_binary::asset::{ObjectInfo, SerializedFile, SerializedType};
 use unity_asset_binary::file::{UnityFileKind, sniff_unity_file_kind_prefix};
 use unity_asset_binary::typetree::{
     TypeTree, TypeTreeNode, TypeTreeRegistry, TypeTreeSchema, TypeTreeSemanticDigestError,
+    TypeTreeSerializationMode,
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, DigestBuildError, DigestV1, DigestV1Builder,
@@ -127,8 +128,14 @@ pub fn recognize_source(path: &Path, prefix: &[u8]) -> SourceRecognition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum FrozenRegistryKey {
-    Class(i32),
-    Script { class_id: i32, script_id: [u8; 16] },
+    Class {
+        class_id: i32,
+        mode: TypeTreeSerializationMode,
+    },
+    Script {
+        class_id: i32,
+        script_id: [u8; 16],
+    },
 }
 
 #[derive(Debug)]
@@ -145,8 +152,17 @@ struct FrozenTypeTreeRegistry {
 }
 
 impl TypeTreeRegistry for FrozenTypeTreeRegistry {
-    fn resolve(&self, _unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>> {
-        self.lookup(FrozenRegistryKey::Class(class_id))
+    fn resolve(&self, unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>> {
+        self.resolve_with_mode(unity_version, class_id, TypeTreeSerializationMode::Release)
+    }
+
+    fn resolve_with_mode(
+        &self,
+        _unity_version: &str,
+        class_id: i32,
+        mode: TypeTreeSerializationMode,
+    ) -> Option<Arc<TypeTree>> {
+        self.lookup(FrozenRegistryKey::Class { class_id, mode })
     }
 
     fn semantic_digest(&self) -> Option<DigestV1> {
@@ -551,6 +567,7 @@ fn freeze_serialized_registry(
         budget,
         "frozen TypeTree lookup keys",
     )?;
+    let serialization_mode = TypeTreeSerializationMode::from_object_context(file.object_context());
     for object in file.objects() {
         let serialized_type = serialized_type_for_object(&file, object);
         if file.type_tree_enabled() && serialized_type.is_some_and(SerializedType::has_type_tree) {
@@ -565,7 +582,10 @@ fn freeze_serialized_registry(
                 script_id: serialized_type.script_id,
             });
         }
-        keys.push(FrozenRegistryKey::Class(object.class_id()));
+        keys.push(FrozenRegistryKey::Class {
+            class_id: object.class_id(),
+            mode: serialization_mode,
+        });
     }
     keys.sort_unstable();
     keys.dedup();
@@ -575,8 +595,8 @@ fn freeze_serialized_registry(
         reserve_budgeted_vec::<FrozenRegistryEntry>(keys.len(), budget, "frozen TypeTree entries")?;
     for key in keys {
         let tree = match key {
-            FrozenRegistryKey::Class(class_id) => {
-                source_registry.resolve(&file.unity_version, class_id)
+            FrozenRegistryKey::Class { class_id, mode } => {
+                source_registry.resolve_with_mode(&file.unity_version, class_id, mode)
             }
             FrozenRegistryKey::Script {
                 class_id,
@@ -617,7 +637,7 @@ fn freeze_serialized_registry(
 }
 
 fn frozen_registry_digest(entries: &[FrozenRegistryEntry]) -> Result<DigestV1, DigestBuildError> {
-    const PREFIX: &[u8] = b"unity-asset:frozen-typetree-registry:v1\0";
+    const PREFIX: &[u8] = b"unity-asset:frozen-typetree-registry:v2\0";
     const COMMON_ENTRY_BYTES: u64 = 1 + 4 + DigestV1::BYTE_LEN as u64;
 
     let mut logical_length =
@@ -628,10 +648,9 @@ fn frozen_registry_digest(entries: &[FrozenRegistryEntry]) -> Result<DigestV1, D
     for entry in entries {
         logical_length = logical_length
             .checked_add(COMMON_ENTRY_BYTES)
-            .and_then(|length| {
-                matches!(entry.key, FrozenRegistryKey::Script { .. })
-                    .then(|| length.checked_add(16))
-                    .unwrap_or(Some(length))
+            .and_then(|length| match entry.key {
+                FrozenRegistryKey::Class { .. } => length.checked_add(1),
+                FrozenRegistryKey::Script { .. } => length.checked_add(16),
             })
             .ok_or(DigestBuildError::LengthOverflow)?;
     }
@@ -645,9 +664,13 @@ fn frozen_registry_digest(entries: &[FrozenRegistryEntry]) -> Result<DigestV1, D
     )?;
     for entry in entries {
         match entry.key {
-            FrozenRegistryKey::Class(class_id) => {
+            FrozenRegistryKey::Class { class_id, mode } => {
                 digest.update(&[0])?;
                 digest.update(&class_id.to_le_bytes())?;
+                digest.update(&[match mode {
+                    TypeTreeSerializationMode::Release => 0,
+                    TypeTreeSerializationMode::Editor => 1,
+                }])?;
             }
             FrozenRegistryKey::Script {
                 class_id,

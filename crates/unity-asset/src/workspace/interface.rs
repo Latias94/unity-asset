@@ -37,7 +37,7 @@ impl WorkspaceOptions {
         Self::default()
     }
 
-    /// Loads an immutable JSON/TPK registry under the caller's budget.
+    /// Loads immutable JSON, TPK, or AssetRipper `InfoJson` registries under the caller's budget.
     ///
     /// Workspace loads deliberately reject arbitrary registry callbacks: snapshot state may only
     /// retain registries whose construction is budgeted and whose lookups are allocation-free.

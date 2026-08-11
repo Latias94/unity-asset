@@ -7,7 +7,7 @@ use crate::reference::BinaryReferenceScan;
 use crate::shared_bytes::SharedBytes;
 use crate::typetree::{
     PPtrScanResult, TypeTree, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
-    TypeTreeParseWarning, TypeTreeSchema, TypeTreeTraversalStats,
+    TypeTreeParseWarning, TypeTreeSchema, TypeTreeSerializationMode, TypeTreeTraversalStats,
 };
 use std::fmt::Write as _;
 use std::io::Read;
@@ -960,7 +960,8 @@ fn type_tree_for_object(file: &SerializedFile, info: &ObjectInfo) -> Option<Type
             return Some(TypeTreeSource::External(tree));
         }
 
-        r.resolve(&file.unity_version, info.class_id())
+        let mode = TypeTreeSerializationMode::from_object_context(file.object_context());
+        r.resolve_with_mode(&file.unity_version, info.class_id(), mode)
             .map(TypeTreeSource::External)
     })
 }

@@ -3,6 +3,7 @@
 //! Allocation-bearing parsing is exposed by [`TypeTreeParser`] and always requires a
 //! caller-owned [`unity_asset_core::AssetLoadBudget`].
 
+pub mod assetripper_typetree;
 mod common_strings;
 mod execution;
 pub mod parser;
@@ -14,6 +15,7 @@ pub mod types;
 mod write;
 mod write_error;
 
+pub use assetripper_typetree::AssetRipperTypeTreeRegistry;
 pub use execution::{
     PPtrScanResult, TypeTreeParseMode, TypeTreeParseOptions, TypeTreeParseOutput,
     TypeTreeParseWarning, TypeTreeValueRead,
@@ -24,6 +26,7 @@ pub use parser::{
 };
 pub use registry::{
     CompositeTypeTreeRegistry, InMemoryTypeTreeRegistry, JsonTypeTreeRegistry, TypeTreeRegistry,
+    TypeTreeSerializationMode,
 };
 pub(crate) use schema::ManagedReferenceCatalog;
 pub use schema::{

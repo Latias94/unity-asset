@@ -65,10 +65,11 @@ workspace. Its output must still pass the Rust registry parser and caller-owned 
 
 ## Load Registries into a Workspace
 
-`WorkspaceOptions::with_type_tree_registry_paths` parses every JSON/TPK registry under the same
-`AssetLoadBudget` used by the caller. During source loading, only required lookup keys and their
-trees are copied into a frozen per-source registry. Snapshot lookup is therefore immutable and
-allocation-free.
+`WorkspaceOptions::with_type_tree_registry_paths` parses every JSON, TPK, or AssetRipper
+`InfoJson` registry under the same `AssetLoadBudget` used by the caller. AssetRipper directories
+are loaded eagerly; runtime lookup never reads the filesystem. During source loading, only
+required lookup keys and their trees are copied into a frozen per-source registry. Snapshot lookup
+is therefore immutable and allocation-free.
 
 ```rust
 use std::path::PathBuf;
@@ -80,6 +81,7 @@ fn load_with_script_types() -> Result<AssetWorkspace, Box<dyn std::error::Error>
     let registry_paths = [
         PathBuf::from(r"D:\Schemas\script-typetrees.json"),
         PathBuf::from(r"D:\Schemas\engine.tpk"),
+        PathBuf::from(r"D:\Schemas\AssetRipper\InfoJson"),
     ];
     let mut budget = AssetLoadBudget::default();
     let options =
@@ -96,6 +98,7 @@ The CLI exposes the same policy:
 cargo run -p unity-asset-cli --bin unity-asset -- `
   --typetree-registry D:\Schemas\script-typetrees.json `
   --typetree-registry D:\Schemas\engine.tpk `
+  --typetree-registry D:\Schemas\AssetRipper\InfoJson `
   workspace inspect objects --input D:\Game\Game_Data
 ```
 
@@ -105,9 +108,10 @@ format adapter supports them.
 
 ## Low-Level Integration
 
-Format-adapter authors may construct JSON or TPK registries from `unity-asset-binary` and attach a
-registry directly to a `SerializedFile`. Every constructor still requires a caller-owned budget.
-Application code should prefer `WorkspaceOptions`, because it freezes the exact schemas retained
+Format-adapter authors may construct JSON, TPK, or AssetRipper dump registries from
+`unity-asset-binary` and attach a registry directly to a `SerializedFile`. Every constructor still
+requires a caller-owned budget. Application code should prefer `WorkspaceOptions`, because it
+freezes the exact schemas retained
 by snapshots and prevents arbitrary callback behavior from crossing revision boundaries.
 
 ## Validation
