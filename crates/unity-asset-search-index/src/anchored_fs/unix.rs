@@ -13,10 +13,18 @@ use rustix::io::Errno;
 
 use super::{AnchoredFsError, DirectoryEntryHint, EntryKindHint, OpenPolicy};
 
-const DIRECTORY_FLAGS: OFlags =
-    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-const REGULAR_FILE_FLAGS: OFlags =
-    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+const DIRECTORY_FLAGS: OFlags = OFlags::from_bits_retain(
+    OFlags::RDONLY.bits()
+        | OFlags::DIRECTORY.bits()
+        | OFlags::NOFOLLOW.bits()
+        | OFlags::CLOEXEC.bits(),
+);
+const REGULAR_FILE_FLAGS: OFlags = OFlags::from_bits_retain(
+    OFlags::RDONLY.bits()
+        | OFlags::NONBLOCK.bits()
+        | OFlags::NOFOLLOW.bits()
+        | OFlags::CLOEXEC.bits(),
+);
 
 pub(super) struct ReadDirectory {
     descriptor: OwnedFd,

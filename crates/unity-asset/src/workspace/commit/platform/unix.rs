@@ -1267,7 +1267,8 @@ pub(super) fn copy_security_metadata(
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "Unix security metadata could not be preserved exactly",
-        ));
+        )
+        .into());
     }
     fsync(&target).map_err(io::Error::from)?;
     Ok(())

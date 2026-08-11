@@ -72,8 +72,13 @@ impl ProjectRootAuthority {
             .ensure_object(object_identity)
             .context("revalidate retained project root authority")?;
 
-        let path_space = ProjectPathSpace::new(canonical_root.clone(), identity.project_id())
-            .context("create the project lexical path space")?;
+        let verified_root_alias = (absolute_root != canonical_root).then_some(absolute_root);
+        let path_space = ProjectPathSpace::new_with_verified_root_alias(
+            canonical_root.clone(),
+            verified_root_alias,
+            identity.project_id(),
+        )
+        .context("create the project lexical path space")?;
         let authority = Self {
             inner: Arc::new(ProjectRootAuthorityInner {
                 canonical_root,

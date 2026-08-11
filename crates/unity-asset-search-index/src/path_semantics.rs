@@ -113,15 +113,38 @@ pub struct ProjectPathSpace {
 struct ProjectPathSpaceInner {
     project_id: ProjectId,
     root: PathBuf,
+    verified_root_alias: Option<PathBuf>,
 }
 
 impl ProjectPathSpace {
+    #[cfg(test)]
     pub(crate) fn new(root: PathBuf, project_id: ProjectId) -> Result<Self, ProjectPathError> {
+        Self::new_with_verified_root_alias(root, None, project_id)
+    }
+
+    /// Adds an alternate absolute spelling already proven to name `root` by the caller's
+    /// retained filesystem authority.
+    pub(crate) fn new_with_verified_root_alias(
+        root: PathBuf,
+        verified_root_alias: Option<PathBuf>,
+        project_id: ProjectId,
+    ) -> Result<Self, ProjectPathError> {
         if !root.is_absolute() {
             return Err(ProjectPathError::InvalidRoot { root });
         }
+        if let Some(alias) = &verified_root_alias
+            && !alias.is_absolute()
+        {
+            return Err(ProjectPathError::InvalidRoot {
+                root: alias.clone(),
+            });
+        }
         Ok(Self {
-            inner: Arc::new(ProjectPathSpaceInner { project_id, root }),
+            inner: Arc::new(ProjectPathSpaceInner {
+                project_id,
+                root,
+                verified_root_alias,
+            }),
         })
     }
 
@@ -160,10 +183,18 @@ impl ProjectPathSpace {
     /// lexical parent traversal escapes it are rejected.
     pub fn resolve(&self, supplied: &Path) -> Result<Option<ProjectPath>, ProjectPathError> {
         let relative = if supplied.is_absolute() {
-            strip_prefix(self.root(), supplied).map_err(|()| ProjectPathError::OutsideProject {
-                path: supplied.to_path_buf(),
-                project_root: self.root().to_path_buf(),
-            })?
+            match strip_prefix(self.root(), supplied) {
+                Ok(relative) => relative,
+                Err(()) => self
+                    .inner
+                    .verified_root_alias
+                    .as_deref()
+                    .and_then(|alias| strip_prefix(alias, supplied).ok())
+                    .ok_or_else(|| ProjectPathError::OutsideProject {
+                        path: supplied.to_path_buf(),
+                        project_root: self.root().to_path_buf(),
+                    })?,
+            }
         } else {
             supplied
         };
@@ -929,6 +960,29 @@ mod tests {
             space.root().join(relative.as_relative_path()),
             space.root().join("Assets/Hero.prefab")
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn verified_short_root_alias_shares_the_canonical_coordinate_identity() {
+        let space = ProjectPathSpace::new_with_verified_root_alias(
+            r"\\?\C:\Users\runneradmin\Project".into(),
+            Some(r"C:\Users\RUNNER~1\Project".into()),
+            project_id(1),
+        )
+        .unwrap();
+
+        let canonical = space
+            .resolve(Path::new(r"\\?\C:\Users\runneradmin\Project\Assets\Area"))
+            .unwrap()
+            .unwrap();
+        let short = space
+            .resolve(Path::new(r"C:\Users\RUNNER~1\Project\Assets\Area"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(short, canonical);
+        assert_eq!(short.identity(), canonical.identity());
     }
 
     #[test]
