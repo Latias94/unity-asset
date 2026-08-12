@@ -22,59 +22,14 @@ SPEC.loader.exec_module(ASSEMBLER)
 
 from protocol_sdk_bundle import build_protocol_sdk_bundle  # noqa: E402
 from release_evidence import canonical_json_bytes  # noqa: E402
-from release_evidence_support import make_release_evidence  # noqa: E402
+from release_evidence_support import make_dist_plan, make_release_evidence  # noqa: E402
 
 
-TARGETS = (
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-    "x86_64-unknown-linux-musl",
-)
-APPLICATIONS = ("unity-asset-search-cli", "unity-asset-search-daemon")
 REPOSITORY_ROOT = SCRIPTS_ROOT.parent
 
 
-def artifact_name(application: str, target: str) -> str:
-    extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
-    return f"{application}-{target}{extension}"
-
-
 def local_dist_plan() -> dict[str, object]:
-    artifacts: dict[str, object] = {}
-    releases: list[dict[str, object]] = []
-    for application in APPLICATIONS:
-        release_artifacts: list[str] = []
-        for target in TARGETS:
-            name = artifact_name(application, target)
-            checksum = f"{name}.sha256"
-            artifacts[name] = {
-                "name": name,
-                "kind": "executable-zip",
-                "target_triples": [target],
-                "checksum": checksum,
-            }
-            artifacts[checksum] = {
-                "name": checksum,
-                "kind": "checksum",
-                "target_triples": [target],
-            }
-            release_artifacts.extend((name, checksum))
-        releases.append(
-            {
-                "app_name": application,
-                "app_version": "0.4.0",
-                "artifacts": release_artifacts,
-            }
-        )
-    return {
-        "dist_version": "0.30.3",
-        "announcement_tag": "v0.4.0",
-        "announcement_tag_is_implicit": False,
-        "announcement_is_prerelease": False,
-        "artifacts": artifacts,
-        "releases": releases,
-    }
+    return make_dist_plan(tag="v0.4.0", version="0.4.0")
 
 
 class ReleaseAssetAssemblyTests(unittest.TestCase):

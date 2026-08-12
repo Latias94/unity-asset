@@ -29,6 +29,8 @@ from release_binary_identity import (  # noqa: E402
 from release_contract import (  # noqa: E402
     DISTRIBUTED_APPLICATION_NAMES,
     DISTRIBUTION_TARGET_TRIPLES,
+    distribution_archive_name,
+    distribution_executable_name,
 )
 from verify_release_bundle import ReleaseBundleError, verify_release_bundle  # noqa: E402
 
@@ -48,7 +50,7 @@ def write_executable_archive(
     mode: int = 0o755,
     payload: bytes | None = None,
 ) -> None:
-    executable = application + (".exe" if target.endswith("windows-msvc") else "")
+    executable = distribution_executable_name(application, target)
     contents = payload
     if contents is None:
         contents = (
@@ -84,9 +86,10 @@ class ReleaseBundleTests(unittest.TestCase):
         plan_path.write_text(json.dumps(plan, sort_keys=True), encoding="utf-8")
         for application in APPLICATIONS:
             for target in TARGETS:
-                extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
                 write_executable_archive(
-                    root / f"{application}-{target}{extension}", application, target
+                    root / distribution_archive_name(application, target),
+                    application,
+                    target,
                 )
         for name in sorted(plan["artifacts"]):
             if not name.endswith(".sha256"):

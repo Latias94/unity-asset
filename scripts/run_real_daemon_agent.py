@@ -66,14 +66,17 @@ def build_binaries(cargo: str) -> Path:
 def daemon_build_identity(daemon: Path) -> str:
     command = [str(daemon), "--version"]
     print("$ " + " ".join(command), flush=True)
-    result = subprocess.run(
-        command,
-        cwd=REPOSITORY_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            cwd=REPOSITORY_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"built daemon binary is missing: {daemon}") from error
     if result.returncode != 0:
         raise RuntimeError(
             f"built daemon --version failed with exit code {result.returncode}: "
@@ -100,8 +103,6 @@ def daemon_build_identity(daemon: Path) -> str:
 def main() -> int:
     cargo = os.environ.get("CARGO", "cargo")
     daemon = build_binaries(cargo)
-    if not daemon.is_file():
-        raise FileNotFoundError(f"built daemon binary is missing: {daemon}")
     build_identity = daemon_build_identity(daemon)
 
     environment = os.environ.copy()

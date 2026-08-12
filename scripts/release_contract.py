@@ -80,9 +80,23 @@ def _string_sequence(value: object, label: str) -> tuple[str, ...]:
     return tuple(value)
 
 
-def _archive_name(application: str, target: str) -> str:
-    extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
-    return f"{application}-{target}{extension}"
+def distribution_archive_extension(target: str) -> str:
+    """Return the reviewed archive extension for one distribution target."""
+
+    return ".zip" if target.endswith("windows-msvc") else ".tar.xz"
+
+
+def distribution_archive_name(application: str, target: str) -> str:
+    """Return the canonical archive name for one application and target."""
+
+    return f"{application}-{target}{distribution_archive_extension(target)}"
+
+
+def distribution_executable_name(application: str, target: str) -> str:
+    """Return the executable member name expected in one distribution archive."""
+
+    suffix = ".exe" if target.endswith("windows-msvc") else ""
+    return f"{application}{suffix}"
 
 
 def validate_local_dist_plan_matrix(
@@ -170,7 +184,7 @@ def validate_local_dist_plan_matrix(
                     f"cargo-dist executable artifact {artifact_name!r} must name one target"
             )
             target = targets[0]
-            expected_archive_name = _archive_name(app_name, target)
+            expected_archive_name = distribution_archive_name(app_name, target)
             if artifact_name != expected_archive_name:
                 raise ReleaseContractError(
                     f"cargo-dist release {app_name} target {target} must use its "

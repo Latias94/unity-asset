@@ -19,13 +19,11 @@ from release_contract import (  # noqa: E402
     DISTRIBUTION_TARGET_TRIPLES,
     PUBLISHABLE_PACKAGE_NAMES,
     ReleaseContractError,
+    distribution_archive_name,
     github_distribution_matrix,
     validate_local_dist_plan,
 )
-from release_evidence_support import (  # noqa: E402
-    dist_artifact_name as artifact_name,
-    make_dist_plan,
-)
+from release_evidence_support import make_dist_plan  # noqa: E402
 
 
 def valid_dist_plan() -> dict[str, object]:
@@ -115,8 +113,8 @@ class ReleaseContractTests(unittest.TestCase):
         releases = plan["releases"]
         assert isinstance(releases, list)
         target = DISTRIBUTION_TARGET_TRIPLES[0]
-        cli_archive = artifact_name("unity-asset-search-cli", target)
-        daemon_archive = artifact_name("unity-asset-search-daemon", target)
+        cli_archive = distribution_archive_name("unity-asset-search-cli", target)
+        daemon_archive = distribution_archive_name("unity-asset-search-daemon", target)
         aliases = {
             cli_archive: daemon_archive,
             f"{cli_archive}.sha256": f"{daemon_archive}.sha256",

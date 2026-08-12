@@ -9,14 +9,10 @@ from release_contract import (
     DISTRIBUTED_APPLICATION_NAMES,
     DISTRIBUTION_TARGET_TRIPLES,
     PUBLISHABLE_PACKAGE_NAMES,
+    distribution_archive_name,
 )
 from release_evidence import EVIDENCE_SCHEMA, expected_feature_profiles
 from release_metadata import ReleaseMetadata
-
-
-def dist_artifact_name(application: str, target: str) -> str:
-    extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
-    return f"{application}-{target}{extension}"
 
 
 def make_dist_plan(
@@ -27,7 +23,7 @@ def make_dist_plan(
     for application in DISTRIBUTED_APPLICATION_NAMES:
         release_artifacts: list[str] = []
         for target in DISTRIBUTION_TARGET_TRIPLES:
-            archive = dist_artifact_name(application, target)
+            archive = distribution_archive_name(application, target)
             checksum = f"{archive}.sha256"
             artifacts[archive] = {
                 "name": archive,

@@ -9,7 +9,11 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO
 
-from release_contract import DISTRIBUTION_TARGET_TRIPLES
+from release_contract import (
+    DISTRIBUTION_TARGET_TRIPLES,
+    distribution_archive_extension,
+    distribution_executable_name,
+)
 from release_path_safety import ReleasePathSafetyError, portable_path_alias_key
 
 
@@ -47,11 +51,11 @@ def verify_release_binary_identity(
         raise ReleaseBinaryIdentityError(
             f"release archive {archive.name} uses an unsupported executable target: {target}"
         )
-    expected_name = application + (".exe" if target.endswith("windows-msvc") else "")
+    expected_name = distribution_executable_name(application, target)
     expected_report = version_report(
         application, version, source_commit, target
     ).encode("ascii")
-    expected_extension = ".zip" if target.endswith("windows-msvc") else ".tar.xz"
+    expected_extension = distribution_archive_extension(target)
     if not archive.name.endswith(expected_extension):
         raise ReleaseBinaryIdentityError(
             f"release target {target} requires a {expected_extension} archive: {archive.name}"
