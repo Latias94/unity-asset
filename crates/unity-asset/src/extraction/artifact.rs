@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
@@ -199,7 +199,7 @@ impl OutputLayout {
         relative: &str,
     ) -> Result<Option<File>, OutputArtifactError> {
         let name = LogicalArtifactName::new(relative)?;
-        let root = absolute_path(root)?;
+        let root = resolve_output_root(root)?;
         let root_identity = match observe_directory_identity(&root) {
             Ok(identity) => identity,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -290,7 +290,7 @@ impl OutputLayout {
             });
         }
 
-        let root = absolute_path(root)?;
+        let root = resolve_output_root(root)?;
         let root_identity =
             ensure_directory_no_follow(&root).map_err(|source| OutputArtifactError::Io {
                 kind: ExtractionOutputErrorKind::PrepareRoot,
@@ -646,7 +646,7 @@ impl Drop for StagedOutput {
     }
 }
 
-fn absolute_path(path: &Path) -> Result<PathBuf, OutputArtifactError> {
+fn resolve_output_root(path: &Path) -> Result<PathBuf, OutputArtifactError> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -671,7 +671,40 @@ fn absolute_path(path: &Path) -> Result<PathBuf, OutputArtifactError> {
             ),
         });
     }
-    Ok(path)
+
+    // Resolve aliases only outside the output root. The root leaf and every
+    // descendant remain subject to the platform's component-wise no-follow
+    // opens, while system aliases such as macOS `/var -> /private/var` do not
+    // make an otherwise valid output namespace unusable.
+    let Some(mut ancestor) = path.parent().map(Path::to_path_buf) else {
+        return Ok(path);
+    };
+    loop {
+        match fs::canonicalize(&ancestor) {
+            Ok(canonical) => {
+                let suffix = path
+                    .strip_prefix(&ancestor)
+                    .expect("a parent-derived output ancestor must prefix the root");
+                return Ok(canonical.join(suffix));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if !ancestor.pop() {
+                    return Err(OutputArtifactError::Io {
+                        kind: ExtractionOutputErrorKind::ValidateRoot,
+                        path,
+                        source: error,
+                    });
+                }
+            }
+            Err(source) => {
+                return Err(OutputArtifactError::Io {
+                    kind: ExtractionOutputErrorKind::ValidateRoot,
+                    path,
+                    source,
+                });
+            }
+        }
+    }
 }
 
 fn logical_path(value: &str) -> PathBuf {
@@ -815,6 +848,66 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn layout_accepts_an_output_root_below_an_external_path_alias() {
+        use std::os::unix::fs::symlink;
+
+        let namespace = tempfile::tempdir().expect("output namespace");
+        let physical_parent = namespace.path().join("physical");
+        let physical_root = physical_parent.join("output");
+        std::fs::create_dir_all(&physical_root).expect("physical output root");
+        let alias = namespace.path().join("alias");
+        symlink(&physical_parent, &alias).expect("external path alias");
+        let requested_root = alias.join("output");
+
+        let layout = OutputLayout::prepare(&requested_root, ["objects/item.bin"])
+            .expect("an alias outside the output root may name its physical parent");
+        let mut staging = layout
+            .path("objects/item.bin")
+            .expect("prepared output")
+            .create_staging()
+            .expect("staging file");
+        staging.writer().write_all(b"published").unwrap();
+        staging.finish().unwrap().publish(false).unwrap();
+
+        assert_eq!(
+            std::fs::read(physical_root.join("objects/item.bin")).unwrap(),
+            b"published"
+        );
+        assert!(OutputLayout::has_existing(&requested_root, "objects/item.bin").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn layout_rejects_a_symlinked_output_root() {
+        use std::os::unix::fs::symlink;
+
+        let namespace = tempfile::tempdir().expect("output namespace");
+        let external = tempfile::tempdir().expect("external directory");
+        let root = namespace.path().join("output");
+        symlink(external.path(), &root).expect("symlinked output root");
+
+        let error = OutputLayout::prepare(&root, ["objects/item.bin"])
+            .expect_err("the output root itself must remain no-follow");
+
+        assert_eq!(error.kind(), super::ExtractionOutputErrorKind::PrepareRoot);
+        assert!(!external.path().join(super::EXECUTION_LOCK_NAME).exists());
+        assert!(!external.path().join("objects/item.bin").exists());
+    }
+
+    #[test]
+    fn layout_creates_multiple_missing_output_root_components() {
+        let namespace = tempfile::tempdir().expect("output namespace");
+        let root = namespace.path().join("missing/parents/output");
+
+        let layout = OutputLayout::prepare(&root, ["objects/item.bin"])
+            .expect("the output root retains recursive creation semantics");
+
+        assert!(root.is_dir());
+        assert!(layout.path("objects/item.bin").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn layout_rejects_a_symlinked_output_ancestor() {
         use std::os::unix::fs::symlink;
 
@@ -822,9 +915,13 @@ mod tests {
         let external = tempfile::tempdir().expect("external directory");
         symlink(external.path(), root.path().join("escape")).expect("directory symlink");
 
-        OutputLayout::prepare(root.path(), ["escape/artifact.bin"])
+        let error = OutputLayout::prepare(root.path(), ["escape/artifact.bin"])
             .expect_err("symlinked output ancestor must be rejected");
 
+        assert_eq!(
+            error.kind(),
+            super::ExtractionOutputErrorKind::PrepareDirectory
+        );
         assert!(!external.path().join("artifact.bin").exists());
     }
 

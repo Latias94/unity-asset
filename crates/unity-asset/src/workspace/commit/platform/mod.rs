@@ -121,7 +121,7 @@ pub(crate) fn reserve_security_metadata_copy(
 ) -> Result<SecurityMetadataCopyReservation, BudgetError> {
     budget.consume_bytes(SECURITY_METADATA_COPY_RESERVATION_BYTES)?;
     let private_limits = AssetLoadLimits {
-        max_bytes: SECURITY_METADATA_COPY_RESERVATION_BYTES.max(1),
+        max_bytes: private_budget_limit(SECURITY_METADATA_COPY_RESERVATION_BYTES),
         ..AssetLoadLimits::default()
     };
     let private_budget = AssetLoadBudget::new(private_limits)
@@ -135,6 +135,14 @@ pub(crate) fn reserve_security_metadata_copy(
 /// journal-to-journal security-metadata copy.
 pub(crate) const SECURITY_METADATA_COPY_RESERVATION_BYTES: u64 =
     platform::SECURITY_METADATA_COPY_RESERVATION_BYTES;
+
+const fn private_budget_limit(reserved_bytes: u64) -> u64 {
+    if reserved_bytes == 0 {
+        1
+    } else {
+        reserved_bytes
+    }
+}
 
 /// Conservative caller-owned reservation required before opening an
 /// identity-bound directory iterator.
@@ -981,7 +989,7 @@ mod tests {
         );
         assert_eq!(
             reservation.budget_mut().limits().max_bytes,
-            SECURITY_METADATA_COPY_RESERVATION_BYTES.max(1)
+            private_budget_limit(SECURITY_METADATA_COPY_RESERVATION_BYTES)
         );
     }
 }

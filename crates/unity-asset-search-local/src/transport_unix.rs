@@ -188,8 +188,7 @@ fn verify_peer_credentials(
         .and_then(|pid| u32::try_from(pid).ok())
         .filter(|pid| *pid != 0)
         .ok_or(EndpointTransportError::PeerCredentialUnavailable)?;
-    let effective_uid = u32::try_from(credentials.uid())
-        .map_err(|_| EndpointTransportError::PeerCredentialUnavailable)?;
+    let effective_uid = credentials.uid();
     if SecurityContextIdV1::for_effective_uid(effective_uid)? != expected {
         return Err(EndpointTransportError::PeerContextMismatch);
     }

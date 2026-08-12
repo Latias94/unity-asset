@@ -809,7 +809,7 @@ fn acquire_lock_at(parent: &OwnedFd, name: &OsStr) -> io::Result<File> {
     )
     .map_err(io::Error::from)?;
     let metadata = validate_regular_entry(
-        &parent,
+        parent,
         name,
         &descriptor,
         "publication lock changed during validation",
@@ -821,7 +821,7 @@ fn acquire_lock_at(parent: &OwnedFd, name: &OsStr) -> io::Result<File> {
     // A cooperating process must not be able to acquire a different inode by
     // replacing the lock pathname after this process acquired its lock.
     validate_regular_entry(
-        &parent,
+        parent,
         name,
         &descriptor,
         "publication lock path changed after locking",
@@ -2016,6 +2016,10 @@ fn validate_opened_digest(
     Ok(())
 }
 
+// `dev_t` is signed on Apple/BSD and unsigned on Linux. The serialized token
+// preserves the platform bit pattern, so these casts are intentionally shared
+// across Unix targets even when Clippy sees no conversion on Linux.
+#[allow(clippy::unnecessary_cast)]
 fn identity(metadata: &Stat) -> FileIdentity {
     FileIdentity {
         device: metadata.st_dev as u64,
@@ -2024,6 +2028,7 @@ fn identity(metadata: &Stat) -> FileIdentity {
     }
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn directory_identity(metadata: &Stat) -> DirectoryIdentity {
     DirectoryIdentity {
         device: metadata.st_dev as u64,

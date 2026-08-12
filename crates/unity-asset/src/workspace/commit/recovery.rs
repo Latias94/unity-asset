@@ -7284,7 +7284,8 @@ mod tests {
             artifact.old_identity().expect("existing target identity"),
         )
         .expect("restore base target identity");
-        fs::remove_file(&path).expect("remove original target");
+        let displaced = path.with_extension("externally-displaced");
+        fs::rename(&path, &displaced).expect("retain original inode outside the target path");
         fs::write(&path, YAML).expect("byte-identical replacement");
         let replacement_identity = observe_file_identity(&path).expect("replacement identity");
         assert_ne!(

@@ -1589,6 +1589,9 @@ mod platform {
         Ok(())
     }
 
+    // `dev_t` is signed on Apple and unsigned on Linux. Preserve the native
+    // identity bit pattern across both targets.
+    #[allow(clippy::unnecessary_cast)]
     fn directory_identity(stat: &rustix::fs::Stat) -> io::Result<DirectoryIdentity> {
         if !FileType::from_raw_mode(stat.st_mode).is_dir() {
             return Err(io::Error::other("path is not a directory"));
