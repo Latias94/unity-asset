@@ -43,6 +43,7 @@ pub(crate) enum AnchoredFsError {
     )]
     UnsupportedPlatform,
     LinkOrReparse,
+    #[cfg_attr(not(windows), allow(dead_code))]
     UnsupportedCaseSensitiveDirectory,
     NotDirectory,
     NotRegular,

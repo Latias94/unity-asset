@@ -873,7 +873,10 @@ mod tests {
             std::fs::read(physical_root.join("objects/item.bin")).unwrap(),
             b"published"
         );
-        assert!(OutputLayout::has_existing(&requested_root, "objects/item.bin").unwrap());
+        assert_eq!(
+            std::fs::read(requested_root.join("objects/item.bin")).unwrap(),
+            b"published"
+        );
     }
 
     #[cfg(unix)]

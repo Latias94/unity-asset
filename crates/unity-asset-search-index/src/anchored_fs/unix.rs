@@ -231,6 +231,10 @@ fn validate_directory(descriptor: &OwnedFd) -> Result<(), AnchoredFsError> {
     }
 }
 
+// Unix identity typedefs vary by target (`dev_t` is signed on Apple targets,
+// for example). The token preserves their bit patterns, so these casts are
+// shared intentionally even when Clippy sees no conversion on Linux.
+#[allow(clippy::unnecessary_cast)]
 fn regular_file_identity(
     metadata: &Stat,
     policy: OpenPolicy,
@@ -272,6 +276,7 @@ fn regular_file_identity(
     })
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn directory_identity(metadata: &Stat) -> Result<DirectoryIdentity, AnchoredFsError> {
     if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
         return Err(AnchoredFsError::NotDirectory);
