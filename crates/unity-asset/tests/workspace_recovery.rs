@@ -143,7 +143,7 @@ fn public_recovery_discovery_blocks_a_replaced_publication_root() {
     let root = directory.path().join("published");
     fs::create_dir(&root).unwrap();
     let target = PublicationTarget::in_place(&root).unwrap();
-    fs::remove_dir(&root).unwrap();
+    fs::rename(&root, directory.path().join("original-published")).unwrap();
     fs::create_dir(&root).unwrap();
 
     let error = target

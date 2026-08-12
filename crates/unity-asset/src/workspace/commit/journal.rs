@@ -3445,6 +3445,7 @@ mod tests {
         parent: &Path,
         existing: bool,
     ) -> (CommitReport, JournalManifest, JournalLayout) {
+        let parent = std::fs::canonicalize(parent).expect("canonical publication root");
         let workspace = WorkspaceId::from_u128(7).expect("workspace id");
         let source = SourceId::new(workspace, SourceKind::Yaml, 1).expect("source id");
         let from = WorkspaceRevision::new(DigestV1::hash_bytes(b"from"));
@@ -3459,7 +3460,7 @@ mod tests {
         let old_digest = existing.then(|| DigestV1::hash_bytes(b"old"));
         let old_identity = existing.then(|| FileIdentity::test_identity(1, 3));
         let destination_parent_identity =
-            observe_directory_identity(parent).expect("destination parent identity");
+            observe_directory_identity(&parent).expect("destination parent identity");
         let root_identity = destination_parent_identity.clone();
         let outputs = [JournalTransactionOutputSeed {
             ordinal: 0,
@@ -3512,7 +3513,7 @@ mod tests {
             Vec::new(),
         )
         .expect("change set");
-        let layout = JournalLayout::new(parent, transaction, root_identity);
+        let layout = JournalLayout::new(&parent, transaction, root_identity);
         std::fs::create_dir_all(layout.events_directory()).expect("events directory");
         std::fs::create_dir(layout.stage_directory()).expect("stage directory");
         std::fs::create_dir(layout.backup_directory()).expect("backup directory");
