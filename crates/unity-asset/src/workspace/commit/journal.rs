@@ -4054,13 +4054,14 @@ mod tests {
     #[test]
     fn identity_bound_json_read_rejects_replaced_events_parent_before_budget_use() {
         let directory = tempdir().expect("temporary directory");
-        let events = directory.path().join("events");
+        let parent = fs::canonicalize(directory.path()).expect("canonical fixture parent");
+        let events = parent.join("events");
         fs::create_dir(&events).expect("events directory");
         let expected_parent = observe_directory_identity(&events).expect("events identity");
         let event = events.join("event.json");
         fs::write(&event, b"null").expect("event fixture");
 
-        let displaced = directory.path().join("events-displaced");
+        let displaced = parent.join("events-displaced");
         fs::rename(&events, &displaced).expect("displace events directory");
         fs::create_dir(&events).expect("replacement events directory");
         fs::write(&event, b"null").expect("replacement event fixture");
