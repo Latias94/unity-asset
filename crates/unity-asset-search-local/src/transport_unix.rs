@@ -5,9 +5,6 @@ use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-#[cfg(target_os = "macos")]
-use std::time::Duration;
-
 use tokio::net::{UnixListener, UnixStream};
 use unity_asset_search_protocol::DaemonInstanceId;
 
@@ -16,9 +13,6 @@ use crate::{DiscoveredEndpointV1, EndpointNamespaceV1, ProcessIdentityV1, Securi
 
 const SOCKET_FILE: &str = "daemon.sock";
 const SOCKET_MODE: u32 = 0o600;
-#[cfg(target_os = "macos")]
-const PEER_CREDENTIAL_READY_RETRY: Duration = Duration::from_millis(1);
-const READ_PEER_CREDENTIALS: &str = "read Unix peer credentials";
 
 pub(super) struct Server {
     listener: UnixListener,
@@ -31,7 +25,7 @@ pub(super) struct Stream {
     inner: UnixStream,
 }
 
-pub(super) struct ReceivePrincipal;
+pub(super) struct ReceivePrincipal(ProcessIdentityV1);
 
 pub(super) fn validate_namespace_path(namespace_path: &Path) -> Result<(), EndpointTransportError> {
     socket_path(namespace_path).map(|_| ())
@@ -112,9 +106,7 @@ pub(super) async fn connect(
             EndpointTransportError::io("connect Unix endpoint", source)
         }
     })?;
-    let process_id =
-        verify_connected_peer_credentials(&inner, namespace.security_context_id(), deadline)
-            .await?;
+    let process_id = verify_peer_credentials(&inner, namespace.security_context_id())?;
     ensure_deadline(deadline)?;
     let validation_namespace = namespace.clone();
     let validation_path = socket_path.clone();
@@ -156,16 +148,20 @@ fn socket_path(namespace_path: &Path) -> Result<PathBuf, EndpointTransportError>
 pub(super) fn begin_receive(
     _stream: &Stream,
     _expected: SecurityContextIdV1,
+    authenticated_peer: ProcessIdentityV1,
 ) -> Result<ReceivePrincipal, EndpointTransportError> {
-    Ok(ReceivePrincipal)
+    // A connected Unix stream remains bound to the peer authenticated when the connection was
+    // established. Re-reading SO_PEERCRED does not provide a per-message identity, and Darwin no
+    // longer exposes it after the peer closes even when a complete frame remains buffered.
+    Ok(ReceivePrincipal(authenticated_peer))
 }
 
 pub(super) fn finish_receive(
-    stream: &Stream,
-    expected: SecurityContextIdV1,
-    _principal: ReceivePrincipal,
+    _stream: &Stream,
+    _expected: SecurityContextIdV1,
+    principal: ReceivePrincipal,
 ) -> Result<ProcessIdentityV1, EndpointTransportError> {
-    verify_peer(&stream.inner, expected)
+    Ok(principal.0)
 }
 
 fn prepare_socket_path(path: &Path) -> Result<(), EndpointTransportError> {
@@ -198,7 +194,7 @@ fn verify_peer_credentials(
 ) -> Result<u32, EndpointTransportError> {
     let credentials = stream
         .peer_cred()
-        .map_err(|source| EndpointTransportError::io(READ_PEER_CREDENTIALS, source))?;
+        .map_err(|source| EndpointTransportError::io("read Unix peer credentials", source))?;
     let process_id = credentials
         .pid()
         .and_then(|pid| u32::try_from(pid).ok())
@@ -209,47 +205,6 @@ fn verify_peer_credentials(
         return Err(EndpointTransportError::PeerContextMismatch);
     }
     Ok(process_id)
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn verify_connected_peer_credentials(
-    stream: &UnixStream,
-    expected: SecurityContextIdV1,
-    _deadline: Instant,
-) -> Result<u32, EndpointTransportError> {
-    verify_peer_credentials(stream, expected)
-}
-
-#[cfg(target_os = "macos")]
-async fn verify_connected_peer_credentials(
-    stream: &UnixStream,
-    expected: SecurityContextIdV1,
-    deadline: Instant,
-) -> Result<u32, EndpointTransportError> {
-    loop {
-        ensure_deadline(deadline)?;
-        match verify_peer_credentials(stream, expected) {
-            Ok(process_id) => return Ok(process_id),
-            Err(error) if peer_credentials_are_not_connected(&error) => {
-                let retry_at = Instant::now()
-                    .checked_add(PEER_CREDENTIAL_READY_RETRY)
-                    .unwrap_or(deadline)
-                    .min(deadline);
-                tokio::time::sleep_until(tokio::time::Instant::from_std(retry_at)).await;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn peer_credentials_are_not_connected(error: &EndpointTransportError) -> bool {
-    matches!(
-        error,
-        EndpointTransportError::Io { operation, source }
-            if *operation == READ_PEER_CREDENTIALS
-                && source.kind() == io::ErrorKind::NotConnected
-    )
 }
 
 fn inspect_peer_process(

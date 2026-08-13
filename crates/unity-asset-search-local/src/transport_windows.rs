@@ -375,6 +375,7 @@ fn pipe_slot_name(pipe_base: &str, slot_id: PipeSlotId) -> String {
 pub(super) fn begin_receive(
     stream: &Stream,
     expected: SecurityContextIdV1,
+    _authenticated_peer: ProcessIdentityV1,
 ) -> Result<ReceivePrincipal, EndpointTransportError> {
     match &stream.inner {
         // Windows exposes the server process bound to a client handle, but not a server-side

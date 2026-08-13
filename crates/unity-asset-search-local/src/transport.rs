@@ -65,6 +65,7 @@ mod platform {
     pub(super) fn begin_receive(
         _stream: &Stream,
         _expected: SecurityContextIdV1,
+        _authenticated_peer: ProcessIdentityV1,
     ) -> Result<ReceivePrincipal, EndpointTransportError> {
         Err(EndpointTransportError::UnsupportedPlatform)
     }
@@ -149,15 +150,21 @@ impl VerifiedFramedTransportV1 {
         self.peer_identity
     }
 
-    /// Reads one complete frame and verifies the latest platform-bound peer proof before returning
-    /// its bytes. On Windows, server reads use message-level client impersonation; client reads
-    /// revalidate the named-pipe server process and primary-token identity before receiving.
+    /// Reads one complete frame while preserving its platform-bound peer proof. Unix streams use
+    /// the immutable identity authenticated when the connection was established, including when
+    /// the peer closes after writing a complete buffered frame. On Windows, server reads use
+    /// message-level client impersonation; client reads revalidate the named-pipe server process
+    /// and primary-token identity before receiving.
     pub async fn read_frame(
         &mut self,
         limits: FrameLimits,
         timeouts: FrameReadTimeoutsV1,
     ) -> Result<Option<Vec<u8>>, EndpointTransportError> {
-        let principal = platform::begin_receive(&self.inner, self.expected_security_context)?;
+        let principal = platform::begin_receive(
+            &self.inner,
+            self.expected_security_context,
+            self.peer_identity,
+        )?;
         let frame = read_frame_from(
             &mut self.inner,
             limits.max_encoded_bytes(),

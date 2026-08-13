@@ -108,6 +108,73 @@ async fn same_principal_connects_to_the_published_process() {
     std::fs::remove_dir(cleanup_path).unwrap();
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn complete_unix_frame_remains_authenticated_after_the_peer_closes() {
+    let roots = PrivateRootsV1::discover_for_current_context().unwrap();
+    let mut project_bytes = rand::random::<[u8; 32]>();
+    project_bytes[0] |= 1;
+    let namespace = roots
+        .runtime()
+        .endpoint_namespace(ProjectId::from_bytes(project_bytes))
+        .unwrap();
+    let cleanup_path = namespace.path().to_path_buf();
+    let mut claim = namespace.claim_daemon_endpoint().unwrap();
+    let mut endpoint = claim
+        .publish(generate_daemon_instance_id().unwrap())
+        .unwrap();
+    let discovered = namespace.discover_endpoint().unwrap();
+    let (accepted, connected) = tokio::join!(
+        endpoint.accept_verified(),
+        discovered.connect_verified(&namespace, Instant::now() + Duration::from_secs(5))
+    );
+    let mut accepted = accepted.unwrap();
+    let mut connected = connected.unwrap();
+    let frame = [0, 0, 0, 4, b'd', b'o', b'n', b'e'];
+
+    accepted
+        .write_frame(&frame, FrameLimits::bootstrap(), Duration::from_secs(5))
+        .await
+        .unwrap();
+    drop(accepted);
+
+    assert_eq!(
+        connected
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        frame
+    );
+    assert!(
+        connected
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
+            )
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    drop(connected);
+    assert_eq!(endpoint.withdraw().unwrap(), EndpointCleanupV1::Removed);
+    drop(endpoint);
+    drop(namespace);
+    drop(roots);
+    for name in ["binding.v1", BINDING_LOCK_FILE, ".daemon-v1.lock"] {
+        let result = std::fs::remove_file(cleanup_path.join(name));
+        assert!(
+            result.is_ok()
+                || result.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        );
+    }
+    std::fs::remove_dir(cleanup_path).unwrap();
+}
+
 #[tokio::test]
 async fn a_previously_discovered_endpoint_becoming_absent_is_a_generation_change() {
     let roots = PrivateRootsV1::discover_for_current_context().unwrap();
