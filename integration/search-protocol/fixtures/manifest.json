@@ -16,6 +16,11 @@
       "business_revision": 3,
       "path": "frozen-business-v3.json",
       "sha256": "5774a6331cf7f560d389b86bd268639672304d4ad638dd9d8a5a6053b49a9d7a"
+    },
+    {
+      "business_revision": 4,
+      "path": "frozen-business-v4.json",
+      "sha256": "43a825a10cf984122d4c6fd4f8d6d33e9d9a09cdbce17711924df46fa21b00c7"
     }
   ],
   "binding": {

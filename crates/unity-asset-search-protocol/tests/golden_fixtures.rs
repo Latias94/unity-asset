@@ -17,6 +17,8 @@ const FROZEN_BUSINESS_V2_INVENTORY_SHA256: &str =
     "6891e3190d36396e546989a0f55ac97766902aa37289993b5f4709ffa3ccf776";
 const FROZEN_BUSINESS_V3_INVENTORY_SHA256: &str =
     "5774a6331cf7f560d389b86bd268639672304d4ad638dd9d8a5a6053b49a9d7a";
+const FROZEN_BUSINESS_V4_INVENTORY_SHA256: &str =
+    "43a825a10cf984122d4c6fd4f8d6d33e9d9a09cdbce17711924df46fa21b00c7";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -193,6 +195,7 @@ fn assert_frozen_business(root: &Path, references: &[FrozenInventoryReference]) 
         (1, FROZEN_BUSINESS_V1_INVENTORY_SHA256),
         (2, FROZEN_BUSINESS_V2_INVENTORY_SHA256),
         (3, FROZEN_BUSINESS_V3_INVENTORY_SHA256),
+        (4, FROZEN_BUSINESS_V4_INVENTORY_SHA256),
     ];
     assert_eq!(references.len(), expected.len());
 

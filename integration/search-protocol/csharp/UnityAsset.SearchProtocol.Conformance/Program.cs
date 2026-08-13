@@ -17,6 +17,8 @@ internal static class ConformanceProgram
         "6891e3190d36396e546989a0f55ac97766902aa37289993b5f4709ffa3ccf776";
     private const string FrozenBusinessV3InventorySha256 =
         "5774a6331cf7f560d389b86bd268639672304d4ad638dd9d8a5a6053b49a9d7a";
+    private const string FrozenBusinessV4InventorySha256 =
+        "43a825a10cf984122d4c6fd4f8d6d33e9d9a09cdbce17711924df46fa21b00c7";
 
     private static readonly string[] OperationNames =
     {
@@ -291,6 +293,7 @@ internal static class ConformanceProgram
             [1] = FrozenBusinessV1InventorySha256,
             [2] = FrozenBusinessV2InventorySha256,
             [3] = FrozenBusinessV3InventorySha256,
+            [4] = FrozenBusinessV4InventorySha256,
         };
         Require(references.Count == expectedDigests.Count, "Frozen business inventory set is incomplete.");
         var inventories = new List<FrozenBusinessInventory>(references.Count);
