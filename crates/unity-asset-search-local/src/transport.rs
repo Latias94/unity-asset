@@ -1,6 +1,8 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -19,6 +21,13 @@ pub const MAX_LOCAL_IPC_CONNECTIONS_V1: usize = 64;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "transport_unix.rs"]
 mod platform;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn validate_endpoint_namespace_path(
+    namespace_path: &Path,
+) -> Result<(), EndpointTransportError> {
+    platform::validate_namespace_path(namespace_path)
+}
 #[cfg(windows)]
 #[path = "transport_windows.rs"]
 mod platform;

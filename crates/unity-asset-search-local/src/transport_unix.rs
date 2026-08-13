@@ -1,6 +1,7 @@
 use std::fs;
 use std::io;
 use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+use std::os::unix::net::SocketAddr as UnixSocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -26,6 +27,10 @@ pub(super) struct Stream {
 
 pub(super) struct ReceivePrincipal;
 
+pub(super) fn validate_namespace_path(namespace_path: &Path) -> Result<(), EndpointTransportError> {
+    socket_path(namespace_path).map(|_| ())
+}
+
 pub(super) fn bind(
     namespace: &EndpointNamespaceV1,
     _instance: DaemonInstanceId,
@@ -33,9 +38,7 @@ pub(super) fn bind(
     namespace.revalidate().map_err(|source| {
         EndpointTransportError::io("revalidate endpoint namespace", io::Error::other(source))
     })?;
-    let socket_path = namespace.path().join(SOCKET_FILE);
-    rustix::net::SocketAddrUnix::new(&socket_path)
-        .map_err(|_| EndpointTransportError::EndpointNameTooLong)?;
+    let socket_path = socket_path(namespace.path())?;
     prepare_socket_path(&socket_path)?;
     let listener = UnixListener::bind(&socket_path)
         .map_err(|source| EndpointTransportError::io("bind Unix endpoint", source))?;
@@ -76,9 +79,7 @@ pub(super) async fn connect(
     deadline: Instant,
 ) -> Result<(Stream, ProcessIdentityV1), EndpointTransportError> {
     ensure_deadline(deadline)?;
-    let socket_path = namespace.path().join(SOCKET_FILE);
-    rustix::net::SocketAddrUnix::new(&socket_path)
-        .map_err(|_| EndpointTransportError::EndpointNameTooLong)?;
+    let socket_path = socket_path(namespace.path())?;
     let before = match validate_socket(&socket_path) {
         Ok(identity) => identity,
         Err(EndpointTransportError::Io { source, .. })
@@ -135,6 +136,13 @@ pub(super) async fn connect(
             )
         })??;
     Ok((Stream { inner }, peer))
+}
+
+fn socket_path(namespace_path: &Path) -> Result<PathBuf, EndpointTransportError> {
+    let socket_path = namespace_path.join(SOCKET_FILE);
+    UnixSocketAddr::from_pathname(&socket_path)
+        .map_err(|_| EndpointTransportError::EndpointNameTooLong)?;
+    Ok(socket_path)
 }
 
 pub(super) fn begin_receive(
@@ -295,12 +303,14 @@ impl tokio::io::AsyncWrite for Stream {
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::SocketAddr as UnixSocketAddr;
+    use std::path::PathBuf;
     use std::process::Stdio;
     use std::time::Duration;
 
     use tokio::net::UnixListener;
 
-    use super::{EndpointTransportError, verify_peer};
+    use super::{EndpointTransportError, SOCKET_FILE, socket_path, verify_peer};
     use crate::SecurityContextIdV1;
 
     const SECONDARY_USER_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_USER";
@@ -321,6 +331,31 @@ print(f"peer-euid={actual_uid}", flush=True)
 if client.recv(1):
     raise SystemExit("rejected peer received unexpected endpoint data")
 "#;
+
+    #[test]
+    fn namespace_validation_matches_the_standard_library_pathname_boundary() {
+        let mut accepted_namespace = None;
+        let mut rejected_namespace = None;
+        for length in 1..=512 {
+            let namespace = PathBuf::from(format!("/{}", "x".repeat(length)));
+            let candidate = namespace.join(SOCKET_FILE);
+            let accepted = UnixSocketAddr::from_pathname(&candidate).is_ok();
+            if accepted {
+                accepted_namespace = Some(namespace);
+            } else if accepted_namespace.is_some() {
+                rejected_namespace = Some(namespace);
+                break;
+            }
+        }
+
+        let accepted_namespace = accepted_namespace.expect("platform accepts a Unix pathname");
+        let rejected_namespace = rejected_namespace.expect("platform pathname limit is bounded");
+        assert!(socket_path(&accepted_namespace).is_ok());
+        assert!(matches!(
+            socket_path(&rejected_namespace),
+            Err(EndpointTransportError::EndpointNameTooLong)
+        ));
+    }
 
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires passwordless sudo and a secondary Unix account; exercised by platform CI"]

@@ -803,6 +803,8 @@ pub enum PrivateRootsError {
     MissingHomeDirectory,
     #[error("project ID must not be zero")]
     ZeroProjectId,
+    #[error("private runtime root at {path} cannot represent a local endpoint path")]
+    EndpointPathTooLong { path: PathBuf },
     #[error("the effective security context changed while private roots were in use")]
     SecurityContextChanged,
     #[error("private {actual} root cannot provide a {expected} namespace")]
@@ -916,7 +918,8 @@ mod platform {
     use rustix::io::Errno;
 
     use super::{
-        DiscoveredRoots, PRODUCT_DIRECTORY, PrivateRootKind, PrivateRootsError, filesystem_error,
+        DiscoveredRoots, ENDPOINT_NAMESPACE_KEY_BYTES, PRODUCT_DIRECTORY, PrivateRootKind,
+        PrivateRootsError, filesystem_error,
     };
     use crate::security_context::CurrentSecurityContextSnapshot;
 
@@ -1126,49 +1129,40 @@ mod platform {
             return create_product_root(kind, &base_path, &base, expected_uid);
         }
 
-        let temporary_path = PathBuf::from("/tmp");
-        let temporary = open_path(&temporary_path).map_err(|source| {
-            filesystem_error(kind, "open /tmp fallback", &temporary_path, source)
-        })?;
-        validate_sticky_temporary_base(&temporary).map_err(|source| {
-            filesystem_error(kind, "validate /tmp fallback", &temporary_path, source)
-        })?;
-        let name = OsString::from(format!("{PRODUCT_DIRECTORY}-{expected_uid}"));
-        let path = temporary_path.join(&name);
-        let root = create_or_open_private_child(&temporary, &name, expected_uid)
-            .map_err(|source| filesystem_error(kind, "create /tmp runtime root", &path, source))?;
-        Ok((path, root))
+        discover_sticky_temporary_runtime(Path::new("/tmp"), expected_uid)
     }
 
     #[cfg(target_os = "macos")]
     fn discover_runtime(
         expected_uid: u32,
     ) -> Result<(PathBuf, PrivateDirectory), PrivateRootsError> {
+        discover_sticky_temporary_runtime(Path::new("/private/tmp"), expected_uid)
+    }
+
+    fn discover_sticky_temporary_runtime(
+        temporary_path: &Path,
+        expected_uid: u32,
+    ) -> Result<(PathBuf, PrivateDirectory), PrivateRootsError> {
         let kind = PrivateRootKind::Runtime;
-        let requested_base_path = darwin_user_temporary_directory().map_err(|source| {
+        let temporary = open_path(temporary_path).map_err(|source| {
+            filesystem_error(kind, "open temporary runtime base", temporary_path, source)
+        })?;
+        validate_sticky_temporary_base(&temporary).map_err(|source| {
             filesystem_error(
                 kind,
-                "resolve user temporary base",
-                Path::new("<darwin-user-temp>"),
+                "validate temporary runtime base",
+                temporary_path,
                 source,
             )
         })?;
-        let base_path =
-            resolve_trusted_locator_ancestors(&requested_base_path).map_err(|source| {
-                filesystem_error(
-                    kind,
-                    "resolve user temporary base ancestors",
-                    &requested_base_path,
-                    source,
-                )
+        let name = OsString::from(format!("{PRODUCT_DIRECTORY}-{expected_uid}"));
+        let path = temporary_path.join(&name);
+        validate_runtime_endpoint_capacity(&path)?;
+        let root =
+            create_or_open_private_child(&temporary, &name, expected_uid).map_err(|source| {
+                filesystem_error(kind, "create private runtime root", &path, source)
             })?;
-        let base = open_path(&base_path).map_err(|source| {
-            filesystem_error(kind, "open user temporary base", &base_path, source)
-        })?;
-        validate_private_directory(&base, expected_uid).map_err(|source| {
-            filesystem_error(kind, "validate user temporary base", &base_path, source)
-        })?;
-        create_product_root(kind, &base_path, &base, expected_uid)
+        Ok((path, root))
     }
 
     #[cfg(target_os = "macos")]
@@ -1236,9 +1230,25 @@ mod platform {
         expected_uid: u32,
     ) -> Result<(PathBuf, PrivateDirectory), PrivateRootsError> {
         let path = base_path.join(PRODUCT_DIRECTORY);
+        if kind == PrivateRootKind::Runtime {
+            validate_runtime_endpoint_capacity(&path)?;
+        }
         let root = create_or_open_private_child(base, OsStr::new(PRODUCT_DIRECTORY), expected_uid)
             .map_err(|source| filesystem_error(kind, "create product root", &path, source))?;
         Ok((path, root))
+    }
+
+    fn validate_runtime_endpoint_capacity(path: &Path) -> Result<(), PrivateRootsError> {
+        let component = format!(
+            "p-{}",
+            "0".repeat(ENDPOINT_NAMESPACE_KEY_BYTES.saturating_mul(2))
+        );
+        let namespace_path = path.join(component);
+        crate::transport::validate_endpoint_namespace_path(&namespace_path).map_err(|_| {
+            PrivateRootsError::EndpointPathTooLong {
+                path: path.to_path_buf(),
+            }
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1602,7 +1612,6 @@ mod platform {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn validate_sticky_temporary_base(directory: &OwnedFd) -> io::Result<()> {
         crate::local_filesystem::validate_local_directory(directory)?;
         let metadata = fstat(directory.as_fd()).map_err(io::Error::from)?;
@@ -1614,6 +1623,8 @@ mod platform {
                 "temporary fallback must be root-owned, sticky, and world-writable",
             ));
         }
+        #[cfg(target_os = "macos")]
+        macos_acl::reject_allow_entries(directory)?;
         Ok(())
     }
 
@@ -1654,37 +1665,6 @@ mod platform {
             io::ErrorKind::InvalidInput,
             "private root contains an invalid or escaping path component",
         )
-    }
-
-    #[cfg(target_os = "macos")]
-    fn darwin_user_temporary_directory() -> io::Result<PathBuf> {
-        // SAFETY: the null-buffer call is the documented size query for confstr.
-        let required =
-            unsafe { libc::confstr(libc::_CS_DARWIN_USER_TEMP_DIR, std::ptr::null_mut(), 0) };
-        if required == 0 || required > 64 * 1024 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut buffer = vec![0_u8; required];
-        // SAFETY: `buffer` is writable for its full declared length.
-        let returned = unsafe {
-            libc::confstr(
-                libc::_CS_DARWIN_USER_TEMP_DIR,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-            )
-        };
-        if returned == 0 || returned > buffer.len() || buffer[returned - 1] != 0 {
-            return Err(io::Error::other(
-                "confstr returned an invalid Darwin user temporary directory",
-            ));
-        }
-        buffer.truncate(returned - 1);
-        if buffer.is_empty() {
-            return Err(io::Error::other(
-                "confstr returned an empty Darwin user temporary directory",
-            ));
-        }
-        Ok(PathBuf::from(OsString::from_vec(buffer)))
     }
 
     #[cfg(target_os = "macos")]
@@ -1888,6 +1868,23 @@ mod platform {
             let bound_leaf = resolve_trusted_locator_ancestors(&linked_leaf).unwrap();
             assert_eq!(bound_leaf, linked_leaf);
             assert!(open_path(&bound_leaf).is_err());
+        }
+
+        #[test]
+        fn runtime_root_must_leave_capacity_for_the_transport_endpoint() {
+            #[cfg(target_os = "linux")]
+            let temporary_path = Path::new("/tmp");
+            #[cfg(target_os = "macos")]
+            let temporary_path = Path::new("/private/tmp");
+            let maximum_uid_root = temporary_path.join(format!("{PRODUCT_DIRECTORY}-{}", u32::MAX));
+
+            validate_runtime_endpoint_capacity(&maximum_uid_root).unwrap();
+            let oversized = Path::new("/").join("x".repeat(512));
+
+            assert!(matches!(
+                validate_runtime_endpoint_capacity(&oversized),
+                Err(PrivateRootsError::EndpointPathTooLong { path }) if path == oversized
+            ));
         }
 
         #[cfg(target_os = "macos")]
