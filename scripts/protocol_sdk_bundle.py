@@ -920,9 +920,9 @@ def build_protocol_sdk_bundle(
             except OSError:
                 pass
 
-    written_metadata = verify_protocol_sdk_bundle(output_path, release_tag)
-    if written_metadata != metadata:
+    _, written_bundle = _read_bundle_file(output_path)
+    if written_bundle != bundle:
         raise ProtocolSdkBundleError(
             "written protocol SDK bundle does not match the generated artifact"
         )
-    return written_metadata
+    return metadata
