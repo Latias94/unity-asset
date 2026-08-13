@@ -18,49 +18,11 @@ namespace UnityAsset.SearchProtocol.Reference
         private const int MaxSearchHitsJsonBytes = 10 * 1024 * 1024;
         private const int MaxSearchResponseJsonBytes = 15 * 1024 * 1024;
         private const int MaxStatusPathsJsonBytes = 224 * 1024;
-        private static readonly string[] BackgroundReindexOrigins =
-        {
-            "startup",
-            "watcher",
-            "watcher_overflow",
-            "timer",
-            "semantic_upgrade",
-        };
-
         private static readonly string[] BackgroundReindexOperationProperties =
         {
             "origin",
             "operation_id",
             "state",
-        };
-
-        private static readonly string[] ReindexOperationStates =
-        {
-            "queued",
-            "coalesced",
-            "running",
-            "succeeded",
-            "failed",
-            "cancelled",
-            "expired",
-            "lost",
-        };
-
-        private static readonly string[] ApiErrorCodes =
-        {
-            "invalid_request",
-            "invalid_cursor",
-            "stale_cursor",
-            "incompatible_protocol",
-            "peer_rejected",
-            "busy",
-            "not_ready",
-            "revision_mismatch",
-            "index_build_failed",
-            "idempotency_conflict",
-            "operation_not_found",
-            "operation_control_forbidden",
-            "internal",
         };
 
         private static readonly string[] Operations =
@@ -172,14 +134,6 @@ namespace UnityAsset.SearchProtocol.Reference
             return result;
         }
 
-        internal static IReadOnlyList<BackgroundReindexOperation> ReadBackgroundReindexOperations(
-            JsonElement operations,
-            string path)
-        {
-            ValidateBackgroundReindexOperations(operations, path);
-            return MaterializeBackgroundReindexOperations(operations);
-        }
-
         internal static SearchCapabilities MaterializeSearchCapabilities(JsonElement capabilities)
         {
             return new SearchCapabilities(
@@ -196,7 +150,7 @@ namespace UnityAsset.SearchProtocol.Reference
 
         internal static ApiErrorCode ReadApiErrorCode(JsonElement code, string path)
         {
-            return ParseApiErrorCode(StrictJson.Enum(code, path, ApiErrorCodes));
+            return ParseApiErrorCode(StrictJson.String(code, path));
         }
 
         internal static void ValidateResponseForRequest(ResponseEnvelopeV1 response, RequestEnvelopeV1 request)
@@ -1270,10 +1224,10 @@ namespace UnityAsset.SearchProtocol.Reference
         {
             StrictJson.Properties(response, path, "operation_id", "state", "admission?", "completion?", "status?", "error?");
             OperationId.Parse(StrictJson.String(StrictJson.Required(response, "operation_id", path), path + ".operation_id"));
-            string state = StrictJson.Enum(
-                StrictJson.Required(response, "state", path),
-                path + ".state",
-                ReindexOperationStates);
+            ReindexOperationState state = ParseReindexOperationState(
+                StrictJson.String(
+                    StrictJson.Required(response, "state", path),
+                    path + ".state"));
             bool hasAdmission = StrictJson.Optional(response, "admission", out JsonElement admission);
             bool hasCompletion = StrictJson.Optional(response, "completion", out JsonElement completion);
             bool hasStatus = StrictJson.Optional(response, "status", out JsonElement status);
@@ -1298,15 +1252,15 @@ namespace UnityAsset.SearchProtocol.Reference
             bool valid;
             switch (state)
             {
-                case "queued":
-                case "coalesced":
-                case "running":
+                case ReindexOperationState.Queued:
+                case ReindexOperationState.Coalesced:
+                case ReindexOperationState.Running:
                     valid = !hasCompletion && !hasStatus && !hasError;
                     break;
-                case "succeeded":
+                case ReindexOperationState.Succeeded:
                     valid = hasCompletion && hasStatus && !hasError;
                     break;
-                case "failed":
+                case ReindexOperationState.Failed:
                     valid = !hasCompletion && !hasStatus && hasError;
                     break;
                 default:
@@ -1317,7 +1271,7 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 throw new ProtocolValidationException(path + " has fields inconsistent with its lifecycle state");
             }
-            if (state == "succeeded")
+            if (state == ReindexOperationState.Succeeded)
             {
                 string completionDisposition = StrictJson.String(
                     StrictJson.Required(completion, "disposition", path + ".completion"),
@@ -1344,12 +1298,12 @@ namespace UnityAsset.SearchProtocol.Reference
         {
             StrictJson.Properties(response, path, "operation_id", "state", "cancelled");
             OperationId.Parse(StrictJson.String(StrictJson.Required(response, "operation_id", path), path + ".operation_id"));
-            string state = StrictJson.Enum(
-                StrictJson.Required(response, "state", path),
-                path + ".state",
-                ReindexOperationStates);
+            ReindexOperationState state = ParseReindexOperationState(
+                StrictJson.String(
+                    StrictJson.Required(response, "state", path),
+                    path + ".state"));
             bool cancelled = StrictJson.Boolean(StrictJson.Required(response, "cancelled", path), path + ".cancelled");
-            if (cancelled != (state == "cancelled"))
+            if (cancelled != (state == ReindexOperationState.Cancelled))
             {
                 throw new ProtocolValidationException(path + " has an inconsistent cancellation result");
             }
@@ -1662,11 +1616,11 @@ namespace UnityAsset.SearchProtocol.Reference
                 string operationPath = $"{path}[{index}]";
                 StrictJson.Properties(operation, operationPath, BackgroundReindexOperationProperties);
 
-                string originValue = StrictJson.Enum(
-                    StrictJson.Required(operation, "origin", operationPath),
-                    operationPath + ".origin",
-                    BackgroundReindexOrigins);
-                int originIndex = Array.IndexOf(BackgroundReindexOrigins, originValue);
+                BackgroundReindexOrigin origin = ParseBackgroundReindexOrigin(
+                    StrictJson.String(
+                        StrictJson.Required(operation, "origin", operationPath),
+                        operationPath + ".origin"));
+                int originIndex = (int)origin;
                 if (originIndex <= previousOrigin)
                 {
                     throw new ProtocolValidationException(path + " origins must be strictly increasing");
@@ -1691,11 +1645,11 @@ namespace UnityAsset.SearchProtocol.Reference
                     previousIndex++;
                 }
 
-                string stateValue = StrictJson.Enum(
-                    StrictJson.Required(operation, "state", operationPath),
-                    operationPath + ".state",
-                    ReindexOperationStates);
-                if (stateValue == "lost")
+                ReindexOperationState state = ParseReindexOperationState(
+                    StrictJson.String(
+                        StrictJson.Required(operation, "state", operationPath),
+                        operationPath + ".state"));
+                if (state == ReindexOperationState.Lost)
                 {
                     throw new ProtocolValidationException(
                         operationPath + ".state cannot be lost for a discoverable background operation");
