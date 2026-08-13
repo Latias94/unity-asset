@@ -311,44 +311,59 @@ class PackageVerifierRejectionTests(unittest.TestCase):
 
             self.assertTrue(workspace.is_file())
             self.assertEqual(len(positive), 4)
-            self.assertEqual(
-                len(consumers), 4 + len(verifier.REMOVED_DECODE_API_PATHS)
-            )
-            self.assertTrue(removed.isdisjoint(positive))
-            self.assertTrue(removed.issubset(consumers))
-            self.assertEqual(len(removed), len(verifier.REMOVED_DECODE_API_PATHS))
+            self.assertEqual(len(consumers), 5)
+            self.assertNotIn(removed, positive)
+            self.assertIn(removed, consumers)
             self.assertEqual(required, {"unity-asset-decode", "unity-asset"})
             self.assertEqual(
-                {
-                    (
-                        consumers[name].parent / "src" / "lib.rs"
-                    ).read_text(encoding="utf-8")
-                    for name in removed
-                },
-                {
+                (consumers[removed].parent / "src" / "lib.rs").read_text(
+                    encoding="utf-8"
+                ),
+                "".join(
                     f"use unity_asset_decode::{path};\n"
                     for path in verifier.REMOVED_DECODE_API_PATHS
-                },
+                ),
             )
-            for name in removed:
-                removed_manifest = consumers[name].read_text(encoding="utf-8")
-                self.assertIn('default-features = false', removed_manifest)
-                self.assertIn('features = ["full"]', removed_manifest)
+            removed_manifest = consumers[removed].read_text(encoding="utf-8")
+            self.assertIn('default-features = false', removed_manifest)
+            self.assertIn('features = ["full"]', removed_manifest)
 
-    def test_removed_api_probe_accepts_any_compile_failure(self) -> None:
+    def test_removed_api_probe_requires_each_rustc_import_diagnostic(self) -> None:
+        source = Path("consumer-workspace") / "removed-decode" / "src" / "lib.rs"
+        events = []
+        for line in range(1, len(verifier.REMOVED_DECODE_API_PATHS) + 1):
+            events.append(
+                json.dumps(
+                    {
+                        "reason": "compiler-message",
+                        "target": {"src_path": str(source)},
+                        "message": {
+                            "code": {"code": "E0432"},
+                            "spans": [
+                                {
+                                    "is_primary": True,
+                                    "line_start": line,
+                                    "line_end": line,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
         result = mock.Mock(
             returncode=101,
-            stdout="",
-            stderr="compile failed",
+            stdout="\n".join(events),
+            stderr="",
         )
 
         with mock.patch.object(verifier.subprocess, "run", return_value=result) as run:
-            verifier.check_removed_api_consumers(
+            verifier.check_removed_api_consumer(
                 cargo="cargo",
                 cargo_cwd=Path("clean-cwd"),
                 environment={"CARGO_HOME": "isolated"},
                 workspace_manifest=Path("consumer-workspace") / "Cargo.toml",
-                consumer_names=("removed-decode",),
+                consumer_name="removed-decode",
+                source_path=source,
             )
 
         self.assertEqual(
@@ -362,19 +377,31 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 "removed-decode",
                 "--lib",
                 "--locked",
+                "--message-format=json",
             ],
         )
-        self.assertEqual(
-            run.call_args.kwargs,
-            {
-                "cwd": Path("clean-cwd"),
-                "env": {"CARGO_HOME": "isolated"},
-                "check": False,
-                "capture_output": True,
-                "text": True,
-                "timeout": verifier.CARGO_COMMAND_TIMEOUT_SECONDS,
-            },
-        )
+        self.assertEqual(run.call_count, 1)
+
+    def test_removed_api_probe_rejects_an_unrelated_compile_failure(self) -> None:
+        result = mock.Mock(returncode=101, stdout="", stderr="compile failed")
+        with (
+            mock.patch.object(verifier.subprocess, "run", return_value=result),
+            self.assertRaisesRegex(
+                contract.VerificationError,
+                "authoritative unresolved/private import diagnostic",
+            ),
+        ):
+            verifier.check_removed_api_consumer(
+                cargo="cargo",
+                cargo_cwd=Path("clean-cwd"),
+                environment={},
+                workspace_manifest=Path("consumer-workspace") / "Cargo.toml",
+                consumer_name="removed-decode",
+                source_path=Path("consumer-workspace")
+                / "removed-decode"
+                / "src"
+                / "lib.rs",
+            )
 
     def test_removed_api_probe_rejects_a_reintroduced_symbol(self) -> None:
         result = mock.Mock(returncode=0, stdout="", stderr="")
@@ -385,12 +412,16 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 "unexpectedly compiled.*removed-decode",
             ),
         ):
-            verifier.check_removed_api_consumers(
+            verifier.check_removed_api_consumer(
                 cargo="cargo",
                 cargo_cwd=Path("clean-cwd"),
                 environment={},
                 workspace_manifest=Path("consumer-workspace") / "Cargo.toml",
-                consumer_names=("removed-decode",),
+                consumer_name="removed-decode",
+                source_path=Path("consumer-workspace")
+                / "removed-decode"
+                / "src"
+                / "lib.rs",
             )
 
     def test_package_mode_is_the_safe_local_default(self) -> None:

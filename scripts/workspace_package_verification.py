@@ -53,6 +53,8 @@ REMOVED_DECODE_API_PATHS = (
     "texture::Texture2D",
     "texture::TextureSwizzler",
 )
+REMOVED_DECODE_CONSUMER_NAME = f"{CONSUMER_PACKAGE_PREFIX}-removed-decode"
+REMOVED_API_DIAGNOSTIC_CODES = frozenset(("E0432", "E0433", "E0603"))
 
 
 def command_text(command: Sequence[str]) -> str:
@@ -556,7 +558,7 @@ def create_consumer_suite(
     Path,
     dict[str, Path],
     set[str],
-    set[str],
+    str,
     set[str],
 ]:
     """Create one resolver graph while preserving per-consumer feature checks."""
@@ -612,17 +614,17 @@ def create_consumer_suite(
         ("full",),
         default_features=False,
     )
-    removed_names = set()
-    for index, symbol in enumerate(REMOVED_DECODE_API_PATHS, start=1):
-        removed_name = f"{CONSUMER_PACKAGE_PREFIX}-removed-decode-{index}"
-        consumer_manifests[removed_name] = write_consumer_package(
-            workspace_root / removed_name,
-            name=removed_name,
-            dependency_name=target.name,
-            dependency=removed_dependency,
-            source=f"use unity_asset_decode::{symbol};\n",
-        )
-        removed_names.add(removed_name)
+    removed_name = REMOVED_DECODE_CONSUMER_NAME
+    consumer_manifests[removed_name] = write_consumer_package(
+        workspace_root / removed_name,
+        name=removed_name,
+        dependency_name=target.name,
+        dependency=removed_dependency,
+        source="".join(
+            f"use unity_asset_decode::{symbol};\n"
+            for symbol in REMOVED_DECODE_API_PATHS
+        ),
+    )
     required_internal.add(target.name)
 
     required_packages = {
@@ -639,7 +641,7 @@ def create_consumer_suite(
         workspace_manifest,
         consumer_manifests,
         positive_names,
-        removed_names,
+        removed_name,
         required_internal,
     )
 
@@ -831,47 +833,94 @@ def check_consumer_packages(
         )
 
 
-def check_removed_api_consumers(
+def check_removed_api_consumer(
     *,
     cargo: str,
     cargo_cwd: Path,
     environment: Mapping[str, str],
     workspace_manifest: Path,
-    consumer_names: Sequence[str],
+    consumer_name: str,
+    source_path: Path,
 ) -> None:
-    """Require every dedicated removed-API consumer to fail compilation."""
+    """Require rustc to reject every removed import in one isolated consumer."""
 
-    for consumer_name in sorted(consumer_names):
-        command = [
-            cargo,
-            "check",
-            "--manifest-path",
-            str(workspace_manifest),
-            "--package",
-            consumer_name,
-            "--lib",
-            "--locked",
-        ]
-        print(f"$ {command_text(command)}", flush=True)
+    command = [
+        cargo,
+        "check",
+        "--manifest-path",
+        str(workspace_manifest),
+        "--package",
+        consumer_name,
+        "--lib",
+        "--locked",
+        "--message-format=json",
+    ]
+    print(f"$ {command_text(command)}", flush=True)
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cargo_cwd,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=CARGO_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise VerificationError(
+            f"removed API probe timed out after {CARGO_COMMAND_TIMEOUT_SECONDS}s: "
+            f"{consumer_name}"
+        ) from error
+    if result.returncode == 0:
+        raise VerificationError(
+            f"removed API consumer unexpectedly compiled: {consumer_name}"
+        )
+
+    expected_source = os.path.normcase(os.path.abspath(source_path))
+    rejected_lines: set[int] = set()
+    for encoded_event in result.stdout.splitlines():
         try:
-            result = subprocess.run(
-                command,
-                cwd=cargo_cwd,
-                env=environment,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=CARGO_COMMAND_TIMEOUT_SECONDS,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise VerificationError(
-                f"removed API probe timed out after {CARGO_COMMAND_TIMEOUT_SECONDS}s: "
-                f"{consumer_name}"
-            ) from error
-        if result.returncode == 0:
-            raise VerificationError(
-                f"removed API consumer unexpectedly compiled: {consumer_name}"
-            )
+            event = json.loads(encoded_event)
+        except json.JSONDecodeError:
+            continue
+        if event.get("reason") != "compiler-message":
+            continue
+        target = event.get("target")
+        message = event.get("message")
+        if not isinstance(target, dict) or not isinstance(message, dict):
+            continue
+        target_source = target.get("src_path")
+        code = message.get("code")
+        spans = message.get("spans")
+        if (
+            not isinstance(target_source, str)
+            or os.path.normcase(os.path.abspath(target_source)) != expected_source
+            or not isinstance(code, dict)
+            or code.get("code") not in REMOVED_API_DIAGNOSTIC_CODES
+            or not isinstance(spans, list)
+        ):
+            continue
+        for span in spans:
+            if not isinstance(span, dict) or not span.get("is_primary"):
+                continue
+            line_start = span.get("line_start")
+            line_end = span.get("line_end")
+            if isinstance(line_start, int) and line_end == line_start:
+                rejected_lines.add(line_start)
+
+    expected_lines = set(range(1, len(REMOVED_DECODE_API_PATHS) + 1))
+    missing_lines = sorted(expected_lines - rejected_lines)
+    if missing_lines:
+        missing_symbols = ", ".join(
+            REMOVED_DECODE_API_PATHS[line - 1] for line in missing_lines
+        )
+        details = result.stderr.strip()
+        suffix = f"; cargo stderr: {details}" if details else ""
+        raise VerificationError(
+            "removed API consumer did not receive an authoritative unresolved/private "
+            f"import diagnostic for: {missing_symbols}{suffix}"
+        )
 
 
 def verify_binary_packages_standalone(
@@ -1096,7 +1145,7 @@ def run_verification(
             consumer_manifest,
             consumer_manifests,
             positive_names,
-            removed_names,
+            removed_name,
             required_internal,
         ) = create_consumer_suite(
             consumer_workspace_root,
@@ -1122,10 +1171,11 @@ def run_verification(
             consumer_names=tuple(positive_names),
         )
         if verify_binaries:
-            check_removed_api_consumers(
+            check_removed_api_consumer(
                 cargo=cargo,
                 cargo_cwd=cargo_cwd,
                 environment=verification_environment,
                 workspace_manifest=consumer_manifest,
-                consumer_names=tuple(removed_names),
+                consumer_name=removed_name,
+                source_path=consumer_manifests[removed_name].parent / "src" / "lib.rs",
             )
