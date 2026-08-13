@@ -8,11 +8,11 @@ use unity_asset_search_protocol::{
     OperationId, PortablePath, ProjectId, QueryPolicyId, ReferenceCoverage,
     ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse, ReindexAdmitRequest,
     ReindexDisposition, ReindexEvidence, ReindexOperationState, ReindexOperationStatus,
-    ReindexReceipt, RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope,
-    ResponseOperation, ResponseOutcome, SEARCH_PROTOCOL_REVISION, SearchCapabilities,
-    SearchRequest, SearchResponse, ServingAvailability, ShutdownRequest, StatusResponse,
-    SuggestRequest, SuggestResponse, TimerLifecycleState, ValidateContract, WatcherLifecycleState,
-    encode_response_frame,
+    ReindexReceipt, ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation,
+    ResponseEnvelope, ResponseOperation, ResponseOutcome, SEARCH_PROTOCOL_REVISION,
+    SearchCapabilities, SearchRequest, SearchResponse, ServingAvailability, ShutdownRequest,
+    StatusResponse, SuggestRequest, SuggestResponse, TimerLifecycleState, ValidateContract,
+    WatcherLifecycleState, encode_response_frame,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -529,6 +529,45 @@ fn succeeded_reindex_requires_matching_completion_and_status_generation() {
         .generation
         .building_revision = Some(active.actual_revision);
     assert!(still_building.validate().is_err());
+}
+
+#[test]
+fn failed_reindex_rejects_status_and_binds_nested_error_policy() {
+    let operation_id = OperationId::from_bytes([7; 16]);
+    let request = request(RequestOperation::ReindexWait(ReindexWaitRequest {
+        operation_id,
+        timeout_ms: 1,
+    }));
+    let failed = ReindexOperationStatus {
+        operation_id,
+        state: ReindexOperationState::Failed,
+        admission: None,
+        completion: None,
+        status: None,
+        error: Some(
+            ApiError::new(
+                ApiErrorCode::IndexBuildFailed,
+                "generation build failed",
+                true,
+            )
+            .with_query_policy(query_policy(4)),
+        ),
+    };
+    ResponseEnvelope::success(&request, ResponseOperation::ReindexWait(failed.clone()))
+        .validate_for(&request)
+        .unwrap();
+
+    let mut contradictory = failed.clone();
+    contradictory.status = Some(status(generation(5), query_policy(4)));
+    assert!(contradictory.validate().is_err());
+
+    let mut wrong_policy = failed;
+    wrong_policy.error.as_mut().unwrap().query_policy_id = Some(query_policy(9));
+    assert!(
+        ResponseEnvelope::success(&request, ResponseOperation::ReindexWait(wrong_policy))
+            .validate_for(&request)
+            .is_err()
+    );
 }
 
 #[test]

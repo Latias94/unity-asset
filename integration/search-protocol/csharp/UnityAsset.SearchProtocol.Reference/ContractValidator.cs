@@ -1307,7 +1307,7 @@ namespace UnityAsset.SearchProtocol.Reference
                     valid = hasCompletion && hasStatus && !hasError;
                     break;
                 case "failed":
-                    valid = !hasCompletion && hasError;
+                    valid = !hasCompletion && !hasStatus && hasError;
                     break;
                 default:
                     valid = !hasCompletion && !hasStatus && !hasError;

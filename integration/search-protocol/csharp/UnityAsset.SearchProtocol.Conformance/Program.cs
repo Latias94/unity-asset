@@ -599,6 +599,7 @@ internal static class ConformanceProgram
         AssertResponseRequestBindings(fixtureRoot, binding);
         AssertReferenceResponseBindings(fixtureRoot, binding, referenceBinding, generation, policy);
         AssertReindexSucceededState(fixtureRoot, binding);
+        AssertReindexFailedState(fixtureRoot, binding);
         AssertCanonicalCoreValues(fixtureRoot, binding);
         AssertUnicodeScalarPathOrdering(binding);
         AssertStatusPathBudget(fixtureRoot);
@@ -1039,6 +1040,30 @@ internal static class ConformanceProgram
         building["value"]!["response"]!["status"]!["generation"]!["building_revision"] =
             "blake3-v1:" + new string('b', 64);
         ExpectFailure(() => BusinessCodec.DecodeResponse(SerializeNode(building)), "building succeeded status");
+    }
+
+    private static void AssertReindexFailedState(string fixtureRoot, ProtocolBinding binding)
+    {
+        JsonObject failedRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/reindex-wait-v5.json"));
+        RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(
+            Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/reindex-wait-v5.json")),
+            binding);
+        BusinessCodec.DecodeResponse(SerializeNode(failedRoot)).ValidateFor(request);
+
+        JsonObject contradictory = failedRoot.DeepClone().AsObject();
+        JsonObject statusRoot = ParseObjectNode(ReadFixtureText(fixtureRoot, "responses/status-v5.json"));
+        contradictory["value"]!["response"]!["status"] =
+            statusRoot["value"]!["response"]!.DeepClone();
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(contradictory)),
+            "failed reindex status snapshot");
+
+        JsonObject wrongPolicy = failedRoot.DeepClone().AsObject();
+        wrongPolicy["value"]!["response"]!["error"]!["query_policy_id"] =
+            "query-policy-v1:" + new string('5', 64);
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(wrongPolicy)),
+            "failed reindex query policy binding");
     }
 
     private static void AssertCanonicalCoreValues(string fixtureRoot, ProtocolBinding binding)

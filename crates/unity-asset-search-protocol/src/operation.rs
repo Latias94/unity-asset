@@ -488,7 +488,9 @@ impl ValidateContract for ReindexOperationStatus {
             ReindexOperationState::Succeeded => {
                 self.completion.is_some() && self.status.is_some() && self.error.is_none()
             }
-            ReindexOperationState::Failed => self.completion.is_none() && self.error.is_some(),
+            ReindexOperationState::Failed => {
+                self.completion.is_none() && self.status.is_none() && self.error.is_some()
+            }
             ReindexOperationState::Cancelled
             | ReindexOperationState::Expired
             | ReindexOperationState::Lost => {
@@ -626,7 +628,10 @@ impl ResponseOperation {
             | Self::ReindexStatus(status)
             | Self::ReindexWait(status) => match &status.status {
                 Some(response) => Some(response.query_policy_id),
-                None => None,
+                None => match &status.error {
+                    Some(error) => error.query_policy_id,
+                    None => None,
+                },
             },
             Self::Capabilities(_) | Self::ReindexCancel(_) | Self::Shutdown(_) => None,
         }
