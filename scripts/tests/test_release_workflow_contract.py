@@ -57,7 +57,6 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
                 "test",
                 "package",
                 "platform-contracts",
-                "source-recheck",
                 "github-draft",
                 "publish",
                 "dist",
@@ -122,7 +121,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("ref: refs/tags/${{ env.RELEASE_TAG }}", self.jobs["validate"])
         self.assertIn("if: inputs.mode == 'dry-run'", self.jobs["dry-run"])
         self.assertIn("python scripts/verify_release_bundle.py", self.jobs["dry-run"])
-        for job_name in ("attest", "source-recheck", "github-draft", "publish", "github-release"):
+        for job_name in ("attest", "github-draft", "publish", "github-release"):
             self.assertIn("if: inputs.mode == 'publish'", self.jobs[job_name])
         for job_name in ("msrv", "test", "package", "platform-contracts", "dist"):
             self.assertIn(
@@ -158,7 +157,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_publish_credentials_are_scoped_to_the_protected_publish_step(self) -> None:
         publish = self.jobs["publish"]
         self.assertIn(
-            "needs: [validate, release-assets, source-recheck, github-draft]", publish
+            "needs: [validate, release-assets, github-draft]", publish
         )
         self.assertIn("timeout-minutes: 90", publish)
         self.assertIn("name: crates-io-production", publish)
@@ -188,7 +187,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
 
     def test_asset_publication_is_verified_before_crates_io_and_after_upload(self) -> None:
         draft = self.jobs["github-draft"]
-        self.assertIn("needs: [validate, release-assets, source-recheck]", draft)
+        self.assertIn("needs: [validate, release-assets, attest]", draft)
         self.assertIn("contents: write", draft)
         self.assertIn(
             "release_id: ${{ steps.staged.outputs.release_id }}", draft
@@ -313,10 +312,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("--release-body release-proof/release-notes.md", dry_run)
 
     def test_tag_validation_is_a_single_scripted_contract_at_each_boundary(self) -> None:
-        for job_name in ("validate", "source-recheck", "github-draft", "publish", "github-release"):
+        for job_name in ("validate", "github-draft", "publish", "github-release"):
             self.assertIn("python scripts/verify_release_tag.py", self.jobs[job_name])
         self.assertNotIn("--expected-event-sha", self.jobs["validate"])
-        self.assertIn("--refresh-tag", self.jobs["source-recheck"])
+        self.assertNotIn("source-recheck:", self.workflow)
         self.assertIn("cancel-in-progress: false", self.workflow)
 
 

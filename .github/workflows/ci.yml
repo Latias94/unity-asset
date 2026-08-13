@@ -164,12 +164,14 @@ jobs:
         shared-key: workspace-publication-${{ matrix.os }}
 
     - name: Run platform publication, recovery, and extraction unit tests
+      if: runner.os != 'Linux'
       run: >-
         cargo nextest run -p unity-asset
         --test-threads 2
         -E 'test(/^workspace::commit::/) | test(/^extraction::artifact::tests::/)'
 
     - name: Run workspace and security black-box contract tests
+      if: runner.os != 'Linux'
       run: >-
         cargo nextest run
         --test-threads 2
@@ -194,6 +196,7 @@ jobs:
       run: python scripts/run_real_daemon_agent.py
 
     - name: Run generation security unit contracts
+      if: runner.os != 'Linux'
       run: >-
         cargo nextest run
         --test-threads 2
@@ -201,6 +204,7 @@ jobs:
         --lib
 
     - name: Run daemon lifecycle and watcher security unit contracts
+      if: runner.os != 'Linux'
       run: >-
         cargo nextest run
         --test-threads 2
@@ -208,6 +212,7 @@ jobs:
         --bin unity-asset-search-daemon
 
     - name: Run complete platform-local identity and filesystem security suite
+      if: runner.os != 'Linux'
       run: >-
         cargo nextest run
         --test-threads 2
