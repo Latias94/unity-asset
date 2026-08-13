@@ -30,7 +30,7 @@ impl SearchDaemonFixture {
             .runtime()
             .endpoint_namespace(project.project_id())
             .expect("derive endpoint namespace");
-        let index_directory = project_directory.path().join(".process-contract-index");
+        let index_directory = project.root().join(".process-contract-index");
         Self {
             project_directory,
             project,

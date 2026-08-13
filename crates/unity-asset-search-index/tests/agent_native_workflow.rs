@@ -381,9 +381,10 @@ fn public_structured_workflow_spans_mutation_recovery_extraction_and_search() {
     );
     assert_eq!(streamed_payload(&reopened), REPLACEMENT_PAYLOAD);
 
+    let private_index_root = project_root.canonicalize().unwrap().join(".search-index");
     let paths = IndexPaths::for_project(
         project_root.to_path_buf(),
-        Some(project_root.join(".search-index")),
+        Some(private_index_root),
         Some(vec![PathBuf::from("Assets")]),
     )
     .unwrap();
