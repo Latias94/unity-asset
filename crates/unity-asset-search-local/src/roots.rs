@@ -1981,9 +1981,12 @@ mod platform {
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_xdg_roots_are_created_under_validated_bases() {
-            let temporary = strict_test_tempdir();
-            let runtime_base = temporary.path().join("runtime");
-            let cache_base = temporary.path().join("cache");
+            let temporary = tempfile::Builder::new()
+                .prefix("uas-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let runtime_base = temporary.path().join("r");
+            let cache_base = temporary.path().join("c");
             fs::create_dir(&runtime_base).unwrap();
             fs::create_dir(&cache_base).unwrap();
             fs::set_permissions(&runtime_base, fs::Permissions::from_mode(0o700)).unwrap();
