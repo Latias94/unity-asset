@@ -87,12 +87,14 @@ impl OperationOrigin {
 }
 
 /// Typed terminal evidence retained independently of the transport DTO.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum OperationFailure {
+    #[error("{scope:?} reindex execution failed: {message}")]
     Execution {
         scope: ReindexScopeKind,
         message: String,
     },
+    #[error("reindex completion channel closed unexpectedly")]
     CompletionChannelClosed,
 }
 
@@ -327,6 +329,17 @@ impl OperationService {
             .await
     }
 
+    pub(crate) async fn admit_timer_and_wait(&self) -> Result<OperationSnapshot, OperationError> {
+        let admitted = self
+            .admit(
+                OperationOrigin::Timer,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await?;
+        self.wait_until_terminal(admitted.operation_id).await
+    }
+
     pub async fn admit_watcher_overflow(&self) -> Result<OperationSnapshot, OperationError> {
         let prepared = self
             .coordinator
@@ -349,33 +362,37 @@ impl OperationService {
             .ok_or(OperationError::Draining)?;
         let _admission = self.admission_gate.lock().await;
         self.ensure_completion_tasks_healthy().await?;
-        if !self.tasks.lock().await.accepting {
+        let mut tasks = self.tasks.lock().await;
+        if !tasks.accepting {
             return Err(OperationError::Draining);
         }
 
         let intent_fingerprint = prepared.fingerprint();
-        let existing = {
-            let mut state = self.state.lock().await;
-            state.prune(Instant::now(), self.retention);
-            let existing = idempotency_key
-                .as_ref()
-                .and_then(|key| state.idempotency.get(key).copied());
-            let maximum = origin.active_limit(self.retention);
-            if existing.is_none() && state.active_count >= maximum {
-                return Err(OperationError::Saturated { maximum });
-            }
-            existing
-        };
+        let mut registry = self.state.lock().await;
+        registry.prune(Instant::now(), self.retention);
+        let existing = idempotency_key
+            .as_ref()
+            .and_then(|key| registry.idempotency.get(key).copied());
+        let maximum = origin.active_limit(self.retention);
+        if existing.is_none() && registry.active_count >= maximum {
+            return Err(OperationError::Saturated { maximum });
+        }
         if let Some(existing) = existing {
             if existing.intent_fingerprint != intent_fingerprint {
                 return Err(OperationError::IdempotencyConflict {
                     operation_id: existing.operation_id,
                 });
             }
+            drop(registry);
+            drop(tasks);
             return self.status(existing.operation_id).await;
         }
 
-        let operation_id = self.unique_operation_id().await;
+        let operation_id = self.unique_operation_id(&registry);
+        // The coordinator mutates no state before its single mutex wait completes. Holding the
+        // registry and task-owner guards across that wait makes the following handoff atomic from
+        // the caller's perspective: once the coordinator accepts an observer, this future reaches
+        // registry insertion and owned task installation without another cancellation point.
         let observation = if watcher_overflow {
             self.coordinator.admit_watcher_overflow_observed().await?
         } else {
@@ -404,30 +421,27 @@ impl OperationService {
             changed: Notify::new(),
             cancellation,
         });
-        {
-            let mut registry = self.state.lock().await;
+        registry
+            .entries
+            .insert(operation_id, OperationRecord::Active(Arc::clone(&entry)));
+        registry.active_count = registry.active_count.saturating_add(1);
+        if let Some(background_origin) = origin.background() {
             registry
-                .entries
-                .insert(operation_id, OperationRecord::Active(Arc::clone(&entry)));
-            registry.active_count = registry.active_count.saturating_add(1);
-            if let Some(background_origin) = origin.background() {
-                registry
-                    .background_by_origin
-                    .entry(background_origin)
-                    .or_default()
-                    .push_back(operation_id);
-            }
-            if let Some(key) = idempotency_key {
-                registry.idempotency.insert(
-                    key,
-                    IdempotencyBinding {
-                        operation_id,
-                        intent_fingerprint,
-                    },
-                );
-            }
+                .background_by_origin
+                .entry(background_origin)
+                .or_default()
+                .push_back(operation_id);
         }
-        self.tasks.lock().await.tasks.spawn(complete_operation(
+        if let Some(key) = idempotency_key {
+            registry.idempotency.insert(
+                key,
+                IdempotencyBinding {
+                    operation_id,
+                    intent_fingerprint,
+                },
+            );
+        }
+        tasks.tasks.spawn(complete_operation(
             entry,
             observation,
             operation_id,
@@ -657,13 +671,13 @@ impl OperationService {
         }
     }
 
-    async fn unique_operation_id(&self) -> OperationId {
+    fn unique_operation_id(&self, registry: &RegistryState) -> OperationId {
         loop {
             let mut bytes = rand::random::<[u8; 16]>();
             bytes[..OPERATION_EPOCH_BYTES].copy_from_slice(&self.operation_epoch);
             bytes[OPERATION_EPOCH_BYTES] |= 1;
             let candidate = OperationId::from_bytes(bytes);
-            if !self.state.lock().await.entries.contains_key(&candidate) {
+            if !registry.entries.contains_key(&candidate) {
                 return candidate;
             }
         }
@@ -1107,6 +1121,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use tokio::sync::Notify;
     use tokio::time::Instant;
     use unity_asset_search_index::{FilesystemReindexIntent, IndexPaths, ProjectPathSpace};
     use unity_asset_search_protocol::{
@@ -1115,11 +1130,14 @@ mod tests {
     };
 
     use super::{
-        INITIAL_SEMANTIC_RETRY_BACKOFF, OperationError, OperationOrigin, OperationRetentionPolicy,
-        OperationService, SemanticUpgradeRuntime,
+        INITIAL_SEMANTIC_RETRY_BACKOFF, OperationError, OperationFailure, OperationOrigin,
+        OperationRetentionPolicy, OperationService, OperationServiceOwner, SemanticUpgradeRuntime,
     };
-    use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
+    use crate::coordinator::{
+        ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexScopeKind,
+    };
     use crate::lifecycle::AdmissionGate;
+    use crate::watcher::{MaintenanceRuntime, TimerLifecycle};
 
     struct CoordinatorFixture {
         _project: tempfile::TempDir,
@@ -1180,6 +1198,90 @@ mod tests {
             .unwrap()
             .into_iter()
             .find(|operation| operation.origin == origin)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timer_admission_returns_real_executor_failure_evidence() {
+        let mut fixture = CoordinatorFixture::with_executor(|_intent| async move {
+            anyhow::bail!("timer build failed")
+        });
+        let service = fixture.service(14);
+
+        let terminal = service.admit_timer_and_wait().await.unwrap();
+
+        assert_eq!(terminal.state, ReindexOperationState::Failed);
+        assert_eq!(
+            terminal.failure,
+            Some(OperationFailure::Execution {
+                scope: ReindexScopeKind::Reconcile,
+                message: "timer build failed".to_owned(),
+            })
+        );
+        fixture.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn maintenance_shutdown_stops_waiting_while_operation_owners_drain_execution() {
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let executor_started = Arc::clone(&started);
+        let executor_release = Arc::clone(&release);
+        let fixture = CoordinatorFixture::with_executor(move |_intent| {
+            let started = Arc::clone(&executor_started);
+            let release = Arc::clone(&executor_release);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                anyhow::bail!("timer build failed after maintenance stopped")
+            }
+        });
+        let admission = AdmissionGate::default();
+        let mut owner = OperationServiceOwner::new(
+            DaemonInstanceId::from_bytes([15; 16]),
+            fixture.runtime.coordinator(),
+            admission,
+        );
+        let service = owner.service();
+        let mut maintenance =
+            MaintenanceRuntime::start(service.clone(), None, Some(Duration::from_secs(1)));
+        let maintenance_status = maintenance.handle();
+
+        tokio::time::advance(Duration::from_secs(61)).await;
+        started.notified().await;
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        let active = background_operation(&service, BackgroundReindexOrigin::Timer)
+            .await
+            .unwrap();
+        assert_eq!(active.state, ReindexOperationState::Running);
+
+        maintenance.shutdown().await.unwrap();
+        assert_eq!(
+            maintenance_status.snapshot().await.timer,
+            TimerLifecycle::Stopped
+        );
+
+        let CoordinatorFixture {
+            _project,
+            mut runtime,
+        } = fixture;
+        let coordinator_shutdown = tokio::spawn(async move { runtime.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!coordinator_shutdown.is_finished());
+
+        release.notify_one();
+        coordinator_shutdown.await.unwrap().unwrap();
+        owner.shutdown().await.unwrap();
+        let terminal = service.status(active.operation_id).await.unwrap();
+        assert_eq!(terminal.state, ReindexOperationState::Failed);
+        assert_eq!(
+            terminal.failure,
+            Some(OperationFailure::Execution {
+                scope: ReindexScopeKind::Reconcile,
+                message: "timer build failed after maintenance stopped".to_owned(),
+            })
+        );
     }
 
     #[tokio::test]

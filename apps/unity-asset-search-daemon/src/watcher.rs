@@ -16,7 +16,6 @@ use unity_asset_search_index::{
 };
 use unity_asset_search_protocol::ProjectId;
 
-use crate::coordinator::ReindexSource;
 use crate::operations::{OperationError, OperationOrigin, OperationService};
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
@@ -49,6 +48,7 @@ pub enum TimerLifecycle {
     Disabled,
     Scheduled,
     Running,
+    Failed,
     Stopped,
 }
 
@@ -107,6 +107,7 @@ impl MaintenanceRuntime {
         reconcile_interval: Option<Duration>,
         watcher_factory: Arc<dyn WatcherFactory>,
     ) -> Self {
+        let timer_deadline = reconcile_interval.map(|interval| Instant::now() + interval);
         let state = Arc::new(RwLock::new(MaintenanceState {
             watcher: watcher
                 .as_ref()
@@ -118,7 +119,7 @@ impl MaintenanceRuntime {
                 .map_or(TimerLifecycle::Disabled, |_| TimerLifecycle::Scheduled),
             timer_run_count: 0,
             timer_last_failure: None,
-            timer_next_run: reconcile_interval.map(|interval| Instant::now() + interval),
+            timer_next_run: timer_deadline,
         }));
         let handle = MaintenanceHandle {
             state: Arc::clone(&state),
@@ -134,10 +135,11 @@ impl MaintenanceRuntime {
                 watcher_factory,
             ));
         }
-        if let Some(interval) = reconcile_interval {
+        if let (Some(interval), Some(deadline)) = (reconcile_interval, timer_deadline) {
             tasks.spawn(reconcile_loop(
                 operations,
                 interval,
+                deadline,
                 state,
                 shutdown_receiver,
             ));
@@ -207,24 +209,20 @@ fn remaining_millis(deadline: Option<Instant>) -> Option<u64> {
 }
 
 type AdmissionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), OperationError>> + Send + 'a>>;
+type TimerFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 trait MaintenanceOperations: Send + Sync {
-    fn admit(&self, source: ReindexSource, intent: FilesystemReindexIntent) -> AdmissionFuture<'_>;
+    fn admit_watcher(&self, intent: FilesystemReindexIntent) -> AdmissionFuture<'_>;
 
     fn admit_watcher_overflow(&self) -> AdmissionFuture<'_>;
+
+    fn run_timer(&self) -> TimerFuture<'_>;
 }
 
 impl MaintenanceOperations for OperationService {
-    fn admit(&self, source: ReindexSource, intent: FilesystemReindexIntent) -> AdmissionFuture<'_> {
-        let origin = match source {
-            ReindexSource::Startup => OperationOrigin::Startup,
-            ReindexSource::Watcher => OperationOrigin::Watcher,
-            ReindexSource::Timer => OperationOrigin::Timer,
-            ReindexSource::SemanticUpgrade => OperationOrigin::SemanticUpgrade,
-            ReindexSource::Ipc => OperationOrigin::Ipc,
-        };
+    fn admit_watcher(&self, intent: FilesystemReindexIntent) -> AdmissionFuture<'_> {
         Box::pin(async move {
-            OperationService::admit(self, origin, intent, None).await?;
+            OperationService::admit(self, OperationOrigin::Watcher, intent, None).await?;
             Ok(())
         })
     }
@@ -233,6 +231,26 @@ impl MaintenanceOperations for OperationService {
         Box::pin(async move {
             OperationService::admit_watcher_overflow(self).await?;
             Ok(())
+        })
+    }
+
+    fn run_timer(&self) -> TimerFuture<'_> {
+        Box::pin(async move {
+            let terminal = OperationService::admit_timer_and_wait(self)
+                .await
+                .map_err(|error| error.to_string())?;
+            match terminal.state {
+                unity_asset_search_protocol::ReindexOperationState::Succeeded => Ok(()),
+                unity_asset_search_protocol::ReindexOperationState::Failed => {
+                    Err(terminal.failure.map_or_else(
+                        || "timer reindex failed without terminal evidence".to_owned(),
+                        |failure| failure.to_string(),
+                    ))
+                }
+                state => Err(format!(
+                    "timer reindex reached unexpected terminal state {state:?}"
+                )),
+            }
         })
     }
 }
@@ -570,10 +588,7 @@ async fn admit_watcher_intent(
 ) -> Result<(), String> {
     let mut backoff = INITIAL_RETRY_BACKOFF;
     loop {
-        match operations
-            .admit(ReindexSource::Watcher, intent.clone())
-            .await
-        {
+        match operations.admit_watcher(intent.clone()).await {
             Ok(()) => return Ok(()),
             Err(error) if error.is_retryable_admission() => {
                 tokio::time::sleep(backoff).await;
@@ -609,16 +624,14 @@ async fn admit_watcher_overflow(operations: &dyn MaintenanceOperations) -> Resul
 async fn reconcile_loop(
     operations: Arc<dyn MaintenanceOperations>,
     interval: Duration,
+    mut deadline: Instant,
     state: Arc<RwLock<MaintenanceState>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    let mut deadline = Instant::now() + interval;
+    let initial_retry_backoff = Duration::from_secs(1).min(interval);
+    let maximum_retry_backoff = MAXIMUM_RETRY_BACKOFF.min(interval);
+    let mut retry_backoff = initial_retry_backoff;
     loop {
-        {
-            let mut state = state.write().await;
-            state.timer = TimerLifecycle::Scheduled;
-            state.timer_next_run = Some(deadline);
-        }
         tokio::select! {
             biased;
             () = shutdown_requested(&mut shutdown) => {
@@ -635,9 +648,8 @@ async fn reconcile_loop(
             state.timer = TimerLifecycle::Running;
             state.timer_next_run = None;
         }
-        let admission =
-            operations.admit(ReindexSource::Timer, FilesystemReindexIntent::reconcile());
-        tokio::pin!(admission);
+        let run = operations.run_timer();
+        tokio::pin!(run);
         let result = tokio::select! {
             biased;
             () = shutdown_requested(&mut shutdown) => {
@@ -646,15 +658,28 @@ async fn reconcile_loop(
                 state.timer_next_run = None;
                 return Ok(());
             }
-            result = &mut admission => result,
+            result = &mut run => result,
         };
-        deadline = Instant::now() + interval;
+        let (next_delay, next_state, failure) = match result {
+            Ok(()) => {
+                retry_backoff = initial_retry_backoff;
+                (interval, TimerLifecycle::Scheduled, None)
+            }
+            Err(failure) => {
+                let delay = retry_backoff;
+                retry_backoff = retry_backoff.saturating_mul(2).min(maximum_retry_backoff);
+                (
+                    delay,
+                    TimerLifecycle::Failed,
+                    Some(bounded_failure(failure)),
+                )
+            }
+        };
+        deadline = Instant::now() + next_delay;
         let mut state = state.write().await;
         state.timer_run_count = state.timer_run_count.saturating_add(1);
-        state.timer_last_failure = result
-            .err()
-            .map(|error| bounded_failure(format!("{error:?}")));
-        state.timer = TimerLifecycle::Scheduled;
+        state.timer_last_failure = failure;
+        state.timer = next_state;
         state.timer_next_run = Some(deadline);
     }
 }
@@ -749,45 +774,48 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use tokio::sync::{mpsc, watch};
+    use tokio::sync::{mpsc, oneshot, watch};
     use unity_asset_search_index::{
         FilesystemReindexIntent, FilesystemReindexScope, IndexPaths, ProjectPath, ProjectPathSet,
     };
 
     use super::{
         AdmissionFuture, INITIAL_RETRY_BACKOFF, MaintenanceOperations, MaintenanceRuntime,
-        NotifyWatcherFactory, TimerLifecycle, WatchSignal, WatcherConfig, WatcherEventFuture,
-        WatcherEventStream, WatcherFactory, WatcherLifecycle, WatcherSession, WatcherSessionEvent,
-        is_project_root_search_policy_path, project_root_watch_signal, report_backend_failure,
-        run_watcher_session, send_watch_signal, typed_index_namespace_exclusion, watch_signal,
+        NotifyWatcherFactory, TimerFuture, TimerLifecycle, WatchSignal, WatcherConfig,
+        WatcherEventFuture, WatcherEventStream, WatcherFactory, WatcherLifecycle, WatcherSession,
+        WatcherSessionEvent, is_project_root_search_policy_path, project_root_watch_signal,
+        report_backend_failure, run_watcher_session, send_watch_signal,
+        typed_index_namespace_exclusion, watch_signal,
     };
-    use crate::coordinator::ReindexSource;
     use crate::operations::OperationError;
 
     #[derive(Default)]
     struct ScriptedOperations {
-        timer_results: Mutex<VecDeque<Result<(), OperationError>>>,
+        timer_results: Mutex<VecDeque<Result<(), String>>>,
         watcher_results: Mutex<VecDeque<Result<(), OperationError>>>,
         timer_calls: AtomicUsize,
         watcher_calls: AtomicUsize,
         admissions: Mutex<Vec<ScriptedAdmission>>,
+        blocked_timer: Mutex<Option<oneshot::Receiver<Result<(), String>>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ScriptedAdmission {
-        Reindex {
-            source: ReindexSource,
-            intent: FilesystemReindexIntent,
-        },
+        Watcher(FilesystemReindexIntent),
         WatcherOverflow,
     }
 
     impl ScriptedOperations {
-        fn with_timer_results(
-            results: impl IntoIterator<Item = Result<(), OperationError>>,
-        ) -> Self {
+        fn with_timer_results(results: impl IntoIterator<Item = Result<(), String>>) -> Self {
             Self {
                 timer_results: Mutex::new(results.into_iter().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn with_blocked_timer(receiver: oneshot::Receiver<Result<(), String>>) -> Self {
+            Self {
+                blocked_timer: Mutex::new(Some(receiver)),
                 ..Self::default()
             }
         }
@@ -810,30 +838,18 @@ mod tests {
     }
 
     impl MaintenanceOperations for ScriptedOperations {
-        fn admit(
-            &self,
-            source: ReindexSource,
-            intent: FilesystemReindexIntent,
-        ) -> AdmissionFuture<'_> {
+        fn admit_watcher(&self, intent: FilesystemReindexIntent) -> AdmissionFuture<'_> {
             self.admissions
                 .lock()
                 .expect("admission record should not be poisoned")
-                .push(ScriptedAdmission::Reindex { source, intent });
-            let result = if source == ReindexSource::Timer {
-                self.timer_calls.fetch_add(1, Ordering::Relaxed);
-                self.timer_results
-                    .lock()
-                    .expect("timer result script should not be poisoned")
-                    .pop_front()
-                    .unwrap_or(Ok(()))
-            } else {
-                self.watcher_calls.fetch_add(1, Ordering::Relaxed);
-                self.watcher_results
-                    .lock()
-                    .expect("watcher result script should not be poisoned")
-                    .pop_front()
-                    .unwrap_or(Ok(()))
-            };
+                .push(ScriptedAdmission::Watcher(intent));
+            self.watcher_calls.fetch_add(1, Ordering::Relaxed);
+            let result = self
+                .watcher_results
+                .lock()
+                .expect("watcher result script should not be poisoned")
+                .pop_front()
+                .unwrap_or(Ok(()));
             Box::pin(std::future::ready(result))
         }
 
@@ -844,6 +860,29 @@ mod tests {
                 .expect("admission record should not be poisoned")
                 .push(ScriptedAdmission::WatcherOverflow);
             Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn run_timer(&self) -> TimerFuture<'_> {
+            self.timer_calls.fetch_add(1, Ordering::Relaxed);
+            let blocked = self
+                .blocked_timer
+                .lock()
+                .expect("blocked timer script should not be poisoned")
+                .take();
+            let result = self
+                .timer_results
+                .lock()
+                .expect("timer result script should not be poisoned")
+                .pop_front()
+                .unwrap_or(Ok(()));
+            Box::pin(async move {
+                let Some(blocked) = blocked else {
+                    return result;
+                };
+                blocked
+                    .await
+                    .unwrap_or_else(|_| Err("scripted timer completion channel closed".to_owned()))
+            })
         }
     }
 
@@ -1254,12 +1293,9 @@ mod tests {
         assert_eq!(
             operations.admissions(),
             vec![
-                ScriptedAdmission::Reindex {
-                    source: ReindexSource::Watcher,
-                    intent: FilesystemReindexIntent {
-                        scope: FilesystemReindexScope::ChangedPaths { paths: changed },
-                    },
-                },
+                ScriptedAdmission::Watcher(FilesystemReindexIntent {
+                    scope: FilesystemReindexScope::ChangedPaths { paths: changed },
+                }),
                 ScriptedAdmission::WatcherOverflow,
             ]
         );
@@ -1298,14 +1334,8 @@ mod tests {
         assert_eq!(
             operations.admissions(),
             vec![
-                ScriptedAdmission::Reindex {
-                    source: ReindexSource::Watcher,
-                    intent: FilesystemReindexIntent::changed_paths(changed.clone()),
-                },
-                ScriptedAdmission::Reindex {
-                    source: ReindexSource::Watcher,
-                    intent: FilesystemReindexIntent::changed_paths(changed),
-                },
+                ScriptedAdmission::Watcher(FilesystemReindexIntent::changed_paths(changed.clone())),
+                ScriptedAdmission::Watcher(FilesystemReindexIntent::changed_paths(changed)),
             ]
         );
         assert_eq!(
@@ -1412,9 +1442,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timer_failure_remains_scheduled_and_success_clears_evidence() {
+    async fn timer_failure_retries_and_success_clears_evidence() {
         let operations = Arc::new(ScriptedOperations::with_timer_results([
-            Err(OperationError::Saturated { maximum: 1 }),
+            Err(OperationError::Saturated { maximum: 1 }.to_string()),
             Ok(()),
         ]));
         let mut maintenance = MaintenanceRuntime::start_with_dependencies(
@@ -1429,12 +1459,12 @@ mod tests {
         tokio::time::advance(Duration::from_secs(10)).await;
         settle().await;
         let failed_run = handle.snapshot().await;
-        assert_eq!(failed_run.timer, TimerLifecycle::Scheduled);
+        assert_eq!(failed_run.timer, TimerLifecycle::Failed);
         assert_eq!(failed_run.timer_run_count, 1);
         assert!(failed_run.timer_last_failure.is_some());
-        assert_eq!(failed_run.timer_next_run_in_ms, Some(10_000));
+        assert_eq!(failed_run.timer_next_run_in_ms, Some(1_000));
 
-        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         settle().await;
         let successful_run = handle.snapshot().await;
         assert_eq!(successful_run.timer, TimerLifecycle::Scheduled);
@@ -1443,6 +1473,40 @@ mod tests {
 
         maintenance.shutdown().await.unwrap();
         assert_eq!(handle.snapshot().await.timer, TimerLifecycle::Stopped);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timer_stays_running_without_overlapping_slow_operations() {
+        let (completion, receiver) = oneshot::channel();
+        let operations = Arc::new(ScriptedOperations::with_blocked_timer(receiver));
+        let mut maintenance = MaintenanceRuntime::start_with_dependencies(
+            operations.clone(),
+            None,
+            Some(Duration::from_secs(10)),
+            Arc::new(NotifyWatcherFactory),
+        );
+        let handle = maintenance.handle();
+        settle().await;
+
+        tokio::time::advance(Duration::from_secs(10)).await;
+        settle().await;
+        assert_eq!(handle.snapshot().await.timer, TimerLifecycle::Running);
+        assert_eq!(operations.timer_calls.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        settle().await;
+        assert_eq!(handle.snapshot().await.timer, TimerLifecycle::Running);
+        assert_eq!(operations.timer_calls.load(Ordering::Relaxed), 1);
+
+        completion.send(Err("build failed".to_owned())).unwrap();
+        settle().await;
+        let failed = handle.snapshot().await;
+        assert_eq!(failed.timer, TimerLifecycle::Failed);
+        assert_eq!(failed.timer_run_count, 1);
+        assert_eq!(failed.timer_last_failure.as_deref(), Some("build failed"));
+        assert_eq!(failed.timer_next_run_in_ms, Some(1_000));
+
+        maintenance.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

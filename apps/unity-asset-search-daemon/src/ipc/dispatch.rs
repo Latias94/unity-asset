@@ -347,6 +347,7 @@ const fn timer_lifecycle_state(state: InternalTimerLifecycle) -> TimerLifecycleS
         InternalTimerLifecycle::Disabled => TimerLifecycleState::Disabled,
         InternalTimerLifecycle::Scheduled => TimerLifecycleState::Scheduled,
         InternalTimerLifecycle::Running => TimerLifecycleState::Running,
+        InternalTimerLifecycle::Failed => TimerLifecycleState::Failed,
         InternalTimerLifecycle::Stopped => TimerLifecycleState::Stopped,
     }
 }
