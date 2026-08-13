@@ -1,17 +1,18 @@
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, DaemonInstanceId, FilesystemReindexIntent, FreshnessMaintenance,
-    FuzzyWorkUsageV1, GenerationFreshness, GenerationIdV1, GenerationMaintenanceState,
-    GenerationStamp, GenerationStatus, MAX_API_ERROR_JSON_BYTES, MAX_ERROR_MESSAGE_BYTES,
-    MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS, MAX_SEARCH_HITS_JSON_BYTES,
-    MatchCountRelationV1, MatchCountV1, OperationId, PortablePath, ProjectId, QueryPolicyId,
-    ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse,
-    ReindexAdmitRequest, ReindexDisposition, ReindexEvidence, ReindexOperationState,
-    ReindexOperationStatus, ReindexReceipt, RequestEnvelope, RequestId, RequestOperation,
-    ResponseEnvelope, ResponseOperation, ResponseOutcome, SEARCH_PROTOCOL_REVISION,
-    SearchCapabilities, SearchRequest, SearchResponse, ServingAvailability, ShutdownRequest,
-    StatusResponse, SuggestRequest, SuggestResponse, TimerLifecycleState, ValidateContract,
-    WatcherLifecycleState, encode_response_frame,
+    ApiError, ApiErrorCode, BackgroundReindexOperation, BackgroundReindexOrigin, DaemonInstanceId,
+    FilesystemReindexIntent, FreshnessMaintenance, FuzzyWorkUsageV1, GenerationFreshness,
+    GenerationIdV1, GenerationMaintenanceState, GenerationStamp, GenerationStatus,
+    MAX_API_ERROR_JSON_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_REINDEX_PUBLISH_WARNING_BYTES,
+    MAX_REINDEX_PUBLISH_WARNINGS, MAX_SEARCH_HITS_JSON_BYTES, MatchCountRelationV1, MatchCountV1,
+    OperationId, PortablePath, ProjectId, QueryPolicyId, ReferenceCoverage,
+    ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse, ReindexAdmitRequest,
+    ReindexDisposition, ReindexEvidence, ReindexOperationState, ReindexOperationStatus,
+    ReindexReceipt, RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope,
+    ResponseOperation, ResponseOutcome, SEARCH_PROTOCOL_REVISION, SearchCapabilities,
+    SearchRequest, SearchResponse, ServingAvailability, ShutdownRequest, StatusResponse,
+    SuggestRequest, SuggestResponse, TimerLifecycleState, ValidateContract, WatcherLifecycleState,
+    encode_response_frame,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -66,7 +67,7 @@ fn search_response() -> SearchResponse {
 
 fn fixture_search_response() -> SearchResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/search-v4.json"
+        "../../../integration/search-protocol/fixtures/responses/search-v5.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -81,7 +82,7 @@ fn fixture_search_response() -> SearchResponse {
 
 fn fixture_references_response() -> ReferencesResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/references-v4.json"
+        "../../../integration/search-protocol/fixtures/responses/references-v5.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
@@ -281,6 +282,62 @@ fn daemon_status_requires_failure_evidence_and_consistent_maintenance() {
     response.daemon.timer.state = TimerLifecycleState::Disabled;
     response.daemon.timer.next_run_in_ms = Some(1);
     assert!(response.validate().is_err());
+}
+
+#[test]
+fn background_reindex_operations_are_bounded_ordered_and_non_lost() {
+    let operation = |origin, seed, state| BackgroundReindexOperation {
+        origin,
+        operation_id: OperationId::from_bytes([seed; 16]),
+        state,
+    };
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.background_reindex_operations = vec![
+        operation(
+            BackgroundReindexOrigin::Startup,
+            1,
+            ReindexOperationState::Succeeded,
+        ),
+        operation(
+            BackgroundReindexOrigin::Watcher,
+            2,
+            ReindexOperationState::Running,
+        ),
+        operation(
+            BackgroundReindexOrigin::WatcherOverflow,
+            3,
+            ReindexOperationState::Queued,
+        ),
+        operation(
+            BackgroundReindexOrigin::Timer,
+            4,
+            ReindexOperationState::Failed,
+        ),
+        operation(
+            BackgroundReindexOrigin::SemanticUpgrade,
+            5,
+            ReindexOperationState::Expired,
+        ),
+    ];
+    response.validate().unwrap();
+
+    let mut duplicate_origin = response.clone();
+    duplicate_origin.daemon.background_reindex_operations[1].origin =
+        BackgroundReindexOrigin::Startup;
+    assert!(duplicate_origin.validate().is_err());
+
+    let mut duplicate_id = response.clone();
+    duplicate_id.daemon.background_reindex_operations[1].operation_id =
+        duplicate_id.daemon.background_reindex_operations[0].operation_id;
+    assert!(duplicate_id.validate().is_err());
+
+    let mut unordered = response.clone();
+    unordered.daemon.background_reindex_operations.swap(0, 1);
+    assert!(unordered.validate().is_err());
+
+    let mut lost = response;
+    lost.daemon.background_reindex_operations[0].state = ReindexOperationState::Lost;
+    assert!(lost.validate().is_err());
 }
 
 #[test]

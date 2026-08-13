@@ -16,10 +16,11 @@ use unity_asset_search_core::{
     TermExplanation,
 };
 
+use crate::operation::{BackgroundReindexOperation, validate_background_reindex_operations};
 use crate::validation::{ContractValidationError, ValidateContract, ensure_revision};
 use crate::{MAX_REFERENCE_RESULTS, QueryPolicyId};
 
-pub const SEARCH_PROTOCOL_REVISION: u16 = 4;
+pub const SEARCH_PROTOCOL_REVISION: u16 = 5;
 pub const MAX_API_ERROR_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_PORTABLE_PATH_BYTES: usize = 32 * 1024;
@@ -686,6 +687,7 @@ pub enum ApiErrorCode {
     IndexBuildFailed,
     IdempotencyConflict,
     OperationNotFound,
+    OperationControlForbidden,
     Internal,
 }
 
@@ -746,6 +748,7 @@ pub struct SearchCapabilities {
     pub outgoing_references: bool,
     pub filesystem_reindex: bool,
     pub reindex_lifecycle: bool,
+    pub background_reindex_discovery: bool,
     pub graceful_shutdown: bool,
 }
 
@@ -760,6 +763,7 @@ impl SearchCapabilities {
             outgoing_references: true,
             filesystem_reindex: true,
             reindex_lifecycle: true,
+            background_reindex_discovery: true,
             graceful_shutdown: true,
         }
     }
@@ -1086,10 +1090,6 @@ pub struct SearchHit {
     pub matched_script_symbols: Vec<String>,
     pub highlight_path_ranges: Vec<HighlightRangeV1>,
     pub highlight_name_ranges: Vec<HighlightRangeV1>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub highlight_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub highlight_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1307,6 +1307,7 @@ pub struct DaemonLifecycleStatus {
     pub generation_maintenance: GenerationMaintenanceStatus,
     pub watcher: WatcherStatus,
     pub timer: TimerStatus,
+    pub background_reindex_operations: Vec<BackgroundReindexOperation>,
 }
 
 impl DaemonLifecycleStatus {
@@ -1338,6 +1339,7 @@ impl DaemonLifecycleStatus {
                 last_failure: None,
                 next_run_in_ms: None,
             },
+            background_reindex_operations: Vec::new(),
         }
     }
 }
@@ -1890,6 +1892,7 @@ impl StatusResponse {
                 field: "freshness maintenance",
             });
         }
+        validate_background_reindex_operations(&self.daemon.background_reindex_operations)?;
         for (field, failure) in [
             (
                 "generation maintenance last cleanup failure",

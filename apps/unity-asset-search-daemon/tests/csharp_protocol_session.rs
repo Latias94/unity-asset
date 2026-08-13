@@ -41,7 +41,7 @@ async fn public_csharp_session_reaches_every_real_daemon_operation_through_verif
     fixture.write_asset("Owner.prefab", OWNER, OWNER_GUID);
     fixture.write_asset("Target.prefab", TARGET, TARGET_GUID);
 
-    let mut daemon = fixture.spawn_daemon();
+    let mut daemon = fixture.spawn_daemon(true);
     let discovered = fixture.wait_for_endpoint(&mut daemon).await;
     let descriptor = discovered.descriptor();
 

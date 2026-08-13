@@ -3,7 +3,7 @@ use std::cell::Cell;
 use unity_asset_search_core::{
     CandidateFacts, CandidateField, FuzzyFallbackPolicy, MatchCountRelation, MatchField, MatchKind,
     RetrievalEvidence, RetrievalStage, SearchDiagnostic, SearchKind, SearchLimits, SearchOutcome,
-    SearchPolicy, SearchRequest, highlight_html,
+    SearchPolicy, SearchRequest,
 };
 
 #[test]
@@ -911,20 +911,12 @@ fn unicode_normalization_produces_original_byte_highlights() {
         assert!("ＵＩ按钮".is_char_boundary(range.end));
     }
     assert_eq!(
-        ranked.highlight_name.as_deref(),
-        Some("<em>ＵＩ</em><em>按钮</em>")
-    );
-}
-
-#[test]
-fn highlight_html_escapes_untrusted_asset_text() {
-    assert_eq!(
-        highlight_html(
-            r#"Assets/<script data-x='1'>&Button".prefab"#,
-            &["button".to_string()],
-        )
-        .as_deref(),
-        Some(r#"Assets/&lt;script data-x=&#39;1&#39;&gt;&amp;<em>Button</em>&quot;.prefab"#)
+        ranked
+            .highlight_name_ranges
+            .iter()
+            .map(|range| &"ＵＩ按钮"[range.start..range.end])
+            .collect::<Vec<_>>(),
+        ["ＵＩ", "按钮"]
     );
 }
 
@@ -941,10 +933,6 @@ fn canonically_reordered_combining_marks_keep_original_byte_highlights() {
             start: 0,
             end: text.len(),
         }]
-    );
-    assert_eq!(
-        outcome.matches[0].highlight_name.as_deref(),
-        Some("<em>a\u{0315}\u{0300}</em>")
     );
 }
 

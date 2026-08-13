@@ -36,11 +36,24 @@ REFERENCE_SOURCE_DIRECTORY = Path(
     "integration/search-protocol/csharp/UnityAsset.SearchProtocol.Reference"
 )
 FIXTURE_SOURCE_DIRECTORY = Path("integration/search-protocol/fixtures")
+SCHEMA_SOURCE_DIRECTORY = Path("integration/search-protocol/schema")
 REFERENCE_ARCHIVE_DIRECTORY = PurePosixPath(
     "csharp/UnityAsset.SearchProtocol.Reference"
 )
 FIXTURE_ARCHIVE_DIRECTORY = PurePosixPath("fixtures")
+SCHEMA_ARCHIVE_DIRECTORY = PurePosixPath("schema")
 MANIFEST_FILENAME = "bundle-manifest.json"
+REQUIRED_SDK_PATHS = frozenset(
+    {
+        (
+            REFERENCE_ARCHIVE_DIRECTORY
+            / "UnityAsset.SearchProtocol.Reference.csproj"
+        ).as_posix(),
+        (FIXTURE_ARCHIVE_DIRECTORY / "manifest.json").as_posix(),
+        (SCHEMA_ARCHIVE_DIRECTORY / "bootstrap-v2.schema.json").as_posix(),
+        (SCHEMA_ARCHIVE_DIRECTORY / "business-v5.schema.json").as_posix(),
+    }
+)
 
 EXCLUDED_DIRECTORY_NAMES = frozenset(
     {
@@ -191,14 +204,14 @@ def _canonical_text_contents(contents: bytes, path: str) -> bytes:
     return text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
 
 
-def _require_confined_path(path: Path, root: Path, label: str) -> Path:
+def _require_confined_path(path: Path, resolved_root: Path, label: str) -> Path:
     try:
-        path.relative_to(root)
+        path.relative_to(resolved_root)
     except ValueError as error:
         raise ProtocolSdkBundleError(f"{label} escapes its source root: {path}") from error
     try:
         resolved = path.resolve(strict=True)
-        resolved.relative_to(root.resolve(strict=True))
+        resolved.relative_to(resolved_root)
     except (OSError, ValueError) as error:
         raise ProtocolSdkBundleError(f"{label} escapes its source root: {path}") from error
     return resolved
@@ -213,6 +226,12 @@ def _collect_directory(
 ) -> list[_SourceFile]:
     if not source_root.is_dir():
         raise ProtocolSdkBundleError(f"required source directory is missing: {source_root}")
+    try:
+        source_root = source_root.resolve(strict=True)
+    except OSError as error:
+        raise ProtocolSdkBundleError(
+            f"failed to resolve protocol SDK source directory: {source_root}"
+        ) from error
 
     def raise_walk_error(error: OSError) -> None:
         raise ProtocolSdkBundleError(
@@ -249,19 +268,20 @@ def _collect_directory(
                     f"source file is a symlink or junction: {candidate}"
                 )
             resolved = _require_confined_path(candidate, source_root, "source file")
-            if not resolved.is_file():
-                raise ProtocolSdkBundleError(f"source path is not a regular file: {candidate}")
             try:
-                size = resolved.stat().st_size
+                metadata = resolved.stat()
             except OSError as error:
                 raise ProtocolSdkBundleError(
                     f"failed to inspect source file: {candidate}"
                 ) from error
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ProtocolSdkBundleError(f"source path is not a regular file: {candidate}")
+            size = metadata.st_size
             if size > MAX_SOURCE_FILE_BYTES:
                 raise ProtocolSdkBundleError(
                     f"source file exceeds {MAX_SOURCE_FILE_BYTES} bytes: {candidate}"
                 )
-            relative = resolved.relative_to(source_root.resolve(strict=True))
+            relative = resolved.relative_to(source_root)
             archive_path = (archive_root / PurePosixPath(relative.as_posix())).as_posix()
             _validate_relative_archive_path(archive_path)
             inventory.reserve(archive_path, size)
@@ -291,9 +311,11 @@ def _collect_sources(repository_root: Path) -> list[_SourceFile]:
 
     reference_root = repository_root / REFERENCE_SOURCE_DIRECTORY
     fixture_root = repository_root / FIXTURE_SOURCE_DIRECTORY
+    schema_root = repository_root / SCHEMA_SOURCE_DIRECTORY
     for source_root, label in (
         (reference_root, "reference codec"),
         (fixture_root, "golden fixtures"),
+        (schema_root, "protocol schemas"),
     ):
         _safe_path(source_root, label)
         _require_confined_path(source_root, repository_root, label)
@@ -313,20 +335,21 @@ def _collect_sources(repository_root: Path) -> list[_SourceFile]:
             inventory=inventory,
         )
     )
+    sources.extend(
+        _collect_directory(
+            schema_root,
+            SCHEMA_ARCHIVE_DIRECTORY,
+            exclude_generated=True,
+            inventory=inventory,
+        )
+    )
     sources.sort(key=lambda source: source.archive_path)
 
     archive_paths = [source.archive_path for source in sources]
     if len(archive_paths) != len(set(archive_paths)):
         raise ProtocolSdkBundleError("protocol SDK source inventory contains duplicate paths")
 
-    required_paths = {
-        (
-            REFERENCE_ARCHIVE_DIRECTORY
-            / "UnityAsset.SearchProtocol.Reference.csproj"
-        ).as_posix(),
-        (FIXTURE_ARCHIVE_DIRECTORY / "manifest.json").as_posix(),
-    }
-    missing = sorted(required_paths.difference(archive_paths))
+    missing = sorted(REQUIRED_SDK_PATHS.difference(archive_paths))
     if missing:
         raise ProtocolSdkBundleError(
             f"protocol SDK source inventory is incomplete: {', '.join(missing)}"
@@ -343,7 +366,11 @@ def _reject_output_source_overlap(
         output_directory, "protocol SDK bundle output"
     )
     output_absolute = Path(os.path.abspath(output_directory))
-    for relative_source in (REFERENCE_SOURCE_DIRECTORY, FIXTURE_SOURCE_DIRECTORY):
+    for relative_source in (
+        REFERENCE_SOURCE_DIRECTORY,
+        FIXTURE_SOURCE_DIRECTORY,
+        SCHEMA_SOURCE_DIRECTORY,
+    ):
         source_root = (repository_root / relative_source).resolve(strict=True)
         try:
             output_absolute.relative_to(source_root)
@@ -456,6 +483,10 @@ def _validate_payload_path_policy(path: str) -> None:
         FIXTURE_ARCHIVE_DIRECTORY.parts
     ):
         relative_parts = parts[len(FIXTURE_ARCHIVE_DIRECTORY.parts) :]
+    elif parts[: len(SCHEMA_ARCHIVE_DIRECTORY.parts)] == (
+        SCHEMA_ARCHIVE_DIRECTORY.parts
+    ):
+        relative_parts = parts[len(SCHEMA_ARCHIVE_DIRECTORY.parts) :]
     else:
         raise ProtocolSdkBundleError(
             f"bundle manifest file is outside the public SDK roots: {path}"
@@ -576,14 +607,7 @@ def _parse_manifest(
             )
         files.append(file)
     file_paths = {str(file["path"]) for file in files}
-    required_paths = {
-        (
-            REFERENCE_ARCHIVE_DIRECTORY
-            / "UnityAsset.SearchProtocol.Reference.csproj"
-        ).as_posix(),
-        (FIXTURE_ARCHIVE_DIRECTORY / "manifest.json").as_posix(),
-    }
-    missing = sorted(required_paths.difference(file_paths))
+    missing = sorted(REQUIRED_SDK_PATHS.difference(file_paths))
     if missing:
         raise ProtocolSdkBundleError(
             f"bundle manifest is missing required SDK inputs: {', '.join(missing)}"

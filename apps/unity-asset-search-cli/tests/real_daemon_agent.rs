@@ -74,7 +74,7 @@ async fn json_agent_drives_a_real_daemon_across_generation_and_process_replaceme
 
     let project_id = fixture.project().project_id().to_string();
     let namespace = fixture.namespace();
-    let mut daemon = fixture.spawn_daemon();
+    let mut daemon = fixture.spawn_daemon(false);
     let discovered = fixture.wait_for_endpoint(&mut daemon).await;
     let stale_discovered = discovered;
     let original_instance = discovered.descriptor().daemon_instance_id();
@@ -203,7 +203,7 @@ async fn json_agent_drives_a_real_daemon_across_generation_and_process_replaceme
         Err(EndpointStoreError::DescriptorMissing)
     ));
 
-    let mut replacement = fixture.spawn_daemon();
+    let mut replacement = fixture.spawn_daemon(false);
     let replacement_discovered = fixture.wait_for_endpoint(&mut replacement).await;
     let replacement_instance = replacement_discovered.descriptor().daemon_instance_id();
     assert_ne!(replacement_instance, original_instance);

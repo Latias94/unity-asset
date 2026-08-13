@@ -9,11 +9,11 @@ use unity_asset_search_index::{
     ProjectPathError, ProjectPathSpace, SearchIndex, SearchRequest as IndexSearchRequest,
 };
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, CapabilitiesResponse, DaemonLifecycleState, DaemonLifecycleStatus,
-    FilesystemReindexIntent, FilesystemReindexScope, FreshnessMaintenance, QueryPolicyId,
-    ReconcileLifecycle, ReindexCancelResponse, ReindexOperationStatus, RequestOperation,
-    ResponseOperation, SearchCapabilities, ShutdownResponse, TimerLifecycleState, TimerStatus,
-    WatcherLifecycleState, WatcherStatus,
+    ApiError, ApiErrorCode, BackgroundReindexOperation, CapabilitiesResponse, DaemonLifecycleState,
+    DaemonLifecycleStatus, FilesystemReindexIntent, FilesystemReindexScope, FreshnessMaintenance,
+    QueryPolicyId, ReconcileLifecycle, ReindexCancelResponse, ReindexOperationStatus,
+    RequestOperation, ResponseOperation, SearchCapabilities, ShutdownResponse, TimerLifecycleState,
+    TimerStatus, WatcherLifecycleState, WatcherStatus,
 };
 
 use crate::coordinator::{CoordinatorError, ReindexScopeKind};
@@ -242,11 +242,18 @@ impl Dispatcher {
         let mut status = blocking_index(&self.inner.blocking_tasks, move || index.status()).await?;
         let coordinator = self.inner.operations.coordinator_snapshot().await;
         let maintenance = self.inner.maintenance.snapshot().await;
+        let background_reindex_operations = self
+            .inner
+            .operations
+            .background_operations()
+            .await
+            .map_err(|error| operation_error(error, self.inner.query_policy_id))?;
         status.daemon = daemon_lifecycle_status(
             self.inner.admission.is_draining().await,
             &status.daemon,
             &coordinator,
             maintenance,
+            background_reindex_operations,
         );
         Ok(status)
     }
@@ -268,6 +275,7 @@ const fn requires_lifecycle_admission(
         unity_asset_search_protocol::OperationKind::Capabilities
             | unity_asset_search_protocol::OperationKind::Status
             | unity_asset_search_protocol::OperationKind::ReindexStatus
+            | unity_asset_search_protocol::OperationKind::ReindexWait
             | unity_asset_search_protocol::OperationKind::ReindexAdmit
             | unity_asset_search_protocol::OperationKind::Shutdown
     )
@@ -278,6 +286,7 @@ fn daemon_lifecycle_status(
     index_status: &DaemonLifecycleStatus,
     coordinator: &crate::coordinator::ReindexCoordinatorSnapshot,
     maintenance: MaintenanceSnapshot,
+    background_reindex_operations: Vec<BackgroundReindexOperation>,
 ) -> DaemonLifecycleStatus {
     let watcher = watcher_lifecycle_state(maintenance.watcher);
     let timer = timer_lifecycle_state(maintenance.timer);
@@ -320,6 +329,7 @@ fn daemon_lifecycle_status(
             last_failure: maintenance.timer_last_failure,
             next_run_in_ms: maintenance.timer_next_run_in_ms,
         },
+        background_reindex_operations,
     }
 }
 
@@ -529,6 +539,20 @@ fn operation_error(error: OperationError, query_policy: QueryPolicyId) -> ApiErr
             false,
         )
         .with_query_policy(query_policy),
+        OperationError::ControlForbidden { origin } => ApiError::new(
+            ApiErrorCode::OperationControlForbidden,
+            "daemon-owned reindex operation cannot be cancelled by a client",
+            false,
+        )
+        .with_detail("origin", origin.wire_name())
+        .with_query_policy(query_policy),
+        OperationError::RegistryInvariant { message } => ApiError::new(
+            ApiErrorCode::Internal,
+            "operation registry invariant failed",
+            false,
+        )
+        .with_detail("cause", message)
+        .with_query_policy(query_policy),
         OperationError::Coordinator(error) => coordinator_error(error, query_policy),
     }
 }
@@ -601,7 +625,10 @@ mod tests {
         TimerLifecycleState, TimerStatus, ValidateContract, WatcherLifecycleState, WatcherStatus,
     };
 
-    use super::{DispatcherShutdown, daemon_lifecycle_status, operation_status, tighten_shutdown};
+    use super::{
+        DispatcherShutdown, daemon_lifecycle_status, operation_status,
+        requires_lifecycle_admission, tighten_shutdown,
+    };
     use crate::coordinator::{
         ReindexAdmissionCounts, ReindexCoordinatorSnapshot, ReindexFailure, ReindexScopeKind,
     };
@@ -635,6 +662,7 @@ mod tests {
                 last_failure: None,
                 next_run_in_ms: None,
             },
+            background_reindex_operations: Vec::new(),
         };
         let coordinator = ReindexCoordinatorSnapshot {
             running: false,
@@ -661,9 +689,23 @@ mod tests {
             timer_next_run_in_ms: None,
         };
 
-        let status = daemon_lifecycle_status(false, &index_status, &coordinator, maintenance);
+        let status =
+            daemon_lifecycle_status(false, &index_status, &coordinator, maintenance, Vec::new());
         assert_eq!(status.reconcile, ReconcileLifecycle::Idle);
         assert_eq!(status.lifecycle, DaemonLifecycleState::Serving);
+    }
+
+    #[test]
+    fn draining_keeps_operation_observation_available() {
+        assert!(!requires_lifecycle_admission(
+            unity_asset_search_protocol::OperationKind::ReindexStatus,
+        ));
+        assert!(!requires_lifecycle_admission(
+            unity_asset_search_protocol::OperationKind::ReindexWait,
+        ));
+        assert!(requires_lifecycle_admission(
+            unity_asset_search_protocol::OperationKind::ReindexCancel,
+        ));
     }
 
     #[test]

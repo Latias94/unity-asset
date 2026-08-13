@@ -16,6 +16,7 @@ pub const MAX_REFERENCE_RESULTS: u32 = 500;
 pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 pub const MAX_WAIT_TIMEOUT_MS: u32 = 5 * 60 * 1_000;
 pub const MAX_SHUTDOWN_DRAIN_MS: u32 = 60 * 1_000;
+pub const MAX_BACKGROUND_REINDEX_OPERATIONS: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -366,6 +367,77 @@ pub enum ReindexOperationState {
     Cancelled,
     Expired,
     Lost,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundReindexOrigin {
+    Startup,
+    Watcher,
+    WatcherOverflow,
+    Timer,
+    SemanticUpgrade,
+}
+
+pub const BACKGROUND_REINDEX_ORIGINS: [BackgroundReindexOrigin; MAX_BACKGROUND_REINDEX_OPERATIONS] = [
+    BackgroundReindexOrigin::Startup,
+    BackgroundReindexOrigin::Watcher,
+    BackgroundReindexOrigin::WatcherOverflow,
+    BackgroundReindexOrigin::Timer,
+    BackgroundReindexOrigin::SemanticUpgrade,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackgroundReindexOperation {
+    pub origin: BackgroundReindexOrigin,
+    pub operation_id: OperationId,
+    pub state: ReindexOperationState,
+}
+
+impl ValidateContract for BackgroundReindexOperation {
+    fn validate(&self) -> Result<(), ContractValidationError> {
+        if self.state == ReindexOperationState::Lost {
+            return Err(ContractValidationError::Inconsistent {
+                field: "background reindex operation state",
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_background_reindex_operations(
+    operations: &[BackgroundReindexOperation],
+) -> Result<(), ContractValidationError> {
+    if operations.len() > MAX_BACKGROUND_REINDEX_OPERATIONS {
+        return Err(ContractValidationError::EntryLimit {
+            field: "background reindex operations",
+            actual: operations.len(),
+            maximum: MAX_BACKGROUND_REINDEX_OPERATIONS,
+        });
+    }
+    for operation in operations {
+        operation.validate()?;
+    }
+    if operations
+        .windows(2)
+        .any(|pair| pair[0].origin >= pair[1].origin)
+    {
+        return Err(ContractValidationError::NotStrictlyIncreasing {
+            field: "background reindex operation origins",
+        });
+    }
+    for (index, operation) in operations.iter().enumerate() {
+        if operations[..index]
+            .iter()
+            .any(|previous| previous.operation_id == operation.operation_id)
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "background reindex operation IDs",
+            });
+        }
+    }
+    Ok(())
 }
 
 impl ReindexOperationState {

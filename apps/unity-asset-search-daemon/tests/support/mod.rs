@@ -70,8 +70,8 @@ impl SearchDaemonFixture {
         .expect("write daemon fixture asset metadata");
     }
 
-    pub fn spawn_daemon(&self) -> DaemonChild {
-        DaemonChild::spawn(self.project_root(), self.index_directory())
+    pub fn spawn_daemon(&self, startup_reindex: bool) -> DaemonChild {
+        DaemonChild::spawn(self.project_root(), self.index_directory(), startup_reindex)
     }
 
     pub async fn wait_for_endpoint(&self, daemon: &mut DaemonChild) -> DiscoveredEndpointV1 {
@@ -115,15 +115,19 @@ pub struct DaemonChild {
 }
 
 impl DaemonChild {
-    fn spawn(project_root: &Path, index_directory: &Path) -> Self {
-        let child = Command::new(daemon_executable())
+    fn spawn(project_root: &Path, index_directory: &Path, startup_reindex: bool) -> Self {
+        let mut command = Command::new(daemon_executable());
+        command
             .arg("--project-root")
             .arg(project_root)
             .arg("--index-dir")
             .arg(index_directory)
-            .arg("--no-startup-reindex")
             .arg("--reconcile-interval-ms")
-            .arg("0")
+            .arg("0");
+        if !startup_reindex {
+            command.arg("--no-startup-reindex");
+        }
+        let child = command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

@@ -153,7 +153,7 @@ A completed GitHub Release contains:
 - `release-dist-plan.json`: the exact cargo-dist local-artifact inventory
   bound into the source evidence.
 - `unity-asset-search-protocol-sdk-v<version>.zip`: the public C# reference
-  codec and all golden protocol fixtures with an internal manifest.
+  codec, structural JSON schemas, and all golden protocol fixtures with an internal manifest.
 - `SHA256SUMS`: checksums for every attached binary, protocol SDK, and
   provenance file.
 

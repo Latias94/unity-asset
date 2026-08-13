@@ -1532,8 +1532,6 @@ fn build_search_hit(
             .into_iter()
             .map(HighlightRangeV1::try_from)
             .collect::<std::result::Result<Vec<_>, _>>()?,
-        highlight_path: ranked.highlight_path,
-        highlight_name: ranked.highlight_name,
     })
 }
 
@@ -1703,11 +1701,11 @@ mod tests {
     #[test]
     fn escaped_search_hits_keep_the_largest_frame_safe_prefix() {
         let request_json =
-            include_str!("../../../integration/search-protocol/fixtures/requests/search-v4.json")
+            include_str!("../../../integration/search-protocol/fixtures/requests/search-v5.json")
                 .replace("\"limit\":25", "\"limit\":200");
         let request: RequestEnvelope = serde_json::from_str(&request_json).unwrap();
         let fixture: ResponseEnvelope = serde_json::from_str(include_str!(
-            "../../../integration/search-protocol/fixtures/responses/search-v4.json"
+            "../../../integration/search-protocol/fixtures/responses/search-v5.json"
         ))
         .unwrap();
         let ResponseOutcome::Success(operation) = fixture.into_outcome() else {
@@ -1717,8 +1715,7 @@ mod tests {
             panic!("search fixture must contain a search response");
         };
         let template = response.hits[0].clone();
-        let name = "&".repeat(16 * 1024);
-        let highlighted_name = "&amp;".repeat(16 * 1024);
+        let name = "\"".repeat(32 * 1024);
         let mut hits = Vec::new();
         let mut encoded_bytes = 2_u64;
 
@@ -1726,7 +1723,6 @@ mod tests {
             let mut hit = template.clone();
             hit.rank = ordinal + 1;
             hit.name.clone_from(&name);
-            hit.highlight_name = Some(highlighted_name.clone());
             if !push_search_hit_within_json_budget(&mut hits, hit, &mut encoded_bytes).unwrap() {
                 break;
             }

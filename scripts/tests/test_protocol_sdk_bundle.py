@@ -28,6 +28,7 @@ class ProtocolSdkBundleTests(unittest.TestCase):
             / "integration/search-protocol/csharp/UnityAsset.SearchProtocol.Reference"
         )
         fixtures = self.root / "integration/search-protocol/fixtures"
+        schemas = self.root / "integration/search-protocol/schema"
         self.write(
             reference / "UnityAsset.SearchProtocol.Reference.csproj",
             b"<Project Sdk=\"Microsoft.NET.Sdk\" />\n",
@@ -42,6 +43,14 @@ class ProtocolSdkBundleTests(unittest.TestCase):
         self.write(
             fixtures / "requests" / "search-v2.json",
             b'{"operation":"search"}\n',
+        )
+        self.write(
+            schemas / "bootstrap-v2.schema.json",
+            b'{"$id":"bootstrap","$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
+        )
+        self.write(
+            schemas / "business-v5.schema.json",
+            b'{"$id":"business","$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
         )
 
     def tearDown(self) -> None:
@@ -107,6 +116,8 @@ class ProtocolSdkBundleTests(unittest.TestCase):
                     "UnityAsset.SearchProtocol.Reference.csproj",
                     "fixtures/manifest.json",
                     "fixtures/requests/search-v2.json",
+                    "schema/bootstrap-v2.schema.json",
+                    "schema/business-v5.schema.json",
                 ],
             )
 
@@ -240,6 +251,14 @@ class ProtocolSdkBundleTests(unittest.TestCase):
                 b"<Project />\n",
             ),
             BUNDLE._SourceFile("fixtures/manifest.json", b"{}\n"),
+            BUNDLE._SourceFile(
+                "schema/bootstrap-v2.schema.json",
+                b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
+            ),
+            BUNDLE._SourceFile(
+                "schema/business-v5.schema.json",
+                b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
+            ),
         )
         bundle = BUNDLE._build_bundle_bytes("v0.4.0", sources)
         bundle_path = (
@@ -329,6 +348,13 @@ class ProtocolSdkBundleTests(unittest.TestCase):
                 fixture_root / "release-output",
                 "v0.4.0",
             )
+
+    def test_builder_requires_both_public_schema_entrypoints(self) -> None:
+        (self.root / "integration/search-protocol/schema/business-v5.schema.json").unlink()
+        with self.assertRaisesRegex(
+            BUNDLE.ProtocolSdkBundleError, "protocol SDK source inventory is incomplete"
+        ):
+            self.build("missing-schema")
 
     def test_release_tag_cannot_inject_an_archive_path(self) -> None:
         with self.assertRaisesRegex(

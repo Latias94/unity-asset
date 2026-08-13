@@ -1440,38 +1440,44 @@ mod tests {
         };
         assert_eq!(error.code, ApiErrorCode::NotReady);
 
-        for (request_id, operation) in [
-            (
-                26,
-                RequestOperation::ReindexWait(ReindexWaitRequest {
-                    operation_id: unknown_operation,
-                    timeout_ms: 1,
-                }),
-            ),
-            (
-                27,
-                RequestOperation::ReindexCancel(ReindexCancelRequest {
-                    operation_id: unknown_operation,
-                }),
-            ),
-        ] {
-            let request = RequestEnvelope::new(
-                BUSINESS_PROTOCOL_REVISION,
-                RequestId::from_bytes([request_id; 16]),
-                project_id,
-                instance_id,
-                query_policy_id,
-                operation,
-            )
-            .unwrap();
-            let ResponseOutcome::Error(error) = exchange_request(&mut work_client, &request)
-                .await
-                .into_outcome()
-            else {
-                panic!("draining daemon admitted operation state mutation");
-            };
-            assert_eq!(error.code, ApiErrorCode::NotReady);
-        }
+        let wait = RequestEnvelope::new(
+            BUSINESS_PROTOCOL_REVISION,
+            RequestId::from_bytes([26; 16]),
+            project_id,
+            instance_id,
+            query_policy_id,
+            RequestOperation::ReindexWait(ReindexWaitRequest {
+                operation_id: unknown_operation,
+                timeout_ms: 1,
+            }),
+        )
+        .unwrap();
+        let ResponseOutcome::Error(error) = exchange_request(&mut work_client, &wait)
+            .await
+            .into_outcome()
+        else {
+            panic!("unknown draining operation unexpectedly completed a wait");
+        };
+        assert_eq!(error.code, ApiErrorCode::OperationNotFound);
+
+        let cancel = RequestEnvelope::new(
+            BUSINESS_PROTOCOL_REVISION,
+            RequestId::from_bytes([27; 16]),
+            project_id,
+            instance_id,
+            query_policy_id,
+            RequestOperation::ReindexCancel(ReindexCancelRequest {
+                operation_id: unknown_operation,
+            }),
+        )
+        .unwrap();
+        let ResponseOutcome::Error(error) = exchange_request(&mut work_client, &cancel)
+            .await
+            .into_outcome()
+        else {
+            panic!("draining daemon admitted operation state mutation");
+        };
+        assert_eq!(error.code, ApiErrorCode::NotReady);
         assert_eq!(
             coordinator.snapshot().await.admissions.ipc,
             admissions_before

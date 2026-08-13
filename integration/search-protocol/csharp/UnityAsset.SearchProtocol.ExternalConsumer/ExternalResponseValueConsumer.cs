@@ -95,6 +95,27 @@ public static class ExternalProtocolConsumer
         return OperationId.Parse(operationId);
     }
 
+    public static OperationId ReadReindexOperationId(ResponseEnvelopeV1 response)
+    {
+        return response.ReadReindexOperationId();
+    }
+
+    public static SearchCapabilities ReadSearchCapabilities(ResponseEnvelopeV1 response)
+    {
+        return response.ReadSearchCapabilities();
+    }
+
+    public static IReadOnlyList<BackgroundReindexOperation> ReadBackgroundReindexOperations(
+        ResponseEnvelopeV1 response)
+    {
+        return response.ReadBackgroundReindexOperations();
+    }
+
+    public static ApiErrorCode ReadApiErrorCode(ResponseEnvelopeV1 response)
+    {
+        return response.ReadApiErrorCode();
+    }
+
     public static string ReadBootstrapRejectionCode(ProtocolBootstrapRejectedException error)
     {
         return error.Code;

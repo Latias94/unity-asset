@@ -9,6 +9,7 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use unity_asset_search_index::FilesystemReindexIntent;
 use unity_asset_search_protocol::{
+    BACKGROUND_REINDEX_ORIGINS, BackgroundReindexOperation, BackgroundReindexOrigin,
     DaemonInstanceId, OperationId, ReindexOperationState, ReindexReceipt, StatusResponse,
 };
 
@@ -59,6 +60,28 @@ impl OperationOrigin {
             | Self::WatcherOverflow
             | Self::Timer
             | Self::SemanticUpgrade => retention.maximum_active,
+        }
+    }
+
+    const fn background(self) -> Option<BackgroundReindexOrigin> {
+        match self {
+            Self::Startup => Some(BackgroundReindexOrigin::Startup),
+            Self::Watcher => Some(BackgroundReindexOrigin::Watcher),
+            Self::WatcherOverflow => Some(BackgroundReindexOrigin::WatcherOverflow),
+            Self::Timer => Some(BackgroundReindexOrigin::Timer),
+            Self::SemanticUpgrade => Some(BackgroundReindexOrigin::SemanticUpgrade),
+            Self::Ipc => None,
+        }
+    }
+
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Watcher => "watcher",
+            Self::WatcherOverflow => "watcher_overflow",
+            Self::Timer => "timer",
+            Self::SemanticUpgrade => "semantic_upgrade",
+            Self::Ipc => "ipc",
         }
     }
 }
@@ -156,6 +179,10 @@ pub enum OperationError {
     CompletionTaskTerminated { message: String },
     #[error("reindex operation was not found")]
     NotFound,
+    #[error("{origin:?} reindex operation is daemon-owned and cannot be cancelled by a client")]
+    ControlForbidden { origin: OperationOrigin },
+    #[error("operation registry invariant failed: {message}")]
+    RegistryInvariant { message: &'static str },
     #[error(transparent)]
     Coordinator(#[from] CoordinatorError),
 }
@@ -200,7 +227,7 @@ struct RegistryState {
     terminal_order: VecDeque<(Instant, OperationId)>,
     expired_order: VecDeque<(Instant, OperationId)>,
     idempotency: BTreeMap<String, IdempotencyBinding>,
-    latest_by_origin: BTreeMap<OperationOrigin, OperationId>,
+    background_by_origin: BTreeMap<BackgroundReindexOrigin, VecDeque<OperationId>>,
     active_count: usize,
     completion_task_failure: Option<String>,
 }
@@ -383,7 +410,13 @@ impl OperationService {
                 .entries
                 .insert(operation_id, OperationRecord::Active(Arc::clone(&entry)));
             registry.active_count = registry.active_count.saturating_add(1);
-            registry.latest_by_origin.insert(origin, operation_id);
+            if let Some(background_origin) = origin.background() {
+                registry
+                    .background_by_origin
+                    .entry(background_origin)
+                    .or_default()
+                    .push_back(operation_id);
+            }
             if let Some(key) = idempotency_key {
                 registry.idempotency.insert(
                     key,
@@ -421,27 +454,46 @@ impl OperationService {
         }
     }
 
-    #[cfg(test)]
-    pub async fn latest(
+    pub async fn background_operations(
         &self,
-        origin: OperationOrigin,
-    ) -> Result<Option<OperationSnapshot>, OperationError> {
+    ) -> Result<Vec<BackgroundReindexOperation>, OperationError> {
         self.ensure_completion_tasks_healthy().await?;
-        let operation_id = self
-            .state
-            .lock()
-            .await
-            .latest_by_origin
-            .get(&origin)
-            .copied();
-        match operation_id {
-            Some(operation_id) => match self.lookup(operation_id).await {
-                Some(OperationLookup::Entry(entry)) => Ok(Some(entry.status.read().await.clone())),
-                Some(OperationLookup::Snapshot(status)) => Ok(Some(*status)),
-                None => Ok(None),
-            },
-            None => Ok(None),
+        let captured = {
+            let mut registry = self.state.lock().await;
+            registry.prune(Instant::now(), self.retention);
+            let mut captured = Vec::with_capacity(BACKGROUND_REINDEX_ORIGINS.len());
+            for origin in BACKGROUND_REINDEX_ORIGINS {
+                let Some(operation_id) = registry
+                    .background_by_origin
+                    .get(&origin)
+                    .and_then(|operations| operations.back())
+                    .copied()
+                else {
+                    continue;
+                };
+                let Some(record) = registry.entries.get(&operation_id) else {
+                    return Err(OperationError::RegistryInvariant {
+                        message: "background operation is missing from the retained registry",
+                    });
+                };
+                captured.push((origin, operation_id, record.lookup()));
+            }
+            captured
+        };
+
+        let mut operations = Vec::with_capacity(captured.len());
+        for (origin, operation_id, lookup) in captured {
+            let state = match lookup {
+                OperationLookup::Entry(entry) => entry.status.read().await.state,
+                OperationLookup::Snapshot(snapshot) => snapshot.state,
+            };
+            operations.push(BackgroundReindexOperation {
+                origin,
+                operation_id,
+                state,
+            });
         }
+        Ok(operations)
     }
 
     pub async fn wait(
@@ -509,8 +561,20 @@ impl OperationService {
     ) -> Result<OperationCancellation, OperationError> {
         self.ensure_completion_tasks_healthy().await?;
         let entry = match self.lookup(operation_id).await {
-            Some(OperationLookup::Entry(entry)) => entry,
+            Some(OperationLookup::Entry(entry)) => {
+                if entry.origin != OperationOrigin::Ipc {
+                    return Err(OperationError::ControlForbidden {
+                        origin: entry.origin,
+                    });
+                }
+                entry
+            }
             Some(OperationLookup::Snapshot(status)) => {
+                if let Some(origin) = status.origin
+                    && origin != OperationOrigin::Ipc
+                {
+                    return Err(OperationError::ControlForbidden { origin });
+                }
                 return Ok(OperationCancellation {
                     operation_id,
                     state: status.state,
@@ -613,12 +677,10 @@ impl OperationService {
     async fn lookup(&self, operation_id: OperationId) -> Option<OperationLookup> {
         let mut state = self.state.lock().await;
         state.prune(Instant::now(), self.retention);
-        state.entries.get(&operation_id).map(|record| match record {
-            OperationRecord::Active(entry) | OperationRecord::Terminal(entry) => {
-                OperationLookup::Entry(Arc::clone(entry))
-            }
-            OperationRecord::Expired(status) => OperationLookup::Snapshot(status.clone()),
-        })
+        state
+            .entries
+            .get(&operation_id)
+            .map(OperationRecord::lookup)
     }
 
     fn belongs_to_current_epoch(&self, operation_id: OperationId) -> bool {
@@ -683,6 +745,17 @@ impl OperationServiceOwner {
 enum OperationLookup {
     Entry(Arc<OperationEntry>),
     Snapshot(Box<OperationSnapshot>),
+}
+
+impl OperationRecord {
+    fn lookup(&self) -> OperationLookup {
+        match self {
+            Self::Active(entry) | Self::Terminal(entry) => {
+                OperationLookup::Entry(Arc::clone(entry))
+            }
+            Self::Expired(status) => OperationLookup::Snapshot(status.clone()),
+        }
+    }
 }
 
 async fn wait_for_terminal(entry: &OperationEntry) -> OperationSnapshot {
@@ -860,11 +933,24 @@ impl RegistryState {
                 self.entries.get(&operation_id),
                 Some(OperationRecord::Expired(_))
             ) {
-                self.entries.remove(&operation_id);
+                let origin = match self.entries.remove(&operation_id) {
+                    Some(OperationRecord::Expired(status)) => status.origin,
+                    _ => None,
+                };
                 self.idempotency
                     .retain(|_, retained| retained.operation_id != operation_id);
-                self.latest_by_origin
-                    .retain(|_, latest| *latest != operation_id);
+                if let Some(origin) = origin.and_then(OperationOrigin::background) {
+                    let remove_origin =
+                        self.background_by_origin
+                            .get_mut(&origin)
+                            .is_some_and(|operations| {
+                                operations.retain(|retained| *retained != operation_id);
+                                operations.is_empty()
+                            });
+                    if remove_origin {
+                        self.background_by_origin.remove(&origin);
+                    }
+                }
             }
         }
     }
@@ -1026,8 +1112,12 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use tokio::time::Instant;
     use unity_asset_search_index::{FilesystemReindexIntent, IndexPaths, ProjectPathSpace};
-    use unity_asset_search_protocol::{DaemonInstanceId, ReindexOperationState};
+    use unity_asset_search_protocol::{
+        BackgroundReindexOperation, BackgroundReindexOrigin, DaemonInstanceId,
+        ReindexOperationState,
+    };
 
     use super::{
         INITIAL_SEMANTIC_RETRY_BACKOFF, OperationError, OperationOrigin, OperationRetentionPolicy,
@@ -1085,6 +1175,18 @@ mod tests {
         }
     }
 
+    async fn background_operation(
+        service: &OperationService,
+        origin: BackgroundReindexOrigin,
+    ) -> Option<BackgroundReindexOperation> {
+        service
+            .background_operations()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.origin == origin)
+    }
+
     #[tokio::test]
     async fn every_internal_origin_retains_a_queryable_operation_id() {
         let fixture = CoordinatorFixture::pending();
@@ -1093,6 +1195,14 @@ mod tests {
         let startup = service
             .admit(
                 OperationOrigin::Startup,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+        let watcher = service
+            .admit(
+                OperationOrigin::Watcher,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1107,39 +1217,161 @@ mod tests {
             )
             .await
             .unwrap();
+        let semantic = service
+            .admit(
+                OperationOrigin::SemanticUpgrade,
+                FilesystemReindexIntent::full(),
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .admit(
+                OperationOrigin::Ipc,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(
             service
-                .latest(OperationOrigin::Startup)
+                .background_operations()
                 .await
                 .unwrap()
-                .unwrap()
-                .operation_id,
-            startup.operation_id
-        );
-        assert_eq!(
-            service
-                .latest(OperationOrigin::WatcherOverflow)
-                .await
-                .unwrap()
-                .unwrap()
-                .operation_id,
-            overflow.operation_id
-        );
-        assert_eq!(
-            service
-                .latest(OperationOrigin::Timer)
-                .await
-                .unwrap()
-                .unwrap()
-                .operation_id,
-            timer.operation_id
+                .into_iter()
+                .map(|operation| (operation.origin, operation.operation_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (BackgroundReindexOrigin::Startup, startup.operation_id),
+                (BackgroundReindexOrigin::Watcher, watcher.operation_id),
+                (
+                    BackgroundReindexOrigin::WatcherOverflow,
+                    overflow.operation_id,
+                ),
+                (BackgroundReindexOrigin::Timer, timer.operation_id),
+                (
+                    BackgroundReindexOrigin::SemanticUpgrade,
+                    semantic.operation_id,
+                ),
+            ]
         );
         let coordinator = service.coordinator_snapshot().await;
         assert_eq!(coordinator.watcher_overflows, 1);
         assert_eq!(coordinator.admissions.startup, 1);
-        assert_eq!(coordinator.admissions.watcher, 1);
+        assert_eq!(coordinator.admissions.watcher, 2);
         assert_eq!(coordinator.admissions.timer, 1);
+    }
+
+    #[tokio::test]
+    async fn background_summary_replaces_an_origin_without_exposing_ipc_operations() {
+        let fixture = CoordinatorFixture::pending();
+        let service = fixture.service(10);
+        let first = service
+            .admit(
+                OperationOrigin::Watcher,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+        let second = service
+            .admit(
+                OperationOrigin::Watcher,
+                FilesystemReindexIntent::full(),
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .admit(
+                OperationOrigin::Ipc,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let operations = service.background_operations().await.unwrap();
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].origin, BackgroundReindexOrigin::Watcher);
+        assert_eq!(operations[0].operation_id, second.operation_id);
+        assert_ne!(operations[0].operation_id, first.operation_id);
+    }
+
+    #[tokio::test]
+    async fn daemon_owned_operation_cannot_be_cancelled_by_a_client() {
+        let fixture = CoordinatorFixture::pending();
+        let service = fixture.service(11);
+        let operation = service
+            .admit(
+                OperationOrigin::Watcher,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service.cancel(operation.operation_id).await,
+            Err(OperationError::ControlForbidden {
+                origin: OperationOrigin::Watcher
+            })
+        ));
+        assert_eq!(
+            background_operation(&service, BackgroundReindexOrigin::Watcher)
+                .await
+                .unwrap()
+                .operation_id,
+            operation.operation_id
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn background_summary_falls_back_to_an_older_retained_operation() {
+        let fixture = CoordinatorFixture::pending();
+        let retention = OperationRetentionPolicy {
+            maximum_active: 4,
+            maximum_client_active: 4,
+            maximum_terminal: 4,
+            maximum_expired: 1,
+            terminal_retention: Duration::from_secs(1),
+            expired_retention: Duration::from_secs(1),
+        };
+        let service = OperationService::with_retention(
+            DaemonInstanceId::from_bytes([12; 16]),
+            fixture.runtime.coordinator(),
+            AdmissionGate::default(),
+            retention,
+        );
+        let older = service
+            .admit(
+                OperationOrigin::Watcher,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+        let newer = service
+            .admit(
+                OperationOrigin::Watcher,
+                FilesystemReindexIntent::full(),
+                None,
+            )
+            .await
+            .unwrap();
+        {
+            let mut registry = service.state.lock().await;
+            let now = Instant::now();
+            registry.mark_terminal(newer.operation_id, now, retention);
+        }
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        let retained = background_operation(&service, BackgroundReindexOrigin::Watcher)
+            .await
+            .unwrap();
+        assert_eq!(retained.operation_id, older.operation_id);
+        assert_ne!(retained.operation_id, newer.operation_id);
     }
 
     #[tokio::test]
@@ -1243,7 +1475,7 @@ mod tests {
             .unwrap();
         let second = service
             .admit(
-                OperationOrigin::Watcher,
+                OperationOrigin::Ipc,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1381,10 +1613,8 @@ mod tests {
 
         let first_id = semantic.ensure_first_admission().await.unwrap().unwrap();
         assert_eq!(
-            service
-                .latest(OperationOrigin::SemanticUpgrade)
+            background_operation(&service, BackgroundReindexOrigin::SemanticUpgrade)
                 .await
-                .unwrap()
                 .unwrap()
                 .operation_id,
             first_id
@@ -1397,10 +1627,8 @@ mod tests {
         for _ in 0..8 {
             tokio::task::yield_now().await;
         }
-        let retried = service
-            .latest(OperationOrigin::SemanticUpgrade)
+        let retried = background_operation(&service, BackgroundReindexOrigin::SemanticUpgrade)
             .await
-            .unwrap()
             .unwrap();
         assert_ne!(retried.operation_id, first_id);
         assert!(matches!(
@@ -1470,10 +1698,8 @@ mod tests {
         let admitted = admitted.unwrap().unwrap();
         assert!(publication_allowed.load(Ordering::Acquire));
         assert_eq!(
-            service
-                .latest(OperationOrigin::SemanticUpgrade)
+            background_operation(&service, BackgroundReindexOrigin::SemanticUpgrade)
                 .await
-                .unwrap()
                 .unwrap()
                 .operation_id,
             admitted

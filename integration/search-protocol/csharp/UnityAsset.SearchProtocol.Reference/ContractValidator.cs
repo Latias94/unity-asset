@@ -18,6 +18,50 @@ namespace UnityAsset.SearchProtocol.Reference
         private const int MaxSearchHitsJsonBytes = 10 * 1024 * 1024;
         private const int MaxSearchResponseJsonBytes = 15 * 1024 * 1024;
         private const int MaxStatusPathsJsonBytes = 224 * 1024;
+        private static readonly string[] BackgroundReindexOrigins =
+        {
+            "startup",
+            "watcher",
+            "watcher_overflow",
+            "timer",
+            "semantic_upgrade",
+        };
+
+        private static readonly string[] BackgroundReindexOperationProperties =
+        {
+            "origin",
+            "operation_id",
+            "state",
+        };
+
+        private static readonly string[] ReindexOperationStates =
+        {
+            "queued",
+            "coalesced",
+            "running",
+            "succeeded",
+            "failed",
+            "cancelled",
+            "expired",
+            "lost",
+        };
+
+        private static readonly string[] ApiErrorCodes =
+        {
+            "invalid_request",
+            "invalid_cursor",
+            "stale_cursor",
+            "incompatible_protocol",
+            "peer_rejected",
+            "busy",
+            "not_ready",
+            "revision_mismatch",
+            "index_build_failed",
+            "idempotency_conflict",
+            "operation_not_found",
+            "operation_control_forbidden",
+            "internal",
+        };
 
         private static readonly string[] Operations =
         {
@@ -104,6 +148,55 @@ namespace UnityAsset.SearchProtocol.Reference
             JsonElement response = StrictJson.Required(value, "response", "response envelope.value");
             ValidateResponsePayload(kind, response, "response envelope.value.response", envelopePolicy);
             return kind;
+        }
+
+        internal static IReadOnlyList<BackgroundReindexOperation> MaterializeBackgroundReindexOperations(
+            JsonElement operations)
+        {
+            int count = operations.GetArrayLength();
+            if (count == 0)
+            {
+                return Array.Empty<BackgroundReindexOperation>();
+            }
+
+            var result = new BackgroundReindexOperation[count];
+            int index = 0;
+            foreach (JsonElement operation in operations.EnumerateArray())
+            {
+                result[index] = new BackgroundReindexOperation(
+                    ParseBackgroundReindexOrigin(operation.GetProperty("origin").GetString()!),
+                    OperationId.Parse(operation.GetProperty("operation_id").GetString()!),
+                    ParseReindexOperationState(operation.GetProperty("state").GetString()!));
+                index++;
+            }
+            return result;
+        }
+
+        internal static IReadOnlyList<BackgroundReindexOperation> ReadBackgroundReindexOperations(
+            JsonElement operations,
+            string path)
+        {
+            ValidateBackgroundReindexOperations(operations, path);
+            return MaterializeBackgroundReindexOperations(operations);
+        }
+
+        internal static SearchCapabilities MaterializeSearchCapabilities(JsonElement capabilities)
+        {
+            return new SearchCapabilities(
+                capabilities.GetProperty("protocol_revision").GetUInt16(),
+                capabilities.GetProperty("search").GetBoolean(),
+                capabilities.GetProperty("suggest").GetBoolean(),
+                capabilities.GetProperty("incoming_references").GetBoolean(),
+                capabilities.GetProperty("outgoing_references").GetBoolean(),
+                capabilities.GetProperty("filesystem_reindex").GetBoolean(),
+                capabilities.GetProperty("reindex_lifecycle").GetBoolean(),
+                capabilities.GetProperty("background_reindex_discovery").GetBoolean(),
+                capabilities.GetProperty("graceful_shutdown").GetBoolean());
+        }
+
+        internal static ApiErrorCode ReadApiErrorCode(JsonElement code, string path)
+        {
+            return ParseApiErrorCode(StrictJson.Enum(code, path, ApiErrorCodes));
         }
 
         internal static void ValidateResponseForRequest(ResponseEnvelopeV1 response, RequestEnvelopeV1 request)
@@ -494,7 +587,8 @@ namespace UnityAsset.SearchProtocol.Reference
                 "reconcile",
                 "generation_maintenance",
                 "watcher",
-                "timer");
+                "timer",
+                "background_reindex_operations");
             StrictJson.Enum(
                 StrictJson.Required(daemon, "lifecycle", path),
                 path + ".lifecycle",
@@ -654,6 +748,10 @@ namespace UnityAsset.SearchProtocol.Reference
                 throw new ProtocolValidationException(path + ".timer must advertise its next run");
             }
 
+            ValidateBackgroundReindexOperations(
+                StrictJson.Required(daemon, "background_reindex_operations", path),
+                path + ".background_reindex_operations");
+
             string expectedMaintenance = watcherState == "disabled" && timerState == "disabled"
                 ? "unmanaged"
                 : "managed";
@@ -772,9 +870,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "matched_hierarchy_paths",
                 "matched_script_symbols",
                 "highlight_path_ranges",
-                "highlight_name_ranges",
-                "highlight_path?",
-                "highlight_name?");
+                "highlight_name_ranges");
             uint rank = StrictJson.UInt32(StrictJson.Required(hit, "rank", path), path + ".rank");
             if (rank != expectedRank)
             {
@@ -796,14 +892,6 @@ namespace UnityAsset.SearchProtocol.Reference
             ValidateStringArray(StrictJson.Required(hit, "matched_script_symbols", path), path + ".matched_script_symbols");
             ValidateRanges(StrictJson.Required(hit, "highlight_path_ranges", path), path + ".highlight_path_ranges");
             ValidateRanges(StrictJson.Required(hit, "highlight_name_ranges", path), path + ".highlight_name_ranges");
-            if (StrictJson.Optional(hit, "highlight_path", out JsonElement highlightPath))
-            {
-                StrictJson.String(highlightPath, path + ".highlight_path");
-            }
-            if (StrictJson.Optional(hit, "highlight_name", out JsonElement highlightName))
-            {
-                StrictJson.String(highlightName, path + ".highlight_name");
-            }
         }
 
         private static void ValidateRankingSignals(JsonElement signals, string path)
@@ -1185,14 +1273,7 @@ namespace UnityAsset.SearchProtocol.Reference
             string state = StrictJson.Enum(
                 StrictJson.Required(response, "state", path),
                 path + ".state",
-                "queued",
-                "coalesced",
-                "running",
-                "succeeded",
-                "failed",
-                "cancelled",
-                "expired",
-                "lost");
+                ReindexOperationStates);
             bool hasAdmission = StrictJson.Optional(response, "admission", out JsonElement admission);
             bool hasCompletion = StrictJson.Optional(response, "completion", out JsonElement completion);
             bool hasStatus = StrictJson.Optional(response, "status", out JsonElement status);
@@ -1266,14 +1347,7 @@ namespace UnityAsset.SearchProtocol.Reference
             string state = StrictJson.Enum(
                 StrictJson.Required(response, "state", path),
                 path + ".state",
-                "queued",
-                "coalesced",
-                "running",
-                "succeeded",
-                "failed",
-                "cancelled",
-                "expired",
-                "lost");
+                ReindexOperationStates);
             bool cancelled = StrictJson.Boolean(StrictJson.Required(response, "cancelled", path), path + ".cancelled");
             if (cancelled != (state == "cancelled"))
             {
@@ -1413,21 +1487,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "query_policy_id?",
                 "details");
             StrictJson.RequireRevision(StrictJson.Required(error, "protocol_revision", path), path + ".protocol_revision");
-            StrictJson.Enum(
-                StrictJson.Required(error, "code", path),
-                path + ".code",
-                "invalid_request",
-                "invalid_cursor",
-                "stale_cursor",
-                "incompatible_protocol",
-                "peer_rejected",
-                "busy",
-                "not_ready",
-                "revision_mismatch",
-                "index_build_failed",
-                "idempotency_conflict",
-                "operation_not_found",
-                "internal");
+            ReadApiErrorCode(StrictJson.Required(error, "code", path), path + ".code");
             StrictJson.String(
                 StrictJson.Required(error, "message", path),
                 path + ".message",
@@ -1565,6 +1625,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "outgoing_references",
                 "filesystem_reindex",
                 "reindex_lifecycle",
+                "background_reindex_discovery",
                 "graceful_shutdown");
             StrictJson.RequireRevision(StrictJson.Required(capabilities, "protocol_revision", path), path + ".protocol_revision");
             string[] flags =
@@ -1575,12 +1636,125 @@ namespace UnityAsset.SearchProtocol.Reference
                 "outgoing_references",
                 "filesystem_reindex",
                 "reindex_lifecycle",
+                "background_reindex_discovery",
                 "graceful_shutdown",
             };
             foreach (string flag in flags)
             {
                 StrictJson.Boolean(StrictJson.Required(capabilities, flag, path), path + "." + flag);
             }
+        }
+
+        private static void ValidateBackgroundReindexOperations(JsonElement operations, string path)
+        {
+            StrictJson.RequireKind(operations, JsonValueKind.Array, path);
+            int count = operations.GetArrayLength();
+            if (count > ProtocolConstants.MaxBackgroundReindexOperations)
+            {
+                throw new ProtocolValidationException(
+                    $"{path} exceeds {ProtocolConstants.MaxBackgroundReindexOperations} entries");
+            }
+
+            int previousOrigin = -1;
+            int index = 0;
+            foreach (JsonElement operation in operations.EnumerateArray())
+            {
+                string operationPath = $"{path}[{index}]";
+                StrictJson.Properties(operation, operationPath, BackgroundReindexOperationProperties);
+
+                string originValue = StrictJson.Enum(
+                    StrictJson.Required(operation, "origin", operationPath),
+                    operationPath + ".origin",
+                    BackgroundReindexOrigins);
+                int originIndex = Array.IndexOf(BackgroundReindexOrigins, originValue);
+                if (originIndex <= previousOrigin)
+                {
+                    throw new ProtocolValidationException(path + " origins must be strictly increasing");
+                }
+                previousOrigin = originIndex;
+
+                string operationId = OperationId.Parse(
+                    StrictJson.String(
+                        StrictJson.Required(operation, "operation_id", operationPath),
+                        operationPath + ".operation_id")).Value;
+                int previousIndex = 0;
+                foreach (JsonElement previousOperation in operations.EnumerateArray())
+                {
+                    if (previousIndex == index)
+                    {
+                        break;
+                    }
+                    if (previousOperation.GetProperty("operation_id").ValueEquals(operationId))
+                    {
+                        throw new ProtocolValidationException(path + " operation IDs must be unique");
+                    }
+                    previousIndex++;
+                }
+
+                string stateValue = StrictJson.Enum(
+                    StrictJson.Required(operation, "state", operationPath),
+                    operationPath + ".state",
+                    ReindexOperationStates);
+                if (stateValue == "lost")
+                {
+                    throw new ProtocolValidationException(
+                        operationPath + ".state cannot be lost for a discoverable background operation");
+                }
+                index++;
+            }
+        }
+
+        private static BackgroundReindexOrigin ParseBackgroundReindexOrigin(string value)
+        {
+            return value switch
+            {
+                "startup" => BackgroundReindexOrigin.Startup,
+                "watcher" => BackgroundReindexOrigin.Watcher,
+                "watcher_overflow" => BackgroundReindexOrigin.WatcherOverflow,
+                "timer" => BackgroundReindexOrigin.Timer,
+                "semantic_upgrade" => BackgroundReindexOrigin.SemanticUpgrade,
+                _ => throw new ProtocolValidationException(
+                    $"background reindex origin contains unsupported value '{value}'"),
+            };
+        }
+
+        private static ReindexOperationState ParseReindexOperationState(string value)
+        {
+            return value switch
+            {
+                "queued" => ReindexOperationState.Queued,
+                "coalesced" => ReindexOperationState.Coalesced,
+                "running" => ReindexOperationState.Running,
+                "succeeded" => ReindexOperationState.Succeeded,
+                "failed" => ReindexOperationState.Failed,
+                "cancelled" => ReindexOperationState.Cancelled,
+                "expired" => ReindexOperationState.Expired,
+                "lost" => ReindexOperationState.Lost,
+                _ => throw new ProtocolValidationException(
+                    $"reindex operation state contains unsupported value '{value}'"),
+            };
+        }
+
+        private static ApiErrorCode ParseApiErrorCode(string value)
+        {
+            return value switch
+            {
+                "invalid_request" => ApiErrorCode.InvalidRequest,
+                "invalid_cursor" => ApiErrorCode.InvalidCursor,
+                "stale_cursor" => ApiErrorCode.StaleCursor,
+                "incompatible_protocol" => ApiErrorCode.IncompatibleProtocol,
+                "peer_rejected" => ApiErrorCode.PeerRejected,
+                "busy" => ApiErrorCode.Busy,
+                "not_ready" => ApiErrorCode.NotReady,
+                "revision_mismatch" => ApiErrorCode.RevisionMismatch,
+                "index_build_failed" => ApiErrorCode.IndexBuildFailed,
+                "idempotency_conflict" => ApiErrorCode.IdempotencyConflict,
+                "operation_not_found" => ApiErrorCode.OperationNotFound,
+                "operation_control_forbidden" => ApiErrorCode.OperationControlForbidden,
+                "internal" => ApiErrorCode.Internal,
+                _ => throw new ProtocolValidationException(
+                    $"API error code contains unsupported value '{value}'"),
+            };
         }
 
         private static void ValidateLocation(JsonElement location, string path)

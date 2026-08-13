@@ -831,6 +831,7 @@ const fn api_error_code_name(code: ApiErrorCode) -> &'static str {
         ApiErrorCode::IndexBuildFailed => "index_build_failed",
         ApiErrorCode::IdempotencyConflict => "idempotency_conflict",
         ApiErrorCode::OperationNotFound => "operation_not_found",
+        ApiErrorCode::OperationControlForbidden => "operation_control_forbidden",
         ApiErrorCode::Internal => "internal",
     }
 }

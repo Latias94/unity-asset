@@ -19,8 +19,8 @@ from protocol_sdk_bundle import (
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Build the deterministic, versioned C# reference codec and golden-fixture "
-            "release bundle."
+            "Build the deterministic, versioned C# reference codec, JSON Schema, and "
+            "golden-fixture release bundle."
         )
     )
     parser.add_argument(

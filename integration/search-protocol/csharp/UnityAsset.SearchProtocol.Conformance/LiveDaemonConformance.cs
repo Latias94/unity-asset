@@ -60,7 +60,7 @@ internal static class LiveDaemonConformance
 
         var observedOperations = new HashSet<string>(StringComparer.Ordinal);
         int requestOrdinal = 1;
-        async Task<JsonElement> ExchangeAsync(string operation, object payload)
+        async Task<ResponseEnvelopeV1> ExchangeResponseAsync(string operation, object payload)
         {
             RequestId requestId = RequestId.Parse($"request-v1:{requestOrdinal++:x32}");
             RequestEnvelopeV1 request = BusinessCodec.CreateRequest(
@@ -71,23 +71,41 @@ internal static class LiveDaemonConformance
             ResponseEnvelopeV1 response = await session.ExchangeAsync(
                 request,
                 cancellation.Token).ConfigureAwait(false);
+            observedOperations.Add(operation);
+            return response;
+        }
+
+        async Task<JsonElement> ExchangeAsync(string operation, object payload)
+        {
+            ResponseEnvelopeV1 response = await ExchangeResponseAsync(operation, payload)
+                .ConfigureAwait(false);
             Require(!response.IsError, $"Real daemon returned an error for {operation}: {response.Value}");
             Require(
                 string.Equals(response.OperationKind, operation, StringComparison.Ordinal),
                 $"Real daemon returned {response.OperationKind} for {operation}.");
-            observedOperations.Add(operation);
             return response.Value.GetProperty("response").Clone();
         }
 
-        JsonElement capabilities = await ExchangeAsync("capabilities", new { }).ConfigureAwait(false);
+        ResponseEnvelopeV1 capabilitiesResponse = await ExchangeResponseAsync("capabilities", new { })
+            .ConfigureAwait(false);
+        Require(!capabilitiesResponse.IsError, "Real daemon rejected the capabilities request.");
+        SearchCapabilities capabilitySet = capabilitiesResponse.ReadSearchCapabilities();
+        Require(
+            capabilitySet.ProtocolRevision == ProtocolConstants.BusinessProtocolRevision
+                && capabilitySet.BackgroundReindexDiscovery,
+            "Real daemon did not advertise background reindex discovery.");
+        JsonElement capabilities = capabilitiesResponse.Value.GetProperty("response");
         Require(capabilities.GetProperty("daemon_version").GetString() is { Length: > 0 }, "Capabilities omitted daemon version.");
 
-        JsonElement initialStatus = await ExchangeAsync("status", new { }).ConfigureAwait(false);
+        ResponseEnvelopeV1 initialStatusResponse = await ExchangeResponseAsync("status", new { })
+            .ConfigureAwait(false);
+        Require(!initialStatusResponse.IsError, "Real daemon rejected the initial status request.");
+        JsonElement initialStatus = initialStatusResponse.Value.GetProperty("response");
         Require(
             initialStatus.GetProperty("daemon").GetProperty("lifecycle").GetString() == "serving",
             "Real daemon was not serving after Bootstrap.");
 
-        JsonElement admission = await ExchangeAsync(
+        ResponseEnvelopeV1 admissionResponse = await ExchangeResponseAsync(
             "reindex_admit",
             new
             {
@@ -98,8 +116,8 @@ internal static class LiveDaemonConformance
                 },
                 idempotency_key = "csharp-live-daemon-v1",
             }).ConfigureAwait(false);
-        string operationId = admission.GetProperty("operation_id").GetString()
-            ?? throw new InvalidOperationException("Reindex admission omitted its operation ID.");
+        Require(!admissionResponse.IsError, $"Real daemon rejected reindex admission: {admissionResponse.Value}");
+        string operationId = admissionResponse.ReadReindexOperationId().Value;
 
         JsonElement operationStatus = await ExchangeAsync(
             "reindex_status",
@@ -112,6 +130,28 @@ internal static class LiveDaemonConformance
             operationStatus.TryGetProperty("admission", out JsonElement statusAdmission)
                 && statusAdmission.ValueKind == JsonValueKind.Object,
             "Reindex status omitted admission evidence.");
+
+        IReadOnlyList<BackgroundReindexOperation> backgroundOperations =
+            initialStatusResponse.ReadBackgroundReindexOperations();
+        BackgroundReindexOperation? backgroundOperation = backgroundOperations.FirstOrDefault(
+            operation => operation.Origin == BackgroundReindexOrigin.Startup);
+        Require(
+            backgroundOperation is not null,
+            "Real daemon status did not expose its startup reindex operation.");
+        JsonElement backgroundStatus = await ExchangeAsync(
+            "reindex_status",
+            new { operation_id = backgroundOperation!.OperationId.Value }).ConfigureAwait(false);
+        Require(
+            backgroundStatus.GetProperty("operation_id").GetString() == backgroundOperation.OperationId.Value,
+            "Background reindex discovery returned an operation ID that could not be queried.");
+
+        ResponseEnvelopeV1 forbiddenCancel = await ExchangeResponseAsync(
+            "reindex_cancel",
+            new { operation_id = backgroundOperation.OperationId.Value }).ConfigureAwait(false);
+        Require(forbiddenCancel.IsError, "Real daemon allowed a client to cancel a background reindex operation.");
+        Require(
+            forbiddenCancel.ReadApiErrorCode() == ApiErrorCode.OperationControlForbidden,
+            "Real daemon returned the wrong error when cancelling a background reindex operation.");
 
         JsonElement completed = await ExchangeAsync(
             "reindex_wait",
@@ -164,7 +204,7 @@ internal static class LiveDaemonConformance
         Require(
             observedOperations.Count == ExpectedOperations.Length
                 && observedOperations.SetEquals(ExpectedOperations),
-            "Public C# session did not reach every real daemon operation exactly once.");
+            "Public C# session did not reach every real daemon operation.");
     }
 
     private static async Task AssertBootstrapRejectedAsync(

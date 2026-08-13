@@ -9,13 +9,13 @@ use unity_asset_search_local::{
     EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1, VerifiedFramedTransportV1,
 };
 use unity_asset_search_protocol::{
-    ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
-    CapabilitiesRequest, DaemonLifecycleState, FilesystemReindexIntent, FrameLimits, OperationId,
-    QueryPolicyId, ReferenceRequest, ReindexAdmitRequest, ReindexCancelRequest,
-    ReindexOperationState, ReindexStatusRequest, ReindexWaitRequest, RequestEnvelope, RequestId,
-    RequestOperation, ResponseOperation, ResponseOutcome, SearchCapabilities, SearchRequest,
-    ShutdownRequest, StatusRequest, SuggestRequest, decode_response_frame, decode_validated_frame,
-    encode_frame, encode_request_frame,
+    ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BackgroundReindexOrigin, BootstrapHelloV2,
+    BootstrapReplyV2, CapabilitiesRequest, DaemonLifecycleState, FilesystemReindexIntent,
+    FrameLimits, OperationId, QueryPolicyId, ReferenceRequest, ReindexAdmitRequest,
+    ReindexCancelRequest, ReindexOperationState, ReindexStatusRequest, ReindexWaitRequest,
+    RequestEnvelope, RequestId, RequestOperation, ResponseOperation, ResponseOutcome,
+    SearchCapabilities, SearchRequest, ShutdownRequest, StatusRequest, SuggestRequest,
+    decode_response_frame, decode_validated_frame, encode_frame, encode_request_frame,
 };
 
 const OWNER_ONE_GUID: &str = "11111111111111111111111111111111";
@@ -59,6 +59,82 @@ GameObject:
 "#;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_reindex_is_discoverable_observable_and_not_client_cancelable() {
+    let fixture = SearchDaemonFixture::new();
+    fixture.write_asset("Startup.prefab", TARGET, TARGET_GUID);
+    let project = fixture.project();
+    let namespace = fixture.namespace();
+    let mut daemon = fixture.spawn_daemon(true);
+    let discovered = fixture.wait_for_endpoint(&mut daemon).await;
+    let descriptor = discovered.descriptor();
+    let stream = discovered
+        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
+        .await
+        .expect("connect to startup-reindex daemon");
+    let mut client = ProcessClient::bootstrap(
+        stream,
+        project.project_id(),
+        descriptor.daemon_instance_id(),
+    )
+    .await;
+
+    let status = client
+        .exchange(RequestOperation::Status(StatusRequest::default()))
+        .await;
+    let ResponseOperation::Status(status) = status else {
+        panic!("real daemon returned a non-status response");
+    };
+    let startup = status
+        .daemon
+        .background_reindex_operations
+        .iter()
+        .find(|operation| operation.origin == BackgroundReindexOrigin::Startup)
+        .copied()
+        .expect("startup operation remains discoverable after endpoint publication");
+
+    let observed = client
+        .exchange(RequestOperation::ReindexStatus(ReindexStatusRequest {
+            operation_id: startup.operation_id,
+        }))
+        .await;
+    let ResponseOperation::ReindexStatus(observed) = observed else {
+        panic!("real daemon returned a non-reindex-status response");
+    };
+    assert_eq!(observed.operation_id, startup.operation_id);
+    assert_ne!(observed.state, ReindexOperationState::Lost);
+
+    let completed = client
+        .exchange(RequestOperation::ReindexWait(ReindexWaitRequest {
+            operation_id: startup.operation_id,
+            timeout_ms: 20_000,
+        }))
+        .await;
+    let ResponseOperation::ReindexWait(completed) = completed else {
+        panic!("real daemon returned a non-reindex-wait response");
+    };
+    assert_eq!(completed.state, ReindexOperationState::Succeeded);
+
+    let cancellation = client
+        .exchange_outcome(RequestOperation::ReindexCancel(ReindexCancelRequest {
+            operation_id: startup.operation_id,
+        }))
+        .await;
+    let ResponseOutcome::Error(cancellation) = cancellation else {
+        panic!("daemon-owned startup operation was client-cancelable");
+    };
+    assert_eq!(cancellation.code, ApiErrorCode::OperationControlForbidden);
+    assert!(!cancellation.retryable);
+    assert_eq!(
+        cancellation.details.get("origin").map(String::as_str),
+        Some("startup")
+    );
+
+    shutdown(&mut client).await;
+    drop(client);
+    assert!(daemon.wait_for_exit().await.success());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state() {
     let fixture = SearchDaemonFixture::new();
     fixture.write_asset("OwnerOne.prefab", OWNER_ONE, OWNER_ONE_GUID);
@@ -68,7 +144,7 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
 
     let project = fixture.project();
     let namespace = fixture.namespace();
-    let mut daemon = fixture.spawn_daemon();
+    let mut daemon = fixture.spawn_daemon(false);
     let discovered = fixture.wait_for_endpoint(&mut daemon).await;
     let stale_discovered = discovered;
     let descriptor = discovered.descriptor();
@@ -289,7 +365,7 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
         Err(EndpointStoreError::DescriptorMissing)
     ));
 
-    let mut replacement = fixture.spawn_daemon();
+    let mut replacement = fixture.spawn_daemon(false);
     let replacement_discovered = fixture.wait_for_endpoint(&mut replacement).await;
     assert_ne!(
         replacement_discovered.descriptor().daemon_instance_id(),

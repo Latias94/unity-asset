@@ -186,8 +186,6 @@ struct SearchHitFact {
     matched_script_symbols: Vec<String>,
     highlight_path_ranges: Vec<HighlightRangeV1>,
     highlight_name_ranges: Vec<HighlightRangeV1>,
-    highlight_path: Option<String>,
-    highlight_name: Option<String>,
 }
 
 impl From<SearchHit> for SearchHitFact {
@@ -207,8 +205,6 @@ impl From<SearchHit> for SearchHitFact {
             matched_script_symbols: hit.matched_script_symbols,
             highlight_path_ranges: hit.highlight_path_ranges,
             highlight_name_ranges: hit.highlight_name_ranges,
-            highlight_path: hit.highlight_path,
-            highlight_name: hit.highlight_name,
         }
     }
 }

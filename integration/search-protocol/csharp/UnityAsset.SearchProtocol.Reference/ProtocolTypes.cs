@@ -7,8 +7,109 @@ namespace UnityAsset.SearchProtocol.Reference
     public static class ProtocolConstants
     {
         public const ushort BootstrapVersion = 2;
-        public const ushort BusinessProtocolRevision = 4;
+        public const ushort BusinessProtocolRevision = 5;
         public const uint CoreDiagnosticVersion = 2;
+        public const int MaxBackgroundReindexOperations = 5;
+    }
+
+    public enum ReindexOperationState
+    {
+        Queued,
+        Coalesced,
+        Running,
+        Succeeded,
+        Failed,
+        Cancelled,
+        Expired,
+        Lost,
+    }
+
+    public enum BackgroundReindexOrigin
+    {
+        Startup,
+        Watcher,
+        WatcherOverflow,
+        Timer,
+        SemanticUpgrade,
+    }
+
+    public enum ApiErrorCode
+    {
+        InvalidRequest,
+        InvalidCursor,
+        StaleCursor,
+        IncompatibleProtocol,
+        PeerRejected,
+        Busy,
+        NotReady,
+        RevisionMismatch,
+        IndexBuildFailed,
+        IdempotencyConflict,
+        OperationNotFound,
+        OperationControlForbidden,
+        Internal,
+    }
+
+    public sealed class BackgroundReindexOperation
+    {
+        internal BackgroundReindexOperation(
+            BackgroundReindexOrigin origin,
+            OperationId operationId,
+            ReindexOperationState state)
+        {
+            Origin = origin;
+            OperationId = operationId ?? throw new ArgumentNullException(nameof(operationId));
+            State = state;
+        }
+
+        public BackgroundReindexOrigin Origin { get; }
+
+        public OperationId OperationId { get; }
+
+        public ReindexOperationState State { get; }
+    }
+
+    public sealed class SearchCapabilities
+    {
+        internal SearchCapabilities(
+            ushort protocolRevision,
+            bool search,
+            bool suggest,
+            bool incomingReferences,
+            bool outgoingReferences,
+            bool filesystemReindex,
+            bool reindexLifecycle,
+            bool backgroundReindexDiscovery,
+            bool gracefulShutdown)
+        {
+            ProtocolRevision = protocolRevision;
+            Search = search;
+            Suggest = suggest;
+            IncomingReferences = incomingReferences;
+            OutgoingReferences = outgoingReferences;
+            FilesystemReindex = filesystemReindex;
+            ReindexLifecycle = reindexLifecycle;
+            BackgroundReindexDiscovery = backgroundReindexDiscovery;
+            GracefulShutdown = gracefulShutdown;
+        }
+
+        public ushort ProtocolRevision { get; }
+
+        public bool Search { get; }
+
+        public bool Suggest { get; }
+
+        public bool IncomingReferences { get; }
+
+        public bool OutgoingReferences { get; }
+
+        public bool FilesystemReindex { get; }
+
+        public bool ReindexLifecycle { get; }
+
+        public bool BackgroundReindexDiscovery { get; }
+
+        public bool GracefulShutdown { get; }
     }
 
     public sealed class ProtocolValidationException : Exception
@@ -226,6 +327,67 @@ namespace UnityAsset.SearchProtocol.Reference
         /// Gets the schema-validated operation result or structured error payload.
         /// </summary>
         public JsonElement Value { get; }
+
+        /// <summary>
+        /// Reads the closed capability set from a successful capabilities or status response.
+        /// </summary>
+        public SearchCapabilities ReadSearchCapabilities()
+        {
+            if (IsError
+                || (!string.Equals(OperationKind, "capabilities", StringComparison.Ordinal)
+                    && !string.Equals(OperationKind, "status", StringComparison.Ordinal)))
+            {
+                throw new ProtocolValidationException(
+                    "search capabilities are available only on a successful capabilities or status response");
+            }
+            JsonElement response = Value.GetProperty("response");
+            return ContractValidator.MaterializeSearchCapabilities(response.GetProperty("capabilities"));
+        }
+
+        /// <summary>
+        /// Reads the bounded background reindex summary from a successful status response.
+        /// </summary>
+        public IReadOnlyList<BackgroundReindexOperation> ReadBackgroundReindexOperations()
+        {
+            if (IsError || !string.Equals(OperationKind, "status", StringComparison.Ordinal))
+            {
+                throw new ProtocolValidationException(
+                    "background reindex operations are available only on a successful status response");
+            }
+            JsonElement response = Value.GetProperty("response");
+            JsonElement daemon = response.GetProperty("daemon");
+            return ContractValidator.MaterializeBackgroundReindexOperations(
+                daemon.GetProperty("background_reindex_operations"));
+        }
+
+        /// <summary>
+        /// Reads the operation identifier from a successful reindex lifecycle response.
+        /// </summary>
+        public OperationId ReadReindexOperationId()
+        {
+            if (IsError || OperationKind is null || !OperationKind.StartsWith("reindex_", StringComparison.Ordinal))
+            {
+                throw new ProtocolValidationException(
+                    "a reindex operation ID is available only on a successful reindex lifecycle response");
+            }
+            return OperationId.Parse(
+                Value.GetProperty("response").GetProperty("operation_id").GetString()!);
+        }
+
+        /// <summary>
+        /// Reads the closed error code from a structured error response.
+        /// </summary>
+        public ApiErrorCode ReadApiErrorCode()
+        {
+            if (!IsError)
+            {
+                throw new ProtocolValidationException(
+                    "an API error code is available only on an error response");
+            }
+            return ContractValidator.ReadApiErrorCode(
+                Value.GetProperty("code"),
+                "response envelope.value.code");
+        }
 
         internal int EncodedLength { get; }
 

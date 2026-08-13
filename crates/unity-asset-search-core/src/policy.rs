@@ -6,9 +6,7 @@ use fuzzy_matcher::skim::SkimMatcherV2;
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::text::{
-    HighlightRange, highlight_html_from_ranges, highlight_ranges_for, normalize_for_match, to_terms,
-};
+use crate::text::{HighlightRange, highlight_ranges_for, normalize_for_match, to_terms};
 
 const MAX_FUZZY_FIELD_CHARS: usize = 512;
 pub const ABSOLUTE_MAX_CANDIDATES: usize = 4_096;
@@ -272,8 +270,6 @@ pub struct RankedMatch {
     pub explanation: MatchExplanation,
     pub highlight_path_ranges: Vec<HighlightRange>,
     pub highlight_name_ranges: Vec<HighlightRange>,
-    pub highlight_path: Option<String>,
-    pub highlight_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1690,10 +1686,6 @@ impl InternalRankedMatch<'_> {
     fn add_highlights(&mut self, query_terms: &[QueryTerm]) {
         self.match_.highlight_path_ranges = highlight_ranges_for(self.source_path, query_terms);
         self.match_.highlight_name_ranges = highlight_ranges_for(self.source_name, query_terms);
-        self.match_.highlight_path =
-            highlight_html_from_ranges(self.source_path, &self.match_.highlight_path_ranges);
-        self.match_.highlight_name =
-            highlight_html_from_ranges(self.source_name, &self.match_.highlight_name_ranges);
     }
 }
 
@@ -1813,8 +1805,6 @@ fn rank_candidate<'a>(
             },
             highlight_path_ranges: Vec::new(),
             highlight_name_ranges: Vec::new(),
-            highlight_path: None,
-            highlight_name: None,
         },
         normalized_path,
         normalized_name,

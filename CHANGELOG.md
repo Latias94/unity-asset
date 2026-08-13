@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Added business search protocol revision 5 with bounded background-reindex discovery, explicit control rejection for internal operations, published Draft 2020-12 structural schemas, and a deterministic SDK bundle containing the schema and fixture contract.
+
 - Added `AssetWorkspace` as the authoritative owner of immutable source catalogs, content-addressed backing bytes, workspace revisions, snapshots, and prepared views.
 - Added the versioned `WorkspaceInspector` source and object projections, exact structured lookup, streamed-resource resolution, and the allocation-free `workspace_capabilities` catalog.
 - Added canonical `MutationPlan` v3 JSON/YAML contracts with workspace, revision, source fingerprint, object digest, operation-order, and semantic guard validation.
@@ -22,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added deterministic performance contracts for unified TypeTree traversal and segmented prepared artifacts.
 
 ### Changed
+
+- **Breaking:** Advanced the current Rust/C# business search protocol from revision 4 to revision 5, removed pre-rendered HTML search-hit fields, and retained revisions 1 through 4 as immutable archives.
 
 - **Breaking:** Replaced mutable high-level loading and editing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
 - **Breaking:** Replaced broad text-oriented CLI inspection and export surfaces with typed `workspace`, `references`, `export`, and `split-yaml` commands that exchange versioned JSON contracts; `split-yaml` now emits the canonical extraction report and manifest instead of a parallel YAML-split report.

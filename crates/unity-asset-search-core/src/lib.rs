@@ -9,6 +9,5 @@ pub use policy::{
     SearchLimits, SearchOutcome, SearchPolicy, SearchRequest, TermExplanation, parse_query,
 };
 pub use text::{
-    HighlightRange, TryToTermsError, highlight_html, highlight_ranges, normalize_for_match,
-    to_terms, try_to_terms,
+    HighlightRange, TryToTermsError, highlight_ranges, normalize_for_match, to_terms, try_to_terms,
 };

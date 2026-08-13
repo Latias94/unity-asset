@@ -162,42 +162,6 @@ fn is_term_separator(ch: char) -> bool {
         )
 }
 
-pub fn highlight_html(text: &str, query_tokens: &[String]) -> Option<String> {
-    let ranges = highlight_ranges(text, query_tokens);
-    highlight_html_from_ranges(text, &ranges)
-}
-
-pub(super) fn highlight_html_from_ranges(text: &str, ranges: &[HighlightRange]) -> Option<String> {
-    if ranges.is_empty() {
-        return None;
-    }
-
-    let mut out = String::with_capacity(text.len() + ranges.len().saturating_mul(9));
-    let mut cursor = 0usize;
-    for &HighlightRange { start, end } in ranges {
-        push_html_escaped(&mut out, text.get(cursor..start)?);
-        out.push_str("<em>");
-        push_html_escaped(&mut out, text.get(start..end)?);
-        out.push_str("</em>");
-        cursor = end;
-    }
-    push_html_escaped(&mut out, text.get(cursor..)?);
-    Some(out)
-}
-
-fn push_html_escaped(out: &mut String, text: &str) {
-    for ch in text.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(ch),
-        }
-    }
-}
-
 pub fn highlight_ranges(text: &str, query_tokens: &[String]) -> Vec<HighlightRange> {
     highlight_ranges_for(text, query_tokens)
 }
@@ -478,11 +442,5 @@ mod tests {
         if !out.is_empty() && !out.ends_with(' ') {
             out.push(' ');
         }
-    }
-
-    #[test]
-    fn highlight_html_wraps_tokens() {
-        let output = highlight_html("Assets/UI/Button.prefab", &[String::from("ui")]).unwrap();
-        assert!(output.contains("<em>UI</em>") || output.contains("<em>ui</em>"));
     }
 }

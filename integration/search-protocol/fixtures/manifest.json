@@ -1,6 +1,6 @@
 {
   "fixture_format": 3,
-  "protocol_revision": 4,
+  "protocol_revision": 5,
   "frozen_inventories": [
     {
       "business_revision": 1,
@@ -29,51 +29,283 @@
     "query_policy_id": "query-policy-v1:4444444444444444444444444444444444444444444444444444444444444444"
   },
   "valid": [
-    { "name": "bootstrap hello", "kind": "bootstrap_hello", "path": "bootstrap/hello-v2.json" },
-    { "name": "bootstrap accepted", "kind": "bootstrap_reply", "path": "bootstrap/accepted-v2.json" },
-    { "name": "bootstrap rejected", "kind": "bootstrap_reply", "path": "bootstrap/rejected-v2.json" },
-    { "name": "capabilities request", "kind": "request", "operation": "capabilities", "path": "requests/capabilities-v4.json" },
-    { "name": "status request", "kind": "request", "operation": "status", "path": "requests/status-v4.json" },
-    { "name": "search request", "kind": "request", "operation": "search", "path": "requests/search-v4.json" },
-    { "name": "suggest request", "kind": "request", "operation": "suggest", "path": "requests/suggest-v4.json" },
-    { "name": "references request", "kind": "request", "operation": "references", "path": "requests/references-v4.json" },
-    { "name": "YAML object references request", "kind": "request", "operation": "references", "path": "requests/references-yaml-object-v4.json" },
-    { "name": "minimum YAML file ID references request", "kind": "request", "operation": "references", "path": "requests/references-yaml-object-min-v4.json" },
-    { "name": "maximum YAML file ID references request", "kind": "request", "operation": "references", "path": "requests/references-yaml-object-max-v4.json" },
-    { "name": "reindex admit request", "kind": "request", "operation": "reindex_admit", "path": "requests/reindex-admit-v4.json" },
-    { "name": "reindex status request", "kind": "request", "operation": "reindex_status", "path": "requests/reindex-status-v4.json" },
-    { "name": "reindex wait request", "kind": "request", "operation": "reindex_wait", "path": "requests/reindex-wait-v4.json" },
-    { "name": "reindex cancel request", "kind": "request", "operation": "reindex_cancel", "path": "requests/reindex-cancel-v4.json" },
-    { "name": "shutdown request", "kind": "request", "operation": "shutdown", "path": "requests/shutdown-v4.json" },
-    { "name": "capabilities response", "kind": "response", "operation": "capabilities", "path": "responses/capabilities-v4.json", "request": "requests/capabilities-v4.json" },
-    { "name": "status response", "kind": "response", "operation": "status", "path": "responses/status-v4.json", "request": "requests/status-v4.json" },
-    { "name": "semantics-stale status response", "kind": "response", "operation": "status", "path": "responses/status-semantics-stale-v4.json", "request": "requests/status-v4.json" },
-    { "name": "configuration-stale status response", "kind": "response", "operation": "status", "path": "responses/status-configuration-stale-v4.json", "request": "requests/status-v4.json" },
-    { "name": "recovery-required status response", "kind": "response", "operation": "status", "path": "responses/status-recovery-required-v4.json", "request": "requests/status-v4.json" },
-    { "name": "search response", "kind": "response", "operation": "search", "path": "responses/search-v4.json", "request": "requests/search-v4.json" },
-    { "name": "suggest response", "kind": "response", "operation": "suggest", "path": "responses/suggest-v4.json", "request": "requests/suggest-v4.json" },
-    { "name": "references response", "kind": "response", "operation": "references", "path": "responses/references-v4.json", "request": "requests/references-v4.json" },
-    { "name": "unanchored YAML document references response", "kind": "response", "operation": "references", "path": "responses/references-unanchored-document-v4.json", "request": "requests/references-v4.json" },
-    { "name": "reindex admit response", "kind": "response", "operation": "reindex_admit", "path": "responses/reindex-admit-v4.json", "request": "requests/reindex-admit-v4.json" },
-    { "name": "reindex status response", "kind": "response", "operation": "reindex_status", "path": "responses/reindex-status-v4.json", "request": "requests/reindex-status-v4.json" },
-    { "name": "reindex wait response", "kind": "response", "operation": "reindex_wait", "path": "responses/reindex-wait-v4.json", "request": "requests/reindex-wait-v4.json" },
-    { "name": "reindex cancel response", "kind": "response", "operation": "reindex_cancel", "path": "responses/reindex-cancel-v4.json", "request": "requests/reindex-cancel-v4.json" },
-    { "name": "shutdown response", "kind": "response", "operation": "shutdown", "path": "responses/shutdown-v4.json", "request": "requests/shutdown-v4.json" },
-    { "name": "structured error response", "kind": "response", "operation": "reindex_admit", "path": "responses/structured-error-v4.json", "request": "requests/reindex-admit-v4.json" }
+    {
+      "name": "bootstrap hello",
+      "kind": "bootstrap_hello",
+      "path": "bootstrap/hello-v2.json"
+    },
+    {
+      "name": "bootstrap accepted",
+      "kind": "bootstrap_reply",
+      "path": "bootstrap/accepted-v2.json"
+    },
+    {
+      "name": "bootstrap rejected",
+      "kind": "bootstrap_reply",
+      "path": "bootstrap/rejected-v2.json"
+    },
+    {
+      "name": "capabilities request",
+      "kind": "request",
+      "operation": "capabilities",
+      "path": "requests/capabilities-v5.json"
+    },
+    {
+      "name": "status request",
+      "kind": "request",
+      "operation": "status",
+      "path": "requests/status-v5.json"
+    },
+    {
+      "name": "search request",
+      "kind": "request",
+      "operation": "search",
+      "path": "requests/search-v5.json"
+    },
+    {
+      "name": "suggest request",
+      "kind": "request",
+      "operation": "suggest",
+      "path": "requests/suggest-v5.json"
+    },
+    {
+      "name": "references request",
+      "kind": "request",
+      "operation": "references",
+      "path": "requests/references-v5.json"
+    },
+    {
+      "name": "YAML object references request",
+      "kind": "request",
+      "operation": "references",
+      "path": "requests/references-yaml-object-v5.json"
+    },
+    {
+      "name": "minimum YAML file ID references request",
+      "kind": "request",
+      "operation": "references",
+      "path": "requests/references-yaml-object-min-v5.json"
+    },
+    {
+      "name": "maximum YAML file ID references request",
+      "kind": "request",
+      "operation": "references",
+      "path": "requests/references-yaml-object-max-v5.json"
+    },
+    {
+      "name": "reindex admit request",
+      "kind": "request",
+      "operation": "reindex_admit",
+      "path": "requests/reindex-admit-v5.json"
+    },
+    {
+      "name": "reindex status request",
+      "kind": "request",
+      "operation": "reindex_status",
+      "path": "requests/reindex-status-v5.json"
+    },
+    {
+      "name": "reindex wait request",
+      "kind": "request",
+      "operation": "reindex_wait",
+      "path": "requests/reindex-wait-v5.json"
+    },
+    {
+      "name": "reindex cancel request",
+      "kind": "request",
+      "operation": "reindex_cancel",
+      "path": "requests/reindex-cancel-v5.json"
+    },
+    {
+      "name": "shutdown request",
+      "kind": "request",
+      "operation": "shutdown",
+      "path": "requests/shutdown-v5.json"
+    },
+    {
+      "name": "capabilities response",
+      "kind": "response",
+      "operation": "capabilities",
+      "path": "responses/capabilities-v5.json",
+      "request": "requests/capabilities-v5.json"
+    },
+    {
+      "name": "status response",
+      "kind": "response",
+      "operation": "status",
+      "path": "responses/status-v5.json",
+      "request": "requests/status-v5.json"
+    },
+    {
+      "name": "semantics-stale status response",
+      "kind": "response",
+      "operation": "status",
+      "path": "responses/status-semantics-stale-v5.json",
+      "request": "requests/status-v5.json"
+    },
+    {
+      "name": "configuration-stale status response",
+      "kind": "response",
+      "operation": "status",
+      "path": "responses/status-configuration-stale-v5.json",
+      "request": "requests/status-v5.json"
+    },
+    {
+      "name": "recovery-required status response",
+      "kind": "response",
+      "operation": "status",
+      "path": "responses/status-recovery-required-v5.json",
+      "request": "requests/status-v5.json"
+    },
+    {
+      "name": "search response",
+      "kind": "response",
+      "operation": "search",
+      "path": "responses/search-v5.json",
+      "request": "requests/search-v5.json"
+    },
+    {
+      "name": "suggest response",
+      "kind": "response",
+      "operation": "suggest",
+      "path": "responses/suggest-v5.json",
+      "request": "requests/suggest-v5.json"
+    },
+    {
+      "name": "references response",
+      "kind": "response",
+      "operation": "references",
+      "path": "responses/references-v5.json",
+      "request": "requests/references-v5.json"
+    },
+    {
+      "name": "unanchored YAML document references response",
+      "kind": "response",
+      "operation": "references",
+      "path": "responses/references-unanchored-document-v5.json",
+      "request": "requests/references-v5.json"
+    },
+    {
+      "name": "reindex admit response",
+      "kind": "response",
+      "operation": "reindex_admit",
+      "path": "responses/reindex-admit-v5.json",
+      "request": "requests/reindex-admit-v5.json"
+    },
+    {
+      "name": "reindex status response",
+      "kind": "response",
+      "operation": "reindex_status",
+      "path": "responses/reindex-status-v5.json",
+      "request": "requests/reindex-status-v5.json"
+    },
+    {
+      "name": "reindex wait response",
+      "kind": "response",
+      "operation": "reindex_wait",
+      "path": "responses/reindex-wait-v5.json",
+      "request": "requests/reindex-wait-v5.json"
+    },
+    {
+      "name": "reindex cancel response",
+      "kind": "response",
+      "operation": "reindex_cancel",
+      "path": "responses/reindex-cancel-v5.json",
+      "request": "requests/reindex-cancel-v5.json"
+    },
+    {
+      "name": "shutdown response",
+      "kind": "response",
+      "operation": "shutdown",
+      "path": "responses/shutdown-v5.json",
+      "request": "requests/shutdown-v5.json"
+    },
+    {
+      "name": "structured error response",
+      "kind": "response",
+      "operation": "reindex_cancel",
+      "path": "responses/structured-error-v5.json",
+      "request": "requests/reindex-cancel-v5.json"
+    }
   ],
   "invalid": [
-    { "name": "bootstrap empty revisions", "kind": "bootstrap_hello", "path": "invalid/bootstrap-empty-revisions-v2.json", "expected_error": "supported_revisions" },
-    { "name": "bootstrap duplicate revisions", "kind": "bootstrap_hello", "path": "invalid/bootstrap-duplicate-revisions-v2.json", "expected_error": "strictly increasing" },
-    { "name": "bootstrap unsorted revisions", "kind": "bootstrap_hello", "path": "invalid/bootstrap-unsorted-revisions-v2.json", "expected_error": "strictly increasing" },
-    { "name": "bootstrap wrong version", "kind": "bootstrap_hello", "path": "invalid/bootstrap-wrong-version-v2.json", "expected_error": "bootstrap" },
-    { "name": "bootstrap project mismatch", "kind": "bootstrap_reply", "path": "invalid/bootstrap-project-mismatch-v2.json", "expected_error": "project" },
-    { "name": "bootstrap daemon instance mismatch", "kind": "bootstrap_reply", "path": "invalid/bootstrap-instance-mismatch-v2.json", "expected_error": "daemon instance" },
-    { "name": "bootstrap zero selected revision", "kind": "bootstrap_reply", "path": "invalid/bootstrap-zero-revision-v2.json", "expected_error": "revision" },
-    { "name": "bootstrap zero query policy", "kind": "bootstrap_reply", "path": "invalid/bootstrap-zero-policy-v2.json", "expected_error": "query_policy_id" },
-    { "name": "request cross revision", "kind": "request", "path": "invalid/request-cross-revision-v4.json", "expected_error": "protocol revision" },
-    { "name": "positive YAML file ID overflow", "kind": "request", "path": "invalid/request-yaml-file-id-positive-overflow-v4.json", "expected_error": "64" },
-    { "name": "negative YAML file ID overflow", "kind": "request", "path": "invalid/request-yaml-file-id-negative-overflow-v4.json", "expected_error": "64" },
-    { "name": "request project mismatch", "kind": "request", "path": "invalid/request-project-mismatch-v4.json", "expected_error": "project" },
-    { "name": "request daemon instance mismatch", "kind": "request", "path": "invalid/request-instance-mismatch-v4.json", "expected_error": "daemon instance" }
+    {
+      "name": "bootstrap empty revisions",
+      "kind": "bootstrap_hello",
+      "path": "invalid/bootstrap-empty-revisions-v2.json",
+      "expected_error": "supported_revisions"
+    },
+    {
+      "name": "bootstrap duplicate revisions",
+      "kind": "bootstrap_hello",
+      "path": "invalid/bootstrap-duplicate-revisions-v2.json",
+      "expected_error": "strictly increasing"
+    },
+    {
+      "name": "bootstrap unsorted revisions",
+      "kind": "bootstrap_hello",
+      "path": "invalid/bootstrap-unsorted-revisions-v2.json",
+      "expected_error": "strictly increasing"
+    },
+    {
+      "name": "bootstrap wrong version",
+      "kind": "bootstrap_hello",
+      "path": "invalid/bootstrap-wrong-version-v2.json",
+      "expected_error": "bootstrap"
+    },
+    {
+      "name": "bootstrap project mismatch",
+      "kind": "bootstrap_reply",
+      "path": "invalid/bootstrap-project-mismatch-v2.json",
+      "expected_error": "project"
+    },
+    {
+      "name": "bootstrap daemon instance mismatch",
+      "kind": "bootstrap_reply",
+      "path": "invalid/bootstrap-instance-mismatch-v2.json",
+      "expected_error": "daemon instance"
+    },
+    {
+      "name": "bootstrap zero selected revision",
+      "kind": "bootstrap_reply",
+      "path": "invalid/bootstrap-zero-revision-v2.json",
+      "expected_error": "revision"
+    },
+    {
+      "name": "bootstrap zero query policy",
+      "kind": "bootstrap_reply",
+      "path": "invalid/bootstrap-zero-policy-v2.json",
+      "expected_error": "query_policy_id"
+    },
+    {
+      "name": "request cross revision",
+      "kind": "request",
+      "path": "invalid/request-cross-revision-v5.json",
+      "expected_error": "protocol revision"
+    },
+    {
+      "name": "positive YAML file ID overflow",
+      "kind": "request",
+      "path": "invalid/request-yaml-file-id-positive-overflow-v5.json",
+      "expected_error": "64"
+    },
+    {
+      "name": "negative YAML file ID overflow",
+      "kind": "request",
+      "path": "invalid/request-yaml-file-id-negative-overflow-v5.json",
+      "expected_error": "64"
+    },
+    {
+      "name": "request project mismatch",
+      "kind": "request",
+      "path": "invalid/request-project-mismatch-v5.json",
+      "expected_error": "project"
+    },
+    {
+      "name": "request daemon instance mismatch",
+      "kind": "request",
+      "path": "invalid/request-instance-mismatch-v5.json",
+      "expected_error": "daemon instance"
+    }
   ]
 }
