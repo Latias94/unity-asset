@@ -11,6 +11,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -165,6 +166,20 @@ class ReleaseBundleTests(unittest.TestCase):
                 release_title=title,
                 release_body=body,
             )
+
+    def test_maps_bundle_enumeration_failures_to_the_cli_error(self) -> None:
+        root = Path("release-assets")
+        with (
+            mock.patch("verify_release_bundle.reject_link_components", return_value=root),
+            mock.patch("verify_release_bundle.is_link_or_junction", return_value=False),
+            mock.patch.object(Path, "is_dir", return_value=True),
+            mock.patch.object(Path, "iterdir", side_effect=OSError("access denied")),
+            self.assertRaisesRegex(
+                ReleaseBundleError,
+                "cannot enumerate release bundle.*access denied",
+            ),
+        ):
+            verify_release_bundle(root, "v0.4.0", "0" * 64)
 
     def test_rejects_a_tampered_archive_even_if_the_global_manifest_is_unchanged(self) -> None:
         root, evidence_digest, title, body = self.make_bundle()

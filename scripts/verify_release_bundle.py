@@ -85,7 +85,13 @@ def regular_files(root: Path) -> Mapping[str, Path]:
     if is_link_or_junction(root) or not root.is_dir():
         raise ReleaseBundleError(f"release bundle must be a real directory: {root}")
     files: dict[str, Path] = {}
-    for path in sorted(root.iterdir(), key=lambda candidate: candidate.name):
+    try:
+        entries = sorted(root.iterdir(), key=lambda candidate: candidate.name)
+    except OSError as error:
+        raise ReleaseBundleError(
+            f"cannot enumerate release bundle {root}: {error}"
+        ) from error
+    for path in entries:
         if is_link_or_junction(path) or not path.is_file():
             raise ReleaseBundleError(
                 f"release bundle must contain only flat regular files: {path}"
