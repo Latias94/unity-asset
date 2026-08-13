@@ -151,3 +151,32 @@ fn linked_root_and_marker_are_rejected() {
         })
     ));
 }
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn ancestor_alias_is_accepted_but_remains_part_of_the_binding() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = tempfile::tempdir().unwrap();
+    let physical_parent = temporary.path().join("physical");
+    let replacement_parent = temporary.path().join("replacement");
+    let physical_project = physical_parent.join("project");
+    let replacement_project = replacement_parent.join("project");
+    let alias = temporary.path().join("alias");
+    create_project(&physical_project);
+    create_project(&replacement_project);
+    symlink(&physical_parent, &alias).unwrap();
+
+    let located = ProjectLocatorV1::open(alias.join("project")).unwrap();
+
+    assert_eq!(located.root(), physical_project.canonicalize().unwrap());
+    located.revalidate().unwrap();
+
+    fs::remove_file(&alias).unwrap();
+    symlink(&replacement_parent, &alias).unwrap();
+
+    assert!(matches!(
+        located.revalidate(),
+        Err(ProjectLocatorError::IdentityChanged { .. })
+    ));
+}

@@ -15,6 +15,7 @@ const PROJECT_MARKERS: [&str; 2] = ["Assets", "ProjectSettings"];
 
 pub struct ProjectLocatorV1 {
     root: PathBuf,
+    requested_root_alias: Option<PathBuf>,
     identity: ProjectIdentityV1,
     platform_identity: platform::DirectoryIdentity,
     authority: platform::ReadDirectory,
@@ -22,17 +23,42 @@ pub struct ProjectLocatorV1 {
 
 impl ProjectLocatorV1 {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, ProjectLocatorError> {
-        let root = absolute_path(root.as_ref())?;
-        let authority =
-            platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
-        let (identity, platform_identity) = derive_read_directory_identity(&root, &authority)?;
-        validate_markers(&authority, &root)?;
-        Ok(Self {
-            root,
+        Self::open_with_checkpoint(root.as_ref(), || {})
+    }
+
+    fn open_with_checkpoint(
+        root: &Path,
+        after_authority_captured: impl FnOnce(),
+    ) -> Result<Self, ProjectLocatorError> {
+        let requested_root = absolute_path(root)?;
+        let opened_root = project_root_open_path(&requested_root)
+            .map_err(|source| map_root_error(&requested_root, source))?;
+        let authority = platform::ReadDirectory::open(&opened_root)
+            .map_err(|source| map_root_error(&requested_root, source))?;
+        let (identity, platform_identity) =
+            derive_read_directory_identity(&requested_root, &authority)?;
+        validate_markers(&authority, &requested_root)?;
+
+        after_authority_captured();
+
+        let rebound_root = project_root_open_path(&requested_root)
+            .map_err(|source| map_root_error(&requested_root, source))?;
+        ensure_path_names_authority(&rebound_root, &requested_root, platform_identity)?;
+        let canonical_root = fs_canonicalize(&rebound_root, &requested_root)?;
+        ensure_path_names_authority(&canonical_root, &requested_root, platform_identity)?;
+        ensure_path_names_authority(&rebound_root, &requested_root, platform_identity)?;
+        let requested_root_alias =
+            (requested_root != canonical_root).then_some(requested_root.clone());
+
+        let locator = Self {
+            root: canonical_root,
+            requested_root_alias,
             identity,
             platform_identity,
             authority,
-        })
+        };
+        locator.revalidate()?;
+        Ok(locator)
     }
 
     #[must_use]
@@ -60,17 +86,23 @@ impl ProjectLocatorV1 {
                 path: self.root.clone(),
             });
         }
-        let reopened = platform::ReadDirectory::open(&self.root)
-            .map_err(|source| map_root_error(&self.root, source))?;
-        let rebound = reopened
+        let reopened = ensure_path_names_authority(&self.root, &self.root, self.platform_identity)?;
+        if let Some(alias) = &self.requested_root_alias {
+            let rebound_alias =
+                project_root_open_path(alias).map_err(|source| map_root_error(alias, source))?;
+            ensure_path_names_authority(&rebound_alias, alias, self.platform_identity)?;
+        }
+        validate_markers(&reopened, &self.root)?;
+        let final_pinned = self
+            .authority
             .identity()
             .map_err(|source| map_root_error(&self.root, source))?;
-        if rebound != self.platform_identity {
+        if final_pinned != self.platform_identity {
             return Err(ProjectLocatorError::IdentityChanged {
                 path: self.root.clone(),
             });
         }
-        validate_markers(&reopened, &self.root)
+        Ok(())
     }
 }
 
@@ -120,16 +152,19 @@ impl ProjectIdentityV1 {
     /// Unity project. This is intended for path-scoped local state; callers that need Unity
     /// project validation must use [`ProjectLocatorV1::open`].
     pub fn for_existing_root(root: impl AsRef<Path>) -> Result<Self, ProjectLocatorError> {
-        let root = absolute_path(root.as_ref())?;
-        let authority =
-            platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
-        let (identity, platform_identity) = derive_read_directory_identity(&root, &authority)?;
-        let reopened =
-            platform::ReadDirectory::open(&root).map_err(|source| map_root_error(&root, source))?;
-        let (_, rebound) = derive_read_directory_identity(&root, &reopened)?;
-        if rebound != platform_identity {
-            return Err(ProjectLocatorError::IdentityChanged { path: root });
-        }
+        let requested_root = absolute_path(root.as_ref())?;
+        let opened_root = project_root_open_path(&requested_root)
+            .map_err(|source| map_root_error(&requested_root, source))?;
+        let authority = platform::ReadDirectory::open(&opened_root)
+            .map_err(|source| map_root_error(&requested_root, source))?;
+        let (identity, platform_identity) =
+            derive_read_directory_identity(&requested_root, &authority)?;
+        let rebound_root = project_root_open_path(&requested_root)
+            .map_err(|source| map_root_error(&requested_root, source))?;
+        ensure_path_names_authority(&rebound_root, &requested_root, platform_identity)?;
+        let canonical_root = fs_canonicalize(&rebound_root, &requested_root)?;
+        ensure_path_names_authority(&canonical_root, &requested_root, platform_identity)?;
+        ensure_path_names_authority(&rebound_root, &requested_root, platform_identity)?;
         Ok(identity)
     }
 
@@ -212,6 +247,60 @@ fn validate_markers(
             })?;
     }
     Ok(())
+}
+
+fn ensure_path_names_authority(
+    path: &Path,
+    path_for_diagnostics: &Path,
+    expected: platform::DirectoryIdentity,
+) -> Result<platform::ReadDirectory, ProjectLocatorError> {
+    let rebound = platform::ReadDirectory::open(path)
+        .map_err(|source| map_root_error(path_for_diagnostics, source))?;
+    let actual = rebound
+        .identity()
+        .map_err(|source| map_root_error(path_for_diagnostics, source))?;
+    if actual != expected {
+        return Err(ProjectLocatorError::IdentityChanged {
+            path: path_for_diagnostics.to_path_buf(),
+        });
+    }
+    Ok(rebound)
+}
+
+fn fs_canonicalize(
+    opened_root: &Path,
+    path_for_diagnostics: &Path,
+) -> Result<PathBuf, ProjectLocatorError> {
+    std::fs::canonicalize(opened_root)
+        .map_err(|source| map_root_error(path_for_diagnostics, source))
+}
+
+/// Resolves aliases above the root leaf without allowing that leaf to be followed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn project_root_open_path(path: &Path) -> io::Result<PathBuf> {
+    use std::path::Component;
+
+    match path.components().next_back() {
+        Some(Component::Normal(leaf)) => {
+            let parent = path.parent().ok_or_else(invalid_project_path)?;
+            std::fs::canonicalize(parent).map(|canonical_parent| canonical_parent.join(leaf))
+        }
+        Some(Component::RootDir) if path.parent().is_none() => std::fs::canonicalize(path),
+        _ => Err(invalid_project_path()),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn project_root_open_path(path: &Path) -> io::Result<PathBuf> {
+    Ok(path.to_path_buf())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn invalid_project_path() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "project root must end in an ordinary directory name",
+    )
 }
 
 fn absolute_path(path: &Path) -> Result<PathBuf, ProjectLocatorError> {
@@ -364,7 +453,7 @@ mod tests {
     #[test]
     fn path_and_open_directory_identity_match() {
         let temporary = tempfile::tempdir().unwrap();
-        let root = temporary.path().join("project");
+        let root = fs::canonicalize(temporary.path()).unwrap().join("project");
         fs::create_dir(&root).unwrap();
         let authority = platform::ReadDirectory::open(&root).unwrap();
 
@@ -377,8 +466,9 @@ mod tests {
     #[test]
     fn borrowed_open_directory_identity_survives_rename() {
         let temporary = tempfile::tempdir().unwrap();
-        let original = temporary.path().join("original");
-        let renamed = temporary.path().join("renamed");
+        let physical_temporary = fs::canonicalize(temporary.path()).unwrap();
+        let original = physical_temporary.join("original");
+        let renamed = physical_temporary.join("renamed");
         fs::create_dir(&original).unwrap();
         let authority = platform::ReadDirectory::open(&original).unwrap();
 
@@ -428,6 +518,48 @@ mod tests {
 
         assert_eq!(first.project_id(), after_rename.project_id());
         assert_ne!(first.project_id(), after_copy.project_id());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn existing_root_identity_accepts_an_ancestor_alias() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let physical_parent = temporary.path().join("physical");
+        let physical_root = physical_parent.join("project");
+        let alias = temporary.path().join("alias");
+        fs::create_dir_all(&physical_root).unwrap();
+        symlink(&physical_parent, &alias).unwrap();
+
+        let physical = ProjectIdentityV1::for_existing_root(&physical_root).unwrap();
+        let through_alias = ProjectIdentityV1::for_existing_root(alias.join("project")).unwrap();
+
+        assert_eq!(physical, through_alias);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn construction_rejects_an_ancestor_alias_rebound_after_capture() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let physical_parent = temporary.path().join("physical");
+        let replacement_parent = temporary.path().join("replacement");
+        let alias = temporary.path().join("alias");
+        fs::create_dir_all(physical_parent.join("project/Assets")).unwrap();
+        fs::create_dir_all(physical_parent.join("project/ProjectSettings")).unwrap();
+        fs::create_dir_all(replacement_parent.join("project/Assets")).unwrap();
+        fs::create_dir_all(replacement_parent.join("project/ProjectSettings")).unwrap();
+        symlink(&physical_parent, &alias).unwrap();
+
+        let error = super::ProjectLocatorV1::open_with_checkpoint(&alias.join("project"), || {
+            fs::remove_file(&alias).unwrap();
+            symlink(&replacement_parent, &alias).unwrap();
+        })
+        .unwrap_err();
+
+        assert!(matches!(error, ProjectLocatorError::IdentityChanged { .. }));
     }
 }
 

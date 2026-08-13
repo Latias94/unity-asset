@@ -582,8 +582,6 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use tempfile::tempdir;
-
     use super::{AnchoredFsError, EntryKindHint, OpenPolicy, ReadDirectory};
     #[cfg(windows)]
     use super::{
@@ -610,7 +608,7 @@ mod tests {
 
     #[test]
     fn opens_multi_component_descendants_from_the_root_handle() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let nested = temporary.path().join("one").join("two");
         fs::create_dir_all(&nested).unwrap();
         fs::write(nested.join("asset.bin"), b"asset bytes").unwrap();
@@ -626,7 +624,7 @@ mod tests {
 
     #[test]
     fn validates_parent_lookup_without_requiring_the_leaf() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::create_dir_all(temporary.path().join("one/two")).unwrap();
         let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
 
@@ -641,7 +639,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_absolute_and_escaping_relative_paths() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
 
         for path in [Path::new(""), Path::new("."), Path::new("../asset.bin")] {
@@ -663,7 +661,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn ordinary_windows_directories_support_opening_and_enumeration() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::create_dir(temporary.path().join("Assets")).unwrap();
         let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
 
@@ -681,7 +679,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rejects_a_case_sensitive_windows_root_when_supported() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let root = temporary.path().join("project");
         fs::create_dir(&root).unwrap();
         if !enable_case_sensitivity_or_skip(&root) {
@@ -699,7 +697,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rejects_a_case_sensitive_windows_scan_root_ancestor_when_supported() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let scan_root_ancestor = temporary.path().join("Assets");
         fs::create_dir(&scan_root_ancestor).unwrap();
         let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
@@ -719,7 +717,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rechecks_windows_case_sensitivity_before_enumeration_when_supported() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let path = temporary.path().join("Assets");
         fs::create_dir(&path).unwrap();
         let directory = ReadDirectory::open(&path, OpenPolicy::ProjectSource).unwrap();
@@ -738,7 +736,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn rechecks_windows_parent_case_sensitivity_before_opening_a_regular_file_when_supported() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let path = temporary.path().join("Assets");
         fs::create_dir(&path).unwrap();
         let directory = ReadDirectory::open(&path, OpenPolicy::ProjectSource).unwrap();
@@ -759,7 +757,7 @@ mod tests {
 
     #[test]
     fn directory_entries_are_unsorted_hints_until_reopened() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::create_dir(temporary.path().join("directory")).unwrap();
         fs::write(temporary.path().join("file.bin"), b"bytes").unwrap();
         let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
@@ -782,7 +780,7 @@ mod tests {
 
     #[test]
     fn directory_name_preflight_matches_full_enumeration() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::create_dir(temporary.path().join("directory")).unwrap();
         fs::write(temporary.path().join("file.bin"), b"bytes").unwrap();
         let root = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
@@ -802,7 +800,7 @@ mod tests {
 
     #[test]
     fn reopened_directory_identity_detects_namespace_replacement() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let active = temporary.path().join("active");
         let replacement = temporary.path().join("replacement");
         let displaced = temporary.path().join("displaced");
@@ -820,7 +818,7 @@ mod tests {
 
     #[test]
     fn every_open_policy_rejects_hard_link_aliases() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::write(temporary.path().join("state.json"), b"original").unwrap();
         fs::hard_link(
             temporary.path().join("state.json"),
@@ -841,7 +839,7 @@ mod tests {
 
     #[test]
     fn recovery_alias_compares_exact_hard_link_names_without_weakening_authority_policies() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::write(temporary.path().join("staging.json"), b"original").unwrap();
         fs::hard_link(
             temporary.path().join("staging.json"),
@@ -859,7 +857,7 @@ mod tests {
 
     #[test]
     fn range_rejects_a_file_truncated_after_open() {
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let path = temporary.path().join("asset.bin");
         fs::write(&path, b"original").unwrap();
         let directory = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
@@ -881,7 +879,7 @@ mod tests {
         use std::fs::FileTimes;
         use std::time::{Duration, UNIX_EPOCH};
 
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let path = temporary.path().join("asset.bin");
         fs::write(&path, b"original").unwrap();
         let directory = ReadDirectory::open(temporary.path(), OpenPolicy::ProjectSource).unwrap();
@@ -911,7 +909,7 @@ mod tests {
     fn pinned_parent_cannot_be_redirected_before_leaf_open() {
         use std::io::Read as _;
 
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let parent = temporary.path().join("activations");
         let replacement = temporary.path().join("replacement");
         let displaced = temporary.path().join("displaced");
@@ -936,7 +934,7 @@ mod tests {
     fn rejects_symbolic_link_leaf() {
         use std::os::unix::fs::symlink;
 
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         fs::write(temporary.path().join("target.json"), b"{}").unwrap();
         symlink("target.json", temporary.path().join("state.json")).unwrap();
         let directory = ReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap();
@@ -956,7 +954,7 @@ mod tests {
 
         use rustix::fs::{CWD, Mode, mkfifoat};
 
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let fifo = temporary.path().join("state.json");
         mkfifoat(CWD, &fifo, Mode::RUSR | Mode::WUSR).unwrap();
         let directory = ReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap();
@@ -979,7 +977,7 @@ mod tests {
     fn rejects_unix_socket_as_a_non_regular_entry() {
         use std::os::unix::net::UnixListener;
 
-        let temporary = tempdir().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let socket = temporary.path().join("state.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         let directory = ReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap();

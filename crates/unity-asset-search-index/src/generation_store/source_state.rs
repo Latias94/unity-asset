@@ -2329,7 +2329,7 @@ mod source_state_tests {
 
     #[test]
     fn source_state_precharges_dense_short_strings_before_deserializing() {
-        let temporary = TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let workspace = WorkspaceId::from_u128(0x56).unwrap();
         let revision = WorkspaceRevision::new(digest("dense strings"));
         let mut value = serde_json::to_value(source_state(workspace, revision)).unwrap();
@@ -2361,7 +2361,7 @@ mod source_state_tests {
 
     #[test]
     fn source_state_precharges_json_parser_work_before_deserializing() {
-        let temporary = TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let workspace = WorkspaceId::from_u128(0x58).unwrap();
         let revision = WorkspaceRevision::new(digest("escaped string"));
         let mut value = serde_json::to_value(source_state(workspace, revision)).unwrap();
@@ -2400,7 +2400,7 @@ mod source_state_tests {
 
     #[test]
     fn source_state_precharges_duplicate_noncanonical_values_before_deserializing() {
-        let temporary = TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let workspace = WorkspaceId::from_u128(0x57).unwrap();
         let revision = WorkspaceRevision::new(digest("duplicate hints"));
         let snapshot = source_state(workspace, revision);
@@ -2445,7 +2445,7 @@ mod source_state_tests {
     fn source_state_precharges_dense_internally_tagged_maps_before_deserializing() {
         const UNKNOWN_MEMBERS: usize = 4_096;
 
-        let temporary = TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let workspace = WorkspaceId::from_u128(0x57_01).unwrap();
         let revision = WorkspaceRevision::new(digest("dense internally tagged map"));
         let mut value = serde_json::to_value(source_state(workspace, revision)).unwrap();
@@ -2507,7 +2507,7 @@ mod source_state_tests {
     fn default_budget_loads_forty_thousand_minimal_filesystem_sources() {
         const SOURCE_COUNT: usize = 40_000;
 
-        let temporary = TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let workspace = WorkspaceId::from_u128(0x58_01).unwrap();
         let revision = WorkspaceRevision::new(digest("large source state"));
         #[cfg(windows)]
@@ -2577,7 +2577,7 @@ mod source_state_tests {
 
     #[test]
     fn source_state_contract_bounds_total_wire_members_independently() {
-        let temporary = TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let workspace = WorkspaceId::from_u128(0x58_02).unwrap();
         let revision = WorkspaceRevision::new(digest("structural member limit"));
         let snapshot = source_state(workspace, revision);

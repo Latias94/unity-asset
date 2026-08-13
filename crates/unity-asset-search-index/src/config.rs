@@ -6,12 +6,11 @@ use unity_asset_core::DigestV1;
 use unity_asset_search_local::PrivateIndexRootV1;
 use unity_asset_search_protocol::{MAX_STATUS_SCAN_ROOTS, PortablePath, ProjectId, StatusResponse};
 
-use crate::anchored_fs::{OpenPolicy, ReadDirectory};
 use crate::path_semantics::{
-    ProjectPathSpace, compare_portable_paths, is_portable_component,
+    ProjectPathError, ProjectPathSpace, compare_portable_paths,
     strip_prefix as strip_platform_prefix,
 };
-use crate::project_root::ProjectRootAuthority;
+use crate::project_root::{ProjectRootAuthority, ResolveBoundProjectPathError};
 use crate::scan::ScanReadLimits;
 
 const SCAN_ENTRIES_HARD_MAX: u64 = 16_000_000;
@@ -60,12 +59,7 @@ impl IndexPaths {
             Some(roots) if !roots.is_empty() => roots,
             _ => default_scan_roots(canonical_project_root),
         };
-        let normalized_scan_roots = normalize_scan_roots(
-            canonical_project_root,
-            canonical_project_root,
-            project.directory(),
-            scan_roots,
-        )?;
+        let normalized_scan_roots = normalize_scan_roots(&project, scan_roots)?;
         let (canonical_scan_roots, logical_scan_roots): (Vec<PathBuf>, Vec<String>) =
             normalized_scan_roots.into_iter().unzip();
 
@@ -528,9 +522,7 @@ fn is_ordinary_directory(path: &Path) -> bool {
 }
 
 fn normalize_scan_roots(
-    project_root: &Path,
-    canonical_project_root: &Path,
-    project_authority: &ReadDirectory,
+    project: &ProjectRootAuthority,
     roots: Vec<PathBuf>,
 ) -> Result<Vec<(PathBuf, String)>> {
     ensure!(
@@ -538,6 +530,7 @@ fn normalize_scan_roots(
         "scan root count {} exceeds the protocol maximum of {MAX_STATUS_SCAN_ROOTS}",
         roots.len()
     );
+    let project_root = project.root();
     let mut normalized = Vec::new();
     for root in roots {
         let root = if root.is_absolute() {
@@ -545,77 +538,33 @@ fn normalize_scan_roots(
         } else {
             project_root.join(root)
         };
-        let root_authority =
-            ReadDirectory::open(&root, OpenPolicy::ProjectSource).with_context(|| {
-                format!("open scan root without following links: {}", root.display())
-            })?;
-        let canonical_root = canonical_directory_binding(
-            &root,
-            &root_authority,
-            OpenPolicy::ProjectSource,
-            "scan root",
-        )?;
-        let relative = strip_platform_prefix(canonical_project_root, &canonical_root)
-            .map_err(|_| anyhow!("scan root must be inside project root: {}", root.display()))?;
-        let mut relative_normalized = PathBuf::new();
-        for component in relative.components() {
-            match component {
-                std::path::Component::Normal(name) => {
-                    let name = name.to_str().ok_or_else(|| {
-                        anyhow!("scan root must be valid UTF-8: {}", root.display())
-                    })?;
-                    ensure!(
-                        is_portable_component(name),
+        let bound = project
+            .resolve_existing_directory(&root)
+            .map_err(|error| match error {
+                ResolveBoundProjectPathError::Path(ProjectPathError::OutsideProject { .. }) => {
+                    anyhow!("scan root must be inside project root: {}", root.display())
+                }
+                ResolveBoundProjectPathError::Path(ProjectPathError::InvalidComponent {
+                    ..
+                }) => {
+                    anyhow!(
                         "scan root contains a non-portable component: {}",
                         root.display()
-                    );
-                    relative_normalized.push(name);
+                    )
                 }
-                std::path::Component::CurDir => {}
-                std::path::Component::ParentDir
-                | std::path::Component::RootDir
-                | std::path::Component::Prefix(_) => {
-                    return Err(anyhow!(
-                        "scan root contains an escaping component: {}",
+                ResolveBoundProjectPathError::Path(error) => anyhow::Error::new(error)
+                    .context(format!("validate scan root path: {}", root.display())),
+                ResolveBoundProjectPathError::Filesystem(error) => anyhow::Error::new(error)
+                    .context(format!(
+                        "open scan root without following links: {}",
                         root.display()
-                    ));
-                }
-            }
-        }
-        let opened = if relative_normalized.as_os_str().is_empty() {
-            None
-        } else {
-            Some(
-                project_authority
-                    .open_directory(&relative_normalized)
-                    .with_context(|| {
-                        format!("open scan root relative to project: {}", root.display())
-                    })?,
-            )
-        };
-        let opened = opened.as_ref().unwrap_or(project_authority);
-        let identity = opened
-            .stable_identity()
-            .with_context(|| format!("capture scan root identity: {}", root.display()))?;
-        let root_object_identity = root_authority
-            .object_identity()
-            .with_context(|| format!("capture scan root object identity: {}", root.display()))?;
-        ensure!(
-            opened
-                .same_object(root_object_identity)
-                .with_context(|| format!("compare scan root identities: {}", root.display()))?,
-            "scan root changed while resolving its project-relative path: {}",
-            root.display()
-        );
-        normalized.push((
-            project_root.join(&relative_normalized),
-            canonical_project_root.join(relative_normalized),
-            identity,
-        ));
+                    )),
+            })?;
+        normalized.push((project_root.join(bound.relative_path()), bound.identity()));
     }
     normalized.sort_unstable_by(|left, right| left.0.cmp(&right.0));
     let mut identities = Vec::with_capacity(normalized.len());
-    normalized.retain(|(_, _, identity)| {
+    normalized.retain(|(_, identity)| {
         if identities.contains(identity) {
             false
         } else {
@@ -625,8 +574,8 @@ fn normalize_scan_roots(
     });
     let mut candidates = normalized
         .into_iter()
-        .map(|(_, canonical, _)| {
-            let logical = logical_scan_root(canonical_project_root, &canonical)?;
+        .map(|(canonical, _)| {
+            let logical = logical_scan_root(project_root, &canonical)?;
             Ok((canonical, logical))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -671,34 +620,6 @@ fn logical_scan_root(project_root: &Path, scan_root: &Path) -> Result<String> {
         logical.push_str(name);
     }
     Ok(logical)
-}
-
-fn canonical_directory_binding(
-    path: &Path,
-    authority: &ReadDirectory,
-    policy: OpenPolicy,
-    label: &'static str,
-) -> Result<PathBuf> {
-    let expected = authority
-        .object_identity()
-        .with_context(|| format!("capture {label} object identity: {}", path.display()))?;
-    let canonical = std::fs::canonicalize(path)
-        .with_context(|| format!("canonicalize {label}: {}", path.display()))?;
-    let canonical_authority = ReadDirectory::open(&canonical, policy)
-        .with_context(|| format!("open canonical {label}: {}", canonical.display()))?;
-    ensure!(
-        canonical_authority
-            .same_object(expected)
-            .with_context(|| format!("compare canonical {label} identity"))?,
-        "canonical {label} changed directory identity: {}",
-        path.display()
-    );
-    let rebound = ReadDirectory::open(path, policy)
-        .with_context(|| format!("reopen {label}: {}", path.display()))?;
-    rebound
-        .ensure_object(expected)
-        .with_context(|| format!("revalidate {label} after canonicalization"))?;
-    Ok(canonical)
 }
 
 fn platform_paths_equal(left: &Path, right: &Path) -> bool {
@@ -945,6 +866,29 @@ mod tests {
         assert!(error.to_string().contains("without following links"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn absolute_scan_root_accepts_an_ancestor_alias_without_following_the_leaf() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = crate::secure_test_tempdir();
+        let physical_parent = temporary.path().join("physical");
+        let alias = temporary.path().join("alias");
+        let project = physical_parent.join("project");
+        std::fs::create_dir_all(project.join("Assets")).unwrap();
+        symlink(&physical_parent, &alias).unwrap();
+
+        let alias_project = alias.join("project");
+        let paths = IndexPaths::for_project(
+            alias_project.clone(),
+            None,
+            Some(vec![alias_project.join("Assets")]),
+        )
+        .unwrap();
+
+        assert_eq!(paths.scan_roots(), &[project.join("Assets")]);
+    }
+
     #[cfg(windows)]
     #[test]
     fn configured_scan_root_rejects_directory_junctions() {
@@ -991,14 +935,28 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir(project.path().join("Assets")).unwrap();
 
-        let paths = IndexPaths::for_project(
+        let aliases = IndexPaths::for_project(
             project.path().to_path_buf(),
             None,
             Some(vec![PathBuf::from("Assets"), PathBuf::from("ASSETS")]),
         )
         .unwrap();
+        let exact = IndexPaths::for_project(
+            project.path().to_path_buf(),
+            None,
+            Some(vec![PathBuf::from("Assets")]),
+        )
+        .unwrap();
 
-        assert_eq!(paths.scan_roots().len(), 1);
+        assert_eq!(aliases.scan_roots(), exact.scan_roots());
+        assert_eq!(
+            aliases
+                .logical_configuration_digest(SearchIndexOptions::default())
+                .unwrap(),
+            exact
+                .logical_configuration_digest(SearchIndexOptions::default())
+                .unwrap()
+        );
     }
 
     #[cfg(windows)]

@@ -584,6 +584,8 @@ mod tests {
 
     use super::*;
     use crate::analysis::{RawReferenceProjection, ReferenceResolutionProjection};
+    #[cfg(unix)]
+    use crate::anchored_fs::AnchoredFsError;
     use crate::anchored_fs::{OpenPolicy, ReadDirectory};
 
     fn projected_reference() -> ReferenceDocument {
@@ -614,7 +616,7 @@ mod tests {
     }
 
     fn open_reader(bytes: &[u8]) -> (TempDir, ReferencePayloadReader) {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         fs::write(directory.path().join(REFERENCE_PAYLOAD_FILE), bytes).unwrap();
         let opened = ReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap();
         let file = opened
@@ -626,7 +628,7 @@ mod tests {
     fn open_written_reader(
         document: &ReferenceDocument,
     ) -> (TempDir, ReferencePayloadReader, ReferencePayloadLocation) {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut writer = ReferencePayloadWriter::create(directory.path()).unwrap();
         let location = writer.append(document, 1024 * 1024).unwrap();
         writer.finish().unwrap();
@@ -795,9 +797,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn valid_payload_rejects_a_mismatched_expected_digest() {
+        let document = projected_reference();
+        let (_directory, reader, location) = open_written_reader(&document);
+        let range = reader
+            .validate_range(
+                location.offset(),
+                location.length(),
+                MAX_REFERENCE_PAYLOAD_BYTES,
+            )
+            .unwrap();
+        let expected = DigestV1::hash_bytes(b"another reference payload");
+
+        let error = reader
+            .read(range, expected, &mut AssetLoadBudget::default())
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ReferencePayloadReadError::DigestMismatch { expected: actual_expected, actual }
+                if actual_expected == expected && actual == location.digest()
+        ));
+    }
+
     #[cfg(unix)]
     #[test]
     fn opened_sidecar_rejects_same_length_in_place_rewrite() {
+        use std::time::{Duration, UNIX_EPOCH};
+
         let document = projected_reference();
         let (directory, reader, location) = open_written_reader(&document);
         let path = directory.path().join(REFERENCE_PAYLOAD_FILE);
@@ -808,7 +836,15 @@ mod tests {
             .position(|window| window == stable_id)
             .unwrap();
         bytes[offset..offset + stable_id.len()].copy_from_slice(b"reference-x");
-        fs::write(path, bytes).unwrap();
+        fs::write(&path, bytes).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(946_684_800)),
+            )
+            .unwrap();
 
         let range = reader
             .validate_range(
@@ -822,7 +858,7 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             error,
-            ReferencePayloadReadError::DigestMismatch { .. }
+            ReferencePayloadReadError::SecureRead(AnchoredFsError::IdentityChanged)
         ));
     }
 }

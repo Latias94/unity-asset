@@ -1520,7 +1520,7 @@ mod tests {
 
     #[test]
     fn schema_marker_contract_accepts_exact_and_rejects_one_short_budget() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         write_schema_marker(
             directory.path(),
             SEARCH_SCHEMA_CONTRACT,
@@ -1584,7 +1584,7 @@ mod tests {
     #[test]
     fn only_older_reference_markers_are_rebuildable() {
         for schema_version in 1..REFERENCE_SCHEMA_VERSION {
-            let directory = tempdir().unwrap();
+            let directory = crate::secure_test_tempdir();
             write_schema_marker(directory.path(), REFERENCE_SCHEMA_CONTRACT, schema_version)
                 .unwrap();
             let opened =
@@ -1600,7 +1600,7 @@ mod tests {
             assert!(is_rebuildable_projection_schema_version(&error));
         }
 
-        let future = tempdir().unwrap();
+        let future = crate::secure_test_tempdir();
         write_schema_marker(
             future.path(),
             REFERENCE_SCHEMA_CONTRACT,
@@ -1618,7 +1618,7 @@ mod tests {
         .unwrap_err();
         assert!(!is_rebuildable_projection_schema_version(&error));
 
-        let wrong_projection = tempdir().unwrap();
+        let wrong_projection = crate::secure_test_tempdir();
         write_schema_marker(
             wrong_projection.path(),
             REFERENCE_SCHEMA_CONTRACT,
@@ -1640,7 +1640,7 @@ mod tests {
 
     #[test]
     fn current_projection_rejects_an_obsolete_storage_marker() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         write_schema_marker_for_test(
             directory.path(),
             SEARCH_SCHEMA_CONTRACT,
@@ -1663,7 +1663,7 @@ mod tests {
 
     #[test]
     fn anchored_directory_reader_locks_do_not_enable_writes() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let anchored = AnchoredTantivyDirectory::new(Arc::new(
             SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState).unwrap(),
         ));
@@ -1681,7 +1681,7 @@ mod tests {
     }
 
     fn validate_catalog_bytes(bytes: &[u8]) -> Result<()> {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let path = directory.path().join(PATH_CATALOG_FILE);
         fs::write(&path, bytes).unwrap();
         let opened = SecureReadDirectory::open(directory.path(), OpenPolicy::PersistedState)
@@ -1701,7 +1701,7 @@ mod tests {
 
     #[test]
     fn stored_paths_are_byte_sorted_and_deduplicated() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut projection = empty_projection();
         projection.search_documents = vec![
             projected_search_document("a", "Assets/Zeta.asset"),
@@ -1732,7 +1732,7 @@ mod tests {
 
     #[test]
     fn path_catalog_wire_is_versioned_and_follows_document_order() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut projection = empty_projection();
         projection.search_documents = vec![
             projected_search_document("a", "Assets/Zeta.asset"),
@@ -1804,7 +1804,7 @@ mod tests {
 
     #[test]
     fn projection_reader_rejects_path_catalog_count_mismatch() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut projection = empty_projection();
         projection.search_documents = vec![projected_search_document("only", "Assets/Only.asset")];
         ProjectionStore::build(directory.path(), &projection).unwrap();
@@ -1837,7 +1837,7 @@ mod tests {
 
     #[test]
     fn projection_reader_rejects_deleted_segments_even_when_live_count_matches() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut projection = empty_projection();
         projection.search_documents = vec![
             projected_search_document("deleted", "Assets/Deleted.asset"),
@@ -1877,7 +1877,7 @@ mod tests {
 
     #[test]
     fn stored_paths_reject_backing_budget_before_allocation() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut projection = empty_projection();
         projection.search_documents = vec![projected_search_document("only", "Assets/Only.asset")];
         ProjectionStore::build(directory.path(), &projection).unwrap();
@@ -1903,7 +1903,7 @@ mod tests {
 
     #[test]
     fn projection_reader_rejects_overlong_catalog_entry_before_publication() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let mut projection = empty_projection();
         projection.search_documents = vec![projected_search_document("only", "Assets/Only.asset")];
         ProjectionStore::build(directory.path(), &projection).unwrap();
@@ -2019,7 +2019,7 @@ mod tests {
 
     #[test]
     fn empty_projection_builds_and_opens_both_versioned_indices() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let evidence = ProjectionStore::build(directory.path(), &empty_projection()).unwrap();
         assert!(evidence.search_artifact().files() > 0);
         assert!(evidence.reference_artifact().files() > 0);

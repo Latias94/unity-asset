@@ -54,7 +54,8 @@ use crate::generation_store::{
 };
 #[cfg(test)]
 use crate::generation_store::{GenerationPublishWarning, GenerationPublishWarningKind};
-use crate::path_semantics::{ProjectPath, ProjectPathError};
+use crate::path_semantics::ProjectPath;
+use crate::project_root::ResolveBoundProjectPathError;
 use crate::projection::ProjectionMetrics;
 use crate::scan::{
     FileHint, PathRejection, ProjectScanner, ProjectSourcePath, ReadSource, ScanDiagnostic,
@@ -1970,19 +1971,16 @@ fn workspace_root_project_path(
     let Some(origin) = root.physical_origin() else {
         return Ok(None);
     };
-    match paths.project_path_space().resolve(origin) {
-        Ok(Some(relative)) => {
-            paths
-                .project_authority()
-                .validate_parent_lookup(relative.as_relative_path())
-                .map_err(|source| {
-                    PipelineError::Scan(Box::new(ScanError::TraversalRead { source }))
-                })?;
-            Ok(Some(relative))
+    match paths.project_authority().resolve_bound_parent(origin) {
+        Ok(relative) => Ok(relative),
+        Err(ResolveBoundProjectPathError::Filesystem(source)) => {
+            Err(PipelineError::Scan(Box::new(ScanError::TraversalRead {
+                source,
+            })))
         }
-        Ok(None) => Ok(None),
-        Err(ProjectPathError::OutsideProject { .. }) => Ok(None),
-        Err(error) => Err(PipelineError::Configuration(anyhow::Error::new(error))),
+        Err(ResolveBoundProjectPathError::Path(error)) => {
+            Err(PipelineError::Configuration(anyhow::Error::new(error)))
+        }
     }
 }
 

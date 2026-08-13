@@ -264,6 +264,7 @@ async fn connect_once(
     discovered
         .ensure_unchanged(&namespace)
         .map_err(ConnectError::Store)?;
+    project.revalidate().map_err(ConnectError::Project)?;
 
     Ok(ClientSession {
         stream,
@@ -564,7 +565,8 @@ mod tests {
     use unity_asset_core::AssetLoadBudget;
     use unity_asset_search_local::{
         EndpointCleanupV1, EndpointDescriptorError, EndpointStoreError, EndpointTransportError,
-        FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id,
+        FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorError, ProjectLocatorV1,
+        generate_daemon_instance_id,
     };
     use unity_asset_search_protocol::{
         BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, FrameLimits, QueryPolicyId,
@@ -640,6 +642,101 @@ mod tests {
         assert!(matches!(
             client.await.expect("join client"),
             Err(ConnectError::Store(EndpointStoreError::EndpointChanged))
+        ));
+        let post_bootstrap = server
+            .read_frame(
+                FrameLimits::request_envelope(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(1)),
+            )
+            .await
+            .expect("observe client disconnect");
+        assert!(post_bootstrap.is_none());
+
+        drop(server);
+        drop(endpoint);
+        drop(claim);
+        drop(namespace);
+        drop(roots);
+        for name in ["binding.v1", ".binding-v1.lock", ".daemon-v1.lock"] {
+            let result = fs::remove_file(cleanup_path.join(name));
+            assert!(
+                result.is_ok()
+                    || result.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+            );
+        }
+        fs::remove_dir(cleanup_path).expect("remove endpoint namespace");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_cannot_commit_a_session_after_project_replacement() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let project_root = temporary.path().join("project");
+        let displaced_root = temporary.path().join("displaced-project");
+        fs::create_dir_all(project_root.join("Assets")).expect("Assets marker");
+        fs::create_dir_all(project_root.join("ProjectSettings")).expect("ProjectSettings marker");
+        let project = ProjectLocatorV1::open(&project_root).expect("locate project");
+        let roots = PrivateRootsV1::discover_for_current_context().expect("private roots");
+        let namespace = roots
+            .runtime()
+            .endpoint_namespace(project.project_id())
+            .expect("endpoint namespace");
+        let cleanup_path = namespace.path().to_path_buf();
+        let mut claim = namespace
+            .claim_daemon_endpoint()
+            .expect("claim daemon endpoint");
+        let instance = generate_daemon_instance_id().expect("daemon instance");
+        let mut endpoint = claim.publish(instance).expect("publish endpoint");
+        let options = ConnectionOptions {
+            project_root: project_root.clone(),
+            index_dir: None,
+            daemon_binary: None,
+            connect_timeout: Duration::from_secs(10),
+            request_timeout: Duration::from_secs(10),
+        };
+
+        let client = tokio::spawn(async move {
+            connect_once(&options, Instant::now() + options.connect_timeout).await
+        });
+        let mut server = endpoint.accept_verified().await.expect("accept client");
+        let hello_frame = server
+            .read_frame(
+                FrameLimits::bootstrap(),
+                FrameReadTimeoutsV1::uniform(Duration::from_secs(10)),
+            )
+            .await
+            .expect("read bootstrap hello")
+            .expect("client sent bootstrap hello");
+        let mut budget = AssetLoadBudget::default();
+        let hello: BootstrapHelloV2 =
+            decode_validated_frame(&hello_frame, &mut budget, FrameLimits::bootstrap())
+                .expect("decode bootstrap hello");
+        let reply = BootstrapReplyV2::negotiate(
+            &hello,
+            project.project_id(),
+            instance,
+            QueryPolicyId::from_bytes([0x45; 32]),
+            &[BUSINESS_PROTOCOL_REVISION],
+        );
+        let reply_frame =
+            encode_frame(&reply, FrameLimits::bootstrap()).expect("encode bootstrap reply");
+        fs::rename(&project_root, &displaced_root).expect("displace project root");
+        fs::create_dir_all(project_root.join("Assets")).expect("replacement Assets marker");
+        fs::create_dir_all(project_root.join("ProjectSettings"))
+            .expect("replacement ProjectSettings marker");
+        server
+            .write_frame(
+                &reply_frame,
+                FrameLimits::bootstrap(),
+                Duration::from_secs(10),
+            )
+            .await
+            .expect("write bootstrap reply");
+
+        assert!(matches!(
+            client.await.expect("join client"),
+            Err(ConnectError::Project(
+                ProjectLocatorError::IdentityChanged { .. }
+            ))
         ));
         let post_bootstrap = server
             .read_frame(

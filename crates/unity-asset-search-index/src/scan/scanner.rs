@@ -4890,7 +4890,7 @@ mod tests {
 
     #[test]
     fn directory_entries_are_sorted_before_traversal() {
-        let project = tempfile::tempdir().unwrap();
+        let project = crate::secure_test_tempdir();
         for name in ["z-last.asset", "a-first.asset", "m-middle.asset"] {
             fs::write(project.path().join(name), b"asset").unwrap();
         }
@@ -6399,6 +6399,41 @@ mod tests {
         let namespace_alias = project_alias.join("assets").join("searchindex");
         let paths = IndexPaths::for_project(project_alias, Some(namespace_alias), None).unwrap();
         fs::write(paths.index_root().join("Internal.asset"), b"internal").unwrap();
+        let scanner = ProjectScanner::new(
+            &paths,
+            SearchIndexOptions::default(),
+            ScanReadLimits::default(),
+        )
+        .unwrap();
+
+        let plan = plan_with_default_budget(&scanner, ScanIntent::Full, &[]);
+
+        assert_eq!(
+            plan.present
+                .iter()
+                .map(ScanCandidate::relative_path)
+                .collect::<Vec<_>>(),
+            ["Assets/Public.asset"]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_apfs_case_alias_uses_the_observed_scan_root_spelling() {
+        let temporary = crate::secure_test_tempdir();
+        let project = temporary.path().join("Project");
+        fs::create_dir_all(project.join("Assets")).unwrap();
+        fs::write(project.join("Assets/Public.asset"), b"public").unwrap();
+        if !project.join("assets").exists() {
+            return;
+        }
+        let paths = IndexPaths::for_project(
+            project.clone(),
+            Some(temporary.path().join("index")),
+            Some(vec![PathBuf::from("assets")]),
+        )
+        .unwrap();
+        assert_eq!(paths.scan_roots(), &[project.join("Assets")]);
         let scanner = ProjectScanner::new(
             &paths,
             SearchIndexOptions::default(),

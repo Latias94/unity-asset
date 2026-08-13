@@ -6189,7 +6189,7 @@ mod generation_store_tests {
 
     #[test]
     fn anchored_artifact_measurement_honors_the_exact_caller_budget() {
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let nested = temporary.path().join("nested");
         fs::create_dir(&nested).unwrap();
         fs::write(nested.join("artifact.bin"), b"anchored artifact").unwrap();
@@ -6243,7 +6243,7 @@ mod generation_store_tests {
 
     #[test]
     fn anchored_artifact_measurement_keeps_wide_tree_handles_bounded() {
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         for ordinal in 0..1_200 {
             fs::create_dir(temporary.path().join(format!("child-{ordinal:04}"))).unwrap();
         }
@@ -6262,7 +6262,7 @@ mod generation_store_tests {
 
     #[test]
     fn activation_materialization_is_budgeted_before_typed_deserialization() {
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let path = temporary.path().join("activation.json");
         fs::write(&path, br#"{"contract_version":"invalid"}"#).unwrap();
         let directory =
@@ -6348,7 +6348,7 @@ mod generation_store_tests {
 
     #[test]
     fn activation_capacity_is_rejected_before_the_reopen_limit_is_exceeded() {
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let activations = temporary.path().join(ACTIVATIONS_DIRECTORY);
         fs::create_dir(&activations).unwrap();
         for ordinal in [1, 2] {
@@ -6368,7 +6368,7 @@ mod generation_store_tests {
     #[test]
     fn activation_snapshot_rejects_a_higher_head_or_candidate_replacement_before_selection() {
         for replace_existing in [false, true] {
-            let temporary = tempfile::TempDir::new().unwrap();
+            let temporary = crate::secure_test_tempdir();
             let activations = temporary.path().join("activations");
             let generations = temporary.path().join("generations");
             fs::create_dir(&activations).unwrap();
@@ -6412,7 +6412,7 @@ mod generation_store_tests {
     #[cfg(unix)]
     #[test]
     fn activation_enumeration_rejects_display_path_rebinding() {
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let activations = temporary.path().join("activations");
         let anchored_activations = temporary.path().join("anchored-activations");
         fs::create_dir(&activations).unwrap();
@@ -6440,7 +6440,7 @@ mod generation_store_tests {
     fn activation_enumeration_rejects_unknown_symbolic_links() {
         use std::os::unix::fs::symlink;
 
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let activations = temporary.path().join("activations");
         fs::create_dir(&activations).unwrap();
         fs::write(temporary.path().join("outside.json"), b"{}").unwrap();
@@ -6465,7 +6465,7 @@ mod generation_store_tests {
 
         use crate::generation::{GenerationProjectionDigests, SearchGenerationIdentityV1};
 
-        let temporary = tempfile::TempDir::new().unwrap();
+        let temporary = crate::secure_test_tempdir();
         let root_path = temporary.path().join("index");
         let project_identity =
             unity_asset_search_local::ProjectIdentityV1::for_existing_root(temporary.path())

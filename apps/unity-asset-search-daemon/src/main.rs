@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         Some(args.scan_root.clone())
     };
     let paths = IndexPaths::for_project(
-        project.root().to_path_buf(),
+        args.project_root.clone(),
         args.index_dir.clone(),
         scan_roots,
     )?;

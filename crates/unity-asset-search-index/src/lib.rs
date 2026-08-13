@@ -72,7 +72,12 @@ pub(crate) fn secure_test_tempdir() -> tempfile::TempDir {
     }
     #[cfg(not(windows))]
     {
-        tempfile::tempdir().expect("create a private test directory")
+        let temporary_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical system temporary directory");
+        tempfile::Builder::new()
+            .prefix("unity-asset-search-test-")
+            .tempdir_in(temporary_root)
+            .expect("create a test directory below the physical temporary namespace")
     }
 }
 
