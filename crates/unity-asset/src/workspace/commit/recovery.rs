@@ -5909,15 +5909,11 @@ mod tests {
             "manifest_temporary_synced",
         ] {
             let (directory, path, locator) = run_crashing_commit(point);
+            let layout = test_layout_from_locator(&locator).expect("premanifest layout");
             assert_target_unchanged(&path, YAML);
             if point == "preparation_installed" {
                 assert!(!locator.root().exists());
-                assert!(
-                    test_layout_from_locator(&locator)
-                        .expect("preparation-only layout")
-                        .preparation_path()
-                        .is_file()
-                );
+                assert!(layout.preparation_path().is_file());
             }
             let outcome = AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default())
                 .unwrap_or_else(|error| panic!("recover {point}: {error}"));
@@ -5930,25 +5926,10 @@ mod tests {
             assert_eq!(receipt.recovery(), &locator);
             assert!(!locator.root().exists(), "{point} transaction directory");
             assert!(
-                !JournalLayout::new(
-                    directory.path(),
-                    locator.transaction(),
-                    locator.root_identity().clone(),
-                )
-                .preparation_path()
-                .exists(),
+                !layout.preparation_path().exists(),
                 "{point} preparation record"
             );
-            assert!(
-                JournalLayout::new(
-                    directory.path(),
-                    locator.transaction(),
-                    locator.root_identity().clone(),
-                )
-                .rollback_path()
-                .is_file(),
-                "{point} rollback receipt"
-            );
+            assert!(layout.rollback_path().is_file(), "{point} rollback receipt");
             assert_eq!(
                 AssetWorkspace::recover_at(&locator, &mut AssetLoadBudget::default(),)
                     .unwrap_or_else(|error| panic!("repeat recover {point}: {error}")),
@@ -7883,9 +7864,10 @@ mod tests {
         const STABLE_BYTES: &[u8] = b"stable physical binding";
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join(SOURCE_ALIAS);
-        let first_binding = directory.path().join("stable-first.resS");
-        let second_binding = directory.path().join("stable-second.resS");
+        let target = PublicationTarget::in_place(directory.path()).expect("publication target");
+        let path = target.root().join(SOURCE_ALIAS);
+        let first_binding = target.root().join("stable-first.resS");
+        let second_binding = target.root().join("stable-second.resS");
         fs::write(&path, YAML).expect("fixture bytes");
         fs::write(&first_binding, STABLE_BYTES).expect("first stable binding");
         fs::write(&second_binding, STABLE_BYTES).expect("second stable binding");
@@ -7916,11 +7898,7 @@ mod tests {
             )
             .expect("prepare mutation");
         let report = workspace
-            .commit(
-                prepared,
-                PublicationTarget::in_place(directory.path()).expect("publication target"),
-                &mut AssetLoadBudget::default(),
-            )
+            .commit(prepared, target, &mut AssetLoadBudget::default())
             .expect("commit mutation");
         let workspace_id = workspace.workspace_id();
         let (layout, artifact) =

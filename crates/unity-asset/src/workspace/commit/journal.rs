@@ -4098,17 +4098,18 @@ mod tests {
         let reopened = Journal::open(layout, &mut AssetLoadBudget::default()).unwrap();
         assert_eq!(reopened.events().len(), 2);
         assert_eq!(reopened.manifest().transaction(), transaction);
+        let recovered_report = reopened
+            .manifest()
+            .report(
+                reopened.layout().directory(),
+                reopened.layout().root_identity(),
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+        assert_eq!(recovered_report.transaction(), transaction);
         assert_eq!(
-            reopened
-                .manifest()
-                .report(
-                    directory.path(),
-                    reopened.layout().root_identity(),
-                    &mut AssetLoadBudget::default(),
-                )
-                .unwrap()
-                .transaction(),
-            transaction
+            recovered_report.recovery().root(),
+            reopened.layout().directory()
         );
     }
 
