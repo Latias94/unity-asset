@@ -306,6 +306,7 @@ impl tokio::io::AsyncWrite for Stream {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read as _;
     use std::os::unix::fs::PermissionsExt as _;
     use std::os::unix::net::SocketAddr as UnixSocketAddr;
     use std::path::PathBuf;
@@ -318,23 +319,10 @@ mod tests {
     use crate::SecurityContextIdV1;
 
     const SECONDARY_USER_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_USER";
-    const PYTHON_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_PYTHON";
-    const SECONDARY_CLIENT: &str = r#"
-import os
-import socket
-import sys
-
-parent_uid = int(sys.argv[2])
-actual_uid = os.geteuid()
-if actual_uid == parent_uid:
-    raise SystemExit("secondary process retained the parent effective UID")
-
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.connect(sys.argv[1])
-print(f"peer-euid={actual_uid}", flush=True)
-if client.recv(1):
-    raise SystemExit("rejected peer received unexpected endpoint data")
-"#;
+    const SECONDARY_SOCKET_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_SOCKET";
+    const PARENT_UID_ENV: &str = "UNITY_ASSET_CROSS_PRINCIPAL_PARENT_UID";
+    const SECONDARY_CLIENT_TEST_NAME: &str =
+        "transport::platform::tests::secondary_effective_uid_client";
 
     #[test]
     fn namespace_validation_matches_the_standard_library_pathname_boundary() {
@@ -361,6 +349,31 @@ if client.recv(1):
         ));
     }
 
+    #[test]
+    #[ignore = "launched by the cross-principal peer-credential contract"]
+    fn secondary_effective_uid_client() {
+        let socket_path = std::env::var(SECONDARY_SOCKET_ENV)
+            .unwrap_or_else(|_| panic!("{SECONDARY_SOCKET_ENV} must name the test socket"));
+        let parent_uid = std::env::var(PARENT_UID_ENV)
+            .unwrap_or_else(|_| panic!("{PARENT_UID_ENV} must name the parent effective UID"))
+            .parse::<u32>()
+            .unwrap();
+        let actual_uid = rustix::process::geteuid().as_raw();
+        assert_ne!(
+            actual_uid, parent_uid,
+            "secondary process retained the parent effective UID"
+        );
+
+        let mut client = std::os::unix::net::UnixStream::connect(socket_path).unwrap();
+        println!("peer-euid={actual_uid}");
+        let mut byte = [0_u8; 1];
+        assert_eq!(
+            client.read(&mut byte).unwrap(),
+            0,
+            "rejected peer received unexpected endpoint data"
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     #[ignore = "requires passwordless sudo and a secondary Unix account; exercised by platform CI"]
     async fn secondary_effective_uid_is_rejected_by_peer_credentials() {
@@ -380,35 +393,53 @@ if client.recv(1):
 
         let secondary_user = std::env::var(SECONDARY_USER_ENV)
             .unwrap_or_else(|_| panic!("{SECONDARY_USER_ENV} must name a secondary Unix account"));
-        let python = std::env::var(PYTHON_ENV)
-            .unwrap_or_else(|_| panic!("{PYTHON_ENV} must name an absolute Python executable"));
+        let helper = temporary.path().join("secondary-client");
+        std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
         let mut command = tokio::process::Command::new("sudo");
         command
             .arg("-n")
             .arg("-u")
             .arg(&secondary_user)
             .arg("--")
-            .arg(&python)
-            .arg("-c")
-            .arg(SECONDARY_CLIENT)
-            .arg(&socket_path)
-            .arg(parent_uid.to_string())
+            .arg("/usr/bin/env")
+            .arg(format!("{SECONDARY_SOCKET_ENV}={}", socket_path.display()))
+            .arg(format!("{PARENT_UID_ENV}={parent_uid}"))
+            .arg(&helper)
+            .arg("--exact")
+            .arg(SECONDARY_CLIENT_TEST_NAME)
+            .arg("--ignored")
+            .arg("--nocapture")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let child = command.spawn().unwrap();
+        let mut child_output = Box::pin(child.wait_with_output());
 
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
-            .await
-            .unwrap_or_else(|_| panic!("secondary Unix user {secondary_user} did not connect"))
-            .unwrap();
+        let (stream, _) = tokio::select! {
+            output = &mut child_output => {
+                let output = output.unwrap();
+                panic!(
+                    "secondary Unix client exited before connecting: status={} stdout={} stderr={}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            accepted = tokio::time::timeout(Duration::from_secs(10), listener.accept()) => {
+                accepted
+                    .unwrap_or_else(|_| panic!("secondary Unix user {secondary_user} did not connect"))
+                    .unwrap()
+            }
+        };
         let error = verify_peer(&stream, expected_context).unwrap_err();
         assert!(matches!(error, EndpointTransportError::PeerContextMismatch));
         drop(stream);
         drop(listener);
 
-        let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        let output = tokio::time::timeout(Duration::from_secs(10), &mut child_output)
             .await
             .expect("secondary Unix client did not exit")
             .unwrap();

@@ -346,7 +346,6 @@ jobs:
         if: runner.os != 'Windows'
         env:
           UNITY_ASSET_CROSS_PRINCIPAL_USER: nobody
-          UNITY_ASSET_CROSS_PRINCIPAL_PYTHON: /usr/bin/python3
         run: >-
           cargo nextest run
           --locked
