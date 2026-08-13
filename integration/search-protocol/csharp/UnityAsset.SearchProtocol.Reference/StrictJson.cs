@@ -270,9 +270,7 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 return;
             }
-            bool hasDrivePrefix = value.Length > 1
-                && value[1] == ':'
-                && ((value[0] >= 'A' && value[0] <= 'Z') || (value[0] >= 'a' && value[0] <= 'z'));
+            bool hasDrivePrefix = value.Length > 1 && value[1] == ':';
             if (value.StartsWith("/", StringComparison.Ordinal) || hasDrivePrefix)
             {
                 throw new ProtocolValidationException($"{path} must be relative");

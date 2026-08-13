@@ -306,6 +306,12 @@
       "kind": "request",
       "path": "invalid/request-instance-mismatch-v5.json",
       "expected_error": "daemon instance"
+    },
+    {
+      "name": "request drive-like relative path",
+      "kind": "request",
+      "path": "invalid/request-drive-prefix-v5.json",
+      "expected_error": "path"
     }
   ]
 }

@@ -1084,23 +1084,6 @@ internal static class ConformanceProgram
                 "uppercase workspace"))),
             "uppercase workspace ID");
 
-        string reindex = ReadFixtureText(fixtureRoot, "requests/reindex-admit-v5.json");
-        BusinessCodec.DecodeRequest(
-            Encoding.UTF8.GetBytes(ReplaceExactly(
-                reindex,
-                "Assets/Prefabs/Player.prefab",
-                "1:/asset",
-                "portable path")),
-            binding);
-        ExpectFailure(
-            () => BusinessCodec.DecodeRequest(
-                Encoding.UTF8.GetBytes(ReplaceExactly(
-                    reindex,
-                    "Assets/Prefabs/Player.prefab",
-                    "C:/asset",
-                    "portable path")),
-                binding),
-            "ASCII-letter drive path");
     }
 
     private static void AssertUnicodeScalarPathOrdering(ProtocolBinding binding)

@@ -508,8 +508,8 @@
         "request": { "$ref": "#/$defs/referenceRequest" },
         "took_ms": { "$ref": "#/$defs/uint64" },
         "coverage": { "$ref": "#/$defs/referenceCoverage" },
-        "hits": { "type": "array", "items": { "$ref": "#/$defs/referenceHit" } },
-        "diagnostics": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+        "hits": { "type": "array", "maxItems": 500, "items": { "$ref": "#/$defs/referenceHit" } },
+        "diagnostics": { "type": "array", "maxItems": 128, "items": { "$ref": "#/$defs/diagnostic" } },
         "diagnostic_coverage": { "$ref": "#/$defs/referenceDiagnosticCoverage" }
       }
     },
@@ -564,7 +564,7 @@
     },
     "reindexReceipt": { "type": "object", "additionalProperties": false, "required": ["protocol_revision", "disposition", "evidence"], "properties": { "protocol_revision": { "$ref": "#/$defs/revision" }, "disposition": { "enum": ["applied", "already_applied", "coalesced", "queued"] }, "transaction": { "$ref": "#/$defs/digest" }, "target_revision": { "$ref": "#/$defs/digest" }, "generation": { "$ref": "#/$defs/generationStamp" }, "evidence": { "$ref": "#/$defs/reindexEvidence" } } },
     "reindexStatus": { "type": "object", "additionalProperties": false, "required": ["operation_id", "state"], "properties": { "operation_id": { "$ref": "#/$defs/operationId" }, "state": { "enum": ["queued", "coalesced", "running", "succeeded", "failed", "cancelled", "expired", "lost"] }, "admission": { "$ref": "#/$defs/reindexReceipt" }, "completion": { "$ref": "#/$defs/reindexReceipt" }, "status": { "$ref": "#/$defs/statusResponse" }, "error": { "$ref": "#/$defs/apiError" } } },
-    "apiError": { "type": "object", "additionalProperties": false, "required": ["protocol_revision", "code", "message", "retryable", "details"], "properties": { "protocol_revision": { "$ref": "#/$defs/revision" }, "code": { "enum": ["invalid_request", "invalid_cursor", "stale_cursor", "incompatible_protocol", "peer_rejected", "busy", "not_ready", "revision_mismatch", "index_build_failed", "idempotency_conflict", "operation_not_found", "operation_control_forbidden", "internal"] }, "message": { "type": "string" }, "retryable": { "type": "boolean" }, "generation": { "$ref": "#/$defs/generationStamp" }, "query_policy_id": { "$ref": "#/$defs/queryPolicyId" }, "details": { "type": "object", "additionalProperties": { "type": "string" } } } },
+    "apiError": { "type": "object", "additionalProperties": false, "required": ["protocol_revision", "code", "message", "retryable", "details"], "properties": { "protocol_revision": { "$ref": "#/$defs/revision" }, "code": { "enum": ["invalid_request", "invalid_cursor", "stale_cursor", "incompatible_protocol", "peer_rejected", "busy", "not_ready", "revision_mismatch", "index_build_failed", "idempotency_conflict", "operation_not_found", "operation_control_forbidden", "internal"] }, "message": { "type": "string" }, "retryable": { "type": "boolean" }, "generation": { "$ref": "#/$defs/generationStamp" }, "query_policy_id": { "$ref": "#/$defs/queryPolicyId" }, "details": { "type": "object", "maxProperties": 64, "additionalProperties": { "type": "string" } } } },
     "responseOperation": {
       "oneOf": [
         { "type": "object", "additionalProperties": false, "required": ["kind", "response"], "properties": { "kind": { "const": "capabilities" }, "response": { "type": "object", "additionalProperties": false, "required": ["daemon_version", "capabilities"], "properties": { "daemon_version": { "type": "string", "minLength": 1 }, "capabilities": { "$ref": "#/$defs/capabilities" } } } } },
