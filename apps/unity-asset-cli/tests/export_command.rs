@@ -262,10 +262,10 @@ fn export_atomically_publishes_a_durable_resume_manifest() {
     let manifest_path = output_root.join(manifest_relative);
     let input = sample("banner_1");
     let request = write_request(temp.path());
-    let read_only_stdout = temp.path().join("read-only-stdout");
-    fs::write(&read_only_stdout, b"unchanged").unwrap();
+    let (stdout_reader, stdout_writer) = std::io::pipe().unwrap();
+    drop(stdout_reader);
 
-    let status = Command::new(env!("CARGO_BIN_EXE_unity-asset"))
+    let failed = Command::new(env!("CARGO_BIN_EXE_unity-asset"))
         .arg("export")
         .arg("--input")
         .arg(&input)
@@ -275,17 +275,23 @@ fn export_atomically_publishes_a_durable_resume_manifest() {
         .arg(&request)
         .arg("--manifest")
         .arg(manifest_relative)
-        .stdout(Stdio::from(fs::File::open(&read_only_stdout).unwrap()))
-        .status()
+        .stdout(Stdio::from(stdout_writer))
+        .stderr(Stdio::piped())
+        .output()
         .expect("the export command must start");
     assert!(
-        !status.success(),
+        !failed.status.success(),
         "the injected stdout failure must surface"
+    );
+    let error: serde_json::Value = serde_json::from_slice(&failed.stderr).unwrap();
+    assert_eq!(error["code"], "CLI_COMMAND_FAILED");
+    assert_eq!(
+        error["message"],
+        "Failed to write the canonical extraction report"
     );
     let first: serde_json::Value =
         serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
     assert_eq!(first["artifacts"][0]["status"], "written");
-    assert_eq!(fs::read(&read_only_stdout).unwrap(), b"unchanged");
 
     let resumed = export_with_manifest(
         &input,
