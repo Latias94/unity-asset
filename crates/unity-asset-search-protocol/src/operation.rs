@@ -379,14 +379,6 @@ pub enum BackgroundReindexOrigin {
     SemanticUpgrade,
 }
 
-pub const BACKGROUND_REINDEX_ORIGINS: [BackgroundReindexOrigin; MAX_BACKGROUND_REINDEX_OPERATIONS] = [
-    BackgroundReindexOrigin::Startup,
-    BackgroundReindexOrigin::Watcher,
-    BackgroundReindexOrigin::WatcherOverflow,
-    BackgroundReindexOrigin::Timer,
-    BackgroundReindexOrigin::SemanticUpgrade,
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackgroundReindexOperation {

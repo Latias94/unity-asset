@@ -9,8 +9,8 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use unity_asset_search_index::FilesystemReindexIntent;
 use unity_asset_search_protocol::{
-    BACKGROUND_REINDEX_ORIGINS, BackgroundReindexOperation, BackgroundReindexOrigin,
-    DaemonInstanceId, OperationId, ReindexOperationState, ReindexReceipt, StatusResponse,
+    BackgroundReindexOperation, BackgroundReindexOrigin, DaemonInstanceId, OperationId,
+    ReindexOperationState, ReindexReceipt, StatusResponse,
 };
 
 use crate::coordinator::{
@@ -461,14 +461,9 @@ impl OperationService {
         let captured = {
             let mut registry = self.state.lock().await;
             registry.prune(Instant::now(), self.retention);
-            let mut captured = Vec::with_capacity(BACKGROUND_REINDEX_ORIGINS.len());
-            for origin in BACKGROUND_REINDEX_ORIGINS {
-                let Some(operation_id) = registry
-                    .background_by_origin
-                    .get(&origin)
-                    .and_then(|operations| operations.back())
-                    .copied()
-                else {
+            let mut captured = Vec::with_capacity(registry.background_by_origin.len());
+            for (&origin, operation_ids) in &registry.background_by_origin {
+                let Some(operation_id) = operation_ids.back().copied() else {
                     continue;
                 };
                 let Some(record) = registry.entries.get(&operation_id) else {
