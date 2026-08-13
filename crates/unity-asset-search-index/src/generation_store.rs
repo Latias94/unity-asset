@@ -35,7 +35,7 @@ use unity_asset_search_local::{PrivateIndexRootV1, PrivateRootsError};
 use crate::anchored_fs::{
     AnchoredFsError as SecureReadError, EntryKindHint, OpenPolicy,
     ReadDirectory as SecureReadDirectory, RegularFile as SecureRegularFile,
-    StableDirectoryIdentity,
+    StableDirectoryIdentity, StableFileIdentity,
 };
 
 const GENERATIONS_DIRECTORY: &str = "generations";
@@ -2514,16 +2514,14 @@ impl GenerationStore {
                     )
                 },
             )?;
-        let mut activation_snapshot =
+        let activation_snapshot =
             activation_candidates_for_open(&self.activations, &opened_activations, budget)?;
-        let mut candidates = std::mem::take(&mut activation_snapshot.candidates);
-        candidates.sort_unstable_by_key(|candidate| std::cmp::Reverse(candidate.ordinal));
 
         let retained = (|| {
             let mut seen = BTreeSet::new();
             seen.insert(active.generation());
             let mut retained = Vec::new();
-            for candidate in candidates {
+            for candidate in activation_snapshot.candidates.iter().rev() {
                 if retained.len() >= self.options.retain_previous_generations {
                     break;
                 }
@@ -2532,6 +2530,7 @@ impl GenerationStore {
                     &candidate.display_path,
                     &candidate.file_name,
                     candidate.ordinal,
+                    Some(candidate.identity),
                     budget,
                 ) {
                     Ok(record) => record,
@@ -2557,11 +2556,11 @@ impl GenerationStore {
             }
             Ok(retained)
         })();
-        revalidate_opened_directory_snapshot(
+        revalidate_activation_candidates(
             &self.activations,
             &opened_activations,
-            activation_snapshot.directory_identity,
-            "revalidate activation directory after reading retained history",
+            &activation_snapshot,
+            budget,
         )?;
         retained
     }
@@ -2687,6 +2686,7 @@ struct ActivationCandidate {
     ordinal: u64,
     display_path: PathBuf,
     file_name: OsString,
+    identity: StableFileIdentity,
 }
 
 #[derive(Debug)]
@@ -2824,7 +2824,7 @@ struct BudgetedDirectoryEntry {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum OpenedDirectoryEntryKind {
     Directory,
-    Regular,
+    Regular(StableFileIdentity),
 }
 
 struct OpenedBudgetedDirectoryEntry {
@@ -2930,7 +2930,9 @@ fn visit_opened_directory_entries_budgeted(
             &display_path,
         )? {
             OpenedArtifactEntry::Directory(_) => OpenedDirectoryEntryKind::Directory,
-            OpenedArtifactEntry::Regular(_) => OpenedDirectoryEntryKind::Regular,
+            OpenedArtifactEntry::Regular(file) => {
+                OpenedDirectoryEntryKind::Regular(file.stable_identity())
+            }
         };
         visitor(
             OpenedBudgetedDirectoryEntry {
@@ -3349,7 +3351,7 @@ fn activation_directory_has_capacity(
         if parse_activation_file_name(name).is_none() {
             return Ok(());
         }
-        if entry.kind != OpenedDirectoryEntryKind::Regular {
+        if !matches!(entry.kind, OpenedDirectoryEntryKind::Regular(_)) {
             return Err(GenerationStoreError::UnsupportedFileType {
                 path: entry.display_path,
             });
@@ -3457,11 +3459,11 @@ fn activation_candidates_for_open(
             let Some(ordinal) = parse_activation_file_name(name) else {
                 return Ok(());
             };
-            if entry.kind != OpenedDirectoryEntryKind::Regular {
+            let OpenedDirectoryEntryKind::Regular(identity) = entry.kind else {
                 return Err(GenerationStoreError::UnsupportedFileType {
                     path: entry.display_path,
                 });
-            }
+            };
             maximum = maximum.max(ordinal);
             push_activation_candidate(
                 &mut candidates,
@@ -3469,6 +3471,7 @@ fn activation_candidates_for_open(
                     ordinal,
                     display_path: entry.display_path,
                     file_name: entry.file_name,
+                    identity,
                 },
                 Some(budget),
             )
@@ -3489,6 +3492,58 @@ fn activation_candidates_for_open(
         next_ordinal: next,
         directory_identity,
     })
+}
+
+fn revalidate_activation_candidates(
+    activations: &Path,
+    opened_activations: &SecureReadDirectory,
+    snapshot: &ActivationDirectorySnapshot,
+    budget: &mut AssetLoadBudget,
+) -> Result<(), GenerationStoreError> {
+    let mut observed = 0_usize;
+    visit_opened_directory_entries_budgeted(
+        activations,
+        opened_activations,
+        budget,
+        |entry, _budget| {
+            let Some(name) = entry.file_name.to_str() else {
+                return Ok(());
+            };
+            let Some(ordinal) = parse_activation_file_name(name) else {
+                return Ok(());
+            };
+            let OpenedDirectoryEntryKind::Regular(identity) = entry.kind else {
+                return Err(GenerationStoreError::UnsupportedFileType {
+                    path: entry.display_path,
+                });
+            };
+            let candidate = snapshot
+                .candidates
+                .binary_search_by_key(&ordinal, |candidate| candidate.ordinal)
+                .ok()
+                .and_then(|index| snapshot.candidates.get(index));
+            if !candidate.is_some_and(|candidate| {
+                candidate.file_name == entry.file_name && candidate.identity == identity
+            }) {
+                return Err(GenerationStoreError::PersistedIdentityChanged {
+                    path: activations.to_path_buf(),
+                });
+            }
+            observed = observed.saturating_add(1);
+            Ok(())
+        },
+    )?;
+    if observed != snapshot.candidates.len() {
+        return Err(GenerationStoreError::PersistedIdentityChanged {
+            path: activations.to_path_buf(),
+        });
+    }
+    revalidate_opened_directory_snapshot(
+        activations,
+        opened_activations,
+        snapshot.directory_identity,
+        "revalidate activation directory after comparing candidates",
+    )
 }
 
 fn push_activation_candidate(
@@ -3598,6 +3653,7 @@ fn select_active_generation(
             &candidate.display_path,
             &candidate.file_name,
             candidate.ordinal,
+            Some(candidate.identity),
             budget,
         );
         match record {
@@ -3626,12 +3682,7 @@ fn select_active_generation(
     } else {
         Ok(SelectedGeneration::Ready(None))
     };
-    revalidate_opened_directory_snapshot(
-        activations,
-        opened_activations,
-        snapshot.directory_identity,
-        "revalidate activation directory after selecting the active generation",
-    )?;
+    revalidate_activation_candidates(activations, opened_activations, snapshot, budget)?;
     selected
 }
 
@@ -3640,6 +3691,7 @@ fn read_activation_record(
     path: &Path,
     file_name: &OsStr,
     expected_ordinal: u64,
+    expected_identity: Option<StableFileIdentity>,
     budget: &mut AssetLoadBudget,
 ) -> Result<GenerationHeadRecord, GenerationStoreError> {
     let mut file = open_contract_file(
@@ -3649,6 +3701,20 @@ fn read_activation_record(
         MAX_ACTIVATION_BYTES_U64,
         "activation record",
     )?;
+    if let Some(expected_identity) = expected_identity {
+        let same_identity = file.same_identity(expected_identity).map_err(|source| {
+            persisted_read_error(
+                "compare activation record snapshot identity",
+                path.to_path_buf(),
+                source,
+            )
+        })?;
+        if !same_identity {
+            return Err(GenerationStoreError::PersistedIdentityChanged {
+                path: path.to_path_buf(),
+            });
+        }
+    }
     let decoded = read_contract_json::<GenerationHeadRecordWire>(
         file.file_mut(),
         budget,
@@ -6274,6 +6340,7 @@ mod generation_store_tests {
             &path,
             OsStr::new("activation.json"),
             0,
+            None,
             &mut measured_budget,
         )
         .unwrap_err();
@@ -6299,6 +6366,7 @@ mod generation_store_tests {
             &path,
             OsStr::new("activation.json"),
             0,
+            None,
             &mut one_byte_short,
         )
         .unwrap_err();
@@ -6316,6 +6384,15 @@ mod generation_store_tests {
 
     #[test]
     fn activation_candidate_vector_has_a_hard_limit() {
+        let temporary = crate::secure_test_tempdir();
+        let candidate = temporary.path().join("candidate.json");
+        fs::write(&candidate, b"{}").unwrap();
+        let directory =
+            SecureReadDirectory::open(temporary.path(), OpenPolicy::PersistedState).unwrap();
+        let identity = directory
+            .open_regular(OsStr::new("candidate.json"))
+            .unwrap()
+            .stable_identity();
         let mut candidates = Vec::new();
         for ordinal in 0..MAX_ACTIVATION_CANDIDATES {
             push_activation_candidate(
@@ -6324,6 +6401,7 @@ mod generation_store_tests {
                     ordinal: u64::try_from(ordinal).unwrap(),
                     display_path: PathBuf::new(),
                     file_name: OsString::new(),
+                    identity,
                 },
                 None,
             )
@@ -6337,6 +6415,7 @@ mod generation_store_tests {
                     ordinal: u64::try_from(MAX_ACTIVATION_CANDIDATES).unwrap(),
                     display_path: PathBuf::new(),
                     file_name: OsString::new(),
+                    identity,
                 },
                 None,
             ),
@@ -6366,15 +6445,26 @@ mod generation_store_tests {
     }
 
     #[test]
-    fn activation_snapshot_rejects_a_higher_head_or_candidate_replacement_before_selection() {
-        for replace_existing in [false, true] {
+    fn activation_snapshot_rejects_candidate_set_or_identity_changes_before_selection() {
+        #[derive(Clone, Copy)]
+        enum Mutation {
+            AddHigher,
+            RemoveExisting,
+            ReplaceExisting,
+        }
+
+        for mutation in [
+            Mutation::AddHigher,
+            Mutation::RemoveExisting,
+            Mutation::ReplaceExisting,
+        ] {
             let temporary = crate::secure_test_tempdir();
             let activations = temporary.path().join("activations");
             let generations = temporary.path().join("generations");
             fs::create_dir(&activations).unwrap();
             fs::create_dir(&generations).unwrap();
             let first = activations.join(activation_file_name(1));
-            if replace_existing {
+            if !matches!(mutation, Mutation::AddHigher) {
                 fs::write(&first, b"{}").unwrap();
             }
             let opened_activations =
@@ -6386,11 +6476,15 @@ mod generation_store_tests {
                 activation_candidates_for_open(&activations, &opened_activations, &mut budget)
                     .unwrap();
 
-            if replace_existing {
-                fs::remove_file(&first).unwrap();
-                fs::write(&first, b"{\"ordinal\":1}").unwrap();
-            } else {
-                fs::write(activations.join(activation_file_name(2)), b"{}").unwrap();
+            match mutation {
+                Mutation::AddHigher => {
+                    fs::write(activations.join(activation_file_name(2)), b"{}").unwrap();
+                }
+                Mutation::RemoveExisting => fs::remove_file(&first).unwrap(),
+                Mutation::ReplaceExisting => {
+                    fs::remove_file(&first).unwrap();
+                    fs::write(&first, b"{\"ordinal\":1}").unwrap();
+                }
             }
 
             let error = select_active_generation(
