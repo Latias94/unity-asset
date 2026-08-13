@@ -1145,7 +1145,7 @@ mod platform {
         expected_uid: u32,
     ) -> Result<(PathBuf, PrivateDirectory), PrivateRootsError> {
         let kind = PrivateRootKind::Runtime;
-        let base_path = darwin_user_temporary_directory().map_err(|source| {
+        let requested_base_path = darwin_user_temporary_directory().map_err(|source| {
             filesystem_error(
                 kind,
                 "resolve user temporary base",
@@ -1153,6 +1153,15 @@ mod platform {
                 source,
             )
         })?;
+        let base_path =
+            resolve_trusted_locator_ancestors(&requested_base_path).map_err(|source| {
+                filesystem_error(
+                    kind,
+                    "resolve user temporary base ancestors",
+                    &requested_base_path,
+                    source,
+                )
+            })?;
         let base = open_path(&base_path).map_err(|source| {
             filesystem_error(kind, "open user temporary base", &base_path, source)
         })?;
@@ -1160,6 +1169,16 @@ mod platform {
             filesystem_error(kind, "validate user temporary base", &base_path, source)
         })?;
         create_product_root(kind, &base_path, &base, expected_uid)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn resolve_trusted_locator_ancestors(requested: &Path) -> io::Result<PathBuf> {
+        if !requested.is_absolute() {
+            return Err(invalid_path());
+        }
+        let parent = requested.parent().ok_or_else(invalid_path)?;
+        let leaf = requested.file_name().ok_or_else(invalid_path)?;
+        std::fs::canonicalize(parent).map(|physical_parent| physical_parent.join(leaf))
     }
 
     fn discover_cache(expected_uid: u32) -> Result<(PathBuf, PrivateDirectory), PrivateRootsError> {
@@ -1173,9 +1192,17 @@ mod platform {
         #[cfg(target_os = "macos")]
         {
             let kind = PrivateRootKind::Cache;
-            let base_path = effective_home_directory(expected_uid)?
-                .join("Library")
-                .join("Caches");
+            let requested_home = effective_home_directory(expected_uid)?;
+            let physical_home =
+                resolve_trusted_locator_ancestors(&requested_home).map_err(|source| {
+                    filesystem_error(
+                        kind,
+                        "resolve effective-user home ancestors",
+                        &requested_home,
+                        source,
+                    )
+                })?;
+            let base_path = physical_home.join("Library").join("Caches");
             let base = open_or_create_owner_controlled_base(&base_path, expected_uid)
                 .map_err(|source| filesystem_error(kind, "open cache base", &base_path, source))?;
             create_product_root(kind, &base_path, &base, expected_uid)
@@ -1214,6 +1241,7 @@ mod platform {
         Ok((path, root))
     }
 
+    #[cfg(target_os = "linux")]
     fn environment_path(
         variable: &'static str,
         value: OsString,
@@ -1725,9 +1753,18 @@ mod platform {
 
         use super::*;
 
+        fn strict_test_tempdir() -> tempfile::TempDir {
+            let temporary_root = std::fs::canonicalize(std::env::temp_dir())
+                .expect("canonicalize the test temporary root");
+            tempfile::Builder::new()
+                .prefix("unity-asset-search-local-test-")
+                .tempdir_in(temporary_root)
+                .expect("create a test directory below the physical temporary root")
+        }
+
         #[test]
         fn private_child_is_exactly_private_and_revalidation_detects_widening() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let base = open_path(temporary.path()).unwrap();
             let path = temporary.path().join("private");
@@ -1756,7 +1793,7 @@ mod platform {
 
         #[test]
         fn private_root_rejects_a_linked_component() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             let target = temporary.path().join("target");
             let linked = temporary.path().join("linked");
             fs::create_dir(&target).unwrap();
@@ -1766,7 +1803,7 @@ mod platform {
 
         #[test]
         fn strict_override_rejects_a_non_sticky_world_writable_ancestor() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             let unsafe_parent = temporary.path().join("unsafe-parent");
             fs::create_dir(&unsafe_parent).unwrap();
             fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
@@ -1783,7 +1820,7 @@ mod platform {
 
         #[test]
         fn strict_override_revalidation_detects_ancestor_permission_widening() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             let stable_parent = temporary.path().join("stable-parent");
             fs::create_dir(&stable_parent).unwrap();
             fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1804,7 +1841,7 @@ mod platform {
 
         #[test]
         fn existing_insecure_child_is_rejected_without_permission_repair() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let base = open_path(temporary.path()).unwrap();
             let child = temporary.path().join("insecure");
@@ -1832,8 +1869,31 @@ mod platform {
 
         #[cfg(target_os = "macos")]
         #[test]
+        fn trusted_locator_resolves_ancestor_alias_without_following_the_leaf() {
+            let temporary = strict_test_tempdir();
+            let physical_parent = temporary.path().join("physical-parent");
+            let base = physical_parent.join("base");
+            let alias = temporary.path().join("alias");
+            fs::create_dir(&physical_parent).unwrap();
+            fs::create_dir(&base).unwrap();
+            symlink(&physical_parent, &alias).unwrap();
+
+            let bound = resolve_trusted_locator_ancestors(&alias.join("base")).unwrap();
+
+            assert_eq!(bound, base);
+            open_path(&bound).unwrap();
+
+            let linked_leaf = physical_parent.join("linked-base");
+            symlink(&base, &linked_leaf).unwrap();
+            let bound_leaf = resolve_trusted_locator_ancestors(&linked_leaf).unwrap();
+            assert_eq!(bound_leaf, linked_leaf);
+            assert!(open_path(&bound_leaf).is_err());
+        }
+
+        #[cfg(target_os = "macos")]
+        #[test]
         fn private_directory_rejects_an_extended_acl_even_with_mode_0700() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let base = open_path(temporary.path()).unwrap();
             let path = temporary.path().join("private");
@@ -1858,7 +1918,7 @@ mod platform {
         #[cfg(target_os = "macos")]
         #[test]
         fn strict_override_rejects_an_ancestor_allow_acl_before_creation() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let ancestor = temporary.path().join("acl-ancestor");
             fs::create_dir(&ancestor).unwrap();
@@ -1881,7 +1941,7 @@ mod platform {
         #[cfg(target_os = "macos")]
         #[test]
         fn strict_override_allows_a_deny_only_ancestor_acl() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let ancestor = temporary.path().join("acl-ancestor");
             fs::create_dir(&ancestor).unwrap();
@@ -1908,6 +1968,7 @@ mod platform {
             assert!(status.success(), "failed to install test ACL: {entry}");
         }
 
+        #[cfg(target_os = "linux")]
         #[test]
         fn environment_roots_must_be_absolute_and_nonempty() {
             assert!(matches!(
@@ -1923,7 +1984,7 @@ mod platform {
         #[cfg(target_os = "linux")]
         #[test]
         fn linux_xdg_roots_are_created_under_validated_bases() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             let runtime_base = temporary.path().join("runtime");
             let cache_base = temporary.path().join("cache");
             fs::create_dir(&runtime_base).unwrap();
@@ -1961,7 +2022,7 @@ mod platform {
         #[cfg(target_os = "linux")]
         #[test]
         fn invalid_explicit_xdg_runtime_never_falls_back() {
-            let temporary = tempfile::tempdir().unwrap();
+            let temporary = strict_test_tempdir();
             let runtime_base = temporary.path().join("runtime");
             fs::create_dir(&runtime_base).unwrap();
             fs::set_permissions(&runtime_base, fs::Permissions::from_mode(0o755)).unwrap();

@@ -17,6 +17,34 @@ use unity_asset_search_protocol::{
     SEARCH_PROTOCOL_REVISION, SearchCapabilities, StatusResponse,
 };
 
+struct ProjectFixture {
+    _temporary: tempfile::TempDir,
+    paths: IndexPaths,
+}
+
+impl ProjectFixture {
+    fn new() -> Self {
+        let temporary = crate::secure_test_tempdir();
+        let assets = temporary.path().join("Assets");
+        std::fs::create_dir(&assets).expect("create coordinator Assets root");
+        let index_root = temporary.path().join(".unity-asset-index");
+        let paths = IndexPaths::for_project(
+            temporary.path().to_path_buf(),
+            Some(index_root),
+            Some(vec![assets]),
+        )
+        .expect("create coordinator project path space");
+        Self {
+            _temporary: temporary,
+            paths,
+        }
+    }
+
+    fn path_space(&self) -> &ProjectPathSpace {
+        self.paths.project_path_space()
+    }
+}
+
 fn project_paths() -> ProjectPathSpace {
     let project = crate::secure_test_tempdir();
     let assets = project.path().join("Assets");
@@ -188,7 +216,8 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
 
 #[tokio::test]
 async fn changed_paths_are_normalized_and_cross_project_paths_fail_closed() {
-    let owned_project_paths = project_paths();
+    let owned_project = ProjectFixture::new();
+    let owned_project_paths = owned_project.path_space();
     let observed = Arc::new(Mutex::new(Vec::new()));
     let _runtime = ReindexCoordinatorRuntime::start(config_for(owned_project_paths.clone()), {
         let observed = Arc::clone(&observed);
@@ -205,7 +234,7 @@ async fn changed_paths_are_normalized_and_cross_project_paths_fail_closed() {
     coordinator
         .admit(
             ReindexSource::Ipc,
-            changed(&owned_project_paths, "Assets/../Assets/hero.prefab"),
+            changed(owned_project_paths, "Assets/../Assets/hero.prefab"),
         )
         .await
         .unwrap();
@@ -223,12 +252,19 @@ async fn changed_paths_are_normalized_and_cross_project_paths_fail_closed() {
     );
     drop(intents);
 
-    let foreign_paths = project_paths();
-    let foreign = changed(&foreign_paths, "Assets/foreign.prefab");
-    assert!(matches!(
-        coordinator.admit(ReindexSource::Ipc, foreign).await,
-        Err(CoordinatorError::ChangedPathProjectMismatch { .. })
-    ));
+    let foreign_project = ProjectFixture::new();
+    let foreign_paths = foreign_project.path_space();
+    let owned_project_id = owned_project_paths.project_id();
+    let foreign_project_id = foreign_paths.project_id();
+    assert_ne!(owned_project_id, foreign_project_id);
+    let foreign = changed(foreign_paths, "Assets/foreign.prefab");
+    match coordinator.admit(ReindexSource::Ipc, foreign).await {
+        Err(CoordinatorError::ChangedPathProjectMismatch { expected, actual }) => {
+            assert_eq!(expected, owned_project_id);
+            assert_eq!(actual, foreign_project_id);
+        }
+        unexpected => panic!("foreign changed paths were not rejected: {unexpected:?}"),
+    }
 }
 
 #[tokio::test]
