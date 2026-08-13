@@ -1323,6 +1323,51 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn expired_daemon_owned_operation_remains_discoverable_and_not_client_cancelable() {
+        let fixture = CoordinatorFixture::pending();
+        let retention = OperationRetentionPolicy {
+            maximum_active: 4,
+            maximum_client_active: 4,
+            maximum_terminal: 4,
+            maximum_expired: 4,
+            terminal_retention: Duration::from_secs(1),
+            expired_retention: Duration::from_secs(1),
+        };
+        let service = OperationService::with_retention(
+            DaemonInstanceId::from_bytes([13; 16]),
+            fixture.runtime.coordinator(),
+            AdmissionGate::default(),
+            retention,
+        );
+        let operation = service
+            .admit(
+                OperationOrigin::Watcher,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+        service
+            .state
+            .lock()
+            .await
+            .mark_terminal(operation.operation_id, Instant::now(), retention);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let expired = background_operation(&service, BackgroundReindexOrigin::Watcher)
+            .await
+            .unwrap();
+        assert_eq!(expired.operation_id, operation.operation_id);
+        assert_eq!(expired.state, ReindexOperationState::Expired);
+        assert!(matches!(
+            service.cancel(operation.operation_id).await,
+            Err(OperationError::ControlForbidden {
+                origin: OperationOrigin::Watcher
+            })
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn background_summary_falls_back_to_an_older_retained_operation() {
         let fixture = CoordinatorFixture::pending();
         let retention = OperationRetentionPolicy {

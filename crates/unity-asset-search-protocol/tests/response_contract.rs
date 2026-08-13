@@ -1,18 +1,18 @@
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_protocol::{
-    ApiError, ApiErrorCode, BackgroundReindexOperation, BackgroundReindexOrigin, DaemonInstanceId,
-    FilesystemReindexIntent, FreshnessMaintenance, FuzzyWorkUsageV1, GenerationFreshness,
-    GenerationIdV1, GenerationMaintenanceState, GenerationStamp, GenerationStatus,
-    MAX_API_ERROR_JSON_BYTES, MAX_ERROR_MESSAGE_BYTES, MAX_REINDEX_PUBLISH_WARNING_BYTES,
-    MAX_REINDEX_PUBLISH_WARNINGS, MAX_SEARCH_HITS_JSON_BYTES, MatchCountRelationV1, MatchCountV1,
-    OperationId, PortablePath, ProjectId, QueryPolicyId, ReferenceCoverage,
-    ReferenceDiagnosticCoverage, ReferenceRequest, ReferencesResponse, ReindexAdmitRequest,
-    ReindexDisposition, ReindexEvidence, ReindexOperationState, ReindexOperationStatus,
-    ReindexReceipt, ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation,
-    ResponseEnvelope, ResponseOperation, ResponseOutcome, SEARCH_PROTOCOL_REVISION,
-    SearchCapabilities, SearchRequest, SearchResponse, ServingAvailability, ShutdownRequest,
-    StatusResponse, SuggestRequest, SuggestResponse, TimerLifecycleState, ValidateContract,
-    WatcherLifecycleState, encode_response_frame,
+    ApiError, ApiErrorCode, BackgroundReindexOperation, BackgroundReindexOrigin,
+    ContractValidationError, DaemonInstanceId, FilesystemReindexIntent, FreshnessMaintenance,
+    FuzzyWorkUsageV1, GenerationFreshness, GenerationIdV1, GenerationMaintenanceState,
+    GenerationStamp, GenerationStatus, MAX_API_ERROR_JSON_BYTES, MAX_BACKGROUND_REINDEX_OPERATIONS,
+    MAX_ERROR_MESSAGE_BYTES, MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS,
+    MAX_SEARCH_HITS_JSON_BYTES, MatchCountRelationV1, MatchCountV1, OperationId, PortablePath,
+    ProjectId, QueryPolicyId, ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest,
+    ReferencesResponse, ReindexAdmitRequest, ReindexDisposition, ReindexEvidence,
+    ReindexOperationState, ReindexOperationStatus, ReindexReceipt, ReindexWaitRequest,
+    RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope, ResponseOperation,
+    ResponseOutcome, SEARCH_PROTOCOL_REVISION, SearchCapabilities, SearchRequest, SearchResponse,
+    ServingAvailability, ShutdownRequest, StatusResponse, SuggestRequest, SuggestResponse,
+    TimerLifecycleState, ValidateContract, WatcherLifecycleState, encode_response_frame,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -320,6 +320,24 @@ fn background_reindex_operations_are_bounded_ordered_and_non_lost() {
         ),
     ];
     response.validate().unwrap();
+
+    let mut too_many = response.clone();
+    too_many
+        .daemon
+        .background_reindex_operations
+        .push(operation(
+            BackgroundReindexOrigin::SemanticUpgrade,
+            6,
+            ReindexOperationState::Queued,
+        ));
+    assert!(matches!(
+        too_many.validate(),
+        Err(ContractValidationError::EntryLimit {
+            field: "background reindex operations",
+            actual: 6,
+            maximum: MAX_BACKGROUND_REINDEX_OPERATIONS,
+        })
+    ));
 
     let mut duplicate_origin = response.clone();
     duplicate_origin.daemon.background_reindex_operations[1].origin =

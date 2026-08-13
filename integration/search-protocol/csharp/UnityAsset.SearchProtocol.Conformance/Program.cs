@@ -802,9 +802,12 @@ internal static class ConformanceProgram
         {
             tooManyOperations.Add(BackgroundOperation("startup", (char)('a' + index), "queued"));
         }
-        ExpectFailure(
+        Exception tooManyError = ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(tooMany)),
             "too many background operations");
+        Require(
+            tooManyError.Message.EndsWith("exceeds 5 entries", StringComparison.Ordinal),
+            "Background-operation count hardening did not exercise the explicit entry limit.");
     }
 
     private static JsonObject BackgroundOperation(string origin, char idDigit, string state)
@@ -1112,23 +1115,31 @@ internal static class ConformanceProgram
         using (var stream = new MemoryStream(new byte[] { 0, 0, 0, 2 }))
         using (var framed = new FramedProtocolStream(stream))
         {
-            await ExpectFailureAsync(
+            Exception declarationError = await ExpectFailureAsync(
                 () => framed.ReadPayloadAsync(1, CancellationToken.None),
                 "oversized frame declaration").ConfigureAwait(false);
-            await ExpectFailureAsync(
+            Require(
+                declarationError is ProtocolValidationException,
+                "Oversized frame declaration did not fail protocol validation.");
+            Exception reuseError = await ExpectFailureAsync(
                 () => framed.ReadPayloadAsync(1, CancellationToken.None),
                 "oversized frame stream reuse").ConfigureAwait(false);
+            RequirePoisonedStream(reuseError, "oversized frame stream reuse");
         }
 
         using var cancellation = new CancellationTokenSource();
         using var partial = new CancelAfterPartialReadStream(cancellation);
         using var cancelled = new FramedProtocolStream(partial);
-        await ExpectFailureAsync(
+        Exception cancellationError = await ExpectFailureAsync(
             () => cancelled.ReadPayloadAsync(8, cancellation.Token),
             "cancelled partial frame").ConfigureAwait(false);
-        await ExpectFailureAsync(
+        Require(
+            cancellationError is OperationCanceledException,
+            "Cancelled partial frame did not preserve cancellation evidence.");
+        Exception cancelledReuseError = await ExpectFailureAsync(
             () => cancelled.ReadPayloadAsync(8, CancellationToken.None),
             "cancelled frame stream reuse").ConfigureAwait(false);
+        RequirePoisonedStream(cancelledReuseError, "cancelled frame stream reuse");
     }
 
     private static async Task AssertPublicProtocolSessionAsync(string fixtureRoot)
@@ -1582,6 +1593,14 @@ internal static class ConformanceProgram
             return error;
         }
         throw new InvalidOperationException($"Expected rejection did not occur: {subject}");
+    }
+
+    private static void RequirePoisonedStream(Exception error, string subject)
+    {
+        Require(
+            error.GetType() == typeof(IOException)
+                && error.Message == "Protocol stream is poisoned after an incomplete or invalid exchange.",
+            $"{subject} did not fail from the poisoned-stream guard.");
     }
 
     private static void Require(bool condition, string message)
