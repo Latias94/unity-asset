@@ -5088,7 +5088,10 @@ mod tests {
         assert_eq!(path, PathBuf::from(r"\\?\C:\Project\Assets\owner.prefab"));
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Linux permits arbitrary non-UTF-8 directory-entry bytes. macOS rejects
+    // the same fixture at file creation time, so its path-boundary coverage
+    // lives in `path_semantics` instead.
+    #[cfg(target_os = "linux")]
     #[test]
     fn non_utf8_entry_is_diagnosed_without_becoming_a_candidate() {
         use std::os::unix::ffi::OsStringExt as _;
