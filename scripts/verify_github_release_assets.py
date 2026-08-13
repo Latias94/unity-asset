@@ -15,10 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from release_path_safety import (
-    ReleasePathSafetyError,
-    is_link_or_junction,
-    reject_link_components,
+from release_contract import GIT_OBJECT_PATTERN
+from release_evidence import (
+    ReleaseEvidenceError,
+    TAG_PATTERN,
+    load_release_evidence,
 )
 from release_metadata import (
     ReleaseMetadata,
@@ -27,24 +28,19 @@ from release_metadata import (
     normalize_title as normalize_release_title,
     verify_metadata_files,
 )
-from verify_release_bundle import ReleaseBundleError, verify_release_bundle
+from verify_release_bundle import (
+    ReleaseBundleError,
+    VerifiedReleaseAsset,
+    verify_release_bundle,
+)
 
 GITHUB_REPOSITORY_PATTERN = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
-TAG_PATTERN = re.compile(r"v\d+\.\d+\.\d+")
-COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 GH_COMMAND_TIMEOUT_SECONDS = 60
 ASSET_DOWNLOAD_TIMEOUT_SECONDS = 120
 
 
 class ReleaseAssetError(RuntimeError):
     """An actionable GitHub Release asset verification failure."""
-
-
-@dataclass(frozen=True)
-class ExpectedAsset:
-    name: str
-    size: int
-    sha256: str
 
 
 @dataclass(frozen=True)
@@ -100,44 +96,6 @@ def read_expected_release_metadata(
         return verify_metadata_files(evidence_path, title, body_path)
     except ReleaseMetadataError as error:
         raise ReleaseAssetError(f"invalid verified GitHub Release metadata: {error}") from error
-
-
-def expected_assets(root: Path) -> dict[str, ExpectedAsset]:
-    try:
-        root = reject_link_components(root, "release asset directory")
-    except ReleasePathSafetyError as error:
-        raise ReleaseAssetError(str(error)) from error
-    if is_link_or_junction(root) or not root.is_dir():
-        raise ReleaseAssetError(f"release asset directory must be a real directory: {root}")
-    assets: dict[str, ExpectedAsset] = {}
-    try:
-        entries = sorted(root.iterdir(), key=lambda path: path.name)
-    except OSError as error:
-        raise ReleaseAssetError(f"cannot enumerate release assets {root}: {error}") from error
-    for path in entries:
-        if is_link_or_junction(path) or not path.is_file():
-            raise ReleaseAssetError(f"release assets must be flat regular files: {path}")
-        name = path.name
-        if "\n" in name or "\r" in name:
-            raise ReleaseAssetError(f"release asset name contains a line break: {name!r}")
-        digest = hashlib.sha256()
-        try:
-            with path.open("rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            size = path.stat().st_size
-        except OSError as error:
-            raise ReleaseAssetError(f"cannot read release asset {path}: {error}") from error
-        assets[name] = ExpectedAsset(name=name, size=size, sha256=digest.hexdigest())
-    if not assets:
-        raise ReleaseAssetError("release asset directory is empty")
-    required = {"SHA256SUMS", "release-evidence.json", "release-dist-plan.json"}
-    if not required.issubset(assets):
-        raise ReleaseAssetError(
-            "release asset directory is missing required provenance files: "
-            + ", ".join(sorted(required - set(assets)))
-        )
-    return assets
 
 
 def run_gh(
@@ -278,7 +236,7 @@ def list_remote_assets(repository: str, release_id: int) -> list[RemoteAsset]:
 def download_remote_asset(
     repository: str,
     asset: RemoteAsset,
-    expected: ExpectedAsset,
+    expected: VerifiedReleaseAsset,
 ) -> str:
     arguments = [
         "api",
@@ -434,9 +392,9 @@ def release_metadata(
 
 
 def verify_remote_assets(
-    expected: Mapping[str, ExpectedAsset],
+    expected: Mapping[str, VerifiedReleaseAsset],
     remote_assets: Sequence[RemoteAsset],
-    downloader: Callable[[RemoteAsset, ExpectedAsset], str],
+    downloader: Callable[[RemoteAsset, VerifiedReleaseAsset], str],
     *,
     allow_expected_starters: bool = False,
 ) -> RemoteAssetVerification:
@@ -485,7 +443,7 @@ def verify_remote_assets(
 
 
 def examine_release(
-    expected: Mapping[str, ExpectedAsset],
+    expected: Mapping[str, VerifiedReleaseAsset],
     release: Mapping[str, Any] | None,
     *,
     tag: str,
@@ -493,7 +451,7 @@ def examine_release(
     phase: str,
     expected_metadata: ReleaseMetadata,
     assets_for_release: Callable[[int], Sequence[RemoteAsset]],
-    download: Callable[[RemoteAsset, ExpectedAsset], str],
+    download: Callable[[RemoteAsset, VerifiedReleaseAsset], str],
     expected_release_id: int | None = None,
 ) -> ReleaseState:
     if release is None:
@@ -585,7 +543,7 @@ def main() -> int:
     if TAG_PATTERN.fullmatch(args.tag) is None:
         raise ReleaseAssetError(f"invalid stable release tag: {args.tag!r}")
     commit = args.commit.lower()
-    if COMMIT_PATTERN.fullmatch(commit) is None:
+    if GIT_OBJECT_PATTERN.fullmatch(commit) is None:
         raise ReleaseAssetError(f"invalid release commit: {args.commit!r}")
     expected_release_id = args.expected_release_id
     if expected_release_id is not None and expected_release_id < 1:
@@ -595,24 +553,30 @@ def main() -> int:
             "final publication requires the staged GitHub Release ID"
         )
     try:
-        verify_release_bundle(
+        bundle = verify_release_bundle(
             args.assets,
             args.tag,
             args.expected_evidence_sha256,
+            expected_commit=commit,
         )
     except ReleaseBundleError as error:
         raise ReleaseAssetError(f"invalid local release bundle: {error}") from error
     try:
-        proof_evidence_sha256 = hashlib.sha256(args.evidence.read_bytes()).hexdigest()
-    except OSError as error:
-        raise ReleaseAssetError(
-            f"cannot read verified release evidence {args.evidence}: {error}"
-        ) from error
-    if proof_evidence_sha256 != args.expected_evidence_sha256:
-        raise ReleaseAssetError(
-            "verified release metadata evidence does not match source validation"
+        proof_evidence = load_release_evidence(
+            args.evidence,
+            expected_sha256=args.expected_evidence_sha256,
+            expected_tag=args.tag,
+            expected_commit=commit,
         )
-    expected = expected_assets(args.assets)
+    except ReleaseEvidenceError as error:
+        raise ReleaseAssetError(
+            f"invalid verified release evidence: {error}"
+        ) from error
+    if proof_evidence != bundle.evidence:
+        raise ReleaseAssetError(
+            "verified release metadata evidence differs from the release bundle"
+        )
+    expected = bundle.assets
     expected_metadata = read_expected_release_metadata(
         args.expected_title,
         args.expected_body_file,

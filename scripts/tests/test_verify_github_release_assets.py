@@ -13,9 +13,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-
 SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_ROOT))
+from verify_release_bundle import (  # noqa: E402
+    VerifiedReleaseAsset,
+    VerifiedReleaseBundle,
+)
+
 SCRIPT_PATH = SCRIPTS_ROOT / "verify_github_release_assets.py"
 SPEC = importlib.util.spec_from_file_location("github_release_assets", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
@@ -36,14 +40,19 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             "release-dist-plan.json": b'{"tag":"v0.4.0"}\n',
         }
         expected = {
-            name: VERIFIER.ExpectedAsset(
-                name=name,
+            name: VerifiedReleaseAsset(
                 size=len(contents),
                 sha256=hashlib.sha256(contents).hexdigest(),
             )
             for name, contents in payloads.items()
         }
         return expected, payloads
+
+    def verified_bundle(self, expected: dict[str, object]) -> VerifiedReleaseBundle:
+        return VerifiedReleaseBundle(
+            evidence=mock.sentinel.release_evidence,
+            assets=expected,
+        )
 
     @staticmethod
     def payload_digest(payloads: dict[str, bytes], asset: object) -> str:
@@ -99,28 +108,38 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             VERIFIER.RemoteAsset(index, name, len(contents))
             for index, (name, contents) in enumerate(payloads.items(), start=1)
         ]
-        return (
-            mock.patch.object(VERIFIER, "parse_args", return_value=args),
-            mock.patch.object(VERIFIER, "expected_assets", return_value=expected),
-            mock.patch.object(VERIFIER, "verify_release_bundle"),
-            mock.patch.object(Path, "read_bytes", return_value=b"evidence"),
-            mock.patch.object(
+        bundle = self.verified_bundle(expected)
+        return {
+            "args": mock.patch.object(VERIFIER, "parse_args", return_value=args),
+            "bundle": mock.patch.object(
+                VERIFIER, "verify_release_bundle", return_value=bundle
+            ),
+            "evidence": mock.patch.object(
+                VERIFIER,
+                "load_release_evidence",
+                return_value=bundle.evidence,
+            ),
+            "metadata": mock.patch.object(
                 VERIFIER,
                 "read_expected_release_metadata",
                 return_value=self.metadata(),
             ),
-            mock.patch.object(VERIFIER, "fetch_release", side_effect=releases),
-            mock.patch.object(VERIFIER, "list_remote_assets", return_value=remote),
-            mock.patch.object(
+            "fetch": mock.patch.object(
+                VERIFIER, "fetch_release", side_effect=releases
+            ),
+            "list_assets": mock.patch.object(
+                VERIFIER, "list_remote_assets", return_value=remote
+            ),
+            "download": mock.patch.object(
                 VERIFIER,
                 "download_remote_asset",
                 side_effect=lambda _repository, asset, _expected: self.payload_digest(
                     payloads, asset
                 ),
             ),
-            mock.patch.object(VERIFIER, "publish_draft"),
-            mock.patch.object(VERIFIER, "delete_remote_asset"),
-        )
+            "publish": mock.patch.object(VERIFIER, "publish_draft"),
+            "delete": mock.patch.object(VERIFIER, "delete_remote_asset"),
+        }
 
     def test_preflight_allows_absent_or_matching_draft_but_not_published_partial(self) -> None:
         expected, payloads = self.expected_assets()
@@ -230,11 +249,13 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             releases=[self.release(draft=True), self.release(draft=False)],
         )
         with ExitStack() as stack:
-            entered = [stack.enter_context(patch) for patch in patches]
+            entered = {
+                name: stack.enter_context(patch) for name, patch in patches.items()
+            }
             self.assertEqual(VERIFIER.main(), 0)
 
-        fetch = entered[5]
-        publish = entered[8]
+        fetch = entered["fetch"]
+        publish = entered["publish"]
         publish.assert_called_once_with(
             "owner/repository",
             42,
@@ -242,17 +263,31 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             commit="a" * 40,
             metadata=self.metadata(),
         )
+        entered["bundle"].assert_called_once_with(
+            Path("release-assets"),
+            "v0.4.0",
+            args.expected_evidence_sha256,
+            expected_commit="a" * 40,
+        )
+        entered["evidence"].assert_called_once_with(
+            Path("release-evidence.json"),
+            expected_sha256=args.expected_evidence_sha256,
+            expected_tag="v0.4.0",
+            expected_commit="a" * 40,
+        )
         self.assertEqual(fetch.call_count, 2)
 
     def test_main_recovers_when_bound_release_was_already_published(self) -> None:
         args = self.cli_args(phase="publish", expected_release_id=42)
         patches = self.main_patches(args=args, releases=[self.release(draft=False)])
         with ExitStack() as stack:
-            entered = [stack.enter_context(patch) for patch in patches]
+            entered = {
+                name: stack.enter_context(patch) for name, patch in patches.items()
+            }
             self.assertEqual(VERIFIER.main(), 0)
 
-        fetch = entered[5]
-        publish = entered[8]
+        fetch = entered["fetch"]
+        publish = entered["publish"]
         publish.assert_not_called()
         fetch.assert_called_once()
 
@@ -265,11 +300,14 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
                     releases=[self.release(draft=False)],
                 )
                 with ExitStack() as stack:
-                    entered = [stack.enter_context(patch) for patch in patches]
+                    entered = {
+                        name: stack.enter_context(patch)
+                        for name, patch in patches.items()
+                    }
                     self.assertEqual(VERIFIER.main(), 0)
 
-                entered[8].assert_not_called()
-                entered[5].assert_called_once()
+                entered["publish"].assert_not_called()
+                entered["fetch"].assert_called_once()
 
     def test_main_reads_back_terminal_state_after_publish_request_error(self) -> None:
         args = self.cli_args(phase="publish", expected_release_id=42)
@@ -278,11 +316,15 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             releases=[self.release(draft=True), self.release(draft=False)],
         )
         with ExitStack() as stack:
-            entered = [stack.enter_context(patch) for patch in patches]
-            entered[8].side_effect = VERIFIER.ReleaseAssetError("client timed out")
+            entered = {
+                name: stack.enter_context(patch) for name, patch in patches.items()
+            }
+            entered["publish"].side_effect = VERIFIER.ReleaseAssetError(
+                "client timed out"
+            )
             self.assertEqual(VERIFIER.main(), 0)
 
-        self.assertEqual(entered[5].call_count, 2)
+        self.assertEqual(entered["fetch"].call_count, 2)
 
     def test_main_preserves_publish_error_when_readback_is_not_terminal(self) -> None:
         args = self.cli_args(phase="publish", expected_release_id=42)
@@ -291,8 +333,12 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             releases=[self.release(draft=True), self.release(draft=True)],
         )
         with ExitStack() as stack:
-            entered = [stack.enter_context(patch) for patch in patches]
-            entered[8].side_effect = VERIFIER.ReleaseAssetError("client timed out")
+            entered = {
+                name: stack.enter_context(patch) for name, patch in patches.items()
+            }
+            entered["publish"].side_effect = VERIFIER.ReleaseAssetError(
+                "client timed out"
+            )
             with self.assertRaisesRegex(
                 VERIFIER.ReleaseAssetError,
                 "publish request failed and immediate readback",
@@ -309,7 +355,7 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             ],
         )
         with ExitStack() as stack:
-            for patch in patches:
+            for patch in patches.values():
                 stack.enter_context(patch)
             with self.assertRaisesRegex(VERIFIER.ReleaseAssetError, "release ID"):
                 VERIFIER.main()
@@ -454,8 +500,7 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
     def test_remote_asset_download_streams_to_a_bounded_digest(self) -> None:
         contents = b"daemon"
         asset = VERIFIER.RemoteAsset(1, "daemon.tar.xz", len(contents))
-        expected = VERIFIER.ExpectedAsset(
-            name=asset.name,
+        expected = VerifiedReleaseAsset(
             size=len(contents),
             sha256=hashlib.sha256(contents).hexdigest(),
         )
@@ -510,14 +555,16 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
                 )
             ],
         ]
-        with patches[0], mock.patch.object(
-            VERIFIER, "expected_assets", return_value=expected
-        ), patches[2], patches[3], patches[4], patches[5], mock.patch.object(
-            VERIFIER, "list_remote_assets", return_value=remote
-        ), patches[7], patches[8], patches[9] as delete:
+        with ExitStack() as stack:
+            entered = {
+                name: stack.enter_context(patch) for name, patch in patches.items()
+            }
+            stack.enter_context(
+                mock.patch.object(VERIFIER, "list_remote_assets", return_value=remote)
+            )
             self.assertEqual(VERIFIER.main(), 0)
 
-        delete.assert_called_once_with("owner/repository", 1)
+        entered["delete"].assert_called_once_with("owner/repository", 1)
 
     def test_starter_assets_are_rejected_outside_bound_draft_preflight(self) -> None:
         expected, _ = self.expected_assets()
@@ -601,26 +648,6 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             )
 
         self.assertEqual(metadata, expected)
-
-    def test_expected_assets_reject_symlinked_input_before_resolution(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            real = root / "real"
-            real.mkdir()
-            for name in (
-                "SHA256SUMS",
-                "release-evidence.json",
-                "release-dist-plan.json",
-            ):
-                (real / name).write_bytes(b"contents")
-            linked = root / "linked"
-            try:
-                linked.symlink_to(real, target_is_directory=True)
-            except OSError as error:
-                self.skipTest(f"symlinks are unavailable: {error}")
-            with self.assertRaisesRegex(VERIFIER.ReleaseAssetError, "symlink or junction"):
-                VERIFIER.expected_assets(linked)
-
 
 if __name__ == "__main__":
     unittest.main()

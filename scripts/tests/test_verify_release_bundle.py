@@ -127,13 +127,44 @@ class ReleaseBundleTests(unittest.TestCase):
 
     def test_accepts_a_complete_evidence_bound_bundle(self) -> None:
         root, evidence_digest, title, body = self.make_bundle()
-        verify_release_bundle(
+        verified = verify_release_bundle(
             root,
             "v0.4.0",
             evidence_digest,
             release_title=title,
             release_body=body,
         )
+        self.assertEqual(set(verified.assets), {path.name for path in root.iterdir()})
+        self.assertEqual(verified.evidence.commit, SOURCE_COMMIT)
+
+    def test_rejects_a_bundle_bound_to_another_expected_commit(self) -> None:
+        root, evidence_digest, title, body = self.make_bundle()
+        with self.assertRaisesRegex(ReleaseBundleError, "commit"):
+            verify_release_bundle(
+                root,
+                "v0.4.0",
+                evidence_digest,
+                expected_commit="3" * 40,
+                release_title=title,
+                release_body=body,
+            )
+
+    def test_rejects_a_symlinked_bundle_root(self) -> None:
+        root, evidence_digest, title, body = self.make_bundle()
+        linked = root.parent / f"{root.name}-linked"
+        try:
+            linked.symlink_to(root, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"symlinks are unavailable: {error}")
+        self.addCleanup(linked.unlink, missing_ok=True)
+        with self.assertRaisesRegex(ReleaseBundleError, "symlink or junction"):
+            verify_release_bundle(
+                linked,
+                "v0.4.0",
+                evidence_digest,
+                release_title=title,
+                release_body=body,
+            )
 
     def test_rejects_a_tampered_archive_even_if_the_global_manifest_is_unchanged(self) -> None:
         root, evidence_digest, title, body = self.make_bundle()

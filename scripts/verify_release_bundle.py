@@ -8,7 +8,9 @@ import hashlib
 import json
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from protocol_sdk_bundle import ProtocolSdkBundleError, verify_protocol_sdk_bundle
@@ -17,7 +19,12 @@ from release_binary_identity import (
     verify_release_binary_identity,
 )
 from release_contract import ReleaseContractError, validate_local_dist_plan_matrix
-from release_evidence import ReleaseEvidenceError, TAG_PATTERN, load_release_evidence
+from release_evidence import (
+    ReleaseEvidence,
+    ReleaseEvidenceError,
+    TAG_PATTERN,
+    load_release_evidence,
+)
 from release_metadata import ReleaseMetadataError, verify_metadata_files
 from release_path_safety import (
     ReleasePathSafetyError,
@@ -33,6 +40,18 @@ class ReleaseBundleError(RuntimeError):
     """The assembled release bundle differs from its evidence."""
 
 
+@dataclass(frozen=True)
+class VerifiedReleaseAsset:
+    size: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class VerifiedReleaseBundle:
+    evidence: ReleaseEvidence
+    assets: Mapping[str, VerifiedReleaseAsset]
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Verify a complete release asset directory without publishing it."
@@ -45,15 +64,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def sha256_file(path: Path) -> str:
+def inspect_release_asset(path: Path) -> VerifiedReleaseAsset:
     digest = hashlib.sha256()
+    size = 0
     try:
         with path.open("rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                size += len(chunk)
                 digest.update(chunk)
     except OSError as error:
         raise ReleaseBundleError(f"cannot read release asset {path}: {error}") from error
-    return digest.hexdigest()
+    return VerifiedReleaseAsset(size=size, sha256=digest.hexdigest())
 
 
 def regular_files(root: Path) -> Mapping[str, Path]:
@@ -140,19 +161,19 @@ def verify_release_bundle(
     tag: str,
     expected_evidence_sha256: str,
     *,
+    expected_commit: str | None = None,
     release_title: Path | None = None,
     release_body: Path | None = None,
-) -> None:
+) -> VerifiedReleaseBundle:
     match = TAG_PATTERN.fullmatch(tag)
     if match is None:
         raise ReleaseBundleError(f"invalid stable release tag: {tag!r}")
     version = ".".join(match.groups())
     files = regular_files(assets)
-    digests = {
-        name: sha256_file(path)
-        for name, path in files.items()
-        if name != "SHA256SUMS"
+    verified_assets = {
+        name: inspect_release_asset(path) for name, path in files.items()
     }
+    digests = {name: asset.sha256 for name, asset in verified_assets.items()}
     required = {"release-evidence.json", "release-dist-plan.json", "SHA256SUMS"}
     if not required.issubset(files):
         raise ReleaseBundleError(
@@ -166,6 +187,7 @@ def verify_release_bundle(
             expected_sha256=expected_evidence_sha256,
             expected_tag=tag,
             expected_version=version,
+            expected_commit=expected_commit,
         )
     except ReleaseEvidenceError as error:
         raise ReleaseBundleError(f"invalid release evidence: {error}") from error
@@ -244,6 +266,10 @@ def verify_release_bundle(
             )
         except ReleaseBinaryIdentityError as error:
             raise ReleaseBundleError(str(error)) from error
+    return VerifiedReleaseBundle(
+        evidence=evidence,
+        assets=MappingProxyType(verified_assets),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
