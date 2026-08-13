@@ -4,6 +4,8 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
 
+#[cfg(test)]
+use tokio::sync::oneshot;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -209,7 +211,16 @@ pub(crate) struct IpcService {
     sessions: JoinSet<()>,
     rejection_log: PeerRejectionLog,
     #[cfg(test)]
-    panic_after_session_spawn: bool,
+    session_panic_gate: Option<SessionPanicTestGate>,
+    #[cfg(test)]
+    sessions_drained: Option<oneshot::Sender<()>>,
+}
+
+#[cfg(test)]
+pub(crate) struct SessionPanicTestGate {
+    pub(crate) spawned: oneshot::Sender<()>,
+    pub(crate) release: oneshot::Receiver<()>,
+    pub(crate) drained: oneshot::Sender<()>,
 }
 
 impl IpcService {
@@ -222,13 +233,15 @@ impl IpcService {
             sessions: JoinSet::new(),
             rejection_log: PeerRejectionLog::new(),
             #[cfg(test)]
-            panic_after_session_spawn: false,
+            session_panic_gate: None,
+            #[cfg(test)]
+            sessions_drained: None,
         }
     }
 
     #[cfg(test)]
-    pub(crate) fn with_panic_after_session_spawn(mut self, enabled: bool) -> Self {
-        self.panic_after_session_spawn = enabled;
+    pub(crate) fn with_session_panic_gate(mut self, gate: Option<SessionPanicTestGate>) -> Self {
+        self.session_panic_gate = gate;
         self
     }
 
@@ -312,7 +325,15 @@ impl IpcService {
                             }
                         });
                         #[cfg(test)]
-                        if self.panic_after_session_spawn {
+                        if let Some(gate) = self.session_panic_gate.take() {
+                            let SessionPanicTestGate {
+                                spawned,
+                                release,
+                                drained,
+                            } = gate;
+                            self.sessions_drained = Some(drained);
+                            let _ = spawned.send(());
+                            let _ = release.await;
                             panic!("test-injected IPC service panic after session spawn");
                         }
                     }
@@ -365,7 +386,13 @@ impl IpcService {
     }
 
     async fn drain_to(&mut self, deadline: Instant) -> Option<String> {
-        drain_sessions(&mut self.sessions, &mut self.shutdown, deadline).await
+        let failure = drain_sessions(&mut self.sessions, &mut self.shutdown, deadline).await;
+        #[cfg(test)]
+        if let Some(drained) = self.sessions_drained.take() {
+            debug_assert!(self.sessions.is_empty());
+            let _ = drained.send(());
+        }
+        failure
     }
 }
 

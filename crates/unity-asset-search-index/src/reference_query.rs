@@ -1703,7 +1703,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use tantivy::{Index, TantivyDocument};
-    use tempfile::tempdir;
     use unity_asset_core::{
         AssetLoadLimits, AssetLoadUsage, DiagnosticSeverity, FieldPath, WorkspaceId,
         WorkspaceRevision,
@@ -1808,7 +1807,7 @@ mod tests {
         stamp: GenerationStamp,
         completeness: ReferenceQueryCompleteness,
     ) -> (tempfile::TempDir, ReferenceQueryEngine) {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         ProjectionStore::build(directory.path(), &projection(documents)).unwrap();
         let readers =
             ProjectionReaders::open(directory.path(), &mut AssetLoadBudget::default()).unwrap();
@@ -2564,7 +2563,7 @@ mod tests {
 
     #[test]
     fn corrupt_payload_json_is_not_silently_ignored() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         ProjectionStore::build(
             directory.path(),
             &projection(vec![projected_reference("reference-a", -7)]),
@@ -2593,7 +2592,7 @@ mod tests {
 
     #[test]
     fn payload_stable_id_must_match_the_fast_field() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         let projected = projected_reference("reference-a", -7);
         ProjectionStore::build(directory.path(), &projection(vec![projected.clone()])).unwrap();
         let path = payload_path(directory.path());
@@ -2655,7 +2654,7 @@ mod tests {
 
     #[test]
     fn deeply_nested_payload_fails_contract_validation() {
-        let directory = tempdir().unwrap();
+        let directory = crate::secure_test_tempdir();
         ProjectionStore::build(
             directory.path(),
             &projection(vec![projected_reference("reference-a", -7)]),

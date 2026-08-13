@@ -142,6 +142,8 @@ struct DaemonRuntimeParts {
     index: SearchIndex,
     #[cfg(test)]
     panic_stage: Option<SupervisorPanicStage>,
+    #[cfg(test)]
+    session_panic_gate: Option<crate::ipc::SessionPanicTestGate>,
 }
 
 #[cfg(test)]
@@ -323,6 +325,8 @@ fn assemble_runtime(
         index,
         #[cfg(test)]
         panic_stage: None,
+        #[cfg(test)]
+        session_panic_gate: None,
     })
 }
 
@@ -525,12 +529,12 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             index,
             #[cfg(test)]
             panic_stage,
+            #[cfg(test)]
+            session_panic_gate,
         } = parts;
         let ipc = IpcService::new(dispatcher);
         #[cfg(test)]
-        let ipc = ipc.with_panic_after_session_spawn(
-            panic_stage == Some(SupervisorPanicStage::AfterSessionSpawn),
-        );
+        let ipc = ipc.with_session_panic_gate(session_panic_gate);
         Self {
             endpoint_claim,
             endpoint: None,
@@ -891,7 +895,7 @@ mod tests {
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution,
     };
-    use crate::ipc::Dispatcher;
+    use crate::ipc::{Dispatcher, SessionPanicTestGate};
     use crate::operations::{OperationServiceOwner, SemanticUpgradeRuntime};
     use crate::watcher::{MaintenanceRuntime, WatcherConfig};
 
@@ -1250,10 +1254,18 @@ mod tests {
         );
         fixture.wait_for_publication().await;
         let descriptor = fixture.namespace().discover_endpoint().unwrap();
-        let client = descriptor
+        let mut client = descriptor
             .connect_verified(fixture.namespace(), Instant::now() + Duration::from_secs(5))
             .await
             .unwrap();
+        fixture.wait_for_session_spawn().await;
+        bootstrap_fixture_client(&mut client, descriptor.descriptor()).await;
+        fixture.trigger_session_panic();
+        fixture.wait_for_sessions_drained().await;
+        assert!(matches!(
+            fixture.namespace().discover_endpoint(),
+            Err(EndpointStoreError::DescriptorMissing)
+        ));
 
         assert!(
             tokio::time::timeout(Duration::from_millis(10), fixture.runtime_mut().run())
@@ -1336,6 +1348,13 @@ mod tests {
         index_paths: IndexPaths,
         runtime: Option<DaemonRuntime>,
         release: Option<mpsc::Sender<()>>,
+        session_panic: Option<SessionPanicControl>,
+    }
+
+    struct SessionPanicControl {
+        spawned: Option<oneshot::Receiver<()>>,
+        release: Option<oneshot::Sender<()>>,
+        drained: Option<oneshot::Receiver<()>>,
     }
 
     impl RuntimeFixture {
@@ -1377,6 +1396,26 @@ mod tests {
 
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
             let (release_sender, release_receiver) = mpsc::channel();
+            let (session_panic_gate, session_panic) =
+                if panic_stage == Some(SupervisorPanicStage::AfterSessionSpawn) {
+                    let (spawned_sender, spawned) = oneshot::channel();
+                    let (release, release_receiver) = oneshot::channel();
+                    let (drained_sender, drained) = oneshot::channel();
+                    (
+                        Some(SessionPanicTestGate {
+                            spawned: spawned_sender,
+                            release: release_receiver,
+                            drained: drained_sender,
+                        }),
+                        Some(SessionPanicControl {
+                            spawned: Some(spawned),
+                            release: Some(release),
+                            drained: Some(drained),
+                        }),
+                    )
+                } else {
+                    (None, None)
+                };
             let runtime = start_fixture_runtime(
                 endpoint_claim,
                 daemon_instance_id,
@@ -1385,6 +1424,7 @@ mod tests {
                 started_sender,
                 release_receiver,
                 panic_stage,
+                session_panic_gate,
             );
             started_receiver
                 .recv_timeout(Duration::from_secs(5))
@@ -1397,7 +1437,47 @@ mod tests {
                 index_paths,
                 runtime: Some(runtime),
                 release: Some(release_sender),
+                session_panic,
             }
+        }
+
+        async fn wait_for_session_spawn(&mut self) {
+            let spawned = self
+                .session_panic
+                .as_mut()
+                .expect("fixture has a session panic control")
+                .spawned
+                .take()
+                .expect("session spawn is observed once");
+            tokio::time::timeout(Duration::from_secs(5), spawned)
+                .await
+                .expect("session spawn observation timed out")
+                .expect("IPC service dropped the session spawn observation");
+        }
+
+        fn trigger_session_panic(&mut self) {
+            self.session_panic
+                .as_mut()
+                .expect("fixture has a session panic control")
+                .release
+                .take()
+                .expect("session panic is triggered once")
+                .send(())
+                .expect("IPC service retains the session panic gate");
+        }
+
+        async fn wait_for_sessions_drained(&mut self) {
+            let drained = self
+                .session_panic
+                .as_mut()
+                .expect("fixture has a session panic control")
+                .drained
+                .take()
+                .expect("session drain is observed once");
+            tokio::time::timeout(Duration::from_secs(5), drained)
+                .await
+                .expect("session drain observation timed out")
+                .expect("IPC service dropped the session drain observation");
         }
 
         async fn wait_for_publication(&mut self) {
@@ -1530,6 +1610,7 @@ mod tests {
         started: mpsc::SyncSender<()>,
         release: mpsc::Receiver<()>,
         panic_stage: Option<SupervisorPanicStage>,
+        session_panic_gate: Option<SessionPanicTestGate>,
     ) -> DaemonRuntime {
         DaemonRuntime::start_with_factory(move || -> anyhow::Result<_> {
             let blocking_tasks = BlockingTaskOwner::new();
@@ -1538,7 +1619,7 @@ mod tests {
                 let _ = blocking_handle
                     .run(move || {
                         let _ = started.send(());
-                        release.recv().unwrap();
+                        let _ = release.recv();
                     })
                     .await;
             }));
@@ -1579,8 +1660,22 @@ mod tests {
                 blocking_tasks,
                 index,
                 panic_stage,
+                session_panic_gate,
             })
         })
         .unwrap()
+    }
+
+    impl Drop for RuntimeFixture {
+        fn drop(&mut self) {
+            if let Some(session_panic) = self.session_panic.as_mut()
+                && let Some(release) = session_panic.release.take()
+            {
+                let _ = release.send(());
+            }
+            if let Some(release) = self.release.take() {
+                let _ = release.send(());
+            }
+        }
     }
 }
