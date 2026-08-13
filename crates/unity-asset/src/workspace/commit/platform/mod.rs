@@ -832,10 +832,17 @@ impl CommitGuard {
 
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
-    use tempfile::tempdir;
+    use tempfile::{TempDir, tempdir};
 
     use super::super::journal::RECOVERY_VERSION_DIRECTORY;
     use super::*;
+
+    fn canonical_tempdir() -> (TempDir, PathBuf) {
+        let directory = tempdir().expect("temporary publication directory");
+        let canonical =
+            std::fs::canonicalize(directory.path()).expect("canonical publication directory");
+        (directory, canonical)
+    }
 
     #[test]
     fn file_identity_separates_object_identity_from_length() {
@@ -861,43 +868,49 @@ mod tests {
 
     #[test]
     fn commit_guard_holds_stable_and_v1_compatibility_locks() {
-        let root = tempdir().expect("temporary publication root");
-        let guard = CommitGuard::acquire(root.path()).expect("commit guard");
-        let recovery = root.path().join(RECOVERY_DIRECTORY);
+        let (_root_guard, root) = canonical_tempdir();
+        let guard = CommitGuard::acquire(&root).expect("commit guard");
+        let recovery = root.join(RECOVERY_DIRECTORY);
         let legacy = recovery
             .join(LEGACY_COMMIT_LOCK_DIRECTORY)
             .join(COMMIT_LOCK_FILE);
         let stable = recovery.join(COMMIT_LOCK_FILE);
 
-        assert!(platform::acquire_lock(&legacy).is_err());
-        assert!(platform::acquire_lock(&stable).is_err());
+        assert_eq!(
+            platform::acquire_lock(&legacy)
+                .expect_err("the held compatibility lock must be busy")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(
+            platform::acquire_lock(&stable)
+                .expect_err("the held stable lock must be busy")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
 
         drop(guard);
-        CommitGuard::acquire(root.path()).expect("locks released with guard");
+        CommitGuard::acquire(&root).expect("locks released with guard");
     }
 
     #[test]
     fn existing_commit_guard_is_zero_write_on_a_clean_root_and_reports_busy() {
-        let root = tempdir().expect("temporary publication root");
-        let recovery = root.path().join(RECOVERY_DIRECTORY);
-        let root_identity = observe_directory_identity(root.path()).expect("root identity");
+        let (_root_guard, root) = canonical_tempdir();
+        let recovery = root.join(RECOVERY_DIRECTORY);
+        let root_identity = observe_directory_identity(&root).expect("root identity");
 
         assert!(
-            CommitGuard::acquire_existing(
-                root.path(),
-                &root_identity,
-                existing_lock_paths(root.path()),
-            )
-            .expect("clean root inspection")
-            .is_none()
+            CommitGuard::acquire_existing(&root, &root_identity, existing_lock_paths(&root),)
+                .expect("clean root inspection")
+                .is_none()
         );
         assert!(!recovery.exists());
 
-        let guard = CommitGuard::acquire(root.path()).expect("commit guard");
+        let guard = CommitGuard::acquire(&root).expect("commit guard");
         let busy = match CommitGuard::acquire_existing(
-            root.path(),
+            &root,
             &root_identity,
-            existing_lock_paths(root.path()),
+            existing_lock_paths(&root),
         ) {
             Ok(_) => panic!("existing guard must observe the held compatibility lock"),
             Err(error) => error,
@@ -906,13 +919,9 @@ mod tests {
 
         drop(guard);
         assert!(
-            CommitGuard::acquire_existing(
-                root.path(),
-                &root_identity,
-                existing_lock_paths(root.path()),
-            )
-            .expect("released existing guard")
-            .is_some()
+            CommitGuard::acquire_existing(&root, &root_identity, existing_lock_paths(&root),)
+                .expect("released existing guard")
+                .is_some()
         );
     }
 
@@ -921,13 +930,13 @@ mod tests {
     fn commit_guard_tightens_an_existing_recovery_root() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let root = tempdir().expect("temporary publication root");
-        let recovery = root.path().join(RECOVERY_DIRECTORY);
+        let (_root_guard, root) = canonical_tempdir();
+        let recovery = root.join(RECOVERY_DIRECTORY);
         std::fs::create_dir(&recovery).expect("broad recovery root");
         std::fs::set_permissions(&recovery, std::fs::Permissions::from_mode(0o777))
             .expect("broad recovery permissions");
 
-        let _guard = CommitGuard::acquire(root.path()).expect("commit guard");
+        let _guard = CommitGuard::acquire(&root).expect("commit guard");
         let mode = std::fs::metadata(recovery)
             .expect("recovery metadata")
             .permissions()
@@ -940,9 +949,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn commit_guard_creates_locks_under_the_opened_root_after_path_replacement() {
-        let parent = tempdir().expect("temporary publication parent");
-        let root = parent.path().join("target");
-        let original = parent.path().join("original-target");
+        let (_parent_guard, parent) = canonical_tempdir();
+        let root = parent.join("target");
+        let original = parent.join("original-target");
         std::fs::create_dir(&root).expect("publication root");
         let identity = observe_directory_identity(&root).expect("publication root identity");
         let anchored = open_commit_root(&root, &identity).expect("opened publication root");
@@ -958,9 +967,9 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn journal_namespace_uses_the_current_recovery_version_directory() {
-        let root = tempdir().expect("temporary publication root");
-        let identity = observe_directory_identity(root.path()).expect("publication root identity");
-        let anchored = open_commit_root(root.path(), &identity).expect("opened publication root");
+        let (_root_guard, root) = canonical_tempdir();
+        let identity = observe_directory_identity(&root).expect("publication root identity");
+        let anchored = open_commit_root(&root, &identity).expect("opened publication root");
 
         let _guard = CommitGuard::acquire_with_root(&anchored).expect("commit guard");
         let namespace = open_journal_namespace(&anchored).expect("journal namespace");
@@ -968,7 +977,6 @@ mod tests {
             journal_namespace_version_identity(&namespace).expect("journal version identity");
 
         let version = root
-            .path()
             .join(RECOVERY_DIRECTORY)
             .join(RECOVERY_VERSION_DIRECTORY);
         assert_eq!(

@@ -2064,12 +2064,39 @@ mod tests {
     use std::fs;
     use std::io;
     use std::os::unix::fs::{PermissionsExt as _, symlink};
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use unity_asset_core::{AssetLoadBudget, DigestV1};
+
+    struct CanonicalTempDir {
+        _guard: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl CanonicalTempDir {
+        fn new() -> Self {
+            Self::from_guard(tempfile::tempdir().expect("temporary directory"))
+        }
+
+        fn from_guard(guard: tempfile::TempDir) -> Self {
+            let path = fs::canonicalize(guard.path()).expect("canonical temporary directory");
+            Self {
+                _guard: guard,
+                path,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    fn canonical_tempdir() -> CanonicalTempDir {
+        CanonicalTempDir::new()
+    }
 
     #[test]
     fn no_replace_does_not_overwrite_an_existing_destination() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let destination = directory.path().join("destination");
         fs::write(&source, b"new").expect("source");
@@ -2083,7 +2110,7 @@ mod tests {
 
     #[test]
     fn handle_rooted_journal_moves_preserve_identity_and_content() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let destination = directory.path().join("destination");
         fs::write(&source, b"journal move").expect("source fixture");
@@ -2124,7 +2151,7 @@ mod tests {
 
     #[test]
     fn source_symlink_is_rejected_without_touching_destination() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let real = directory.path().join("real");
         let source = directory.path().join("source");
         let destination = directory.path().join("destination");
@@ -2143,8 +2170,8 @@ mod tests {
 
     #[test]
     fn preexisting_recovery_symlink_is_rejected_before_child_creation() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let external = tempfile::tempdir().expect("external directory");
+        let directory = canonical_tempdir();
+        let external = canonical_tempdir();
         let recovery = directory.path().join(".unity-asset-recovery");
         symlink(external.path(), &recovery).expect("recovery symlink");
 
@@ -2161,8 +2188,8 @@ mod tests {
 
     #[test]
     fn private_file_rejects_symlinked_parent() {
-        let directory = tempfile::tempdir().expect("temporary directory");
-        let external = tempfile::tempdir().expect("external directory");
+        let directory = canonical_tempdir();
+        let external = canonical_tempdir();
         let recovery = directory.path().join("recovery");
         symlink(external.path(), &recovery).expect("recovery symlink");
 
@@ -2173,7 +2200,7 @@ mod tests {
 
     #[test]
     fn bound_readonly_open_rejects_a_replaced_parent() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let parent = directory.path().join("parent");
         let displaced_parent = directory.path().join("displaced-parent");
         let journal = parent.join("journal");
@@ -2200,7 +2227,7 @@ mod tests {
 
     #[test]
     fn exclusive_private_directory_returns_identity_and_rejects_reuse() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let recovery = directory.path().join("recovery");
         fs::create_dir(&recovery).expect("recovery parent");
         let transaction = recovery.join("transaction");
@@ -2225,7 +2252,7 @@ mod tests {
 
     #[test]
     fn exclusive_private_directory_does_not_create_missing_ancestors() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let missing_parent = directory.path().join("missing");
 
         let error = create_private_directory_exclusive(&missing_parent.join("transaction"))
@@ -2237,7 +2264,7 @@ mod tests {
 
     #[test]
     fn bound_private_creation_rejects_a_replaced_parent() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let parent = directory.path().join("parent");
         let displaced_parent = directory.path().join("displaced-parent");
         fs::create_dir(&parent).expect("parent");
@@ -2263,7 +2290,7 @@ mod tests {
 
     #[test]
     fn owned_file_removal_requires_the_captured_parent_and_file() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let parent = directory.path().join("parent");
         let file = parent.join("journal");
         let replacement = parent.join("replacement");
@@ -2293,7 +2320,7 @@ mod tests {
 
     #[test]
     fn owned_empty_directory_removal_requires_the_captured_identity() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let parent = directory.path().join("parent");
         let child = parent.join("transaction");
         let displaced_child = parent.join("displaced-transaction");
@@ -2322,7 +2349,7 @@ mod tests {
 
     #[test]
     fn captured_identity_rejects_a_replaced_source() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let replacement = directory.path().join("replacement");
         let destination = directory.path().join("destination");
@@ -2353,7 +2380,7 @@ mod tests {
 
     #[test]
     fn captured_digest_rejects_in_place_content_change_before_rename() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let destination = directory.path().join("destination");
         fs::write(&source, b"original").expect("source");
@@ -2380,7 +2407,7 @@ mod tests {
 
     #[test]
     fn captured_parent_identity_rejects_a_replaced_destination_directory() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let destination_parent = directory.path().join("destination-parent");
         let displaced_parent = directory.path().join("displaced-parent");
@@ -2413,7 +2440,7 @@ mod tests {
 
     #[test]
     fn captured_parent_identity_rejects_a_replaced_source_directory() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source_parent = directory.path().join("source-parent");
         let displaced_source_parent = directory.path().join("displaced-source-parent");
         let destination_parent = directory.path().join("destination-parent");
@@ -2455,7 +2482,7 @@ mod tests {
 
     #[test]
     fn mutable_hardlink_is_rejected_before_publication() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let alias = directory.path().join("alias");
         fs::write(&source, b"source").expect("source");
@@ -2469,7 +2496,7 @@ mod tests {
 
     #[test]
     fn promoted_source_rejects_a_hardlink_added_after_rename() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let destination = directory.path().join("destination");
         let alias = directory.path().join("alias");
@@ -2498,7 +2525,7 @@ mod tests {
 
     #[test]
     fn security_metadata_preserves_mode_exactly() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let target = directory.path().join("target");
         fs::write(&source, b"source").expect("source");
@@ -2532,7 +2559,7 @@ mod tests {
 
     #[test]
     fn security_metadata_rejects_a_replaced_target_identity() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source = directory.path().join("source");
         let target = directory.path().join("target");
         let replacement = directory.path().join("replacement");
@@ -2575,7 +2602,7 @@ mod tests {
 
     #[test]
     fn security_metadata_rejects_a_replaced_source_parent() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let source_parent = directory.path().join("source-parent");
         let displaced_source_parent = directory.path().join("displaced-source-parent");
         let target_parent = directory.path().join("target-parent");
@@ -2625,7 +2652,7 @@ mod tests {
 
     #[test]
     fn same_filesystem_uses_opened_handles() {
-        let directory = tempfile::tempdir().expect("temporary directory");
+        let directory = canonical_tempdir();
         let first = directory.path().join("first");
         let second = directory.path().join("second");
         fs::write(&first, b"first").expect("first");
@@ -2636,7 +2663,7 @@ mod tests {
 
     #[test]
     fn cross_filesystem_publication_is_classified_as_exdev_when_available() {
-        let source_directory = tempfile::tempdir().expect("temporary directory");
+        let source_directory = canonical_tempdir();
         let source = source_directory.path().join("source");
         fs::write(&source, b"source").expect("source");
 
@@ -2667,10 +2694,11 @@ mod tests {
         assert!(!destination.exists());
     }
 
-    fn different_filesystem(reference: &Path) -> Option<tempfile::TempDir> {
+    fn different_filesystem(reference: &Path) -> Option<CanonicalTempDir> {
         ["/dev/shm", "/tmp", "/var/tmp"]
             .into_iter()
             .filter_map(|candidate| tempfile::Builder::new().tempdir_in(candidate).ok())
+            .map(CanonicalTempDir::from_guard)
             .find(|candidate| ensure_same_filesystem(reference, candidate.path()).is_err())
     }
 }

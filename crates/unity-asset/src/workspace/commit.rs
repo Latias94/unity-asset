@@ -3243,9 +3243,9 @@ mod tests {
     #[test]
     fn recovery_layout_publishes_preparation_before_the_transaction_directory() {
         let directory = tempfile::tempdir().unwrap();
+        let target = PublicationTarget::in_place(directory.path()).unwrap();
         let transaction = TransactionId::new(DigestV1::hash_bytes(b"preparation locator"));
-        let root_identity = observe_directory_identity(directory.path()).unwrap();
-        let layout = JournalLayout::new(directory.path(), transaction, root_identity);
+        let layout = JournalLayout::new(target.root(), transaction, target.identity().clone());
 
         assert_eq!(
             layout.preparation_path().parent(),
@@ -3503,13 +3503,13 @@ mod tests {
     #[test]
     fn cleanup_prejournal_error_uses_the_callers_remaining_budget() {
         let directory = tempfile::tempdir().unwrap();
+        let target = PublicationTarget::in_place(directory.path()).unwrap();
         let transaction = TransactionId::new(DigestV1::hash_bytes(b"cleanup budget"));
-        let root_identity = observe_directory_identity(directory.path()).unwrap();
-        let layout = JournalLayout::new(directory.path(), transaction, root_identity);
+        let layout = JournalLayout::new(target.root(), transaction, target.identity().clone());
         let preparation = layout.preparation_path();
         std::fs::create_dir_all(preparation.parent().expect("preparation parent")).unwrap();
         std::fs::write(preparation, b"{}").unwrap();
-        let root = open_commit_root(layout.parent(), layout.root_identity()).unwrap();
+        let root = open_commit_root(target.root(), target.identity()).unwrap();
         let namespace = open_journal_namespace(&root).unwrap();
         let access = journal_access(&root, &namespace);
 

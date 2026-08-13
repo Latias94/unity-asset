@@ -5068,7 +5068,8 @@ mod tests {
 
     fn committed_fixture() -> (TempDir, std::path::PathBuf, AssetWorkspace, CommitReport) {
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join(SOURCE_ALIAS);
+        let target = PublicationTarget::in_place(directory.path()).expect("publication target");
+        let path = target.root().join(SOURCE_ALIAS);
         fs::write(&path, YAML).expect("fixture bytes");
         let mut workspace = AssetWorkspace::new().expect("workspace");
         workspace
@@ -5096,11 +5097,7 @@ mod tests {
         assert!(candidate_cache.0 >= 1);
         assert_eq!(candidate_cache.1, 1);
         let report = workspace
-            .commit(
-                prepared,
-                PublicationTarget::in_place(directory.path()).expect("publication target"),
-                &mut AssetLoadBudget::default(),
-            )
+            .commit(prepared, target, &mut AssetLoadBudget::default())
             .expect("commit fixture");
         (directory, path, workspace, report)
     }
@@ -7803,9 +7800,10 @@ mod tests {
         const STABLE_BYTES: &[u8] = b"stable physical binding";
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join(SOURCE_ALIAS);
-        let first_binding = directory.path().join("stable-first.resS");
-        let second_binding = directory.path().join("stable-second.resS");
+        let target = PublicationTarget::in_place(directory.path()).expect("publication target");
+        let path = target.root().join(SOURCE_ALIAS);
+        let first_binding = target.root().join("stable-first.resS");
+        let second_binding = target.root().join("stable-second.resS");
         fs::write(&path, YAML).expect("fixture bytes");
         fs::write(&first_binding, STABLE_BYTES).expect("first stable binding");
         fs::write(&second_binding, STABLE_BYTES).expect("second stable binding");
@@ -7837,11 +7835,7 @@ mod tests {
             )
             .expect("prepare mutation");
         let report = workspace
-            .commit(
-                prepared,
-                PublicationTarget::in_place(directory.path()).expect("publication target"),
-                &mut AssetLoadBudget::default(),
-            )
+            .commit(prepared, target, &mut AssetLoadBudget::default())
             .expect("commit mutation");
         assert_eq!(
             workspace.installation_digest(),
@@ -8237,7 +8231,8 @@ mod tests {
     fn recovery_discovery_reports_a_busy_publication_guard() {
         let (directory, _path, _workspace, _report) = committed_fixture();
         let target = PublicationTarget::in_place(directory.path()).expect("publication target");
-        let _guard = CommitGuard::acquire(directory.path()).expect("publication guard");
+        let root = open_commit_root(target.root(), target.identity()).expect("publication root");
+        let _guard = CommitGuard::acquire_with_root(&root).expect("publication guard");
 
         let error = target
             .discover_recoveries(&mut AssetLoadBudget::default())
