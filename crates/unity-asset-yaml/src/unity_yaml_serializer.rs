@@ -7,11 +7,11 @@
 //! - Extra anchor data (stripped, etc.)
 //! - Proper formatting and line endings
 
-use crate::constants::{LineEnding, UNITY_TAG_URI, UNITY_YAML_VERSION};
 use std::fmt::{self, Write as FmtWrite};
 use std::io::{self, Write as IoWrite};
 use unity_asset_core::{
-    AssetLoadBudget, BudgetError, Result, UnityAssetError, UnityClass, UnityValue,
+    AssetLoadBudget, BudgetError, LineEnding, Result, UNITY_TAG_URI, UNITY_YAML_VERSION,
+    UnityAssetError, UnityClass, UnityValue,
 };
 
 /// Unity YAML serializer

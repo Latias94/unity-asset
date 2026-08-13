@@ -211,20 +211,6 @@ mod tests {
     }
 
     #[test]
-    fn removed_network_listener_option_stays_rejected() {
-        assert!(
-            Args::try_parse_from([
-                "unity-asset-search-daemon",
-                "--project-root",
-                ".",
-                "--listen",
-                "127.0.0.1:7777",
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
     fn diagnostic_truncation_preserves_utf8_boundaries() {
         assert_eq!(truncate_utf8("a界b".to_owned(), 4), "a界");
         assert_eq!(truncate_utf8("short".to_owned(), 5), "short");

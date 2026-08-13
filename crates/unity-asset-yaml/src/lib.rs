@@ -23,7 +23,6 @@ pub use unity_asset_core::{
 
 // Core modules
 mod budgeted;
-pub mod constants;
 pub mod reference;
 pub mod unity_yaml_serializer;
 pub mod yaml_document;
