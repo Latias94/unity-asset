@@ -688,7 +688,10 @@ enum SessionError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant as StdInstant};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant as StdInstant},
+    };
 
     use tokio::sync::watch;
     use tokio::time::Instant;
@@ -700,7 +703,7 @@ mod tests {
     };
     use unity_asset_search_protocol::{
         ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
-        DaemonInstanceId, FilesystemReindexIntent, FrameLimits, OperationId, OperationKind,
+        DaemonInstanceId, FilesystemReindexIntent, FrameLimits, MAX_WAIT_TIMEOUT_MS, OperationKind,
         ProjectId, ReindexAdmitRequest, ReindexCancelRequest, ReindexStatusRequest,
         ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope,
         ResponseOperation, ResponseOutcome, SearchRequest, ShutdownRequest, StatusRequest,
@@ -1286,11 +1289,19 @@ mod tests {
             &mut budget,
         )
         .unwrap();
+        let executor_release = Arc::new(tokio::sync::Notify::new());
+        let executor_release_task = Arc::clone(&executor_release);
         let mut coordinator_runtime = ReindexCoordinatorRuntime::start(
             ReindexCoordinatorConfig::new(index.paths().project_path_space().clone())
-                .with_debounce(Duration::from_secs(60))
-                .with_max_debounce(Duration::from_secs(60)),
-            |_intent| async move { std::future::pending().await },
+                .with_debounce(Duration::from_millis(10))
+                .with_max_debounce(Duration::from_millis(10)),
+            move |_intent| {
+                let executor_release = Arc::clone(&executor_release_task);
+                async move {
+                    executor_release.notified().await;
+                    Err(anyhow::anyhow!("test executor released"))
+                }
+            },
         )
         .unwrap();
         let coordinator = coordinator_runtime.coordinator();
@@ -1341,6 +1352,31 @@ mod tests {
             .unwrap();
         bootstrap_client(&mut work_client, project_id, instance_id).await;
 
+        let admission = RequestEnvelope::new(
+            BUSINESS_PROTOCOL_REVISION,
+            RequestId::from_bytes([20; 16]),
+            project_id,
+            instance_id,
+            query_policy_id,
+            RequestOperation::ReindexAdmit(ReindexAdmitRequest {
+                intent: FilesystemReindexIntent::full(),
+                idempotency_key: None,
+            }),
+        )
+        .unwrap();
+        let ResponseOutcome::Success(response) = exchange_request(&mut work_client, &admission)
+            .await
+            .into_outcome()
+        else {
+            panic!("daemon rejected the operation used to prove draining wait admission");
+        };
+        let ResponseOperation::ReindexAdmit(operation) = response.as_ref() else {
+            panic!("reindex admission returned the wrong response operation");
+        };
+        assert!(!operation.state.is_terminal());
+        let active_operation = operation.operation_id;
+        let admissions_before = coordinator.snapshot().await.admissions.ipc;
+
         let shutdown = RequestEnvelope::new(
             BUSINESS_PROTOCOL_REVISION,
             RequestId::from_bytes([21; 16]),
@@ -1376,10 +1412,6 @@ mod tests {
                 if matches!(response.as_ref(), ResponseOperation::Status(_))
         ));
 
-        let mut unknown_operation_bytes = [0x77; 16];
-        unknown_operation_bytes[..8].copy_from_slice(&instance_id.as_bytes()[..8]);
-        unknown_operation_bytes[8] |= 1;
-        let unknown_operation = OperationId::from_bytes(unknown_operation_bytes);
         let operation_status = RequestEnvelope::new(
             BUSINESS_PROTOCOL_REVISION,
             RequestId::from_bytes([23; 16]),
@@ -1387,19 +1419,23 @@ mod tests {
             instance_id,
             query_policy_id,
             RequestOperation::ReindexStatus(ReindexStatusRequest {
-                operation_id: unknown_operation,
+                operation_id: active_operation,
             }),
         )
         .unwrap();
-        let ResponseOutcome::Error(error) = exchange_request(&mut work_client, &operation_status)
-            .await
-            .into_outcome()
+        let ResponseOutcome::Success(response) =
+            exchange_request(&mut work_client, &operation_status)
+                .await
+                .into_outcome()
         else {
-            panic!("unknown draining operation unexpectedly had retained status");
+            panic!("draining daemon hid an existing operation status");
         };
-        assert_eq!(error.code, ApiErrorCode::OperationNotFound);
+        assert!(matches!(
+            response.as_ref(),
+            ResponseOperation::ReindexStatus(operation)
+                if operation.operation_id == active_operation && !operation.state.is_terminal()
+        ));
 
-        let admissions_before = coordinator.snapshot().await.admissions.ipc;
         let reindex = RequestEnvelope::new(
             BUSINESS_PROTOCOL_REVISION,
             RequestId::from_bytes([24; 16]),
@@ -1447,18 +1483,21 @@ mod tests {
             instance_id,
             query_policy_id,
             RequestOperation::ReindexWait(ReindexWaitRequest {
-                operation_id: unknown_operation,
-                timeout_ms: 1,
+                operation_id: active_operation,
+                timeout_ms: MAX_WAIT_TIMEOUT_MS,
             }),
         )
         .unwrap();
-        let ResponseOutcome::Error(error) = exchange_request(&mut work_client, &wait)
-            .await
-            .into_outcome()
-        else {
-            panic!("unknown draining operation unexpectedly completed a wait");
+        let wait_response = tokio::time::timeout(
+            Duration::from_secs(1),
+            exchange_request(&mut work_client, &wait),
+        )
+        .await
+        .expect("draining admission must reject a long operation wait immediately");
+        let ResponseOutcome::Error(error) = wait_response.into_outcome() else {
+            panic!("draining daemon admitted a new operation wait");
         };
-        assert_eq!(error.code, ApiErrorCode::OperationNotFound);
+        assert_eq!(error.code, ApiErrorCode::NotReady);
 
         let cancel = RequestEnvelope::new(
             BUSINESS_PROTOCOL_REVISION,
@@ -1467,7 +1506,7 @@ mod tests {
             instance_id,
             query_policy_id,
             RequestOperation::ReindexCancel(ReindexCancelRequest {
-                operation_id: unknown_operation,
+                operation_id: active_operation,
             }),
         )
         .unwrap();
@@ -1488,6 +1527,7 @@ mod tests {
         let (serve_result, endpoint) = server.await.unwrap();
         assert_eq!(serve_result.unwrap(), EndpointCleanupV1::Removed);
         maintenance.shutdown().await.unwrap();
+        executor_release.notify_one();
         coordinator_runtime.shutdown().await.unwrap();
         operation_service.shutdown().await.unwrap();
         blocking_tasks.shutdown().await.unwrap();

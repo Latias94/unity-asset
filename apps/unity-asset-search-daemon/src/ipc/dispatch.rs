@@ -275,7 +275,6 @@ const fn requires_lifecycle_admission(
         unity_asset_search_protocol::OperationKind::Capabilities
             | unity_asset_search_protocol::OperationKind::Status
             | unity_asset_search_protocol::OperationKind::ReindexStatus
-            | unity_asset_search_protocol::OperationKind::ReindexWait
             | unity_asset_search_protocol::OperationKind::ReindexAdmit
             | unity_asset_search_protocol::OperationKind::Shutdown
     )
@@ -700,7 +699,7 @@ mod tests {
         assert!(!requires_lifecycle_admission(
             unity_asset_search_protocol::OperationKind::ReindexStatus,
         ));
-        assert!(!requires_lifecycle_admission(
+        assert!(requires_lifecycle_admission(
             unity_asset_search_protocol::OperationKind::ReindexWait,
         ));
         assert!(requires_lifecycle_admission(
