@@ -461,11 +461,6 @@ def _validated_archive_path(path: str) -> tuple[PurePosixPath, tuple[str, ...]]:
     return parsed, portable_key
 
 
-def _validate_relative_archive_path(path: str) -> PurePosixPath:
-    parsed, _ = _validated_archive_path(path)
-    return parsed
-
-
 def _portable_archive_key(path: str) -> tuple[str, ...]:
     _, portable_key = _validated_archive_path(path)
     return portable_key

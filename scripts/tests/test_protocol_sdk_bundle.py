@@ -233,7 +233,7 @@ class ProtocolSdkBundleTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(
                 BUNDLE.ProtocolSdkBundleError, "unsafe archive path"
             ):
-                BUNDLE._validate_relative_archive_path(path)
+                BUNDLE._validated_archive_path(path)
         self.assertEqual(
             BUNDLE._portable_archive_key("fixtures/Café.json"),
             BUNDLE._portable_archive_key("fixtures/Cafe\u0301.json"),

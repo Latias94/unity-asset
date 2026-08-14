@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 from protocol_sdk_bundle import (
     ProtocolSdkBundleError,
     ProtocolSdkBundleMetadata,
+    RELEASE_TAG_PATTERN,
     verify_protocol_sdk_bundle,
 )
 from release_atomic import ReleaseAtomicWriteError, atomic_write_bytes
@@ -49,9 +50,6 @@ from workspace_package_contract import (
 )
 
 
-TAG_PATTERN = re.compile(
-    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
-)
 COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 COMMAND_TIMEOUT_SECONDS = 120
 
@@ -113,7 +111,7 @@ def run_text(command: Sequence[str], *, cwd: Path) -> str:
 
 
 def parse_release_tag(tag: str) -> str:
-    match = TAG_PATTERN.fullmatch(tag)
+    match = RELEASE_TAG_PATTERN.fullmatch(tag)
     if match is None:
         raise VerificationError(f"release tag must be vMAJOR.MINOR.PATCH, got {tag!r}")
     return ".".join(match.groups())
