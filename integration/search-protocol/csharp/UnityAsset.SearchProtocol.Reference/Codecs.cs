@@ -257,7 +257,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 write(writer);
                 writer.Flush();
             }
-            return stream.ToArray();
+            return StrictJson.CanonicalizeContractWriterOutput(stream.ToArray());
         }
 
     }

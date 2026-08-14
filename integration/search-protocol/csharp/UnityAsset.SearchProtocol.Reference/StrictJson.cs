@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Encodings.Web;
@@ -11,6 +12,17 @@ namespace UnityAsset.SearchProtocol.Reference
     {
         private const int MaximumCollectionEntries = 1_000_000;
         private const int MaximumObjectMembers = 1_000_000;
+        private static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
+        private static readonly byte[] FalseBytes = Encoding.ASCII.GetBytes("false");
+        private static readonly byte[] NullBytes = Encoding.ASCII.GetBytes("null");
+        private static readonly byte[] TrueBytes = Encoding.ASCII.GetBytes("true");
+        private static readonly byte[] HexDigits = Encoding.ASCII.GetBytes("0123456789abcdef");
+        private static readonly JsonDocumentOptions DocumentOptions = new JsonDocumentOptions
+        {
+            AllowTrailingCommas = false,
+            CommentHandling = JsonCommentHandling.Disallow,
+            MaxDepth = 32,
+        };
 
         internal static readonly JsonWriterOptions WriterOptions = new JsonWriterOptions
         {
@@ -36,20 +48,13 @@ namespace UnityAsset.SearchProtocol.Reference
 
             try
             {
-                using JsonDocument document = JsonDocument.Parse(
-                    utf8Json,
-                    new JsonDocumentOptions
-                    {
-                        AllowTrailingCommas = false,
-                        CommentHandling = JsonCommentHandling.Disallow,
-                        MaxDepth = 32,
-                    });
+                using JsonDocument document = JsonDocument.Parse(utf8Json, DocumentOptions);
                 JsonElement root = document.RootElement;
                 RequireKind(root, JsonValueKind.Object, path);
                 int collectionEntries = 0;
                 int objectMembers = 0;
                 ValidateStructuralLimits(root, path, ref collectionEntries, ref objectMembers);
-                byte[] canonical = BootstrapCodec.Write(writer => root.WriteTo(writer));
+                byte[] canonical = EncodeContractJson(root);
                 if (!utf8Json.AsSpan().SequenceEqual(canonical))
                 {
                     throw new ProtocolValidationException($"{path} JSON is not canonically encoded");
@@ -60,6 +65,24 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 throw new ProtocolValidationException($"{path} contains invalid JSON: {error.Message}", error);
             }
+        }
+
+        internal static byte[] EncodeContractJson(JsonElement element)
+        {
+            using var stream = new MemoryStream();
+            WriteContractValue(stream, element, "JSON");
+            return stream.ToArray();
+        }
+
+        internal static byte[] CanonicalizeContractWriterOutput(byte[] utf8Json)
+        {
+            if (utf8Json == null)
+            {
+                throw new ArgumentNullException(nameof(utf8Json));
+            }
+
+            using JsonDocument document = JsonDocument.Parse(utf8Json, DocumentOptions);
+            return EncodeContractJson(document.RootElement);
         }
 
         internal static void Properties(JsonElement element, string path, params string[] expected)
@@ -339,6 +362,142 @@ namespace UnityAsset.SearchProtocol.Reference
             return checked(0x10000u
                 + ((uint)(first - 0xd800) << 10)
                 + (uint)(second - 0xdc00));
+        }
+
+        private static void WriteContractValue(Stream stream, JsonElement element, string path)
+        {
+            switch (element.ValueKind)
+            {
+                case JsonValueKind.Object:
+                    stream.WriteByte((byte)'{');
+                    bool firstProperty = true;
+                    foreach (JsonProperty property in element.EnumerateObject())
+                    {
+                        if (!firstProperty)
+                        {
+                            stream.WriteByte((byte)',');
+                        }
+                        firstProperty = false;
+                        WriteContractString(stream, property.Name, path + " property name");
+                        stream.WriteByte((byte)':');
+                        WriteContractValue(stream, property.Value, path + "." + property.Name);
+                    }
+                    stream.WriteByte((byte)'}');
+                    return;
+                case JsonValueKind.Array:
+                    stream.WriteByte((byte)'[');
+                    int index = 0;
+                    foreach (JsonElement item in element.EnumerateArray())
+                    {
+                        if (index > 0)
+                        {
+                            stream.WriteByte((byte)',');
+                        }
+                        WriteContractValue(stream, item, $"{path}[{index}]");
+                        index++;
+                    }
+                    stream.WriteByte((byte)']');
+                    return;
+                case JsonValueKind.String:
+                    WriteContractString(stream, element.GetString()!, path);
+                    return;
+                case JsonValueKind.Number:
+                    WriteContractNumber(stream, element, path);
+                    return;
+                case JsonValueKind.True:
+                    stream.Write(TrueBytes, 0, TrueBytes.Length);
+                    return;
+                case JsonValueKind.False:
+                    stream.Write(FalseBytes, 0, FalseBytes.Length);
+                    return;
+                case JsonValueKind.Null:
+                    stream.Write(NullBytes, 0, NullBytes.Length);
+                    return;
+                default:
+                    throw new ProtocolValidationException($"{path} contains an undefined JSON value");
+            }
+        }
+
+        private static void WriteContractString(Stream stream, string value, string path)
+        {
+            ValidateUnicodeScalarString(value, path);
+            byte[] utf8 = Utf8.GetBytes(value);
+            stream.WriteByte((byte)'"');
+            int runStart = 0;
+            for (int index = 0; index < utf8.Length; index++)
+            {
+                byte valueByte = utf8[index];
+                if (valueByte >= 0x20 && valueByte != (byte)'"' && valueByte != (byte)'\\')
+                {
+                    continue;
+                }
+
+                if (index > runStart)
+                {
+                    stream.Write(utf8, runStart, index - runStart);
+                }
+                WriteContractEscape(stream, valueByte);
+                runStart = index + 1;
+            }
+            if (runStart < utf8.Length)
+            {
+                stream.Write(utf8, runStart, utf8.Length - runStart);
+            }
+            stream.WriteByte((byte)'"');
+        }
+
+        private static void WriteContractEscape(Stream stream, byte value)
+        {
+            stream.WriteByte((byte)'\\');
+            switch (value)
+            {
+                case (byte)'"':
+                    stream.WriteByte((byte)'"');
+                    return;
+                case (byte)'\\':
+                    stream.WriteByte((byte)'\\');
+                    return;
+                case 0x08:
+                    stream.WriteByte((byte)'b');
+                    return;
+                case 0x09:
+                    stream.WriteByte((byte)'t');
+                    return;
+                case 0x0a:
+                    stream.WriteByte((byte)'n');
+                    return;
+                case 0x0c:
+                    stream.WriteByte((byte)'f');
+                    return;
+                case 0x0d:
+                    stream.WriteByte((byte)'r');
+                    return;
+                default:
+                    stream.WriteByte((byte)'u');
+                    stream.WriteByte((byte)'0');
+                    stream.WriteByte((byte)'0');
+                    stream.WriteByte(HexDigits[value >> 4]);
+                    stream.WriteByte(HexDigits[value & 0x0f]);
+                    return;
+            }
+        }
+
+        private static void WriteContractNumber(Stream stream, JsonElement element, string path)
+        {
+            string raw = element.GetRawText();
+            // Every numeric field in the protocol is an integer. Reject floating-point
+            // spellings instead of approximating serde_json's float formatter.
+            if (raw.IndexOf('.') >= 0 || raw.IndexOf('e') >= 0 || raw.IndexOf('E') >= 0)
+            {
+                throw new ProtocolValidationException($"{path} contains a non-integer JSON number");
+            }
+            WriteAscii(stream, raw == "-0" ? "0" : raw);
+        }
+
+        private static void WriteAscii(Stream stream, string value)
+        {
+            byte[] bytes = Encoding.ASCII.GetBytes(value);
+            stream.Write(bytes, 0, bytes.Length);
         }
 
         private static void ValidateStructuralLimits(

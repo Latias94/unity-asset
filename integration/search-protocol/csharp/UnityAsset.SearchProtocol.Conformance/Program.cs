@@ -1,9 +1,7 @@
 using System.Text;
-using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
-using System.Text.Json.Serialization.Metadata;
 using System.Security.Cryptography;
 using UnityAsset.SearchProtocol.Reference;
 
@@ -176,6 +174,7 @@ internal static class ConformanceProgram
         AssertFramingHonorsExactLimit();
         AssertFixedIdsRejectNonCanonicalHex();
         AssertJsonRequiresCanonicalEncoding(fixtureRoot, binding);
+        AssertPortablePathSecondCharacterColonSemantics();
         AssertBootstrapRejectsBindingMismatches(fixtureRoot);
         AssertBootstrapRejectsNoCommonRevision(fixtureRoot);
         AssertContractHardening(fixtureRoot, binding);
@@ -457,6 +456,79 @@ internal static class ConformanceProgram
                 Encoding.UTF8.GetBytes(request.Insert(1, " ")),
                 binding),
             "non-canonical JSON whitespace");
+
+        const string writerInput =
+            "{\"unicode\":\"A\\u3000B\\uE000\\uD800\\uDC00\",\"controls\":\"\\u0000\\b\\t\\n\\f\\r\\u001F\",\"signed_zero\":-0}";
+        const string contractCanonical =
+            "{\"unicode\":\"A\u3000B\uE000\U00010000\",\"controls\":\"\\u0000\\b\\t\\n\\f\\r\\u001f\",\"signed_zero\":0}";
+        using JsonDocument writerDocument = JsonDocument.Parse(writerInput);
+        byte[] writerEncoded = BootstrapCodec.Write(writer => writerDocument.RootElement.WriteTo(writer));
+        Require(
+            writerEncoded.AsSpan().SequenceEqual(Encoding.UTF8.GetBytes(contractCanonical)),
+            "C# contract JSON writer does not match Rust contract string and integer bytes.");
+        StrictJson.ParseObject(Encoding.UTF8.GetBytes(contractCanonical), "contract canonical probe");
+        ExpectFailure(
+            () => StrictJson.ParseObject(Encoding.UTF8.GetBytes(writerInput), "non-canonical contract probe"),
+            "escaped Unicode, uppercase control escape, and signed integer zero");
+        ExpectFailure(
+            () => StrictJson.ParseObject(
+                Encoding.UTF8.GetBytes("{\"value\":1.5}"),
+                "floating-point protocol probe"),
+            "floating-point number outside the integer-only protocol");
+
+        const string canonicalSearchPayload =
+            "{\"query\":\"ideographic\u3000space\\u001f\",\"limit\":1}";
+        RequestEnvelopeV1 canonicalSearch = BusinessCodec.CreateRequest(
+            binding,
+            RequestId.Parse("request-v1:91919191919191919191919191919191"),
+            "search",
+            Encoding.UTF8.GetBytes(canonicalSearchPayload));
+        Require(
+            Encoding.UTF8.GetString(BusinessCodec.EncodeRequest(canonicalSearch))
+                .Contains("\"query\":\"ideographic\u3000space\\u001f\"", StringComparison.Ordinal),
+            "Business request encoding did not preserve serde_json Unicode and control escaping.");
+
+        const string signedZeroSelector =
+            "{\"direction\":\"outgoing\",\"selector\":{\"kind\":\"guid\",\"guid\":\"0123456789abcdef0123456789abcdef\",\"file_id\":-0},\"limit\":1}";
+        ExpectFailure(
+            () => BusinessCodec.CreateRequest(
+                binding,
+                RequestId.Parse("request-v1:92929292929292929292929292929292"),
+                "references",
+                Encoding.UTF8.GetBytes(signedZeroSelector)),
+            "signed -0 selector file ID");
+
+        const string unicodeSelector =
+            "{\"kind\":\"object\",\"address\":{\"kind\":\"yaml\",\"version\":2,\"source\":{\"version\":1,\"outer_path\":\"Assets/ideographic\u3000space.prefab\",\"members\":[]},\"selector\":{\"kind\":\"file_id\",\"file_id\":1001}}}";
+        const string queryBinding =
+            "reference-query-v2:611e0c3023cefa5fe3fb52669b57d4eb8a04b0c86a1286ce341a3bf40be8f2d1";
+        string cursorRequest =
+            "{\"direction\":\"outgoing\",\"selector\":"
+            + unicodeSelector
+            + ",\"limit\":1,\"cursor\":{\"generation\":\"blake3-v1:"
+            + new string('6', 64)
+            + "\",\"query_policy_id\":\""
+            + binding.QueryPolicyId.Value
+            + "\",\"after_stable_id\":\"reference:unicode\",\"query_binding\":\""
+            + queryBinding
+            + "\"}}";
+        BusinessCodec.CreateRequest(
+            binding,
+            RequestId.Parse("request-v1:93939393939393939393939393939393"),
+            "references",
+            Encoding.UTF8.GetBytes(cursorRequest));
+    }
+
+    private static void AssertPortablePathSecondCharacterColonSemantics()
+    {
+        using JsonDocument digitPrefix = JsonDocument.Parse("\"1:relative/path\"");
+        ExpectFailure(
+            () => StrictJson.PortablePath(
+                digitPrefix.RootElement,
+                "portable path second-character colon",
+                requireRelative: true,
+                rejectControlCharacters: true),
+            "second-character colon prefix");
     }
 
     private static void AssertBootstrapRejectsBindingMismatches(string fixtureRoot)
@@ -954,7 +1026,7 @@ internal static class ConformanceProgram
                 ["version"] = (int)ProtocolConstants.CoreDiagnosticVersion,
                 ["severity"] = "warning",
                 ["code"] = "YAML_REFERENCE_TEST",
-                ["message"] = "fixture diagnostic",
+                ["message"] = "fixture\u3000diagnostic\u001f",
                 ["address"] = diagnosticAddress,
                 ["field_path"] = null,
             },
@@ -963,7 +1035,12 @@ internal static class ConformanceProgram
         JsonObject diagnosticCoverage = diagnosticResponse["diagnostic_coverage"]!.AsObject();
         diagnosticCoverage["returned"] = 1;
         diagnosticCoverage["total"] = 1;
-        diagnosticCoverage["serialized_bytes"] = SerializeNode(diagnostics).Length;
+        byte[] serializedDiagnostics = SerializeNode(diagnostics);
+        Require(
+            Encoding.UTF8.GetString(serializedDiagnostics)
+                .Contains("\"message\":\"fixture\u3000diagnostic\\u001f\"", StringComparison.Ordinal),
+            "Diagnostic byte accounting did not use Rust contract JSON string bytes.");
+        diagnosticCoverage["serialized_bytes"] = serializedDiagnostics.Length;
         BusinessCodec.DecodeResponse(SerializeNode(diagnosticRoot));
 
         diagnostics[0]!["version"] = 1;
@@ -1092,7 +1169,7 @@ internal static class ConformanceProgram
     private static void AssertUnicodeScalarPathOrdering(ProtocolBinding binding)
     {
         byte[] scalarOrdered = Encoding.UTF8.GetBytes(
-            $"{{\"intent\":{{\"protocol_revision\":{ProtocolConstants.BusinessProtocolRevision},\"scope\":{{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\\uE000\",\"Assets/\\uD800\\uDC00\"]}}}}}}");
+            $"{{\"intent\":{{\"protocol_revision\":{ProtocolConstants.BusinessProtocolRevision},\"scope\":{{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\uE000\",\"Assets/\U00010000\"]}}}}}}");
         BusinessCodec.CreateRequest(
             binding,
             RequestId.Parse("request-v1:81818181818181818181818181818181"),
@@ -1100,7 +1177,7 @@ internal static class ConformanceProgram
             scalarOrdered);
 
         byte[] utf16Ordered = Encoding.UTF8.GetBytes(
-            $"{{\"intent\":{{\"protocol_revision\":{ProtocolConstants.BusinessProtocolRevision},\"scope\":{{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\\uD800\\uDC00\",\"Assets/\\uE000\"]}}}}}}");
+            $"{{\"intent\":{{\"protocol_revision\":{ProtocolConstants.BusinessProtocolRevision},\"scope\":{{\"kind\":\"changed_paths\",\"paths\":[\"Assets/\U00010000\",\"Assets/\uE000\"]}}}}}}");
         ExpectFailure(
             () => BusinessCodec.CreateRequest(
                 binding,
@@ -1494,13 +1571,6 @@ internal static class ConformanceProgram
         UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
     };
 
-    private static JsonSerializerOptions CanonicalOptions() => new()
-    {
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        TypeInfoResolver = new DefaultJsonTypeInfoResolver(),
-        WriteIndented = false,
-    };
-
     private static string ResolveFixtureRoot(string[] args)
     {
         if (args.Length > 0)
@@ -1546,7 +1616,7 @@ internal static class ConformanceProgram
 
     private static byte[] SerializeNode(JsonNode node)
     {
-        return Encoding.UTF8.GetBytes(node.ToJsonString(CanonicalOptions()));
+        return BootstrapCodec.Write(writer => node.WriteTo(writer));
     }
 
     private static string ReplaceExactly(string source, string oldValue, string newValue, string subject)
