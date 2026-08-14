@@ -913,9 +913,9 @@ fn prebuild_registry(
         )?;
         let mut previous_version = None;
         for (version, class) in &information.classes {
-            if previous_version.is_some_and(|previous| *version < previous) {
+            if previous_version.is_some_and(|previous| *version <= previous) {
                 return Err(BinaryError::invalid_data(format!(
-                    "TPK class {class_id} version records are not sorted"
+                    "TPK class {class_id} version records are not strictly increasing"
                 )));
             }
             previous_version = Some(*version);
@@ -1445,6 +1445,30 @@ pub(crate) mod tests {
             release_only_usage.max_observed_depth
         );
         assert_eq!(shared_usage.bytes, release_only_usage.bytes + 2);
+    }
+
+    #[test]
+    fn tpk_registry_rejects_duplicate_class_versions() {
+        let version = parse_unity_version_key("2020.3.0f1").unwrap();
+        let blob = build_typetree_blob_with_graph(
+            &[version],
+            &[
+                TestClassRecord::Present {
+                    version,
+                    editor_root: None,
+                    release_root: Some(0),
+                },
+                TestClassRecord::Missing { version },
+            ],
+            &[Vec::new()],
+        );
+        let tpk = wrap_tpk_blob(&blob, TpkCompressionType::None);
+        let mut budget = AssetLoadBudget::default();
+        let error = TpkTypeTreeRegistry::from_bytes(&tpk, &mut budget).unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::InvalidData(message) if message.contains("strictly increasing")
+        ));
     }
 
     #[test]
