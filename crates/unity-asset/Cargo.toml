@@ -68,7 +68,6 @@ decode = [
 [dev-dependencies]
 flate2 = { workspace = true }
 image = { workspace = true }
-tokio = { workspace = true }
 tempfile = { workspace = true }
 symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis"] }
 unity-asset-decode = { workspace = true, features = ["audio"] }

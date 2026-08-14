@@ -58,9 +58,6 @@ pub use unity_asset_core::{
 pub use unity_asset_core::get_class_name;
 pub use unity_asset_core::get_class_name_str;
 
-// Re-export from YAML crate
-pub use unity_asset_yaml::YamlDocument;
-
 // Re-export the wire model used by workspace inspection.
 pub use unity_asset_binary::asset::SerializedFile;
 pub use unity_asset_binary::error::{BinaryError, BinaryObjectIdentityError};

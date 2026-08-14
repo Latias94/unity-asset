@@ -37,13 +37,12 @@ clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-memmap2 = { version = "0.9.9", optional = true }
 
 [features]
 default = ["mmap"]
 async = ["unity-asset/async"]
 decode = ["unity-asset/decode"]
-mmap = ["unity-asset/mmap", "unity-asset-binary/mmap", "dep:memmap2"]
+mmap = ["unity-asset/mmap", "unity-asset-binary/mmap"]
 full = ["decode", "mmap"]
 
 [package.metadata.docs.rs]

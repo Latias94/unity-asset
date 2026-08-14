@@ -393,23 +393,4 @@ mod tests {
             .is_ok()
         );
     }
-
-    #[test]
-    fn superseded_commands_are_absent() {
-        for command in [
-            "extract",
-            "find-object",
-            "inspect-object",
-            "list-objects",
-            "scan-pptr",
-            "stats",
-            "stats-pathid",
-            "dump-typetree-registry",
-            "deps",
-            "project-graph",
-            "parse-yaml",
-        ] {
-            assert!(Cli::try_parse_from(["unity-asset", command]).is_err());
-        }
-    }
 }

@@ -41,8 +41,6 @@ sprite = ["texture"]
 full = ["texture", "texture-advanced", "audio", "sprite"]
 
 [dev-dependencies]
-tempfile = { workspace = true }
-hex = "0.4"
 serde_json = { workspace = true }
 
 [package.metadata.docs.rs]

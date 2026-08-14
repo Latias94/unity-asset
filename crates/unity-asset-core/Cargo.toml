@@ -37,14 +37,9 @@ hex = { workspace = true }
 serde_json = { workspace = true, features = ["unbounded_depth"] }
 
 # Async support (optional)
-tokio = { workspace = true, optional = true }
 async-trait = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
-[dev-dependencies]
-anyhow = { workspace = true }
-tokio-test = "0.4"
-
 [features]
 default = []
-async = ["tokio", "async-trait", "futures"]
+async = ["async-trait", "futures"]

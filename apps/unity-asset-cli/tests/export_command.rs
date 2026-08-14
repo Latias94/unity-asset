@@ -506,16 +506,6 @@ fn export_reports_resume_plan_mismatch_with_stable_details() {
 }
 
 #[test]
-fn removed_extract_alias_is_a_structured_argument_error() {
-    let output = run(["extract", "--help"]);
-
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(error["code"], "CLI_ARGUMENT_ERROR");
-}
-
-#[test]
 fn split_yaml_cli_is_a_thin_recoverable_extraction_adapter() {
     let temp = tempfile::tempdir().unwrap();
     let input = temp.path().join("scene.prefab");

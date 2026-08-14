@@ -20,7 +20,6 @@ unity-asset-yaml = { workspace = true }
 indexmap = { workspace = true }
 lz4_flex = { workspace = true }
 lzma-rs = "0.3"
-brotli = { version = "8.0", default-features = false, features = ["std"] }
 flate2 = { workspace = true }
 libc = "0.2"
 thiserror = { workspace = true }
@@ -31,6 +30,7 @@ cc = "1"
 
 [dev-dependencies]
 anyhow = { workspace = true }
+brotli = { version = "8.0", default-features = false, features = ["std"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 

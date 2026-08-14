@@ -50,7 +50,6 @@ blake3 = "1.8"
 sha2 = "0.10"
 
 # Binary parsing
-binrw = "0.15"
 byteorder = "1.5"
 image = "0.25"
 flate2 = "1.1"

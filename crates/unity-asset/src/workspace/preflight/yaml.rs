@@ -1048,7 +1048,7 @@ mod tests {
         let handle =
             RevisionedObjectHandle::new(object.source().workspace(), observed_revision, object)
                 .unwrap();
-        let document = crate::YamlDocument::from_entries(vec![class]);
+        let document = unity_asset_yaml::YamlDocument::from_entries(vec![class]);
         let base = WorkspaceObject::from_shared(
             handle,
             WorkspaceObjectValue::Yaml(WorkspaceYamlObject::new(Arc::new(document), 0)),
