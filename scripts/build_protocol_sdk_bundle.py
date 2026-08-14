@@ -64,18 +64,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.release_tag,
         )
         bundle_path = args.output_directory / metadata.artifact_name
+        if args.extract_directory is not None:
+            extracted = extract_protocol_sdk_bundle(
+                bundle_path,
+                args.extract_directory,
+                args.release_tag,
+            )
+            if extracted != metadata:
+                raise ProtocolSdkBundleError(
+                    "extracted protocol SDK bundle does not match its verified evidence"
+                )
     else:
         bundle_path = args.bundle
-        metadata = verify_protocol_sdk_bundle(bundle_path, args.release_tag)
-    if args.extract_directory is not None:
-        extracted = extract_protocol_sdk_bundle(
-            bundle_path,
-            args.extract_directory,
-            args.release_tag,
-        )
-        if extracted != metadata:
-            raise ProtocolSdkBundleError(
-                "extracted protocol SDK bundle does not match its verified evidence"
+        if args.extract_directory is None:
+            metadata = verify_protocol_sdk_bundle(bundle_path, args.release_tag)
+        else:
+            metadata = extract_protocol_sdk_bundle(
+                bundle_path,
+                args.extract_directory,
+                args.release_tag,
             )
     print(metadata.canonical_json())
     return 0

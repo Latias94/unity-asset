@@ -10,7 +10,6 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -28,6 +27,7 @@ from release_contract import (
 )
 from release_evidence import (
     EVIDENCE_SCHEMA,
+    ReleaseEvidence,
     ReleaseEvidenceError,
     canonical_json_bytes,
     parse_release_evidence,
@@ -40,7 +40,9 @@ from release_metadata import (
 )
 from workspace_package_contract import (
     VerificationError,
+    WorkspacePackage,
     discover_workspace_packages,
+    load_toml,
     published_production_closure,
     validate_source_dependencies,
     validate_documented_feature_profiles,
@@ -160,17 +162,6 @@ def verify_git_identity(
     return GitIdentity(tag=tag, tag_object=tag_object, commit=commit)
 
 
-def read_toml(path: Path) -> Mapping[str, Any]:
-    try:
-        with path.open("rb") as stream:
-            document = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as error:
-        raise VerificationError(f"cannot read TOML {path}: {error}") from error
-    if not isinstance(document, dict):
-        raise VerificationError(f"expected a TOML table at {path}")
-    return document
-
-
 def sha256_git_blob(repository_root: Path, repository_path: str) -> str:
     object_mode = run_text(
         ["git", "ls-tree", "--format=%(objectmode)", "HEAD", "--", repository_path],
@@ -204,7 +195,7 @@ def sha256_git_blob(repository_root: Path, repository_path: str) -> str:
 
 
 def workspace_release_contract(repository_root: Path) -> tuple[str, str]:
-    root_document = read_toml(repository_root / "Cargo.toml")
+    root_document = load_toml(repository_root / "Cargo.toml")
     workspace = root_document.get("workspace")
     if not isinstance(workspace, dict) or workspace.get("resolver") != "3":
         raise VerificationError("release workspace must use Cargo resolver 3")
@@ -217,7 +208,7 @@ def workspace_release_contract(repository_root: Path) -> tuple[str, str]:
             "workspace rust-version must be an exact patch version"
         )
 
-    toolchain_document = read_toml(repository_root / "rust-toolchain.toml")
+    toolchain_document = load_toml(repository_root / "rust-toolchain.toml")
     toolchain = toolchain_document.get("toolchain")
     channel = toolchain.get("channel") if isinstance(toolchain, dict) else None
     if not isinstance(channel, str) or not re.fullmatch(r"\d+\.\d+\.\d+", channel):
@@ -226,7 +217,7 @@ def workspace_release_contract(repository_root: Path) -> tuple[str, str]:
 
 
 def validate_internal_requirements(
-    packages: Mapping[str, Any], release_version: str
+    packages: Mapping[str, WorkspacePackage], release_version: str
 ) -> None:
     expected = f"^{release_version}"
     errors: list[str] = []
@@ -251,10 +242,9 @@ def validate_internal_requirements(
 
 def package_evidence(
     repository_root: Path,
-    metadata_text: str,
+    packages: Mapping[str, WorkspacePackage],
     release_version: str,
 ) -> list[dict[str, str]]:
-    packages = discover_workspace_packages(metadata_text)
     closure = published_production_closure(packages)
     validate_source_dependencies(closure, packages)
     validate_internal_requirements(packages, release_version)
@@ -278,17 +268,14 @@ def package_evidence(
 
 
 def documented_feature_profile_evidence(
-    metadata_text: str,
+    packages: Mapping[str, WorkspacePackage],
 ) -> list[dict[str, Any]]:
-    packages = discover_workspace_packages(metadata_text)
     return [
         {
             "name": profile.name,
             "package": profile.package,
             "features": list(profile.features),
             "default_features": profile.default_features,
-            "target_kind": profile.target_kind,
-            "target_name": profile.target_name,
         }
         for profile in validate_documented_feature_profiles(packages)
     ]
@@ -349,26 +336,20 @@ def write_canonical_json(path: Path, payload: Mapping[str, Any]) -> str:
 def append_github_outputs(
     path: Path,
     *,
-    version: str,
-    identity: GitIdentity,
-    package_names: Sequence[str],
+    evidence: ReleaseEvidence,
     evidence_sha256: str,
-    msrv: str,
-    release_toolchain: str,
-    dist_plan_sha256: str,
-    protocol_sdk_artifact: str,
     dist_matrix: Mapping[str, Any],
 ) -> None:
     lines = [
-        f"version={version}",
-        f"commit={identity.commit}",
-        f"tag_object={identity.tag_object}",
-        f"publish_crates={' '.join(package_names)}",
+        f"version={evidence.version}",
+        f"commit={evidence.commit}",
+        f"tag_object={evidence.tag_object}",
+        f"publish_crates={' '.join(evidence.publish_order)}",
         f"evidence_sha256={evidence_sha256}",
-        f"msrv={msrv}",
-        f"release_toolchain={release_toolchain}",
-        f"dist_plan_sha256={dist_plan_sha256}",
-        f"protocol_sdk_artifact={protocol_sdk_artifact}",
+        f"msrv={evidence.msrv}",
+        f"release_toolchain={evidence.release_toolchain}",
+        f"dist_plan_sha256={evidence.dist_plan_sha256}",
+        f"protocol_sdk_artifact={evidence.protocol_sdk['artifact_name']}",
         "dist_matrix="
         + json.dumps(dist_matrix, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
     ]
@@ -409,8 +390,9 @@ def main() -> int:
         ],
         cwd=repository_root,
     )
-    packages = package_evidence(repository_root, metadata_text, version)
-    feature_profiles = documented_feature_profile_evidence(metadata_text)
+    workspace_packages = discover_workspace_packages(metadata_text)
+    packages = package_evidence(repository_root, workspace_packages, version)
+    feature_profiles = documented_feature_profile_evidence(workspace_packages)
     raw_payload = {
         "schema": EVIDENCE_SCHEMA,
         "tag": identity.tag,
@@ -424,7 +406,6 @@ def main() -> int:
         "dist_artifacts": dist_artifacts,
         "protocol_sdk": protocol_sdk.as_dict(),
         "github_release": github_release.evidence(),
-        "publish_order": [package["name"] for package in packages],
         "packages": packages,
         "documented_feature_profiles": feature_profiles,
     }
@@ -447,14 +428,8 @@ def main() -> int:
     if args.github_output is not None:
         append_github_outputs(
             args.github_output,
-            version=version,
-            identity=identity,
-            package_names=evidence.publish_order,
+            evidence=evidence,
             evidence_sha256=evidence_sha256,
-            msrv=msrv,
-            release_toolchain=release_toolchain,
-            dist_plan_sha256=dist_plan_sha256,
-            protocol_sdk_artifact=protocol_sdk.artifact_name,
             dist_matrix=dist_matrix,
         )
     print(

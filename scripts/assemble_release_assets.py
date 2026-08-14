@@ -83,15 +83,19 @@ def load_dist_plan(
 ) -> tuple[Path, tuple[DistributionArtifactPair, ...]]:
     resolved = resolve_real_path(path, "release dist plan", require_exists=True)
     require_regular_file(resolved, "release dist plan")
-    actual_sha256 = sha256_file(resolved)
+    try:
+        encoded = resolved.read_bytes()
+    except OSError as error:
+        raise AssemblyError(f"cannot read release dist plan {resolved}: {error}") from error
+    actual_sha256 = hashlib.sha256(encoded).hexdigest()
     if actual_sha256 != expected_sha256:
         raise AssemblyError(
             "release dist plan SHA-256 mismatch: "
             f"expected {expected_sha256}, got {actual_sha256}"
         )
     try:
-        document = json.loads(resolved.read_bytes())
-    except (OSError, json.JSONDecodeError) as error:
+        document = json.loads(encoded)
+    except json.JSONDecodeError as error:
         raise AssemblyError(f"cannot read release dist plan {resolved}: {error}") from error
     if not isinstance(document, dict):
         raise AssemblyError("release dist plan root must be an object")

@@ -94,7 +94,6 @@ def make_release_evidence(
         "dist_artifacts": sorted(dist_artifacts),
         "protocol_sdk": dict(protocol),
         "github_release": dict(metadata),
-        "publish_order": list(PUBLISHABLE_PACKAGE_NAMES),
         "packages": packages,
         "documented_feature_profiles": [
             profile.as_dict() for profile in expected_feature_profiles()

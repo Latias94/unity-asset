@@ -49,10 +49,6 @@ class ReleaseEvidenceTests(unittest.TestCase):
         for mutate, message in (
             (lambda payload: payload.__setitem__("extra", True), "invalid schema"),
             (
-                lambda payload: payload["publish_order"].reverse(),
-                "publish order does not match",
-            ),
-            (
                 lambda payload: payload["packages"].reverse(),
                 "package topology/order",
             ),

@@ -555,13 +555,11 @@ def create_consumer_suite(
     Path,
     dict[str, Path],
     set[str],
-    set[str],
 ]:
     """Create one resolver graph while preserving per-consumer feature checks."""
 
     packages = {package.name: package for package in closure}
     consumer_manifests: dict[str, Path] = {}
-    positive_names: set[str] = set()
     required_internal: set[str] = set()
     for target in closure:
         if not target.is_library:
@@ -574,19 +572,13 @@ def create_consumer_suite(
             (),
         )
         consumer_manifests[name] = manifest_path
-        positive_names.add(name)
         required_internal.add(target.name)
 
-    if not positive_names:
+    if not consumer_manifests:
         raise VerificationError("default consumer suite has no library targets")
 
     for profile in validate_documented_feature_profiles(packages):
-        target = packages.get(profile.package)
-        if target is None:
-            raise VerificationError(
-                f"documented feature profile {profile.name} package is outside "
-                "the release closure"
-            )
+        target = packages[profile.package]
         consumer_name = consumer_package_name(target, profile.name)
         name, manifest_path = create_consumer(
             workspace_root / consumer_name,
@@ -596,7 +588,6 @@ def create_consumer_suite(
             default_features=profile.default_features,
         )
         consumer_manifests[name] = manifest_path
-        positive_names.add(name)
         required_internal.add(target.name)
 
     required_packages = {
@@ -612,7 +603,6 @@ def create_consumer_suite(
     return (
         workspace_manifest,
         consumer_manifests,
-        positive_names,
         required_internal,
     )
 
@@ -1025,7 +1015,6 @@ def run_verification(
         (
             consumer_manifest,
             consumer_manifests,
-            positive_names,
             required_internal,
         ) = create_consumer_suite(
             consumer_workspace_root,
@@ -1048,5 +1037,5 @@ def run_verification(
             cargo_cwd=cargo_cwd,
             environment=verification_environment,
             workspace_manifest=consumer_manifest,
-            consumer_names=tuple(positive_names),
+            consumer_names=tuple(consumer_manifests),
         )

@@ -249,11 +249,6 @@ def validate_local_dist_plan_matrix(
         raise ReleaseContractError(
             "cargo-dist local plan contains unreferenced or missing artifacts"
         )
-    for artifact_name in artifact_names:
-        if "/" in artifact_name or "\\" in artifact_name or "\n" in artifact_name:
-            raise ReleaseContractError(
-                f"cargo-dist artifact name is not release-safe: {artifact_name!r}"
-            )
     return tuple(
         sorted(matrix, key=lambda pair: (pair.application, pair.target))
     )

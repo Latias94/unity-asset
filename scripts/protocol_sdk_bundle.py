@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping, Sequence
 
+from release_atomic import ReleaseAtomicWriteError, atomic_write_bytes
 from release_path_safety import (
     ReleasePathSafetyError,
     is_link_or_junction,
@@ -283,7 +284,6 @@ def _collect_directory(
                 )
             relative = resolved.relative_to(source_root)
             archive_path = (archive_root / PurePosixPath(relative.as_posix())).as_posix()
-            _validate_relative_archive_path(archive_path)
             inventory.reserve(archive_path, size)
             try:
                 raw_contents = resolved.read_bytes()
@@ -346,9 +346,6 @@ def _collect_sources(repository_root: Path) -> list[_SourceFile]:
     sources.sort(key=lambda source: source.archive_path)
 
     archive_paths = [source.archive_path for source in sources]
-    if len(archive_paths) != len(set(archive_paths)):
-        raise ProtocolSdkBundleError("protocol SDK source inventory contains duplicate paths")
-
     missing = sorted(REQUIRED_SDK_PATHS.difference(archive_paths))
     if missing:
         raise ProtocolSdkBundleError(
@@ -448,7 +445,7 @@ def _build_bundle_bytes(release_tag: str, sources: Sequence[_SourceFile]) -> byt
     return bundle
 
 
-def _validate_relative_archive_path(path: str) -> PurePosixPath:
+def _validated_archive_path(path: str) -> tuple[PurePosixPath, tuple[str, ...]]:
     if not path or "\\" in path or any(ord(character) < 32 for character in path):
         raise ProtocolSdkBundleError(f"unsafe archive path: {path!r}")
     segments = path.split("/")
@@ -458,22 +455,24 @@ def _validate_relative_archive_path(path: str) -> PurePosixPath:
     if parsed.is_absolute() or parsed.as_posix() != path:
         raise ProtocolSdkBundleError(f"unsafe archive path: {path!r}")
     try:
-        portable_path_alias_key(parsed.parts, "archive path")
+        portable_key = portable_path_alias_key(parsed.parts, "archive path")
     except ReleasePathSafetyError as error:
         raise ProtocolSdkBundleError(f"unsafe archive path: {path!r}") from error
+    return parsed, portable_key
+
+
+def _validate_relative_archive_path(path: str) -> PurePosixPath:
+    parsed, _ = _validated_archive_path(path)
     return parsed
 
 
 def _portable_archive_key(path: str) -> tuple[str, ...]:
-    parsed = _validate_relative_archive_path(path)
-    try:
-        return portable_path_alias_key(parsed.parts, "archive path")
-    except ReleasePathSafetyError as error:  # pragma: no cover - validated above
-        raise ProtocolSdkBundleError(f"unsafe archive path: {path!r}") from error
+    _, portable_key = _validated_archive_path(path)
+    return portable_key
 
 
-def _validate_payload_path_policy(path: str) -> None:
-    parsed = _validate_relative_archive_path(path)
+def _validate_payload_path_policy(path: str) -> tuple[str, ...]:
+    parsed, portable_key = _validated_archive_path(path)
     parts = parsed.parts
     if parts[: len(REFERENCE_ARCHIVE_DIRECTORY.parts)] == (
         REFERENCE_ARCHIVE_DIRECTORY.parts
@@ -499,6 +498,7 @@ def _validate_payload_path_policy(path: str) -> None:
         )
     if _is_excluded_file(relative_parts[-1]):
         raise ProtocolSdkBundleError(f"bundle manifest includes a generated file: {path}")
+    return portable_key
 
 
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
@@ -577,13 +577,12 @@ def _parse_manifest(
             raise ProtocolSdkBundleError(
                 f"bundle manifest file {index} path must be a string"
             )
-        _validate_payload_path_policy(path)
+        portable_key = _validate_payload_path_policy(path)
         if previous_path is not None and path <= previous_path:
             raise ProtocolSdkBundleError(
                 "bundle manifest file paths must be unique and strictly sorted"
             )
         previous_path = path
-        portable_key = _portable_archive_key(path)
         if portable_key in portable_paths:
             raise ProtocolSdkBundleError(
                 "bundle manifest contains portable path aliases"
@@ -643,6 +642,8 @@ def _verify_bundle_bytes(
     bundle: bytes,
     artifact_name: str,
     expected_release_tag: str,
+    *,
+    staging_root: Path | None = None,
 ) -> ProtocolSdkBundleMetadata:
     expected_release_tag, expected_version = normalize_release_tag(expected_release_tag)
     expected_artifact_name = archive_name_for_tag(expected_release_tag)
@@ -678,7 +679,6 @@ def _verify_bundle_bytes(
                 "protocol SDK bundle contains portable path aliases"
             )
         for info in infos:
-            _validate_relative_archive_path(info.filename)
             if info.is_dir():
                 raise ProtocolSdkBundleError(
                     f"protocol SDK bundle contains a directory entry: {info.filename}"
@@ -723,6 +723,9 @@ def _verify_bundle_bytes(
                 "protocol SDK bundle contents do not match its manifest"
             )
 
+        if staging_root is not None:
+            _write_staged_file(staging_root / MANIFEST_FILENAME, manifest_bytes)
+
         total_payload_bytes = 0
         for file in files:
             path = str(file["path"])
@@ -749,6 +752,10 @@ def _verify_bundle_bytes(
                 raise ProtocolSdkBundleError(
                     f"protocol SDK bundle file is not canonical UTF-8 LF text: {path}"
                 )
+            if staging_root is not None:
+                _write_staged_file(
+                    staging_root.joinpath(*PurePosixPath(path).parts), contents
+                )
 
     return ProtocolSdkBundleMetadata(
         release_tag=expected_release_tag,
@@ -759,6 +766,18 @@ def _verify_bundle_bytes(
         manifest_sha256=_sha256(manifest_bytes),
         file_count=len(files),
     )
+
+
+def _write_staged_file(path: Path, contents: bytes) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as stream:
+            stream.write(contents)
+        path.chmod(0o644)
+    except OSError as error:
+        raise ProtocolSdkBundleError(
+            f"failed to stage protocol SDK bundle file: {path}"
+        ) from error
 
 
 def _read_bundle_file(bundle_path: Path) -> tuple[Path, bytes]:
@@ -808,7 +827,6 @@ def extract_protocol_sdk_bundle(
     """Verify and safely extract one SDK archive for an exact consumer build."""
 
     bundle_path, bundle = _read_bundle_file(bundle_path)
-    metadata = _verify_bundle_bytes(bundle, bundle_path.name, expected_release_tag)
     expected_root = archive_root_for_tag(expected_release_tag)
 
     output_directory = _safe_path(output_directory, "protocol SDK extraction output")
@@ -833,26 +851,12 @@ def extract_protocol_sdk_bundle(
         ) as temporary:
             staging_root = Path(temporary) / expected_root
             staging_root.mkdir()
-            with zipfile.ZipFile(io.BytesIO(bundle), mode="r") as archive:
-                for info in archive.infolist():
-                    parsed = _validate_relative_archive_path(info.filename)
-                    if parsed.parts[0] != expected_root or len(parsed.parts) < 2:
-                        raise ProtocolSdkBundleError(
-                            f"protocol SDK bundle entry escapes the versioned root: "
-                            f"{info.filename}"
-                        )
-                    target = staging_root.joinpath(*parsed.parts[1:])
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    contents = _read_archive_entry(
-                        archive,
-                        info.filename,
-                        missing_message=(
-                            f"protocol SDK bundle file is missing: {info.filename}"
-                        ),
-                    )
-                    with target.open("xb") as stream:
-                        stream.write(contents)
-                    target.chmod(0o644)
+            metadata = _verify_bundle_bytes(
+                bundle,
+                bundle_path.name,
+                expected_release_tag,
+                staging_root=staging_root,
+            )
             staging_root.rename(destination_root)
     except ProtocolSdkBundleError:
         raise
@@ -894,31 +898,12 @@ def build_protocol_sdk_bundle(
             f"protocol SDK output file is a symlink or junction: {output_path}"
         )
 
-    temporary_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="wb",
-            prefix=f".{artifact_name}.",
-            suffix=".tmp",
-            dir=output_directory,
-            delete=False,
-        ) as stream:
-            temporary_path = Path(stream.name)
-            stream.write(bundle)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary_path, output_path)
-        temporary_path = None
-    except OSError as error:
+        atomic_write_bytes(output_path, bundle, "protocol SDK bundle")
+    except ReleaseAtomicWriteError as error:
         raise ProtocolSdkBundleError(
             f"failed to write protocol SDK bundle: {output_path}"
         ) from error
-    finally:
-        if temporary_path is not None:
-            try:
-                temporary_path.unlink(missing_ok=True)
-            except OSError:
-                pass
 
     _, written_bundle = _read_bundle_file(output_path)
     if written_bundle != bundle:

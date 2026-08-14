@@ -13,6 +13,9 @@ from protocol_sdk_bundle import (
     BUNDLE_FORMAT,
     BUNDLE_METADATA_SCHEMA,
     MAX_BUNDLE_BYTES,
+    RELEASE_TAG_PATTERN,
+    archive_name_for_tag,
+    canonical_json_bytes,
 )
 from release_contract import GIT_OBJECT_PATTERN, PUBLISHABLE_PACKAGE_NAMES
 from release_metadata import ReleaseMetadataError, validate_metadata_evidence_shape
@@ -26,7 +29,7 @@ from workspace_package_contract import DOCUMENTED_FEATURE_PROFILES
 
 EVIDENCE_SCHEMA = "unity-asset.release-evidence.v3"
 MAX_EVIDENCE_BYTES = 4 * 1024 * 1024
-TAG_PATTERN = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+TAG_PATTERN = RELEASE_TAG_PATTERN
 SEMVER_PATTERN = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 
@@ -43,7 +46,6 @@ ROOT_KEYS = {
     "dist_artifacts",
     "protocol_sdk",
     "github_release",
-    "publish_order",
     "packages",
     "documented_feature_profiles",
 }
@@ -53,8 +55,6 @@ PROFILE_KEYS = {
     "package",
     "features",
     "default_features",
-    "target_kind",
-    "target_name",
 }
 PROTOCOL_KEYS = {
     "schema",
@@ -93,8 +93,6 @@ class FeatureProfileEvidence:
     package: str
     features: tuple[str, ...]
     default_features: bool
-    target_kind: str
-    target_name: str | None
 
     def as_dict(self) -> Mapping[str, Any]:
         return {
@@ -102,8 +100,6 @@ class FeatureProfileEvidence:
             "package": self.package,
             "features": list(self.features),
             "default_features": self.default_features,
-            "target_kind": self.target_kind,
-            "target_name": self.target_name,
         }
 
 
@@ -143,19 +139,11 @@ class ReleaseEvidence:
             "dist_artifacts": list(self.dist_artifacts),
             "protocol_sdk": dict(self.protocol_sdk),
             "github_release": dict(self.github_release),
-            "publish_order": list(self.publish_order),
             "packages": [package.as_dict() for package in self.packages],
             "documented_feature_profiles": [
                 profile.as_dict() for profile in self.documented_feature_profiles
             ],
         }
-
-
-def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        + "\n"
-    ).encode("utf-8")
 
 
 def _mapping(value: object, label: str, keys: set[str]) -> Mapping[str, Any]:
@@ -244,8 +232,6 @@ def expected_feature_profiles() -> tuple[FeatureProfileEvidence, ...]:
             package=profile.package,
             features=tuple(profile.features),
             default_features=profile.default_features,
-            target_kind=profile.target_kind,
-            target_name=profile.target_name,
         )
         for profile in DOCUMENTED_FEATURE_PROFILES
     )
@@ -265,23 +251,12 @@ def _feature_profiles(value: object) -> tuple[FeatureProfileEvidence, ...]:
             raise ReleaseEvidenceError(
                 f"documented feature profile {name} default_features must be boolean"
             )
-        target_kind = _string(
-            raw.get("target_kind"),
-            f"documented feature profile {name} target_kind",
-        )
-        target_name = raw.get("target_name")
-        if target_name is not None and (not isinstance(target_name, str) or not target_name):
-            raise ReleaseEvidenceError(
-                f"documented feature profile {name} target_name must be null or non-empty"
-            )
         profiles.append(
             FeatureProfileEvidence(
                 name,
                 package,
                 features,
                 default_features,
-                target_kind,
-                target_name,
             )
         )
     result = tuple(profiles)
@@ -294,7 +269,7 @@ def _feature_profiles(value: object) -> tuple[FeatureProfileEvidence, ...]:
 
 def _protocol_sdk(value: object, tag: str, version: str) -> Mapping[str, Any]:
     raw = _mapping(value, "search protocol SDK evidence", PROTOCOL_KEYS)
-    expected_name = f"unity-asset-search-protocol-sdk-{tag}.zip"
+    expected_name = archive_name_for_tag(tag)
     if (
         raw.get("schema") != BUNDLE_METADATA_SCHEMA
         or raw.get("bundle_format") != BUNDLE_FORMAT
@@ -374,9 +349,6 @@ def parse_release_evidence(
         )
 
     packages = _packages(raw.get("packages"), version)
-    publish_order = _string_list(raw.get("publish_order"), "publish order")
-    if publish_order != tuple(package.name for package in packages):
-        raise ReleaseEvidenceError("publish order does not match the package topology")
     profiles = _feature_profiles(raw.get("documented_feature_profiles"))
     protocol_sdk = _protocol_sdk(raw.get("protocol_sdk"), tag, version)
     if expected_protocol_sdk is not None and protocol_sdk != dict(expected_protocol_sdk):

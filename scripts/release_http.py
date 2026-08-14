@@ -36,6 +36,25 @@ class DownloadMetadata:
     sha256: str
 
 
+def _measure_file(path: Path, max_bytes: int) -> DownloadMetadata:
+    digest = hashlib.sha256()
+    encoded_bytes = 0
+    try:
+        with path.open("rb") as stream:
+            while chunk := stream.read(READ_CHUNK_BYTES):
+                encoded_bytes += len(chunk)
+                if encoded_bytes > max_bytes:
+                    raise ReleaseHttpError(
+                        f"downloaded file exceeds the maximum size of {max_bytes} bytes"
+                    )
+                digest.update(chunk)
+    except OSError as error:
+        raise ReleaseHttpError(
+            f"download worker did not produce a readable file: {path}"
+        ) from error
+    return DownloadMetadata(encoded_bytes=encoded_bytes, sha256=digest.hexdigest())
+
+
 def _download_once(
     url: str,
     destination: Path,
@@ -177,16 +196,7 @@ def download_with_deadline(
         or SHA256_PATTERN.fullmatch(digest) is None
     ):
         raise ReleaseHttpError("download worker returned invalid size or digest")
-    try:
-        contents = destination.read_bytes()
-    except OSError as error:
-        raise ReleaseHttpError(
-            f"download worker did not produce a readable file: {destination}"
-        ) from error
-    actual = DownloadMetadata(
-        encoded_bytes=len(contents),
-        sha256=hashlib.sha256(contents).hexdigest(),
-    )
+    actual = _measure_file(destination, max_bytes)
     expected = DownloadMetadata(encoded_bytes=encoded_bytes, sha256=digest)
     if actual != expected:
         raise ReleaseHttpError("downloaded bytes do not match worker metadata")

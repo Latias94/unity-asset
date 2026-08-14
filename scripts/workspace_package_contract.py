@@ -32,8 +32,6 @@ class DocumentedFeatureProfile:
     package: str
     features: tuple[str, ...]
     default_features: bool
-    target_kind: str
-    target_name: str | None
 
 
 DOCUMENTED_FEATURE_PROFILES = (
@@ -42,16 +40,6 @@ DOCUMENTED_FEATURE_PROFILES = (
         package="unity-asset-decode",
         features=("audio", "texture-advanced"),
         default_features=True,
-        target_kind="dependency",
-        target_name=None,
-    ),
-    DocumentedFeatureProfile(
-        name="workspace-decode",
-        package="unity-asset",
-        features=("decode",),
-        default_features=True,
-        target_kind="dependency",
-        target_name=None,
     ),
 )
 
@@ -101,14 +89,9 @@ def validate_documented_feature_profiles(
             raise VerificationError(
                 f"documented feature profile {profile.name} must name features"
             )
-        if (
-            profile.target_kind != "dependency"
-            or profile.target_name is not None
-            or not package.is_library
-        ):
+        if not package.is_library:
             raise VerificationError(
-                f"documented feature profile {profile.name} must target a library "
-                "dependency without a named Cargo target"
+                f"documented feature profile {profile.name} must target a library package"
             )
     return DOCUMENTED_FEATURE_PROFILES
 

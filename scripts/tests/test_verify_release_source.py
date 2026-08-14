@@ -223,6 +223,11 @@ class ReleaseSourceVerifierTests(unittest.TestCase):
                 ),
                 mock.patch.object(
                     verifier,
+                    "discover_workspace_packages",
+                    return_value={},
+                ) as discover_packages,
+                mock.patch.object(
+                    verifier,
                     "sha256_git_blob",
                     return_value="c" * 64,
                 ),
@@ -242,6 +247,7 @@ class ReleaseSourceVerifierTests(unittest.TestCase):
 
             metadata_command = run_text.call_args.args[0]
             self.assertIn("--locked", metadata_command)
+            discover_packages.assert_called_once_with("{}")
             payload = json.loads(evidence.read_text(encoding="utf-8"))
             self.assertEqual(payload["msrv"], "1.88.0")
             self.assertEqual(payload["release_toolchain"], "1.97.1")

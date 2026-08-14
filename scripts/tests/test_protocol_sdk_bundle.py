@@ -295,6 +295,17 @@ class ProtocolSdkBundleTests(unittest.TestCase):
         with self.assertRaisesRegex(BUNDLE.ProtocolSdkBundleError, "digest mismatch"):
             BUNDLE.verify_protocol_sdk_bundle(bundle_path, "v0.4.0")
 
+        extraction = Path(self.temporary.name) / "tampered-extraction"
+        with self.assertRaisesRegex(BUNDLE.ProtocolSdkBundleError, "digest mismatch"):
+            BUNDLE.extract_protocol_sdk_bundle(
+                bundle_path,
+                extraction,
+                "v0.4.0",
+            )
+        self.assertFalse(
+            (extraction / BUNDLE.archive_root_for_tag("v0.4.0")).exists()
+        )
+
     def test_verifier_rejects_archive_path_traversal(self) -> None:
         bundle_path, _ = self.build("path-traversal")
         root = BUNDLE.archive_root_for_tag("v0.4.0")
