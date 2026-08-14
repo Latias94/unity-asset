@@ -4,7 +4,7 @@ use std::sync::Arc;
 use unity_asset_binary::reader::ByteOrder;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadUsage, DigestV1, SourceFingerprint, SourceId, SourceKind,
-    UnityDocument, VerifiedSourceImage, WorkspaceId, vec_allocation_bytes,
+    VerifiedSourceImage, WorkspaceId, vec_allocation_bytes,
 };
 
 use super::*;
