@@ -66,10 +66,14 @@ class RemovedSurfaceTests(unittest.TestCase):
                         self.assertIsNone(re.search(pattern, source))
 
         facade_contracts = {
-            "crates/unity-asset/src/lib.rs": r"\bpub\s+use\s+unity_asset_yaml\b",
-            "crates/unity-asset-yaml/src/lib.rs": r"\bpub\s+use\s+unity_asset_core\b",
+            "crates/unity-asset/src/lib.rs": (
+                r"\bpub\s+use\b[^;]*\bunity_asset_yaml\b"
+            ),
+            "crates/unity-asset-yaml/src/lib.rs": (
+                r"\bpub\s+use\b[^;]*\bunity_asset_core\b"
+            ),
             "crates/unity-asset-binary/src/lib.rs": (
-                r"\bpub\s+(?:mod|use)\s+unity_objects\b"
+                r"\bpub\s+(?:mod\s+unity_objects\b|use\b[^;]*\bunity_objects\b)"
             ),
         }
         for relative_path, removed_export_pattern in facade_contracts.items():
