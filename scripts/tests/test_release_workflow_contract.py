@@ -118,7 +118,18 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("- dry-run", trigger)
         self.assertIn("- publish", trigger)
         self.assertNotIn("cargo dist ", self.workflow)
-        self.assertIn("ref: refs/tags/${{ env.RELEASE_TAG }}", self.jobs["validate"])
+        validate = self.jobs["validate"]
+        dispatch_gate = step_block(
+            validate, "Require triggering ref to match selected tag"
+        )
+        self.assertIn("EVENT_REF: ${{ github.ref }}", dispatch_gate)
+        self.assertIn('expected_ref="refs/tags/$RELEASE_TAG"', dispatch_gate)
+        self.assertIn('[[ "$EVENT_REF" != "$expected_ref" ]]', dispatch_gate)
+        self.assertLess(
+            validate.index("Require triggering ref to match selected tag"),
+            validate.index("Checkout selected tag"),
+        )
+        self.assertIn("ref: refs/tags/${{ env.RELEASE_TAG }}", validate)
         self.assertIn("if: inputs.mode == 'dry-run'", self.jobs["dry-run"])
         self.assertIn("python scripts/verify_release_bundle.py", self.jobs["dry-run"])
         for job_name in ("attest", "github-draft", "publish", "github-release"):
@@ -313,7 +324,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_tag_validation_is_a_single_scripted_contract_at_each_boundary(self) -> None:
         for job_name in ("validate", "github-draft", "publish", "github-release"):
             self.assertIn("python scripts/verify_release_tag.py", self.jobs[job_name])
-        self.assertNotIn("--expected-event-sha", self.jobs["validate"])
+        initial_validation = step_block(
+            self.jobs["validate"], "Require GitHub-verified annotated tag"
+        )
+        self.assertIn('--expected-event-sha "${{ github.sha }}"', initial_validation)
+        for job_name in ("github-draft", "publish", "github-release"):
+            self.assertNotIn("--expected-event-sha", self.jobs[job_name])
         self.assertNotIn("source-recheck:", self.workflow)
         self.assertIn("cancel-in-progress: false", self.workflow)
 

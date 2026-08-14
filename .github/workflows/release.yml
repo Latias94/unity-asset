@@ -45,6 +45,18 @@ jobs:
       protocol_sdk_artifact: ${{ steps.source.outputs.protocol_sdk_artifact }}
       dist_matrix: ${{ steps.source.outputs.dist_matrix }}
     steps:
+      - name: Require triggering ref to match selected tag
+        env:
+          EVENT_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_ref="refs/tags/$RELEASE_TAG"
+          if [[ "$EVENT_REF" != "$expected_ref" ]]; then
+            echo "release workflow must run from $expected_ref, not $EVENT_REF" >&2
+            exit 1
+          fi
+
       - name: Checkout selected tag
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.2
         with:
@@ -137,6 +149,7 @@ jobs:
             --tag "$RELEASE_TAG"
             --expected-commit "${{ steps.source.outputs.commit }}"
             --expected-tag-object "${{ steps.source.outputs.tag_object }}"
+            --expected-event-sha "${{ github.sha }}"
             --github-repository "$GITHUB_REPOSITORY"
           )
           python scripts/verify_release_tag.py "${arguments[@]}"

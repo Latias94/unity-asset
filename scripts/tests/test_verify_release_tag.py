@@ -68,6 +68,21 @@ class ReleaseTagVerifierTests(unittest.TestCase):
                     "example/unity-asset", identity, identity.tag_object, None
                 )
 
+    def test_rejects_a_dispatch_commit_that_is_not_the_selected_tag(self) -> None:
+        identity = self.identity()
+        with mock.patch.object(TAG_VERIFIER, "gh_json") as gh_json:
+            with self.assertRaisesRegex(
+                TAG_VERIFIER.VerificationError,
+                "neither the release commit nor tag object",
+            ):
+                TAG_VERIFIER.verify_remote_signed_tag(
+                    "example/unity-asset",
+                    identity,
+                    identity.tag_object,
+                    "c" * 40,
+                )
+        gh_json.assert_not_called()
+
     def test_refresh_uses_a_forced_tag_refspec_before_local_verification(self) -> None:
         arguments = mock.Mock(
             repository_root=Path("."),
