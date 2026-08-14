@@ -17,6 +17,8 @@ use unity_asset_search_protocol::{
     SEARCH_PROTOCOL_REVISION, SearchCapabilities, StatusResponse,
 };
 
+use crate::lifecycle::{AdmissionGate, AdmissionLifecycle, DaemonTaskKind};
+
 struct ProjectFixture {
     _temporary: tempfile::TempDir,
     paths: IndexPaths,
@@ -505,5 +507,67 @@ async fn coordinator_client_does_not_retain_executor_resources_after_join() {
             .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
             .await,
         Err(CoordinatorError::ShuttingDown)
+    ));
+}
+
+#[tokio::test]
+async fn runner_panic_closes_lifecycle_and_fails_every_pending_observer() {
+    let lifecycle = AdmissionGate::default();
+    let mut runtime = ReindexCoordinatorRuntime::start_supervised(
+        config()
+            .with_debounce(Duration::from_secs(60))
+            .with_max_debounce(Duration::from_secs(60)),
+        lifecycle.clone(),
+        |intent| async move { Ok(execution(&intent)) },
+    )
+    .unwrap();
+    let coordinator = runtime.coordinator();
+    let observation = coordinator
+        .admit_observed(ReindexSource::Ipc, FilesystemReindexIntent::reconcile())
+        .await
+        .unwrap();
+
+    coordinator.panic_runner();
+
+    let failure = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let AdmissionLifecycle::Failed(failure) = lifecycle.lifecycle() {
+                break failure;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("runner panic must close lifecycle admission");
+    assert_eq!(failure.task, DaemonTaskKind::ReindexCoordinator);
+    assert!(
+        failure
+            .message
+            .contains("test-injected coordinator runner panic")
+    );
+
+    let observation_failure = wait_for_completion(observation).await.unwrap_err();
+    assert!(matches!(
+        observation_failure,
+        CoordinatorError::RunnerTerminated { ref message }
+            if message.contains("test-injected coordinator runner panic")
+    ));
+    assert!(matches!(
+        coordinator
+            .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
+            .await,
+        Err(CoordinatorError::RunnerTerminated { message })
+            if message.contains("test-injected coordinator runner panic")
+    ));
+    let snapshot = coordinator.snapshot().await;
+    assert!(!snapshot.running);
+    assert!(snapshot.in_flight.is_none());
+    assert!(snapshot.pending_general.is_none());
+    assert!(snapshot.runtime_failure.is_some());
+
+    assert!(matches!(
+        runtime.shutdown().await,
+        Err(CoordinatorError::RunnerTerminated { message })
+            if message.contains("test-injected coordinator runner panic")
     ));
 }

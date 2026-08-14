@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures::FutureExt as _;
 use notify::Watcher as _;
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio::task::JoinSet;
@@ -16,6 +17,7 @@ use unity_asset_search_index::{
 };
 use unity_asset_search_protocol::ProjectId;
 
+use crate::lifecycle::{AdmissionGate, DaemonTaskKind};
 use crate::operations::{OperationError, OperationOrigin, OperationService, OperationSnapshot};
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
@@ -40,6 +42,7 @@ pub enum WatcherLifecycle {
     Starting,
     Healthy,
     Retrying,
+    Failed,
     Stopped,
 }
 
@@ -93,19 +96,38 @@ impl MaintenanceRuntime {
         watcher: Option<WatcherConfig>,
         reconcile_interval: Option<Duration>,
     ) -> Self {
-        Self::start_with_dependencies(
+        let lifecycle = operations.lifecycle_admission();
+        Self::start_with_dependencies_and_lifecycle(
             Arc::new(operations),
             watcher,
             reconcile_interval,
             Arc::new(NotifyWatcherFactory),
+            lifecycle,
         )
     }
 
+    #[cfg(test)]
     fn start_with_dependencies(
         operations: Arc<dyn MaintenanceOperations>,
         watcher: Option<WatcherConfig>,
         reconcile_interval: Option<Duration>,
         watcher_factory: Arc<dyn WatcherFactory>,
+    ) -> Self {
+        Self::start_with_dependencies_and_lifecycle(
+            operations,
+            watcher,
+            reconcile_interval,
+            watcher_factory,
+            AdmissionGate::default(),
+        )
+    }
+
+    fn start_with_dependencies_and_lifecycle(
+        operations: Arc<dyn MaintenanceOperations>,
+        watcher: Option<WatcherConfig>,
+        reconcile_interval: Option<Duration>,
+        watcher_factory: Arc<dyn WatcherFactory>,
+        lifecycle: AdmissionGate,
     ) -> Self {
         let timer_deadline = reconcile_interval.map(|interval| Instant::now() + interval);
         let state = Arc::new(RwLock::new(MaintenanceState {
@@ -127,21 +149,38 @@ impl MaintenanceRuntime {
         let (shutdown, shutdown_receiver) = watch::channel(false);
         let mut tasks = JoinSet::new();
         if let Some(config) = watcher {
-            tasks.spawn(supervise_watcher(
-                operations.clone(),
-                config,
-                Arc::clone(&state),
-                shutdown_receiver.clone(),
-                watcher_factory,
+            let task_state = Arc::clone(&state);
+            let task_lifecycle = lifecycle.clone();
+            let expected_shutdown = shutdown_receiver.clone();
+            tasks.spawn(supervise_maintenance_task(
+                DaemonTaskKind::FilesystemWatcher,
+                Arc::clone(&task_state),
+                task_lifecycle,
+                expected_shutdown,
+                supervise_watcher(
+                    operations.clone(),
+                    config,
+                    task_state,
+                    shutdown_receiver.clone(),
+                    watcher_factory,
+                ),
             ));
         }
         if let (Some(interval), Some(deadline)) = (reconcile_interval, timer_deadline) {
-            tasks.spawn(reconcile_loop(
-                operations,
-                interval,
-                deadline,
-                state,
-                shutdown_receiver,
+            let task_state = Arc::clone(&state);
+            let expected_shutdown = shutdown_receiver.clone();
+            tasks.spawn(supervise_maintenance_task(
+                DaemonTaskKind::ReconcileTimer,
+                Arc::clone(&task_state),
+                lifecycle,
+                expected_shutdown,
+                reconcile_loop(
+                    operations,
+                    interval,
+                    deadline,
+                    task_state,
+                    shutdown_receiver,
+                ),
             ));
         }
         Self {
@@ -476,6 +515,59 @@ impl WatcherEventStream {
         while self.events.try_recv().is_ok() {}
         true
     }
+}
+
+async fn supervise_maintenance_task<F>(
+    task: DaemonTaskKind,
+    state: Arc<RwLock<MaintenanceState>>,
+    lifecycle: AdmissionGate,
+    expected_shutdown: watch::Receiver<bool>,
+    future: F,
+) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>> + Send,
+{
+    let outcome = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+    let failure = match outcome {
+        Ok(Ok(())) if *expected_shutdown.borrow() => return Ok(()),
+        Ok(Ok(())) => format!("{task} exited without a shutdown request"),
+        Ok(Err(error)) => format!("{task} failed: {error:#}"),
+        Err(payload) => format!(
+            "{task} panicked: {}",
+            maintenance_panic_message(payload.as_ref())
+        ),
+    };
+    let failure = bounded_failure(failure);
+    lifecycle.fail_task(task, failure.clone());
+    {
+        let mut state = state.write().await;
+        match task {
+            DaemonTaskKind::FilesystemWatcher => {
+                state.watcher = WatcherLifecycle::Failed;
+                state.watcher_last_failure = Some(failure.clone());
+                state.watcher_next_retry = None;
+            }
+            DaemonTaskKind::ReconcileTimer => {
+                state.timer = TimerLifecycle::Failed;
+                state.timer_last_failure = Some(failure.clone());
+                state.timer_next_run = None;
+            }
+            DaemonTaskKind::ReindexCoordinator => {
+                unreachable!("coordinator tasks are not owned by maintenance")
+            }
+        }
+    }
+    Err(anyhow::anyhow!(failure))
+}
+
+fn maintenance_panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return message;
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message;
+    }
+    "non-string panic payload"
 }
 
 async fn supervise_watcher(
@@ -821,6 +913,7 @@ mod tests {
         report_backend_failure, run_watcher_session, send_watch_signal,
         typed_index_namespace_exclusion, watch_signal,
     };
+    use crate::lifecycle::{AdmissionGate, AdmissionLifecycle, DaemonTaskKind};
     use crate::operations::OperationError;
 
     #[derive(Default)]
@@ -1001,6 +1094,34 @@ mod tests {
                 }
                 None => anyhow::bail!("watcher open script exhausted"),
             }
+        }
+    }
+
+    struct PanickingWatcherFactory;
+
+    impl WatcherFactory for PanickingWatcherFactory {
+        fn open(&self, _config: &WatcherConfig) -> anyhow::Result<Box<dyn WatcherSession>> {
+            panic!("test-injected watcher supervisor panic")
+        }
+    }
+
+    struct PanickingTimerOperations;
+
+    impl MaintenanceOperations for PanickingTimerOperations {
+        fn admit_watcher(&self, _intent: FilesystemReindexIntent) -> AdmissionFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+
+        fn admit_watcher_overflow(&self) -> AdmissionFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+
+        fn reconcile_watcher_gap(&self) -> MaintenanceFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+
+        fn run_timer(&self) -> MaintenanceFuture<'_> {
+            panic!("test-injected reconcile timer panic")
         }
     }
 
@@ -1498,6 +1619,74 @@ mod tests {
         );
 
         maintenance.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn watcher_supervisor_panic_closes_daemon_lifecycle_and_surfaces_failure() {
+        let fixture = WatcherFixture::new();
+        let lifecycle = AdmissionGate::default();
+        let mut maintenance = MaintenanceRuntime::start_with_dependencies_and_lifecycle(
+            Arc::new(ScriptedOperations::default()),
+            Some(fixture.config),
+            None,
+            Arc::new(PanickingWatcherFactory),
+            lifecycle.clone(),
+        );
+        let handle = maintenance.handle();
+
+        let failure = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let AdmissionLifecycle::Failed(failure) = lifecycle.lifecycle() {
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("watcher panic must close lifecycle admission");
+
+        assert_eq!(failure.task, DaemonTaskKind::FilesystemWatcher);
+        assert!(
+            failure
+                .message
+                .contains("test-injected watcher supervisor panic")
+        );
+        let snapshot = handle.snapshot().await;
+        assert_eq!(snapshot.watcher, WatcherLifecycle::Failed);
+        assert_eq!(snapshot.watcher_last_failure, Some(failure.message));
+        assert!(lifecycle.admit().await.is_none());
+        assert!(maintenance.shutdown().await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconcile_timer_panic_closes_daemon_lifecycle_and_surfaces_failure() {
+        let lifecycle = AdmissionGate::default();
+        let mut maintenance = MaintenanceRuntime::start_with_dependencies_and_lifecycle(
+            Arc::new(PanickingTimerOperations),
+            None,
+            Some(Duration::from_secs(1)),
+            Arc::new(NotifyWatcherFactory),
+            lifecycle.clone(),
+        );
+        let handle = maintenance.handle();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        settle().await;
+
+        let AdmissionLifecycle::Failed(failure) = lifecycle.lifecycle() else {
+            panic!("reconcile timer panic did not close lifecycle admission");
+        };
+        assert_eq!(failure.task, DaemonTaskKind::ReconcileTimer);
+        assert!(
+            failure
+                .message
+                .contains("test-injected reconcile timer panic")
+        );
+        let snapshot = handle.snapshot().await;
+        assert_eq!(snapshot.timer, TimerLifecycle::Failed);
+        assert_eq!(snapshot.timer_last_failure, Some(failure.message));
+        assert!(lifecycle.admit().await.is_none());
+        assert!(maintenance.shutdown().await.is_err());
     }
 
     #[tokio::test(start_paused = true)]

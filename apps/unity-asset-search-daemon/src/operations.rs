@@ -18,7 +18,7 @@ use crate::coordinator::{
     ReindexCoordinator, ReindexCoordinatorSnapshot, ReindexObservation, ReindexObservationProgress,
     ReindexScopeKind, ReindexSource,
 };
-use crate::lifecycle::AdmissionGate;
+use crate::lifecycle::{AdmissionGate, AdmissionLifecycle, DaemonTaskKind};
 
 const MAX_ACTIVE_OPERATIONS: usize = 256;
 const MAX_ACTIVE_CLIENT_OPERATIONS: usize = 240;
@@ -94,8 +94,8 @@ pub enum OperationFailure {
         scope: ReindexScopeKind,
         message: String,
     },
-    #[error("reindex completion channel closed unexpectedly")]
-    CompletionChannelClosed,
+    #[error("reindex coordinator terminated unexpectedly: {message}")]
+    CoordinatorTerminated { message: String },
 }
 
 /// One queryable operation state. Every retained daemon operation has a typed origin.
@@ -173,6 +173,11 @@ pub struct OperationCancellation {
 pub enum OperationError {
     #[error("operation service is draining")]
     Draining,
+    #[error("daemon task {task} terminated unexpectedly: {message}")]
+    LifecycleFailed {
+        task: DaemonTaskKind,
+        message: String,
+    },
     #[error("reindex operation active limit reached; maximum is {maximum}")]
     Saturated { maximum: usize },
     #[error("idempotency key is already bound to operation {operation_id} with another intent")]
@@ -317,6 +322,10 @@ impl OperationService {
         self.coordinator.project_path_space()
     }
 
+    pub(crate) fn lifecycle_admission(&self) -> AdmissionGate {
+        self.lifecycle_admission.clone()
+    }
+
     pub async fn admit(
         &self,
         origin: OperationOrigin,
@@ -324,6 +333,7 @@ impl OperationService {
         idempotency_key: Option<String>,
     ) -> Result<OperationSnapshot, OperationError> {
         debug_assert_ne!(origin, OperationOrigin::WatcherOverflow);
+        self.ensure_lifecycle_serving()?;
         let prepared = self.coordinator.prepare_intent(&intent)?;
         self.admit_prepared(origin, prepared, idempotency_key, false)
             .await
@@ -341,6 +351,7 @@ impl OperationService {
     }
 
     pub async fn admit_watcher_overflow(&self) -> Result<OperationSnapshot, OperationError> {
+        self.ensure_lifecycle_serving()?;
         let prepared = self
             .coordinator
             .prepare_intent(&FilesystemReindexIntent::full())?;
@@ -362,11 +373,10 @@ impl OperationService {
         idempotency_key: Option<String>,
         watcher_overflow: bool,
     ) -> Result<OperationSnapshot, OperationError> {
-        let _lifecycle_admission = self
-            .lifecycle_admission
-            .admit()
-            .await
-            .ok_or(OperationError::Draining)?;
+        let _lifecycle_admission = match self.lifecycle_admission.admit().await {
+            Some(admission) => admission,
+            None => return Err(self.lifecycle_rejection()),
+        };
         let _admission = self.admission_gate.lock().await;
         self.ensure_completion_tasks_healthy().await?;
         let mut tasks = self.tasks.lock().await;
@@ -456,6 +466,25 @@ impl OperationService {
             self.retention,
         ));
         Ok(status)
+    }
+
+    fn ensure_lifecycle_serving(&self) -> Result<(), OperationError> {
+        match self.lifecycle_admission.lifecycle() {
+            AdmissionLifecycle::Serving => Ok(()),
+            AdmissionLifecycle::Draining | AdmissionLifecycle::Failed(_) => {
+                Err(self.lifecycle_rejection())
+            }
+        }
+    }
+
+    fn lifecycle_rejection(&self) -> OperationError {
+        match self.lifecycle_admission.lifecycle() {
+            AdmissionLifecycle::Failed(failure) => OperationError::LifecycleFailed {
+                task: failure.task,
+                message: failure.message,
+            },
+            AdmissionLifecycle::Serving | AdmissionLifecycle::Draining => OperationError::Draining,
+        }
     }
 
     pub async fn status(
@@ -829,7 +858,10 @@ async fn complete_operation(
                         status: Some(completion.status),
                         failure: None,
                     },
-                    Err(error) => failed_snapshot(entry.origin, operation_id, error),
+                    Err(error) => {
+                        let admission = entry.status.read().await.admission.clone();
+                        failed_snapshot(entry.origin, operation_id, admission, error)
+                    }
                 };
                 *entry.status.write().await = terminal;
                 registry
@@ -847,6 +879,7 @@ async fn complete_operation(
 fn failed_snapshot(
     origin: OperationOrigin,
     operation_id: OperationId,
+    active_admission: Option<ReindexReceipt>,
     error: CoordinatorError,
 ) -> OperationSnapshot {
     let (admission, failure) = match error {
@@ -858,9 +891,10 @@ fn failed_snapshot(
             Some(*admission),
             OperationFailure::Execution { scope, message },
         ),
-        CoordinatorError::CompletionChannelClosed { admission } => {
-            (Some(*admission), OperationFailure::CompletionChannelClosed)
-        }
+        CoordinatorError::RunnerTerminated { message } => (
+            active_admission,
+            OperationFailure::CoordinatorTerminated { message },
+        ),
         other => unreachable!("unexpected terminal coordinator error: {other}"),
     };
     OperationSnapshot {
@@ -1143,7 +1177,7 @@ mod tests {
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexScopeKind,
     };
-    use crate::lifecycle::AdmissionGate;
+    use crate::lifecycle::{AdmissionGate, DaemonTaskKind};
     use crate::watcher::{MaintenanceRuntime, TimerLifecycle};
 
     struct CoordinatorFixture {
@@ -1225,6 +1259,50 @@ mod tests {
             })
         );
         fixture.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinator_runner_failure_becomes_a_typed_terminal_operation() {
+        let fixture = CoordinatorFixture::pending();
+        let coordinator = fixture.runtime.coordinator();
+        let mut owner = OperationServiceOwner::new(
+            DaemonInstanceId::from_bytes([24; 16]),
+            coordinator.clone(),
+            AdmissionGate::default(),
+        );
+        let service = owner.service();
+        let admitted = service
+            .admit(
+                OperationOrigin::Ipc,
+                FilesystemReindexIntent::reconcile(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        coordinator.panic_runner();
+
+        let terminal = tokio::time::timeout(
+            Duration::from_secs(5),
+            service.wait_until_terminal(admitted.operation_id),
+        )
+        .await
+        .expect("runner failure must terminate its operation observer")
+        .unwrap();
+        assert_eq!(terminal.state, ReindexOperationState::Failed);
+        assert_eq!(terminal.admission, admitted.admission);
+        assert!(matches!(
+            terminal.failure,
+            Some(OperationFailure::CoordinatorTerminated { ref message })
+                if message.contains("test-injected coordinator runner panic")
+        ));
+
+        owner.shutdown().await.unwrap();
+        let CoordinatorFixture {
+            _project,
+            mut runtime,
+        } = fixture;
+        assert!(runtime.shutdown().await.is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1741,6 +1819,45 @@ mod tests {
             service.admit_watcher_overflow().await,
             Err(OperationError::Draining)
         ));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_failure_rejects_admission_with_typed_task_evidence() {
+        let fixture = CoordinatorFixture::pending();
+        let admission = AdmissionGate::default();
+        let service = OperationService::new(
+            DaemonInstanceId::from_bytes([25; 16]),
+            fixture.runtime.coordinator(),
+            admission.clone(),
+        );
+        admission.fail_task(
+            DaemonTaskKind::FilesystemWatcher,
+            "watcher supervisor panicked",
+        );
+
+        assert!(matches!(
+            service
+                .admit(
+                    OperationOrigin::Ipc,
+                    FilesystemReindexIntent::reconcile(),
+                    None,
+                )
+                .await,
+            Err(OperationError::LifecycleFailed {
+                task: DaemonTaskKind::FilesystemWatcher,
+                message,
+            }) if message == "watcher supervisor panicked"
+        ));
+        assert_eq!(
+            fixture
+                .runtime
+                .coordinator()
+                .snapshot()
+                .await
+                .admissions
+                .ipc,
+            0
+        );
     }
 
     #[tokio::test(start_paused = true)]

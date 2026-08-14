@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use futures::FutureExt as _;
 use sha2::{Digest as _, Sha256};
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tokio::time::Instant;
 use unity_asset_search_index::{
     FilesystemReindexIntent, FilesystemReindexScope, ProjectPathSet, ProjectPathSpace,
@@ -24,6 +24,8 @@ use unity_asset_search_protocol::{
     ProjectId, ReindexDisposition, ReindexReceipt, SEARCH_PROTOCOL_REVISION, StatusResponse,
     ValidateContract,
 };
+
+use crate::lifecycle::{AdmissionGate, DaemonTaskKind};
 
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(75);
 const DEFAULT_MAX_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -258,6 +260,7 @@ pub struct ReindexCoordinatorSnapshot {
     pub full_escalations: u64,
     pub watcher_overflows: u64,
     pub admissions: ReindexAdmissionCounts,
+    pub runtime_failure: Option<String>,
 }
 
 impl ReindexCoordinatorSnapshot {
@@ -301,6 +304,7 @@ pub struct ReindexCompletion {
 pub struct ReindexObservation {
     admission: ReindexReceipt,
     events: mpsc::Receiver<ObservationEvent>,
+    runtime_failure: watch::Receiver<Option<String>>,
     cancellation: ReindexCancellation,
 }
 
@@ -336,11 +340,23 @@ impl ReindexObservation {
                     }),
                 }))
             }
-            None => ReindexObservationProgress::Terminal(Box::new(Err(
-                CoordinatorError::CompletionChannelClosed {
-                    admission: Box::new(self.admission.clone()),
-                },
-            ))),
+            None => {
+                let failure = wait_for_runtime_failure(&mut self.runtime_failure).await;
+                ReindexObservationProgress::Terminal(Box::new(Err(
+                    CoordinatorError::RunnerTerminated { message: failure },
+                )))
+            }
+        }
+    }
+}
+
+async fn wait_for_runtime_failure(failure: &mut watch::Receiver<Option<String>>) -> String {
+    loop {
+        if let Some(message) = failure.borrow_and_update().clone() {
+            return message;
+        }
+        if failure.changed().await.is_err() {
+            return "coordinator runtime failure evidence channel closed unexpectedly".to_owned();
         }
     }
 }
@@ -415,8 +431,33 @@ impl fmt::Debug for ReindexCoordinator {
 }
 
 impl ReindexCoordinatorRuntime {
+    #[cfg(test)]
     pub fn start<F, Fut>(
         config: ReindexCoordinatorConfig,
+        executor: F,
+    ) -> Result<Self, CoordinatorError>
+    where
+        F: Fn(FilesystemReindexIntent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static,
+    {
+        Self::start_inner(config, None, executor)
+    }
+
+    pub(crate) fn start_supervised<F, Fut>(
+        config: ReindexCoordinatorConfig,
+        lifecycle: AdmissionGate,
+        executor: F,
+    ) -> Result<Self, CoordinatorError>
+    where
+        F: Fn(FilesystemReindexIntent) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<ReindexExecution>> + Send + 'static,
+    {
+        Self::start_inner(config, Some(lifecycle), executor)
+    }
+
+    fn start_inner<F, Fut>(
+        config: ReindexCoordinatorConfig,
+        lifecycle: Option<AdmissionGate>,
         executor: F,
     ) -> Result<Self, CoordinatorError>
     where
@@ -426,6 +467,7 @@ impl ReindexCoordinatorRuntime {
         let config = config.validate()?;
         let executor: Arc<BuildExecutor> =
             Arc::new(move |intent| Box::pin(executor(intent)) as BuildFuture);
+        let (runtime_failure, _) = watch::channel(None);
         let inner = Arc::new(CoordinatorInner {
             config,
             state: Mutex::new(CoordinatorState::default()),
@@ -433,8 +475,14 @@ impl ReindexCoordinatorRuntime {
             changed: Notify::new(),
             next_observation_id: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
+            runtime_failure,
+            #[cfg(test)]
+            panic_requested: AtomicBool::new(false),
         });
-        let runner = tokio::spawn(run_coordinator(Arc::clone(&inner), executor));
+        let runner_inner = Arc::clone(&inner);
+        let runner = tokio::spawn(async move {
+            supervise_coordinator(runner_inner, executor, lifecycle).await;
+        });
         Ok(Self {
             coordinator: ReindexCoordinator { inner },
             runner: Some(runner),
@@ -460,7 +508,11 @@ impl ReindexCoordinatorRuntime {
         self.runner.take();
         result.map_err(|error| CoordinatorError::RunnerTerminated {
             message: crate::truncate_utf8(error.to_string(), MAX_FAILURE_MESSAGE_BYTES),
-        })
+        })?;
+        match self.coordinator.runtime_failure() {
+            Some(message) => Err(CoordinatorError::RunnerTerminated { message }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -554,6 +606,9 @@ impl ReindexCoordinator {
         };
         let (admission, should_start) = {
             let mut state = self.inner.state.lock().await;
+            if let Some(message) = self.runtime_failure() {
+                return Err(CoordinatorError::RunnerTerminated { message });
+            }
             if self.inner.shutting_down.load(Ordering::Acquire) {
                 return Err(CoordinatorError::ShuttingDown);
             }
@@ -580,6 +635,7 @@ impl ReindexCoordinator {
         Ok(ReindexObservation {
             admission,
             events: event_receiver,
+            runtime_failure: self.inner.runtime_failure.subscribe(),
             cancellation: ReindexCancellation {
                 inner: Arc::clone(&self.inner),
                 observation_id,
@@ -613,7 +669,7 @@ impl ReindexCoordinator {
     #[must_use]
     pub async fn snapshot(&self) -> ReindexCoordinatorSnapshot {
         let state = self.inner.state.lock().await;
-        state.snapshot()
+        state.snapshot(self.runtime_failure())
     }
 
     #[cfg(test)]
@@ -623,6 +679,9 @@ impl ReindexCoordinator {
         prepared: PreparedReindexIntent,
     ) -> Result<ReindexReceipt, CoordinatorError> {
         let mut state = self.inner.state.lock().await;
+        if let Some(message) = self.runtime_failure() {
+            return Err(CoordinatorError::RunnerTerminated { message });
+        }
         if self.inner.shutting_down.load(Ordering::Acquire) {
             return Err(CoordinatorError::ShuttingDown);
         }
@@ -664,6 +723,16 @@ impl ReindexCoordinator {
             }
         }
     }
+
+    fn runtime_failure(&self) -> Option<String> {
+        self.inner.runtime_failure.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn panic_runner(&self) {
+        self.inner.panic_requested.store(true, Ordering::Release);
+        self.inner.wake.notify_waiters();
+    }
 }
 
 struct CoordinatorInner {
@@ -673,6 +742,9 @@ struct CoordinatorInner {
     changed: Notify,
     next_observation_id: AtomicU64,
     shutting_down: AtomicBool,
+    runtime_failure: watch::Sender<Option<String>>,
+    #[cfg(test)]
+    panic_requested: AtomicBool,
 }
 
 #[derive(Default)]
@@ -827,7 +899,7 @@ impl CoordinatorState {
         }
     }
 
-    fn snapshot(&self) -> ReindexCoordinatorSnapshot {
+    fn snapshot(&self, runtime_failure: Option<String>) -> ReindexCoordinatorSnapshot {
         ReindexCoordinatorSnapshot {
             running: self.runner_running,
             in_flight: self.in_flight.as_ref().map(ReindexScopeKind::from_intent),
@@ -840,7 +912,16 @@ impl CoordinatorState {
             full_escalations: self.full_escalations,
             watcher_overflows: self.watcher_overflows,
             admissions: ReindexAdmissionCounts::from_array(self.admissions),
+            runtime_failure,
         }
+    }
+
+    fn fail_runner(&mut self) {
+        self.runner_running = false;
+        self.in_flight = None;
+        self.pending_general = None;
+        self.completion_waiter_count = 0;
+        self.last_completion_failed = true;
     }
 }
 
@@ -853,8 +934,59 @@ enum RunnerAction {
     Stop,
 }
 
+async fn supervise_coordinator(
+    inner: Arc<CoordinatorInner>,
+    executor: Arc<BuildExecutor>,
+    lifecycle: Option<AdmissionGate>,
+) {
+    let outcome = AssertUnwindSafe(run_coordinator(Arc::clone(&inner), executor))
+        .catch_unwind()
+        .await;
+    let failure = match outcome {
+        Ok(()) if inner.shutting_down.load(Ordering::Acquire) => return,
+        Ok(()) => "reindex coordinator runner exited without a shutdown request".to_owned(),
+        Err(payload) => format!(
+            "reindex coordinator runner panicked: {}",
+            panic_payload_message(payload.as_ref())
+        ),
+    };
+    record_runtime_failure(&inner, lifecycle.as_ref(), failure).await;
+}
+
+async fn record_runtime_failure(
+    inner: &CoordinatorInner,
+    lifecycle: Option<&AdmissionGate>,
+    message: String,
+) {
+    let message = crate::truncate_utf8(message, MAX_FAILURE_MESSAGE_BYTES);
+    if let Some(lifecycle) = lifecycle {
+        lifecycle.fail_task(DaemonTaskKind::ReindexCoordinator, message.clone());
+    }
+    if inner.runtime_failure.borrow().is_none() {
+        drop(inner.runtime_failure.send_replace(Some(message)));
+    }
+    inner.shutting_down.store(true, Ordering::Release);
+    inner.state.lock().await.fail_runner();
+    inner.changed.notify_waiters();
+    inner.wake.notify_waiters();
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return message;
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message;
+    }
+    "non-string panic payload"
+}
+
 async fn run_coordinator(inner: Arc<CoordinatorInner>, executor: Arc<BuildExecutor>) {
     loop {
+        #[cfg(test)]
+        if inner.panic_requested.swap(false, Ordering::AcqRel) {
+            panic!("test-injected coordinator runner panic");
+        }
         let notified = inner.wake.notified();
         let action = {
             let mut state = inner.state.lock().await;
@@ -1181,9 +1313,6 @@ pub enum CoordinatorError {
         scope: ReindexScopeKind,
         message: String,
     },
-    CompletionChannelClosed {
-        admission: Box<ReindexReceipt>,
-    },
     ChangedPathProjectMismatch {
         expected: ProjectId,
         actual: ProjectId,
@@ -1215,9 +1344,6 @@ impl fmt::Display for CoordinatorError {
             }
             Self::ExecutionFailed { scope, message, .. } => {
                 write!(formatter, "reindex {scope:?} execution failed: {message}")
-            }
-            Self::CompletionChannelClosed { .. } => {
-                formatter.write_str("reindex completion channel closed before reporting a result")
             }
             Self::ChangedPathProjectMismatch { expected, actual } => write!(
                 formatter,

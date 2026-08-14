@@ -10,14 +10,17 @@ use unity_asset_search_index::{
 };
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, BackgroundReindexOperation, CapabilitiesResponse, DaemonLifecycleState,
-    DaemonLifecycleStatus, FilesystemReindexIntent, FilesystemReindexScope, FreshnessMaintenance,
-    QueryPolicyId, ReconcileLifecycle, ReindexCancelResponse, ReindexOperationStatus,
-    RequestOperation, ResponseOperation, SearchCapabilities, ShutdownResponse, TimerLifecycleState,
-    TimerStatus, WatcherLifecycleState, WatcherStatus,
+    DaemonLifecycleStatus, DaemonProcessComponent, DaemonProcessFailure, FilesystemReindexIntent,
+    FilesystemReindexScope, FreshnessMaintenance, QueryPolicyId, ReconcileLifecycle,
+    ReindexCancelResponse, ReindexOperationStatus, RequestOperation, ResponseOperation,
+    SearchCapabilities, ShutdownResponse, TimerLifecycleState, TimerStatus, WatcherLifecycleState,
+    WatcherStatus,
 };
 
 use crate::coordinator::{CoordinatorError, ReindexScopeKind};
-use crate::lifecycle::{AdmissionGate, BlockingTaskError, BlockingTaskHandle};
+use crate::lifecycle::{
+    AdmissionGate, AdmissionLifecycle, BlockingTaskError, BlockingTaskHandle, DaemonTaskKind,
+};
 use crate::operations::{
     OperationCancellation, OperationError, OperationFailure, OperationOrigin, OperationService,
     OperationSnapshot,
@@ -117,13 +120,10 @@ impl Dispatcher {
             && self.inner.admission.admit().await.is_none()
         {
             return DispatchResult {
-                response: Err(ApiError::new(
-                    ApiErrorCode::NotReady,
-                    "daemon is draining and no longer accepts this operation",
-                    false,
-                )
-                .with_detail("lifecycle", "draining")
-                .with_query_policy(self.inner.query_policy_id)),
+                response: Err(lifecycle_admission_error(
+                    self.inner.admission.lifecycle(),
+                    self.inner.query_policy_id,
+                )),
                 shutdown_after_response: None,
             };
         }
@@ -249,7 +249,7 @@ impl Dispatcher {
             .await
             .map_err(|error| operation_error(error, self.inner.query_policy_id))?;
         status.daemon = daemon_lifecycle_status(
-            self.inner.admission.is_draining().await,
+            self.inner.admission.lifecycle(),
             &status.daemon,
             &coordinator,
             maintenance,
@@ -280,15 +280,61 @@ const fn requires_lifecycle_admission(
     )
 }
 
+fn lifecycle_admission_error(
+    lifecycle: AdmissionLifecycle,
+    query_policy: QueryPolicyId,
+) -> ApiError {
+    let error = match lifecycle {
+        AdmissionLifecycle::Failed(failure) => ApiError::new(
+            ApiErrorCode::NotReady,
+            "daemon process-lifetime task failed and work admission is closed",
+            false,
+        )
+        .with_detail("lifecycle", "failed")
+        .with_detail("component", failure.task.wire_name())
+        .with_detail("cause", bounded_detail(failure.message)),
+        AdmissionLifecycle::Serving | AdmissionLifecycle::Draining => ApiError::new(
+            ApiErrorCode::NotReady,
+            "daemon is draining and no longer accepts this operation",
+            false,
+        )
+        .with_detail("lifecycle", "draining"),
+    };
+    error.with_query_policy(query_policy)
+}
+
 fn daemon_lifecycle_status(
-    draining: bool,
+    lifecycle: AdmissionLifecycle,
     index_status: &DaemonLifecycleStatus,
     coordinator: &crate::coordinator::ReindexCoordinatorSnapshot,
     maintenance: MaintenanceSnapshot,
     background_reindex_operations: Vec<BackgroundReindexOperation>,
 ) -> DaemonLifecycleStatus {
-    let watcher = watcher_lifecycle_state(maintenance.watcher);
-    let timer = timer_lifecycle_state(maintenance.timer);
+    let failure = match &lifecycle {
+        AdmissionLifecycle::Failed(failure) => Some(failure),
+        AdmissionLifecycle::Serving | AdmissionLifecycle::Draining => None,
+    };
+    let mut watcher = watcher_lifecycle_state(maintenance.watcher);
+    let mut watcher_failure = maintenance.watcher_last_failure;
+    let mut watcher_next_retry_in_ms = maintenance.watcher_next_retry_in_ms;
+    let mut timer = timer_lifecycle_state(maintenance.timer);
+    let mut timer_failure = maintenance.timer_last_failure;
+    let mut timer_next_run_in_ms = maintenance.timer_next_run_in_ms;
+    if let Some(failure) = failure {
+        match failure.task {
+            DaemonTaskKind::FilesystemWatcher => {
+                watcher = WatcherLifecycleState::Failed;
+                watcher_failure = Some(failure.message.clone());
+                watcher_next_retry_in_ms = None;
+            }
+            DaemonTaskKind::ReconcileTimer => {
+                timer = TimerLifecycleState::Failed;
+                timer_failure = Some(failure.message.clone());
+                timer_next_run_in_ms = None;
+            }
+            DaemonTaskKind::ReindexCoordinator => {}
+        }
+    }
     let freshness_maintenance = if matches!(watcher, WatcherLifecycleState::Disabled)
         && matches!(timer, TimerLifecycleState::Disabled)
     {
@@ -296,7 +342,9 @@ fn daemon_lifecycle_status(
     } else {
         FreshnessMaintenance::Managed
     };
-    let reconcile = if coordinator.in_flight.is_some() {
+    let reconcile = if failure.is_some() || coordinator.runtime_failure.is_some() {
+        ReconcileLifecycle::Failed
+    } else if coordinator.in_flight.is_some() {
         ReconcileLifecycle::Running
     } else if coordinator.pending_general.is_some() {
         ReconcileLifecycle::Queued
@@ -306,11 +354,23 @@ fn daemon_lifecycle_status(
         index_status.reconcile
     };
     DaemonLifecycleStatus {
-        lifecycle: if draining {
-            DaemonLifecycleState::Draining
-        } else {
-            DaemonLifecycleState::Serving
+        lifecycle: match &lifecycle {
+            AdmissionLifecycle::Serving => DaemonLifecycleState::Serving,
+            AdmissionLifecycle::Draining | AdmissionLifecycle::Failed(_) => {
+                DaemonLifecycleState::Draining
+            }
         },
+        process_failure: failure.map(|failure| DaemonProcessFailure {
+            component: match failure.task {
+                DaemonTaskKind::ReindexCoordinator => DaemonProcessComponent::ReindexCoordinator,
+                DaemonTaskKind::FilesystemWatcher => DaemonProcessComponent::FilesystemWatcher,
+                DaemonTaskKind::ReconcileTimer => DaemonProcessComponent::ReconcileTimer,
+            },
+            cause: failure.message.clone(),
+        }),
+        // The wire contract defines serving availability from the active generation. Lifecycle
+        // admission is reported independently so clients can distinguish a queryable generation
+        // from a daemon that no longer accepts work after a process-lifetime task failure.
         serving: index_status.serving,
         freshness: index_status.freshness,
         freshness_maintenance,
@@ -319,14 +379,14 @@ fn daemon_lifecycle_status(
         watcher: WatcherStatus {
             state: watcher,
             retry_count: maintenance.watcher_retry_count,
-            last_failure: maintenance.watcher_last_failure,
-            next_retry_in_ms: maintenance.watcher_next_retry_in_ms,
+            last_failure: watcher_failure,
+            next_retry_in_ms: watcher_next_retry_in_ms,
         },
         timer: TimerStatus {
             state: timer,
             run_count: maintenance.timer_run_count,
-            last_failure: maintenance.timer_last_failure,
-            next_run_in_ms: maintenance.timer_next_run_in_ms,
+            last_failure: timer_failure,
+            next_run_in_ms: timer_next_run_in_ms,
         },
         background_reindex_operations,
     }
@@ -338,6 +398,7 @@ const fn watcher_lifecycle_state(state: InternalWatcherLifecycle) -> WatcherLife
         InternalWatcherLifecycle::Starting => WatcherLifecycleState::Starting,
         InternalWatcherLifecycle::Healthy => WatcherLifecycleState::Healthy,
         InternalWatcherLifecycle::Retrying => WatcherLifecycleState::Retrying,
+        InternalWatcherLifecycle::Failed => WatcherLifecycleState::Failed,
         InternalWatcherLifecycle::Stopped => WatcherLifecycleState::Stopped,
     }
 }
@@ -472,11 +533,6 @@ fn coordinator_error(error: CoordinatorError, query_policy: QueryPolicyId) -> Ap
         )
         .with_detail("scope", format!("{scope:?}"))
         .with_detail("cause", bounded_detail(message)),
-        CoordinatorError::CompletionChannelClosed { .. } => ApiError::new(
-            ApiErrorCode::Internal,
-            "reindex completion channel closed unexpectedly",
-            true,
-        ),
         CoordinatorError::ChangedPathProjectMismatch { .. } => ApiError::new(
             ApiErrorCode::Internal,
             "reindex path set belongs to a different project",
@@ -511,6 +567,15 @@ fn operation_error(error: OperationError, query_policy: QueryPolicyId) -> ApiErr
             false,
         )
         .with_detail("lifecycle", "draining")
+        .with_query_policy(query_policy),
+        OperationError::LifecycleFailed { task, message } => ApiError::new(
+            ApiErrorCode::NotReady,
+            "daemon process-lifetime task failed and operation admission is closed",
+            false,
+        )
+        .with_detail("lifecycle", "failed")
+        .with_detail("component", task.wire_name())
+        .with_detail("cause", bounded_detail(message))
         .with_query_policy(query_policy),
         OperationError::Saturated { maximum } => ApiError::new(
             ApiErrorCode::Busy,
@@ -583,11 +648,12 @@ fn operation_failure(failure: OperationFailure, query_policy: QueryPolicyId) -> 
         .with_detail("scope", reindex_scope_name(scope))
         .with_detail("cause", bounded_detail(message))
         .with_query_policy(query_policy),
-        OperationFailure::CompletionChannelClosed => ApiError::new(
+        OperationFailure::CoordinatorTerminated { message } => ApiError::new(
             ApiErrorCode::Internal,
-            "reindex completion channel closed unexpectedly",
-            true,
+            "reindex coordinator terminated before operation completion",
+            false,
         )
+        .with_detail("cause", bounded_detail(message))
         .with_query_policy(query_policy),
     }
 }
@@ -620,9 +686,10 @@ mod tests {
     use tokio::sync::watch;
     use tokio::time::Instant;
     use unity_asset_search_protocol::{
-        DaemonLifecycleState, DaemonLifecycleStatus, FreshnessMaintenance, GenerationFreshness,
-        OperationId, QueryPolicyId, ReconcileLifecycle, ReindexOperationState, ServingAvailability,
-        TimerLifecycleState, TimerStatus, ValidateContract, WatcherLifecycleState, WatcherStatus,
+        DaemonLifecycleState, DaemonLifecycleStatus, DaemonProcessComponent, FreshnessMaintenance,
+        GenerationFreshness, OperationId, QueryPolicyId, ReconcileLifecycle, ReindexOperationState,
+        ServingAvailability, TimerLifecycleState, TimerStatus, ValidateContract,
+        WatcherLifecycleState, WatcherStatus,
     };
 
     use super::{
@@ -632,7 +699,7 @@ mod tests {
     use crate::coordinator::{
         ReindexAdmissionCounts, ReindexCoordinatorSnapshot, ReindexFailure, ReindexScopeKind,
     };
-    use crate::lifecycle::AdmissionGate;
+    use crate::lifecycle::{AdmissionGate, AdmissionLifecycle, DaemonTaskFailure, DaemonTaskKind};
     use crate::operations::{OperationFailure, OperationOrigin, OperationSnapshot};
     use crate::watcher::{MaintenanceSnapshot, TimerLifecycle, WatcherLifecycle};
 
@@ -644,6 +711,7 @@ mod tests {
     fn daemon_status_reports_current_lifecycle_not_historical_failures() {
         let index_status = DaemonLifecycleStatus {
             lifecycle: DaemonLifecycleState::Serving,
+            process_failure: None,
             serving: ServingAvailability::Queryable,
             freshness: GenerationFreshness::Current,
             freshness_maintenance: FreshnessMaintenance::Unmanaged,
@@ -677,6 +745,7 @@ mod tests {
             full_escalations: 0,
             watcher_overflows: 0,
             admissions: ReindexAdmissionCounts::default(),
+            runtime_failure: None,
         };
         let maintenance = MaintenanceSnapshot {
             watcher: WatcherLifecycle::Disabled,
@@ -689,10 +758,106 @@ mod tests {
             timer_next_run_in_ms: None,
         };
 
-        let status =
-            daemon_lifecycle_status(false, &index_status, &coordinator, maintenance, Vec::new());
+        let status = daemon_lifecycle_status(
+            AdmissionLifecycle::Serving,
+            &index_status,
+            &coordinator,
+            maintenance.clone(),
+            Vec::new(),
+        );
         assert_eq!(status.reconcile, ReconcileLifecycle::Idle);
         assert_eq!(status.lifecycle, DaemonLifecycleState::Serving);
+        assert_eq!(status.process_failure, None);
+
+        let failed = daemon_lifecycle_status(
+            AdmissionLifecycle::Failed(DaemonTaskFailure {
+                task: DaemonTaskKind::ReindexCoordinator,
+                message: "coordinator panicked".to_owned(),
+            }),
+            &index_status,
+            &coordinator,
+            maintenance,
+            Vec::new(),
+        );
+        assert_eq!(failed.lifecycle, DaemonLifecycleState::Draining);
+        assert_eq!(failed.serving, ServingAvailability::Queryable);
+        assert_eq!(failed.reconcile, ReconcileLifecycle::Failed);
+        assert_eq!(
+            failed.process_failure.as_ref().unwrap().component,
+            DaemonProcessComponent::ReindexCoordinator
+        );
+        assert_eq!(
+            failed.process_failure.as_ref().unwrap().cause,
+            "coordinator panicked"
+        );
+
+        let watcher_failed = daemon_lifecycle_status(
+            AdmissionLifecycle::Failed(DaemonTaskFailure {
+                task: DaemonTaskKind::FilesystemWatcher,
+                message: "watcher panicked".to_owned(),
+            }),
+            &index_status,
+            &coordinator,
+            MaintenanceSnapshot {
+                watcher: WatcherLifecycle::Healthy,
+                ..maintenance_fixture()
+            },
+            Vec::new(),
+        );
+        assert_eq!(watcher_failed.watcher.state, WatcherLifecycleState::Failed);
+        assert_eq!(
+            watcher_failed.watcher.last_failure.as_deref(),
+            Some("watcher panicked")
+        );
+        assert_eq!(
+            watcher_failed.process_failure.as_ref().unwrap().component,
+            DaemonProcessComponent::FilesystemWatcher
+        );
+        assert_eq!(
+            watcher_failed.process_failure.as_ref().unwrap().cause,
+            "watcher panicked"
+        );
+
+        let timer_failed = daemon_lifecycle_status(
+            AdmissionLifecycle::Failed(DaemonTaskFailure {
+                task: DaemonTaskKind::ReconcileTimer,
+                message: "timer panicked".to_owned(),
+            }),
+            &index_status,
+            &coordinator,
+            MaintenanceSnapshot {
+                timer: TimerLifecycle::Scheduled,
+                timer_next_run_in_ms: Some(1),
+                ..maintenance_fixture()
+            },
+            Vec::new(),
+        );
+        assert_eq!(timer_failed.timer.state, TimerLifecycleState::Failed);
+        assert_eq!(
+            timer_failed.timer.last_failure.as_deref(),
+            Some("timer panicked")
+        );
+        assert_eq!(
+            timer_failed.process_failure.as_ref().unwrap().component,
+            DaemonProcessComponent::ReconcileTimer
+        );
+        assert_eq!(
+            timer_failed.process_failure.as_ref().unwrap().cause,
+            "timer panicked"
+        );
+    }
+
+    fn maintenance_fixture() -> MaintenanceSnapshot {
+        MaintenanceSnapshot {
+            watcher: WatcherLifecycle::Disabled,
+            watcher_retry_count: 0,
+            watcher_last_failure: None,
+            watcher_next_retry_in_ms: None,
+            timer: TimerLifecycle::Disabled,
+            timer_run_count: 0,
+            timer_last_failure: None,
+            timer_next_run_in_ms: None,
+        }
     }
 
     #[test]

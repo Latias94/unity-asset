@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
-use tokio::sync::{OwnedMutexGuard, oneshot};
+use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use unity_asset_search_index::{
@@ -21,6 +21,7 @@ use crate::operations::{OperationOrigin, OperationServiceOwner, SemanticUpgradeR
 use crate::watcher::{MaintenanceRuntime, WatcherConfig};
 
 const DAEMON_RUNTIME_WORKER_THREADS: usize = 2;
+const MAX_DAEMON_BLOCKING_TASKS: usize = 32;
 
 #[derive(Clone, Default)]
 pub struct AdmissionGate {
@@ -31,6 +32,45 @@ pub struct AdmissionGate {
 struct AdmissionState {
     closed: AtomicBool,
     linearization: Arc<tokio::sync::Mutex<()>>,
+    failure: Mutex<Option<DaemonTaskFailure>>,
+}
+
+/// Process-lifetime daemon task whose unexpected termination invalidates serving authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonTaskKind {
+    ReindexCoordinator,
+    FilesystemWatcher,
+    ReconcileTimer,
+}
+
+impl DaemonTaskKind {
+    pub(crate) const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReindexCoordinator => "reindex_coordinator",
+            Self::FilesystemWatcher => "filesystem_watcher",
+            Self::ReconcileTimer => "reconcile_timer",
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonTaskKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.wire_name())
+    }
+}
+
+/// First process-lifetime task failure retained for admission and status decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonTaskFailure {
+    pub(crate) task: DaemonTaskKind,
+    pub(crate) message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdmissionLifecycle {
+    Serving,
+    Draining,
+    Failed(DaemonTaskFailure),
 }
 
 /// Linearization capability proving that work was accepted before draining began.
@@ -63,11 +103,44 @@ impl AdmissionGate {
         self.state.closed.store(true, Ordering::Release);
     }
 
+    /// Records the first process-lifetime task failure and closes every work admission boundary.
+    pub(crate) fn fail_task(&self, task: DaemonTaskKind, message: impl Into<String>) {
+        let mut message = crate::truncate_utf8(message.into(), 4 * 1024);
+        if message.trim().is_empty() {
+            message = "process-lifetime task terminated without diagnostic evidence".to_owned();
+        }
+        let mut failure = self
+            .state
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if failure.is_none() {
+            *failure = Some(DaemonTaskFailure { task, message });
+        }
+        self.close();
+    }
+
+    #[must_use]
+    pub(crate) fn lifecycle(&self) -> AdmissionLifecycle {
+        let failure = self
+            .state
+            .failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        match failure {
+            Some(failure) => AdmissionLifecycle::Failed(failure),
+            None if self.state.closed.load(Ordering::Acquire) => AdmissionLifecycle::Draining,
+            None => AdmissionLifecycle::Serving,
+        }
+    }
+
     pub async fn begin_draining(&self) {
         self.close();
         let _linearization = self.state.linearization.lock().await;
     }
 
+    #[cfg(test)]
     pub async fn is_draining(&self) -> bool {
         self.state.closed.load(Ordering::Acquire)
     }
@@ -275,27 +348,31 @@ fn assemble_runtime(
                 !generation.semantics_current || !generation.configuration_current
             });
     let blocking_tasks = BlockingTaskOwner::new();
+    let admission = AdmissionGate::default();
     let build_index = index.clone();
     let build_tasks = blocking_tasks.handle();
-    let coordinator = ReindexCoordinatorRuntime::start(coordinator, move |intent| {
-        let index = build_index.clone();
-        let tasks = build_tasks.clone();
-        async move {
-            let result = tasks
-                .run(
-                    move || -> Result<_, unity_asset_search_index::SearchIndexError> {
-                        let mut budget = AssetLoadBudget::default();
-                        let receipt = index.reindex(intent, &mut budget)?;
-                        let status = index.status()?;
-                        Ok(ReindexExecution::new(receipt, status))
-                    },
-                )
-                .await
-                .map_err(anyhow::Error::new)?;
-            result.map_err(anyhow::Error::new)
-        }
-    })?;
-    let admission = AdmissionGate::default();
+    let coordinator = ReindexCoordinatorRuntime::start_supervised(
+        coordinator,
+        admission.clone(),
+        move |intent| {
+            let index = build_index.clone();
+            let tasks = build_tasks.clone();
+            async move {
+                let result = tasks
+                    .run(
+                        move || -> Result<_, unity_asset_search_index::SearchIndexError> {
+                            let mut budget = AssetLoadBudget::default();
+                            let receipt = index.reindex(intent, &mut budget)?;
+                            let status = index.status()?;
+                            Ok(ReindexExecution::new(receipt, status))
+                        },
+                    )
+                    .await
+                    .map_err(anyhow::Error::new)?;
+                result.map_err(anyhow::Error::new)
+            }
+        },
+    )?;
     let operations = OperationServiceOwner::new(
         daemon_instance_id,
         coordinator.coordinator(),
@@ -759,6 +836,7 @@ pub struct BlockingTaskHandle {
 
 struct BlockingTaskShared {
     state: Mutex<BlockingTaskState>,
+    capacity: Arc<Semaphore>,
 }
 
 struct BlockingTaskState {
@@ -768,12 +846,17 @@ struct BlockingTaskState {
 
 impl BlockingTaskOwner {
     pub fn new() -> Self {
+        Self::with_capacity(MAX_DAEMON_BLOCKING_TASKS)
+    }
+
+    fn with_capacity(maximum: usize) -> Self {
         Self {
             shared: Arc::new(BlockingTaskShared {
                 state: Mutex::new(BlockingTaskState {
                     accepting: true,
                     tasks: JoinSet::new(),
                 }),
+                capacity: Arc::new(Semaphore::new(maximum)),
             }),
             draining: None,
         }
@@ -832,6 +915,20 @@ impl BlockingTaskHandle {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        {
+            let state = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| BlockingTaskError::OwnerPoisoned)?;
+            if !state.accepting {
+                return Err(BlockingTaskError::ShuttingDown);
+            }
+        }
+        let capacity = Arc::clone(&self.shared.capacity)
+            .acquire_owned()
+            .await
+            .expect("blocking task capacity remains open");
         let (result_sender, result_receiver) = oneshot::channel();
         {
             let mut state = self
@@ -844,6 +941,7 @@ impl BlockingTaskHandle {
             }
             while state.tasks.try_join_next().is_some() {}
             state.tasks.spawn_blocking(move || {
+                let _capacity: OwnedSemaphorePermit = capacity;
                 let result = catch_unwind(AssertUnwindSafe(operation))
                     .map_err(|_| BlockingTaskError::Panicked);
                 let _receiver_was_cancelled = result_sender.send(result);
@@ -889,8 +987,9 @@ mod tests {
     };
 
     use super::{
-        AdmissionGate, BlockingTaskError, BlockingTaskOwner, DaemonAssemblyError, DaemonRuntime,
-        DaemonRuntimeConfig, DaemonRuntimeParts, SupervisorPanicStage, assemble_runtime,
+        AdmissionGate, AdmissionLifecycle, BlockingTaskError, BlockingTaskOwner,
+        DaemonAssemblyError, DaemonRuntime, DaemonRuntimeConfig, DaemonRuntimeParts,
+        DaemonTaskKind, SupervisorPanicStage, assemble_runtime,
     };
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution,
@@ -1051,6 +1150,26 @@ mod tests {
         assert!(waiter.await.unwrap().is_none());
     }
 
+    #[tokio::test]
+    async fn first_task_failure_closes_admission_and_remains_the_lifecycle_authority() {
+        let gate = AdmissionGate::default();
+
+        gate.fail_task(
+            DaemonTaskKind::ReindexCoordinator,
+            "coordinator runner panicked",
+        );
+        gate.fail_task(DaemonTaskKind::FilesystemWatcher, "watcher followed it");
+
+        assert!(gate.admit().await.is_none());
+        assert_eq!(
+            gate.lifecycle(),
+            AdmissionLifecycle::Failed(super::DaemonTaskFailure {
+                task: DaemonTaskKind::ReindexCoordinator,
+                message: "coordinator runner panicked".to_owned(),
+            })
+        );
+    }
+
     async fn bootstrap_fixture_client(
         client: &mut VerifiedFramedTransportV1,
         descriptor: unity_asset_search_local::EndpointDescriptorV1,
@@ -1105,6 +1224,55 @@ mod tests {
 
         finish_sender.send(()).unwrap();
         shutdown.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_caller_cannot_release_blocking_capacity_early() {
+        let mut owner = BlockingTaskOwner::with_capacity(1);
+        let first_handle = owner.handle();
+        let (first_started_sender, first_started_receiver) = oneshot::channel();
+        let (first_finish_sender, first_finish_receiver) = mpsc::channel();
+        let first_caller = tokio::spawn(async move {
+            first_handle
+                .run(move || {
+                    let _ = first_started_sender.send(());
+                    first_finish_receiver.recv().unwrap();
+                })
+                .await
+        });
+        first_started_receiver.await.unwrap();
+        first_caller.abort();
+
+        let second_handle = owner.handle();
+        let (second_started_sender, second_started_receiver) = oneshot::channel();
+        let second_caller = tokio::spawn(async move {
+            second_handle
+                .run(move || {
+                    let _ = second_started_sender.send(());
+                    2_u8
+                })
+                .await
+        });
+        let mut second_started_receiver = Box::pin(second_started_receiver);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                &mut second_started_receiver,
+            )
+            .await
+            .is_err()
+        );
+
+        first_finish_sender.send(()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            &mut second_started_receiver,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(second_caller.await.unwrap().unwrap(), 2);
+        owner.shutdown().await.unwrap();
     }
 
     #[tokio::test]
