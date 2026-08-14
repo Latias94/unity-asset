@@ -8,7 +8,7 @@ use unity_asset_binary::asset::SerializedFile;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, DiagnosticSeverity, ObjectAddress,
     ObjectId, ObjectKind, RevisionedObjectHandle, SourceId, SourceKind, SourceLocator, UnityClass,
-    UnityDocument, WorkspaceId, WorkspaceRevision, YamlDocumentSelector, vec_allocation_bytes,
+    WorkspaceId, WorkspaceRevision, YamlDocumentSelector, vec_allocation_bytes,
 };
 use unity_asset_yaml::YamlDocument;
 

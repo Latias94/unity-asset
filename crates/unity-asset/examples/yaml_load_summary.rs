@@ -6,7 +6,7 @@
 //! If no path is provided, a small repo fixture is used.
 
 use std::path::PathBuf;
-use unity_asset::{AssetLoadBudget, UnityDocument};
+use unity_asset::AssetLoadBudget;
 use unity_asset_yaml::load_budgeted_yaml_path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

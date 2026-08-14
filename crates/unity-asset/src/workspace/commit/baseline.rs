@@ -7,7 +7,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, BudgetedVerifiedSourceImage,
-    SourceFingerprint, SourceId, SourceKind, UnityDocument, vec_allocation_bytes,
+    SourceFingerprint, SourceId, SourceKind, vec_allocation_bytes,
 };
 use unity_asset_write::artifact::{ArtifactHandle, ArtifactStreamError, PreparedArtifactSet};
 use unity_asset_yaml::parse_prebudgeted_yaml_source;

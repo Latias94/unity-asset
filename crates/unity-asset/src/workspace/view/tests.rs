@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use unity_asset_core::{
-    AssetLoadBudget, DigestV1, SourceFingerprint, SourceId, SourceKind, UnityClass, UnityDocument,
+    AssetLoadBudget, DigestV1, SourceFingerprint, SourceId, SourceKind, UnityClass,
     VerifiedSourceImage, WorkspaceId,
 };
 use unity_asset_write::artifact::{

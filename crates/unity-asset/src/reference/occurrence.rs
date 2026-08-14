@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use unity_asset_binary::asset::SerializedFile;
 use unity_asset_binary::typetree::{TypeTreeParseMode, TypeTreeParseOptions};
-use unity_asset_core::{AssetLoadBudget, BudgetError, DiagnosticSeverity, UnityDocument};
+use unity_asset_core::{AssetLoadBudget, BudgetError, DiagnosticSeverity};
 use unity_asset_yaml::{
     YamlDocument, YamlReferenceDiagnostic, YamlReferenceField, YamlReferenceScanError,
     YamlReferenceShape, YamlValueKind, scan_reference_class_occurrences,

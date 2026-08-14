@@ -13,7 +13,7 @@ use unity_asset_binary::typetree::{
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, BudgetedSourceBytes, DigestBuildError, DigestV1, DigestV1Builder,
-    SourceKind, UnityDocument, YamlDocumentSelector, YamlFileId, arc_slice_allocation_bytes,
+    SourceKind, YamlDocumentSelector, YamlFileId, arc_slice_allocation_bytes,
     arc_value_allocation_bytes,
 };
 use unity_asset_yaml::{BudgetedYamlError, YamlDocument, parse_prebudgeted_yaml_source};

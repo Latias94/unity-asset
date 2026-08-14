@@ -8,8 +8,7 @@ use unity_asset_binary::typetree::TypeTreeSemanticDigestError;
 use unity_asset_binary::unity_version::UnityVersion;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, ObjectId, RevisionedObjectHandle,
-    SemanticDigestError, SourceId, SourceKind, UnityDocument, arc_value_allocation_bytes,
-    yaml_schema_digest,
+    SemanticDigestError, SourceId, SourceKind, arc_value_allocation_bytes, yaml_schema_digest,
 };
 use unity_asset_yaml::YamlDocument;
 

@@ -10,8 +10,8 @@ use unity_asset_binary::asset::ObjectInfo;
 use unity_asset_binary::object::UnityObject;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, Diagnostic, ObjectAddress, RevisionedObjectHandle,
-    SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass, UnityDocument,
-    VerifiedSourceImage, WorkspaceId, WorkspaceRevision,
+    SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityClass, VerifiedSourceImage,
+    WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_write::artifact::{
     ArtifactBuildError, ArtifactHandle, ArtifactReader, PreparedArtifact, PreparedArtifactSet,

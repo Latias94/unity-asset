@@ -4,7 +4,7 @@ use unity_asset_binary::asset::{FileIdentifier, SerializedFile};
 use unity_asset_binary::typetree::TypeTreeParseOptions;
 use unity_asset_core::{
     AssetLoadBudget, ObjectAddress, ObjectId, SourceFingerprint, SourceId, SourceKind,
-    SourceLocator, UnityClass, UnityDocument, WorkspaceId, WorkspaceRevision,
+    SourceLocator, UnityClass, WorkspaceId, WorkspaceRevision,
 };
 use unity_asset_write::artifact::PreparedArtifactSet;
 use unity_asset_yaml::YamlDocument;

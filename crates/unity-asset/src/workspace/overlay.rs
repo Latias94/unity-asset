@@ -11,9 +11,8 @@ use unity_asset_binary::asset::{
 };
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, DigestV1, ObjectAddress, ObjectId, ObjectKind,
-    RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator, UnityDocument,
-    WorkspaceId, WorkspaceRevision, arc_value_allocation_bytes, vec_allocation_bytes,
-    yaml_schema_digest,
+    RevisionedObjectHandle, SourceFingerprint, SourceId, SourceKind, SourceLocator, WorkspaceId,
+    WorkspaceRevision, arc_value_allocation_bytes, vec_allocation_bytes, yaml_schema_digest,
 };
 use unity_asset_write::artifact::{
     ArtifactHandle, PreparedArtifact, PreparedArtifactFormatProof, PreparedArtifactSet,

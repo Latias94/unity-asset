@@ -2,8 +2,8 @@ use std::mem::size_of;
 
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, FieldPath, FieldPathSegment,
-    ObjectId, RevisionedObjectHandle, SourceId, SourceKind, UnityDocument, WorkspaceId,
-    WorkspaceRevision, YamlFileId,
+    ObjectId, RevisionedObjectHandle, SourceId, SourceKind, WorkspaceId, WorkspaceRevision,
+    YamlFileId,
 };
 
 use super::ReferenceGraphError;

@@ -11,7 +11,7 @@ use unity_asset_binary::error::BinaryError;
 use unity_asset_core::{
     AllocationSizeError, AssetLoadBudget, BudgetError, Diagnostic, DiagnosticSeverity, DigestV1,
     FieldPath, ObjectAddress, ObjectId, ObjectKind, RevisionedObjectHandle, SourceFingerprint,
-    SourceId, SourceKind, SourceLocator, UnityDocument, UnityValue, arc_value_allocation_bytes,
+    SourceId, SourceKind, SourceLocator, UnityValue, arc_value_allocation_bytes,
     index_map_allocation_bytes, string_allocation_bytes, vec_allocation_bytes,
 };
 use unity_asset_write::artifact::{
