@@ -35,6 +35,35 @@ pub enum PrivateRootKind {
     Cache,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivateRootAuthority {
+    Runtime(SecurityContextIdV1),
+    PersistentUserCache,
+}
+
+impl PrivateRootAuthority {
+    const fn kind(self) -> PrivateRootKind {
+        match self {
+            Self::Runtime(_) => PrivateRootKind::Runtime,
+            Self::PersistentUserCache => PrivateRootKind::Cache,
+        }
+    }
+
+    const fn runtime_security_context(self) -> Option<SecurityContextIdV1> {
+        match self {
+            Self::Runtime(security_context_id) => Some(security_context_id),
+            Self::PersistentUserCache => None,
+        }
+    }
+
+    fn validate_current(self, current: &CurrentSecurityContextSnapshot) -> bool {
+        match self {
+            Self::Runtime(security_context_id) => current.id() == security_context_id,
+            Self::PersistentUserCache => true,
+        }
+    }
+}
+
 impl fmt::Display for PrivateRootKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -45,26 +74,20 @@ impl fmt::Display for PrivateRootKind {
 }
 
 pub struct PrivateRootV1 {
-    kind: PrivateRootKind,
+    authority_kind: PrivateRootAuthority,
     path: PathBuf,
-    security_context_id: SecurityContextIdV1,
     authority: Arc<platform::PrivateDirectory>,
 }
 
 impl PrivateRootV1 {
     #[must_use]
     pub const fn kind(&self) -> PrivateRootKind {
-        self.kind
+        self.authority_kind.kind()
     }
 
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    #[must_use]
-    pub const fn security_context_id(&self) -> SecurityContextIdV1 {
-        self.security_context_id
     }
 
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
@@ -76,10 +99,10 @@ impl PrivateRootV1 {
         &self,
         project_id: ProjectId,
     ) -> Result<EndpointNamespaceV1, PrivateRootsError> {
-        if self.kind != PrivateRootKind::Runtime {
+        if self.kind() != PrivateRootKind::Runtime {
             return Err(PrivateRootsError::WrongRootKind {
                 expected: PrivateRootKind::Runtime,
-                actual: self.kind,
+                actual: self.kind(),
             });
         }
         require_nonzero_project_id(project_id)?;
@@ -91,7 +114,7 @@ impl PrivateRootV1 {
             .authority
             .create_private_child(OsStr::new(&component), &current)
             .map_err(|source| PrivateRootsError::Filesystem {
-                kind: self.kind,
+                kind: self.kind(),
                 operation: "create project runtime namespace",
                 path: path.clone(),
                 source,
@@ -100,7 +123,12 @@ impl PrivateRootV1 {
             path,
             component,
             project_id,
-            security_context_id: self.security_context_id,
+            security_context_id: self.authority_kind.runtime_security_context().ok_or(
+                PrivateRootsError::WrongRootKind {
+                    expected: PrivateRootKind::Runtime,
+                    actual: self.kind(),
+                },
+            )?,
             authority: Arc::new(authority),
         };
         namespace.bind(&current)?;
@@ -111,10 +139,10 @@ impl PrivateRootV1 {
         &self,
         project_identity: ProjectIdentityV1,
     ) -> Result<PrivateIndexRootV1, PrivateRootsError> {
-        if self.kind != PrivateRootKind::Cache {
+        if self.kind() != PrivateRootKind::Cache {
             return Err(PrivateRootsError::WrongRootKind {
                 expected: PrivateRootKind::Cache,
-                actual: self.kind,
+                actual: self.kind(),
             });
         }
         let project_id = project_identity.project_id();
@@ -127,7 +155,7 @@ impl PrivateRootV1 {
             .authority
             .create_private_child(OsStr::new(&component), &current)
             .map_err(|source| PrivateRootsError::Filesystem {
-                kind: self.kind,
+                kind: self.kind(),
                 operation: "create project private index root",
                 path: path.clone(),
                 source,
@@ -135,7 +163,6 @@ impl PrivateRootV1 {
         let root = PrivateIndexRootV1 {
             path,
             project_id,
-            security_context_id: self.security_context_id,
             parent_path: self.path.clone(),
             parent_authority: Arc::clone(&self.authority),
             authority: Arc::new(authority),
@@ -148,13 +175,13 @@ impl PrivateRootV1 {
         &self,
         current: &CurrentSecurityContextSnapshot,
     ) -> Result<(), PrivateRootsError> {
-        if current.id() != self.security_context_id {
+        if !self.authority_kind.validate_current(current) {
             return Err(PrivateRootsError::SecurityContextChanged);
         }
         self.authority
             .revalidate(&self.path, current)
             .map_err(|source| PrivateRootsError::Filesystem {
-                kind: self.kind,
+                kind: self.kind(),
                 operation: "revalidate",
                 path: self.path.clone(),
                 source,
@@ -521,9 +548,8 @@ impl fmt::Debug for PrivateRootV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PrivateRootV1")
-            .field("kind", &self.kind)
+            .field("authority_kind", &self.authority_kind)
             .field("path", &self.path)
-            .field("security_context_id", &self.security_context_id)
             .finish_non_exhaustive()
     }
 }
@@ -539,7 +565,6 @@ impl fmt::Debug for PrivateRootV1 {
 pub struct PrivateIndexRootV1 {
     path: PathBuf,
     project_id: ProjectId,
-    security_context_id: SecurityContextIdV1,
     parent_path: PathBuf,
     parent_authority: Arc<platform::PrivateDirectory>,
     authority: Arc<platform::PrivateDirectory>,
@@ -554,20 +579,16 @@ impl PrivateIndexRootV1 {
     fn open_override_base(path: &Path) -> Result<PrivateIndexOverrideBase, PrivateRootsError> {
         let path = absolute_private_path(path)?;
         let security_context = current_private_security_context()?;
-        let security_context_id = security_context.id();
-        let authority =
-            platform::open_or_create_private_path(&path, &security_context).map_err(|source| {
-                PrivateRootsError::Filesystem {
-                    kind: PrivateRootKind::Cache,
-                    operation: "open or create explicit private index root",
-                    path: path.clone(),
-                    source,
-                }
+        let authority = platform::open_or_create_persistent_path(&path, &security_context)
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: PrivateRootKind::Cache,
+                operation: "open or create explicit private index root",
+                path: path.clone(),
+                source,
             })?;
         let path = authority.canonical_path(&path);
         let base = PrivateIndexOverrideBase {
             path,
-            security_context_id,
             authority: Arc::new(authority),
         };
         base.revalidate_for_context(&security_context)?;
@@ -588,9 +609,6 @@ impl PrivateIndexRootV1 {
         require_nonzero_project_id(project_id)?;
         let base = Self::open_override_base(path.as_ref())?;
         let current = CurrentSecurityContextSnapshot::current()?;
-        if current.id() != base.security_context_id {
-            return Err(PrivateRootsError::SecurityContextChanged);
-        }
         let component = private_index_root_component(project_id);
         let requested_path = base.path.join(&component);
         let authority = base
@@ -606,7 +624,6 @@ impl PrivateIndexRootV1 {
         let root = Self {
             path,
             project_id,
-            security_context_id: base.security_context_id,
             parent_path: base.path,
             parent_authority: base.authority,
             authority: Arc::new(authority),
@@ -634,11 +651,6 @@ impl PrivateIndexRootV1 {
         self.project_id
     }
 
-    #[must_use]
-    pub const fn security_context_id(&self) -> SecurityContextIdV1 {
-        self.security_context_id
-    }
-
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
         let current = CurrentSecurityContextSnapshot::current()?;
         self.revalidate_for_context(&current)
@@ -648,9 +660,6 @@ impl PrivateIndexRootV1 {
         &self,
         current: &CurrentSecurityContextSnapshot,
     ) -> Result<(), PrivateRootsError> {
-        if current.id() != self.security_context_id {
-            return Err(PrivateRootsError::SecurityContextChanged);
-        }
         self.parent_authority
             .revalidate(&self.parent_path, current)
             .map_err(|source| PrivateRootsError::Filesystem {
@@ -674,7 +683,6 @@ impl PartialEq for PrivateIndexRootV1 {
     fn eq(&self, other: &Self) -> bool {
         self.path == other.path
             && self.project_id == other.project_id
-            && self.security_context_id == other.security_context_id
             && self.parent_path == other.parent_path
     }
 }
@@ -688,14 +696,12 @@ impl fmt::Debug for PrivateIndexRootV1 {
             .field("path", &self.path)
             .field("parent_path", &self.parent_path)
             .field("project_id", &self.project_id)
-            .field("security_context_id", &self.security_context_id)
             .finish_non_exhaustive()
     }
 }
 
 struct PrivateIndexOverrideBase {
     path: PathBuf,
-    security_context_id: SecurityContextIdV1,
     authority: Arc<platform::PrivateDirectory>,
 }
 
@@ -704,9 +710,6 @@ impl PrivateIndexOverrideBase {
         &self,
         current: &CurrentSecurityContextSnapshot,
     ) -> Result<(), PrivateRootsError> {
-        if current.id() != self.security_context_id {
-            return Err(PrivateRootsError::SecurityContextChanged);
-        }
         self.authority
             .revalidate(&self.path, current)
             .map_err(|source| PrivateRootsError::Filesystem {
@@ -732,15 +735,13 @@ impl PrivateRootsV1 {
         Ok(Self {
             security_context_id,
             runtime: PrivateRootV1 {
-                kind: PrivateRootKind::Runtime,
+                authority_kind: PrivateRootAuthority::Runtime(security_context_id),
                 path: discovered.runtime_path,
-                security_context_id,
                 authority: Arc::new(discovered.runtime),
             },
             cache: PrivateRootV1 {
-                kind: PrivateRootKind::Cache,
+                authority_kind: PrivateRootAuthority::PersistentUserCache,
                 path: discovered.cache_path,
-                security_context_id,
                 authority: Arc::new(discovered.cache),
             },
         })
@@ -1073,7 +1074,7 @@ mod platform {
         inode: u64,
     }
 
-    pub(super) fn open_or_create_private_path(
+    pub(super) fn open_or_create_persistent_path(
         path: &Path,
         security_context: &CurrentSecurityContextSnapshot,
     ) -> io::Result<PrivateDirectory> {
@@ -1790,7 +1791,7 @@ mod platform {
             let override_path = unsafe_parent.join("index-base");
             let security_context = CurrentSecurityContextSnapshot::current().unwrap();
 
-            let error = open_or_create_private_path(&override_path, &security_context)
+            let error = open_or_create_persistent_path(&override_path, &security_context)
                 .err()
                 .unwrap();
 
@@ -1806,7 +1807,8 @@ mod platform {
             fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o700)).unwrap();
             let override_path = stable_parent.join("index-base");
             let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-            let private = open_or_create_private_path(&override_path, &security_context).unwrap();
+            let private =
+                open_or_create_persistent_path(&override_path, &security_context).unwrap();
 
             fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o777)).unwrap();
 
@@ -1927,7 +1929,7 @@ mod platform {
             let override_path = ancestor.join("index-base");
             let security_context = CurrentSecurityContextSnapshot::current().unwrap();
 
-            let error = open_or_create_private_path(&override_path, &security_context)
+            let error = open_or_create_persistent_path(&override_path, &security_context)
                 .err()
                 .unwrap();
 
@@ -1947,7 +1949,8 @@ mod platform {
             let override_path = ancestor.join("index-base");
             let security_context = CurrentSecurityContextSnapshot::current().unwrap();
 
-            let private = open_or_create_private_path(&override_path, &security_context).unwrap();
+            let private =
+                open_or_create_persistent_path(&override_path, &security_context).unwrap();
 
             private
                 .revalidate(&override_path, &security_context)
@@ -2147,7 +2150,7 @@ mod platform {
         }
     }
 
-    pub(super) fn open_or_create_private_path(
+    pub(super) fn open_or_create_persistent_path(
         _path: &Path,
         _security_context: &CurrentSecurityContextSnapshot,
     ) -> io::Result<PrivateDirectory> {
