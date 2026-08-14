@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
@@ -52,6 +53,7 @@ class RemotePackageState(Enum):
     MISSING = "missing"
     EXISTS_UNVERIFIED = "exists-unverified"
     VERIFIED = "verified"
+    YANKED = "yanked"
 
 
 @dataclass(frozen=True)
@@ -71,22 +73,23 @@ class PreparedPublication:
         names = tuple(status.package for status in self.packages)
         if len(names) != len(set(names)):
             raise PublishError("prepared publication contains duplicate packages")
-        unresolved = [
-            status.package
+        uncommittable = [
+            f"{status.package} ({status.state.value})"
             for status in self.packages
-            if status.state is RemotePackageState.EXISTS_UNVERIFIED
+            if status.state
+            not in (RemotePackageState.MISSING, RemotePackageState.VERIFIED)
         ]
-        if unresolved:
+        if uncommittable:
             raise PublishError(
-                "prepared publication contains unverified existing packages: "
-                + ", ".join(unresolved)
+                "prepared publication contains non-committable package states: "
+                + ", ".join(uncommittable)
             )
 
 
 class PublishBackend(Protocol):
     def package(self, package: str, version: str) -> None: ...
 
-    def release_exists(self, package: str, version: str) -> bool: ...
+    def release_state(self, package: str, version: str) -> RemotePackageState: ...
 
     def verify_existing(self, package: str, version: str) -> None: ...
 
@@ -145,7 +148,7 @@ class CargoBackend:
             target_dir = self.repository_root / target_dir
         return target_dir / "package" / f"{package}-{version}.crate"
 
-    def release_exists(self, package: str, version: str) -> bool:
+    def release_state(self, package: str, version: str) -> RemotePackageState:
         package_segment = quote(package, safe="")
         version_segment = quote(version, safe="")
         url = f"https://crates.io/api/v1/crates/{package_segment}/{version_segment}"
@@ -153,21 +156,46 @@ class CargoBackend:
             with tempfile.TemporaryDirectory(
                 prefix="unity-asset-crates-io-observation-"
             ) as temporary:
+                destination = Path(temporary) / "release.json"
                 download_with_deadline(
                     url,
-                    Path(temporary) / "release.json",
+                    destination,
                     user_agent="unity-asset-release-verifier/1",
                     max_bytes=MAX_REMOTE_METADATA_BYTES,
                     connect_timeout_seconds=DOWNLOAD_CONNECT_TIMEOUT_SECONDS,
                     total_timeout_seconds=DOWNLOAD_TOTAL_TIMEOUT_SECONDS,
                 )
+                document = json.loads(destination.read_text(encoding="utf-8"))
         except ReleaseHttpNotFound:
-            return False
-        except (OSError, ReleaseHttpError) as error:
+            return RemotePackageState.MISSING
+        except (OSError, UnicodeError, json.JSONDecodeError, ReleaseHttpError) as error:
             raise RetryablePublishError(
                 f"cannot determine whether {package} {version} exists on crates.io: {error}"
             ) from error
-        return True
+
+        if not isinstance(document, dict):
+            raise RetryablePublishError(
+                f"crates.io returned an invalid version document for {package} {version}"
+            )
+        release = document.get("version")
+        if not isinstance(release, dict):
+            raise RetryablePublishError(
+                f"crates.io omitted version metadata for {package} {version}"
+            )
+        if release.get("crate") != package or release.get("num") != version:
+            raise RetryablePublishError(
+                f"crates.io returned mismatched version metadata for {package} {version}"
+            )
+        yanked = release.get("yanked")
+        if not isinstance(yanked, bool):
+            raise RetryablePublishError(
+                f"crates.io returned an invalid yanked state for {package} {version}"
+            )
+        return (
+            RemotePackageState.YANKED
+            if yanked
+            else RemotePackageState.EXISTS_UNVERIFIED
+        )
 
     def verify_existing(self, package: str, version: str) -> None:
         archive = self.archive_path(package, version)
@@ -274,17 +302,13 @@ def inspect_remote_packages(
     return tuple(
         PackageRemoteStatus(
             package=package,
-            state=(
-                RemotePackageState.EXISTS_UNVERIFIED
-                if observe_release_with_retry(
-                    backend,
-                    package,
-                    version,
-                    max_attempts=max_attempts,
-                    retry_delay_seconds=retry_delay_seconds,
-                    sleep=sleep,
-                )
-                else RemotePackageState.MISSING
+            state=observe_release_with_retry(
+                backend,
+                package,
+                version,
+                max_attempts=max_attempts,
+                retry_delay_seconds=retry_delay_seconds,
+                sleep=sleep,
             ),
         )
         for package in packages
@@ -299,13 +323,13 @@ def observe_release_with_retry(
     max_attempts: int,
     retry_delay_seconds: float,
     sleep: Callable[[float], None] = time.sleep,
-) -> bool:
+) -> RemotePackageState:
     if max_attempts < 1:
         raise PublishError("max attempts must be at least one")
     last_error: RetryablePublishError | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            return backend.release_exists(package, version)
+            return backend.release_state(package, version)
         except RetryablePublishError as error:
             last_error = error
         if attempt < max_attempts:
@@ -371,11 +395,13 @@ def publish_missing_package(
     last_error: PublishError | None = None
     for attempt in range(1, max_attempts + 1):
         try:
-            exists_before_publish = backend.release_exists(package, version)
+            state_before_publish = backend.release_state(package, version)
         except RetryablePublishError as error:
             last_error = error
-            exists_before_publish = None
-        if exists_before_publish is True:
+            state_before_publish = None
+        if state_before_publish is RemotePackageState.YANKED:
+            raise PublishError(f"{package} {version} is yanked on crates.io")
+        if state_before_publish is RemotePackageState.EXISTS_UNVERIFIED:
             verified = verify_known_existing(
                 backend,
                 package,
@@ -386,7 +412,7 @@ def publish_missing_package(
             )
             return verified
 
-        if exists_before_publish is None:
+        if state_before_publish is None:
             if attempt < max_attempts:
                 sleep(retry_delay_seconds)
             continue
@@ -399,11 +425,13 @@ def publish_missing_package(
                 last_error = error
 
         try:
-            exists_after_publish = backend.release_exists(package, version)
+            state_after_publish = backend.release_state(package, version)
         except RetryablePublishError as error:
             last_error = error
-            exists_after_publish = None
-        if exists_after_publish is True:
+            state_after_publish = None
+        if state_after_publish is RemotePackageState.YANKED:
+            raise PublishError(f"{package} {version} is yanked on crates.io")
+        if state_after_publish is RemotePackageState.EXISTS_UNVERIFIED:
             verified = verify_known_existing(
                 backend,
                 package,
@@ -460,6 +488,10 @@ def prepare_publication(
         if observation.state is RemotePackageState.MISSING:
             preflight.append(observation)
             continue
+        if observation.state is RemotePackageState.YANKED:
+            raise PublishError(
+                f"{observation.package} {version} is yanked on crates.io"
+            )
         preflight.append(
             verify_known_existing(
                 backend,

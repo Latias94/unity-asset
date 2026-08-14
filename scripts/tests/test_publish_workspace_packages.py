@@ -24,7 +24,7 @@ SPEC.loader.exec_module(PUBLISHER)
 class FakeBackend:
     def __init__(
         self,
-        exists: list[bool],
+        exists: list[bool | PUBLISHER.RemotePackageState],
         *,
         publish_errors: list[Exception | None] | None = None,
         verify_errors: list[Exception | None] | None = None,
@@ -39,9 +39,18 @@ class FakeBackend:
     def package(self, package: str, version: str) -> None:
         self.packaged.append((package, version))
 
-    def release_exists(self, package: str, version: str) -> bool:
+    def release_state(
+        self, package: str, version: str
+    ) -> PUBLISHER.RemotePackageState:
         del package, version
-        return self.exists.popleft() if self.exists else False
+        outcome = self.exists.popleft() if self.exists else False
+        if isinstance(outcome, PUBLISHER.RemotePackageState):
+            return outcome
+        return (
+            PUBLISHER.RemotePackageState.EXISTS_UNVERIFIED
+            if outcome
+            else PUBLISHER.RemotePackageState.MISSING
+        )
 
     def verify_existing(self, package: str, version: str) -> None:
         self.verified.append((package, version))
@@ -61,7 +70,9 @@ class FakeBackend:
 class RecordingBackend:
     def __init__(
         self,
-        exists: dict[str, list[bool | Exception]],
+        exists: dict[
+            str, list[bool | PUBLISHER.RemotePackageState | Exception]
+        ],
         *,
         verify_errors: dict[str, list[Exception | None]] | None = None,
     ) -> None:
@@ -79,13 +90,21 @@ class RecordingBackend:
         del version
         self.events.append(("package", package))
 
-    def release_exists(self, package: str, version: str) -> bool:
+    def release_state(
+        self, package: str, version: str
+    ) -> PUBLISHER.RemotePackageState:
         del version
         self.events.append(("inspect", package))
         outcome = self.exists[package].popleft()
         if isinstance(outcome, Exception):
             raise outcome
-        return outcome
+        if isinstance(outcome, PUBLISHER.RemotePackageState):
+            return outcome
+        return (
+            PUBLISHER.RemotePackageState.EXISTS_UNVERIFIED
+            if outcome
+            else PUBLISHER.RemotePackageState.MISSING
+        )
 
     def verify_existing(self, package: str, version: str) -> None:
         del version
@@ -177,6 +196,28 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
 
         self.assertEqual(backend.published, [])
 
+    def test_later_yanked_version_prevents_every_publish_write(self) -> None:
+        backend = RecordingBackend(
+            {
+                "base": [False],
+                "leaf": [PUBLISHER.RemotePackageState.YANKED],
+            }
+        )
+
+        with self.assertRaisesRegex(
+            PUBLISHER.PublishError, "leaf 1.2.3 is yanked on crates.io"
+        ):
+            PUBLISHER.publish_packages(
+                backend,
+                ("base", "leaf"),
+                "1.2.3",
+                max_attempts=1,
+                retry_delay_seconds=0,
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual(backend.published, [])
+
     def test_commit_publishes_missing_packages_in_input_order(self) -> None:
         backend = RecordingBackend(
             {
@@ -238,8 +279,19 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
     def test_release_observation_only_treats_http_404_as_missing(self) -> None:
         backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "token")
 
-        with mock.patch.object(PUBLISHER, "download_with_deadline") as download:
-            self.assertTrue(backend.release_exists("example", "1.2.3"))
+        def available(_url, destination, **_kwargs):
+            destination.write_text(
+                '{"version":{"crate":"example","num":"1.2.3","yanked":false}}',
+                encoding="utf-8",
+            )
+
+        with mock.patch.object(
+            PUBLISHER, "download_with_deadline", side_effect=available
+        ) as download:
+            self.assertIs(
+                backend.release_state("example", "1.2.3"),
+                PUBLISHER.RemotePackageState.EXISTS_UNVERIFIED,
+            )
         self.assertEqual(
             download.call_args.args[0],
             "https://crates.io/api/v1/crates/example/1.2.3",
@@ -250,7 +302,10 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
             "download_with_deadline",
             side_effect=PUBLISHER.ReleaseHttpNotFound("missing"),
         ):
-            self.assertFalse(backend.release_exists("example", "1.2.3"))
+            self.assertIs(
+                backend.release_state("example", "1.2.3"),
+                PUBLISHER.RemotePackageState.MISSING,
+            )
 
         with mock.patch.object(
             PUBLISHER,
@@ -261,7 +316,41 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
                 PUBLISHER.RetryablePublishError,
                 "cannot determine whether example 1.2.3 exists",
             ):
-                backend.release_exists("example", "1.2.3")
+                backend.release_state("example", "1.2.3")
+
+    def test_release_observation_reports_yanked_and_rejects_mismatched_metadata(
+        self,
+    ) -> None:
+        backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "token")
+
+        def yanked(_url, destination, **_kwargs):
+            destination.write_text(
+                '{"version":{"crate":"example","num":"1.2.3","yanked":true}}',
+                encoding="utf-8",
+            )
+
+        with mock.patch.object(
+            PUBLISHER, "download_with_deadline", side_effect=yanked
+        ):
+            self.assertIs(
+                backend.release_state("example", "1.2.3"),
+                PUBLISHER.RemotePackageState.YANKED,
+            )
+
+        def mismatched(_url, destination, **_kwargs):
+            destination.write_text(
+                '{"version":{"crate":"other","num":"1.2.3","yanked":false}}',
+                encoding="utf-8",
+            )
+
+        with mock.patch.object(
+            PUBLISHER, "download_with_deadline", side_effect=mismatched
+        ):
+            with self.assertRaisesRegex(
+                PUBLISHER.RetryablePublishError,
+                "mismatched version metadata",
+            ):
+                backend.release_state("example", "1.2.3")
 
     def test_publish_subprocess_targets_crates_io_and_only_injects_passed_token(self) -> None:
         backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "passed-token")
@@ -440,13 +529,28 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
 
     def test_prepared_publication_rejects_unverified_existing_state(self) -> None:
         with self.assertRaisesRegex(
-            PUBLISHER.PublishError, "unverified existing packages: example"
+            PUBLISHER.PublishError,
+            "non-committable package states: example \\(exists-unverified\\)",
         ):
             PUBLISHER.PreparedPublication(
                 "1.2.3",
                 (
                     PUBLISHER.PackageRemoteStatus(
                         "example", PUBLISHER.RemotePackageState.EXISTS_UNVERIFIED
+                    ),
+                ),
+            )
+
+    def test_prepared_publication_rejects_yanked_state(self) -> None:
+        with self.assertRaisesRegex(
+            PUBLISHER.PublishError,
+            "non-committable package states: example \\(yanked\\)",
+        ):
+            PUBLISHER.PreparedPublication(
+                "1.2.3",
+                (
+                    PUBLISHER.PackageRemoteStatus(
+                        "example", PUBLISHER.RemotePackageState.YANKED
                     ),
                 ),
             )
