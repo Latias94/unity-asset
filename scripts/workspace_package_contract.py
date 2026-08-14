@@ -41,6 +41,12 @@ DOCUMENTED_FEATURE_PROFILES = (
         features=("audio", "texture-advanced"),
         default_features=True,
     ),
+    DocumentedFeatureProfile(
+        name="workspace-decode",
+        package="unity-asset",
+        features=("decode",),
+        default_features=True,
+    ),
 )
 
 

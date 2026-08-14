@@ -200,6 +200,12 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                     ("audio", "texture-advanced"),
                     True,
                 ),
+                (
+                    "workspace-decode",
+                    "unity-asset",
+                    ("decode",),
+                    True,
+                ),
             ],
         )
 
@@ -235,6 +241,37 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             self.assertIn('features = ["audio", "texture-advanced"]', manifest)
             self.assertNotIn('"texture"', manifest)
 
+    def test_workspace_decode_consumer_enables_only_the_documented_feature(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = contract.WorkspacePackage(
+                name="unity-asset",
+                version="0.4.0",
+                manifest_path=root / "source" / "Cargo.toml",
+                dependencies=(),
+                publish=None,
+                is_library=True,
+                feature_names=("async", "decode", "mmap"),
+                library_target_name="unity_asset",
+            )
+            profile = next(
+                profile
+                for profile in contract.DOCUMENTED_FEATURE_PROFILES
+                if profile.name == "workspace-decode"
+            )
+            _, manifest_path = verifier.create_consumer(
+                root / "consumer",
+                package,
+                profile.name,
+                profile.features,
+                default_features=profile.default_features,
+            )
+
+            manifest = manifest_path.read_text(encoding="utf-8")
+            self.assertIn('features = ["decode"]', manifest)
+            self.assertNotIn('"async"', manifest)
+            self.assertNotIn('"mmap"', manifest)
+
     def test_consumer_suite_batches_public_api_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -269,7 +306,7 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             )
 
             self.assertTrue(workspace.is_file())
-            self.assertEqual(len(consumers), 3)
+            self.assertEqual(len(consumers), 4)
             self.assertEqual(required, {"unity-asset-decode", "unity-asset"})
 
     def test_package_mode_is_the_safe_local_default(self) -> None:
