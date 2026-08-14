@@ -36,6 +36,7 @@ SENSITIVE_ENVIRONMENT_VARIABLES = frozenset(
 )
 
 _CLEANUP_TIMEOUT_SECONDS = 10.0
+_CREATE_SUSPENDED = 0x00000004
 
 
 class BoundedCommandTimeout(TimeoutError):
@@ -185,6 +186,7 @@ def _cleanup_started_process(
     failure_context: str,
 ) -> None:
     deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
+    failures: list[tuple[str, Exception]] = []
 
     def remaining(operation: str) -> float:
         seconds = deadline - time.monotonic()
@@ -196,52 +198,44 @@ def _cleanup_started_process(
             )
         return seconds
 
-    def cleanup_error(
-        operation: str, error: Exception
-    ) -> BoundedCommandCleanupError:
-        detail = str(error) or type(error).__name__
-        return BoundedCommandCleanupError(
-            f"{failure_context}; cleanup failed while {operation}: {detail}: "
-            f"{' '.join(command)}",
-            operation=operation,
-        )
-
-    termination_failure: BaseException | None = None
     try:
         remaining("terminating process tree")
         _terminate_process_tree(process, windows_job)
-    except BaseException as error:
-        termination_failure = error
+    except Exception as error:
+        failures.append(("terminating process tree", error))
 
-    close_failure: Exception | None = None
     if windows_job is not None:
         try:
             windows_job.close()
         except Exception as error:
-            close_failure = error
-
-    if termination_failure is not None:
-        if not isinstance(termination_failure, Exception):
-            raise termination_failure
-        if isinstance(termination_failure, BoundedCommandCleanupError):
-            raise termination_failure
-        raise cleanup_error(
-            "terminating process tree", termination_failure
-        ) from termination_failure
-    if close_failure is not None:
-        raise cleanup_error("closing Windows job", close_failure) from close_failure
+            failures.append(("closing Windows job", error))
 
     operation = "collecting process output"
     try:
         process.communicate(timeout=remaining(operation))
     except subprocess.TimeoutExpired as error:
-        raise BoundedCommandCleanupError(
-            f"{failure_context}; cleanup deadline expired while {operation}: "
-            f"{' '.join(command)}",
-            operation=operation,
-        ) from error
+        failures.append(
+            (
+                operation,
+                BoundedCommandCleanupError(
+                    f"cleanup deadline expired while {operation}",
+                    operation=operation,
+                ),
+            )
+        )
     except Exception as error:
-        raise cleanup_error(operation, error) from error
+        failures.append((operation, error))
+
+    if failures:
+        primary_operation, primary_error = failures[0]
+        details = "; ".join(
+            f"{failed_operation}: {str(error) or type(error).__name__}"
+            for failed_operation, error in failures
+        )
+        raise BoundedCommandCleanupError(
+            f"{failure_context}; cleanup failed: {details}: {' '.join(command)}",
+            operation=primary_operation,
+        ) from primary_error
 
 
 def run_bounded_command(
@@ -259,7 +253,7 @@ def run_bounded_command(
     if os.name == "nt":
         popen_arguments["creationflags"] = (
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            | getattr(subprocess, "CREATE_SUSPENDED", 0)
+            | _CREATE_SUSPENDED
         )
     else:
         popen_arguments["start_new_session"] = True
@@ -306,6 +300,19 @@ def run_bounded_command(
         raise BoundedCommandTimeout(
             f"command exceeded its {timeout_seconds:g}s deadline: {' '.join(command)}"
         ) from error
+    except BaseException as error:
+        cleanup_job = windows_job
+        windows_job = None
+        try:
+            _cleanup_started_process(
+                process,
+                cleanup_job,
+                command=command,
+                failure_context=f"command interrupted by {type(error).__name__}",
+            )
+        except BoundedCommandCleanupError as cleanup_error:
+            raise cleanup_error from error
+        raise
     finally:
         if windows_job is not None:
             windows_job.close()

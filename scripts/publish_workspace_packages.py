@@ -367,7 +367,7 @@ def publish_missing_package(
     if max_attempts < 1:
         raise PublishError("max attempts must be at least one")
 
-    accepted = False
+    publish_attempted = False
     last_error: PublishError | None = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -391,10 +391,10 @@ def publish_missing_package(
                 sleep(retry_delay_seconds)
             continue
 
-        if not accepted:
+        if not publish_attempted:
+            publish_attempted = True
             try:
                 backend.publish(package)
-                accepted = True
             except RetryablePublishError as error:
                 last_error = error
 

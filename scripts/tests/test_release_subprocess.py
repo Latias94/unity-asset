@@ -116,6 +116,7 @@ class ReleaseSubprocessTests(unittest.TestCase):
         self.assertEqual(raised.exception.operation, "terminating process tree")
         self.assertIsInstance(raised.exception.__cause__, OSError)
         self.assertIn("kill denied", str(raised.exception))
+        self.assertEqual(process.communicate.call_count, 2)
 
     def test_cleanup_deadline_exhaustion_still_closes_windows_job(self) -> None:
         process = self._fake_process()
@@ -192,6 +193,55 @@ class ReleaseSubprocessTests(unittest.TestCase):
 
         self.assertEqual(raised.exception.operation, "closing Windows job")
         self.assertIn("close denied", str(raised.exception))
+        self.assertEqual(process.communicate.call_count, 2)
+
+    def test_windows_process_is_suspended_before_job_assignment(self) -> None:
+        process = self._fake_process()
+        process.communicate.return_value = ("", None)
+        windows_job = mock.Mock()
+
+        with (
+            mock.patch.object(release_subprocess_module.os, "name", "nt"),
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(
+                release_subprocess_module,
+                "_WindowsJob",
+                return_value=windows_job,
+            ),
+        ):
+            run_bounded_command(["worker"], timeout_seconds=1)
+
+        creationflags = popen.call_args.kwargs["creationflags"]
+        self.assertEqual(
+            creationflags & release_subprocess_module._CREATE_SUSPENDED,
+            release_subprocess_module._CREATE_SUSPENDED,
+        )
+
+    def test_keyboard_interrupt_cleans_up_before_it_is_reraised(self) -> None:
+        process = self._fake_process()
+        process.communicate.side_effect = [KeyboardInterrupt(), ("", None)]
+
+        with (
+            mock.patch.object(release_subprocess_module.os, "name", "posix"),
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                release_subprocess_module,
+                "_terminate_process_tree",
+            ) as terminate,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                run_bounded_command(["worker"], timeout_seconds=1)
+
+        terminate.assert_called_once_with(process, None)
+        self.assertEqual(process.communicate.call_count, 2)
 
     def test_keyboard_interrupt_is_not_reclassified_as_cleanup_failure(self) -> None:
         process = self._fake_process()

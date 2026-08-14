@@ -512,6 +512,24 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
             )
         self.assertEqual(backend.published, ["example"])
 
+    def test_ambiguous_publish_result_never_repeats_the_write(self) -> None:
+        backend = FakeBackend(
+            [False, False, False, False, False, False],
+            publish_errors=[PUBLISHER.RetryablePublishError("connection reset")],
+        )
+
+        with self.assertRaisesRegex(PUBLISHER.PublishError, "after 3 attempts"):
+            PUBLISHER.publish_missing_package(
+                backend,
+                "example",
+                "1.2.3",
+                max_attempts=3,
+                retry_delay_seconds=0,
+                sleep=lambda _: None,
+            )
+
+        self.assertEqual(backend.published, ["example"])
+
     def test_release_package_set_is_exact(self) -> None:
         packages = list(PUBLISHER.PUBLISHABLE_PACKAGE_NAMES)
         PUBLISHER.validate_publication_request(packages, "1.2.3")
