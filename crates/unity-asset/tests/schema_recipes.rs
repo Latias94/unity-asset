@@ -1972,8 +1972,8 @@ fn audio_clip_recipe_classifies_all_candidate_combinations_without_allocating_ca
             PlanPayload::new(b"OggS".to_vec()),
             &mut AssetLoadBudget::default(),
         ),
-        Err(RecipeError::InvalidMediaDescriptor {
-            source: unity_asset_decode::media::MediaInspectionError::InvalidDescriptor {
+        Err(RecipeError::InvalidAudioClipResourceShape {
+            source: unity_asset_core::AudioClipResourceShapeError::InvalidField {
                 field: "m_Offset",
                 reason: "field must be an unsigned integer",
             },

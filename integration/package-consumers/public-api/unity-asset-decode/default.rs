@@ -6,7 +6,6 @@ pub use unity_asset_decode::{
         MediaFamily, MediaMime, MediaOutputEstimate, PreparedAudioSourceKind, UnityTextureEncoding,
     },
     media::{
-        AudioClipResourceField, AudioClipResourceRef, BudgetedMediaBytes, EmbeddedMediaRef,
-        MediaInspectionError, MediaPayloadRef, StreamDataRef, classify_audio_clip_resource,
+        BudgetedMediaBytes, EmbeddedMediaRef, MediaInspectionError, MediaPayloadRef, StreamDataRef,
     },
 };

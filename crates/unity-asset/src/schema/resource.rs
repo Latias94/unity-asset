@@ -1,6 +1,6 @@
-use unity_asset_core::{AssetLoadBudget, class_ids, class_names};
-use unity_asset_decode::media::{
-    AudioClipResourceField, classify_audio_clip_resource as classify_audio_clip_resource_fields,
+use unity_asset_core::{
+    AssetLoadBudget, AudioClipResourceField, class_ids, class_names,
+    classify_audio_clip_resource as classify_audio_clip_resource_fields,
 };
 
 use crate::workspace::{GenericMutation, PlanPayload};
@@ -89,7 +89,7 @@ pub(crate) fn classify_audio_clip_resource(
         Ok(None) => Err(RecipeError::UnsupportedSchema {
             variant: "AudioClip without m_Resource or compatibility m_StreamData",
         }),
-        Err(source) => Err(RecipeError::InvalidMediaDescriptor { source }),
+        Err(source) => Err(RecipeError::InvalidAudioClipResourceShape { source }),
     }
 }
 

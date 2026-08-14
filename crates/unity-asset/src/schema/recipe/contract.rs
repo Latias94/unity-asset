@@ -2,10 +2,10 @@ use serde::Serialize;
 use thiserror::Error;
 use unity_asset_binary::{typetree::TypeTreeSemanticDigestError, unity_version::UnityVersion};
 use unity_asset_core::{
-    BudgetError, DigestBuildError, DigestV1, FieldPath, FieldPathError, ObjectAddress, ObjectKind,
-    SemanticDigestError, ValuePathError, WorkspaceId, WorkspaceRevision,
+    AudioClipResourceShapeError, BudgetError, DigestBuildError, DigestV1, FieldPath,
+    FieldPathError, ObjectAddress, ObjectKind, SemanticDigestError, ValuePathError, WorkspaceId,
+    WorkspaceRevision,
 };
-use unity_asset_decode::media::MediaInspectionError;
 
 use crate::workspace::{MutationPlanError, MutationPlanFragment, WorkspaceError};
 
@@ -565,10 +565,10 @@ pub enum RecipeError {
         expected: &'static str,
         actual: RecipeValueKind,
     },
-    #[error("media descriptor is invalid: {source}")]
-    InvalidMediaDescriptor {
+    #[error("AudioClip streamed-resource fields are invalid: {source}")]
+    InvalidAudioClipResourceShape {
         #[source]
-        source: MediaInspectionError,
+        source: AudioClipResourceShapeError,
     },
     #[error("field variant is ambiguous between {first} and {second}")]
     AmbiguousFieldVariant {
@@ -712,7 +712,7 @@ impl RecipeError {
             Self::ProtectedSemanticField { .. } => {
                 Some(RecipeRejectionCode::ProtectedSemanticField)
             }
-            Self::WrongFieldShape { .. } | Self::InvalidMediaDescriptor { .. } => {
+            Self::WrongFieldShape { .. } | Self::InvalidAudioClipResourceShape { .. } => {
                 Some(RecipeRejectionCode::WrongFieldShape)
             }
             Self::AmbiguousFieldVariant { .. } => Some(RecipeRejectionCode::AmbiguousFieldVariant),

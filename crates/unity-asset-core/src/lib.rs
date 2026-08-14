@@ -16,6 +16,7 @@ pub mod document;
 pub mod error;
 pub mod field_path;
 pub mod identity;
+pub mod media_schema;
 pub mod revision;
 pub mod semantic_digest;
 pub mod source_image;
@@ -46,6 +47,10 @@ pub use identity::{
     BundleMemberId, ContainmentKind, ContainmentStep, ContractError, ObjectAddress, ObjectId,
     ObjectKind, RevisionedObjectHandle, SourceAlias, SourceId, SourceLocator, SourceMemberId,
     WorkspaceId, YamlDocumentSelector, YamlFileId,
+};
+pub use media_schema::{
+    AudioClipResourceField, AudioClipResourceSelection, AudioClipResourceShapeError,
+    StreamDataDeclaration, classify_audio_clip_resource,
 };
 pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
 pub use semantic_digest::{

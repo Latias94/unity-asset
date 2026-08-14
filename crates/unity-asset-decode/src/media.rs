@@ -3,11 +3,13 @@
 use std::collections::TryReserveError;
 use std::fmt;
 
-use indexmap::IndexMap;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadBudgetDomainToken, BudgetError, UnityValue, vec_allocation_bytes,
 };
+
+#[cfg(feature = "audio")]
+use unity_asset_core::{AudioClipResourceShapeError, StreamDataDeclaration};
 
 /// Owned media bytes whose exact `Vec` allocation belongs to one load-budget domain.
 ///
@@ -117,6 +119,15 @@ impl<'a> StreamDataRef<'a> {
         Ok(Self { path, offset, size })
     }
 
+    #[cfg(feature = "audio")]
+    pub(crate) const fn from_declaration(declaration: StreamDataDeclaration<'a>) -> Self {
+        Self {
+            path: declaration.path(),
+            offset: declaration.offset(),
+            size: declaration.size(),
+        }
+    }
+
     #[must_use]
     pub const fn path(self) -> &'a str {
         self.path
@@ -144,6 +155,7 @@ impl<'a> StreamDataRef<'a> {
 /// size = 0` sentinel. Keeping that state distinct from both an absent field
 /// and a malformed descriptor lets media inspectors apply fallback rules
 /// without accepting damaged metadata.
+#[cfg(feature = "texture")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StreamDataClassification<'a> {
     Missing,
@@ -152,8 +164,8 @@ pub(crate) enum StreamDataClassification<'a> {
     Malformed(MediaInspectionError),
 }
 
+#[cfg(feature = "texture")]
 impl<'a> StreamDataClassification<'a> {
-    #[cfg(feature = "texture")]
     fn into_candidate(self) -> Result<Option<StreamDataRef<'a>>, MediaInspectionError> {
         match self {
             Self::Missing | Self::Inactive => Ok(None),
@@ -298,83 +310,7 @@ pub enum EmbeddedMediaError {
     EvidenceChanged,
 }
 
-/// TypeTree field selected by the AudioClip streamed-resource precedence rule.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AudioClipResourceField {
-    Resource,
-    StreamData,
-}
-
-impl AudioClipResourceField {
-    #[must_use]
-    pub const fn field_name(self) -> &'static str {
-        match self {
-            Self::Resource => "m_Resource",
-            Self::StreamData => "m_StreamData",
-        }
-    }
-}
-
-/// Allocation-free AudioClip streamed-resource selection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioClipResourceRef<'a> {
-    field: AudioClipResourceField,
-    stream: StreamDataRef<'a>,
-}
-
-impl<'a> AudioClipResourceRef<'a> {
-    #[must_use]
-    pub const fn field(self) -> AudioClipResourceField {
-        self.field
-    }
-
-    #[must_use]
-    pub const fn stream(self) -> StreamDataRef<'a> {
-        self.stream
-    }
-}
-
-/// Applies the repository's explicit primary/fallback AudioClip field rule.
-pub fn classify_audio_clip_resource(
-    properties: &IndexMap<String, UnityValue>,
-) -> Result<Option<AudioClipResourceRef<'_>>, MediaInspectionError> {
-    match classify_stream_data(
-        properties.get("m_Resource"),
-        StreamDataShape {
-            field: "m_Resource",
-            path: "m_Source",
-            offset: "m_Offset",
-            size: "m_Size",
-        },
-    ) {
-        StreamDataClassification::Active(stream) => {
-            return Ok(Some(AudioClipResourceRef {
-                field: AudioClipResourceField::Resource,
-                stream,
-            }));
-        }
-        StreamDataClassification::Malformed(error) => return Err(error),
-        StreamDataClassification::Missing | StreamDataClassification::Inactive => {}
-    }
-
-    match classify_stream_data(
-        properties.get("m_StreamData"),
-        StreamDataShape {
-            field: "m_StreamData",
-            path: "path",
-            offset: "offset",
-            size: "size",
-        },
-    ) {
-        StreamDataClassification::Active(stream) => Ok(Some(AudioClipResourceRef {
-            field: AudioClipResourceField::StreamData,
-            stream,
-        })),
-        StreamDataClassification::Missing | StreamDataClassification::Inactive => Ok(None),
-        StreamDataClassification::Malformed(error) => Err(error),
-    }
-}
-
+#[cfg(feature = "texture")]
 #[derive(Clone, Copy)]
 pub(crate) struct StreamDataShape {
     field: &'static str,
@@ -383,8 +319,8 @@ pub(crate) struct StreamDataShape {
     size: &'static str,
 }
 
+#[cfg(feature = "texture")]
 impl StreamDataShape {
-    #[cfg(feature = "texture")]
     pub(crate) const UNITY_STREAM_DATA: Self = Self {
         field: "m_StreamData",
         path: "path",
@@ -401,6 +337,7 @@ pub(crate) fn stream_data_candidate<'a>(
     classify_stream_data(value, shape).into_candidate()
 }
 
+#[cfg(feature = "texture")]
 fn classify_stream_data<'a>(
     value: Option<&'a UnityValue>,
     shape: StreamDataShape,
@@ -516,6 +453,20 @@ pub enum MediaInspectionError {
     UnsupportedRawLayout { layout: &'static str },
 }
 
+#[cfg(feature = "audio")]
+impl From<AudioClipResourceShapeError> for MediaInspectionError {
+    fn from(error: AudioClipResourceShapeError) -> Self {
+        match error {
+            AudioClipResourceShapeError::InvalidField { field, reason } => {
+                Self::InvalidDescriptor { field, reason }
+            }
+            AudioClipResourceShapeError::StreamRangeOverflow { offset, size } => {
+                Self::StreamRangeOverflow { offset, size }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,8 +496,11 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "texture")]
     #[test]
     fn stream_declarations_distinguish_missing_inactive_active_and_malformed() {
+        use indexmap::IndexMap;
+
         let shape = StreamDataShape {
             field: "m_Resource",
             path: "m_Source",

@@ -1,12 +1,10 @@
 //! Strict AudioClip TypeTree inspection.
 
 use indexmap::IndexMap;
-use unity_asset_core::UnityValue;
+use unity_asset_core::{UnityValue, classify_audio_clip_resource};
 
 use super::formats::AudioCompressionFormat;
-use crate::media::{
-    EmbeddedMediaRef, MediaInspectionError, MediaPayloadRef, classify_audio_clip_resource,
-};
+use crate::media::{EmbeddedMediaRef, MediaInspectionError, MediaPayloadRef, StreamDataRef};
 use unity_asset_binary::asset::class_ids;
 use unity_asset_binary::object::UnityObject;
 
@@ -60,7 +58,8 @@ impl<'a> AudioClipLayout<'a> {
         }
 
         let embedded = embedded_payload(properties.get("m_AudioData"))?;
-        let stream = classify_audio_clip_resource(properties)?.map(|resource| resource.stream());
+        let stream = classify_audio_clip_resource(properties)?
+            .map(|selection| StreamDataRef::from_declaration(selection.declaration()));
         let payload = MediaPayloadRef::classify(embedded, stream)?;
 
         Ok(Self {
@@ -266,6 +265,24 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn malformed_primary_shape_maps_to_media_error_and_never_falls_back() {
+        let mut properties = base();
+        properties.insert("m_Resource".to_owned(), UnityValue::Float(1.0));
+        properties.insert(
+            "m_StreamData".to_owned(),
+            compatibility_stream("archive:/CAB-a/CAB-a.resS", 4, 8),
+        );
+
+        assert_eq!(
+            AudioClipLayout::inspect(&object(properties)),
+            Err(MediaInspectionError::InvalidDescriptor {
+                field: "m_Resource",
+                reason: "stream declaration must be an object",
+            })
+        );
     }
 
     #[test]
