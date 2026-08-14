@@ -42,8 +42,8 @@ class BoundedCommandTimeout(TimeoutError):
     """A command exceeded its execution deadline."""
 
 
-class BoundedCommandCleanupError(BoundedCommandTimeout):
-    """A timed-out command could not be cleaned up within the cleanup deadline."""
+class BoundedCommandCleanupError(RuntimeError):
+    """A started command could not be cleaned up within the cleanup deadline."""
 
     def __init__(self, message: str, *, operation: str) -> None:
         super().__init__(message)
@@ -185,9 +185,8 @@ def _cleanup_started_process(
     failure_context: str,
 ) -> None:
     deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
-    operation = "terminating process tree"
 
-    def remaining() -> float:
+    def remaining(operation: str) -> float:
         seconds = deadline - time.monotonic()
         if seconds <= 0:
             raise BoundedCommandCleanupError(
@@ -197,7 +196,9 @@ def _cleanup_started_process(
             )
         return seconds
 
-    def cleanup_error(error: BaseException) -> BoundedCommandCleanupError:
+    def cleanup_error(
+        operation: str, error: Exception
+    ) -> BoundedCommandCleanupError:
         detail = str(error) or type(error).__name__
         return BoundedCommandCleanupError(
             f"{failure_context}; cleanup failed while {operation}: {detail}: "
@@ -205,30 +206,42 @@ def _cleanup_started_process(
             operation=operation,
         )
 
+    termination_failure: BaseException | None = None
     try:
-        try:
-            remaining()
-            _terminate_process_tree(process, windows_job)
-        finally:
-            if windows_job is not None:
-                windows_job.close()
-
-        operation = "collecting process output"
-        try:
-            process.communicate(timeout=remaining())
-        except subprocess.TimeoutExpired:
-            operation = "killing process"
-            remaining()
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            operation = "collecting process output after kill"
-            process.communicate(timeout=remaining())
-    except BoundedCommandCleanupError:
-        raise
+        remaining("terminating process tree")
+        _terminate_process_tree(process, windows_job)
     except BaseException as error:
-        raise cleanup_error(error) from error
+        termination_failure = error
+
+    close_failure: Exception | None = None
+    if windows_job is not None:
+        try:
+            windows_job.close()
+        except Exception as error:
+            close_failure = error
+
+    if termination_failure is not None:
+        if not isinstance(termination_failure, Exception):
+            raise termination_failure
+        if isinstance(termination_failure, BoundedCommandCleanupError):
+            raise termination_failure
+        raise cleanup_error(
+            "terminating process tree", termination_failure
+        ) from termination_failure
+    if close_failure is not None:
+        raise cleanup_error("closing Windows job", close_failure) from close_failure
+
+    operation = "collecting process output"
+    try:
+        process.communicate(timeout=remaining(operation))
+    except subprocess.TimeoutExpired as error:
+        raise BoundedCommandCleanupError(
+            f"{failure_context}; cleanup deadline expired while {operation}: "
+            f"{' '.join(command)}",
+            operation=operation,
+        ) from error
+    except Exception as error:
+        raise cleanup_error(operation, error) from error
 
 
 def run_bounded_command(

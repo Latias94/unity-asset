@@ -105,14 +105,14 @@ class ReleaseSubprocessTests(unittest.TestCase):
             time.sleep(3.5)
             self.assertFalse(escaped.exists())
 
-    def test_cleanup_failure_is_reported_as_a_typed_timeout(self) -> None:
+    def test_cleanup_failure_is_not_misreported_as_a_command_timeout(self) -> None:
         process = self._fake_process()
         process.communicate.side_effect = subprocess.TimeoutExpired(["worker"], 0.01)
 
         with self.assertRaises(BoundedCommandCleanupError) as raised:
             self._run_fake_process(process, terminate=OSError("kill denied"))
 
-        self.assertIsInstance(raised.exception, BoundedCommandTimeout)
+        self.assertNotIsInstance(raised.exception, BoundedCommandTimeout)
         self.assertEqual(raised.exception.operation, "terminating process tree")
         self.assertIsInstance(raised.exception.__cause__, OSError)
         self.assertIn("kill denied", str(raised.exception))
@@ -146,29 +146,6 @@ class ReleaseSubprocessTests(unittest.TestCase):
         self.assertEqual(raised.exception.operation, "terminating process tree")
         windows_job.close.assert_called_once_with()
 
-    def test_cleanup_retry_uses_the_remaining_deadline(self) -> None:
-        process = self._fake_process()
-        communicate_timeouts: list[float] = []
-
-        def communicate(*, timeout: float) -> tuple[str, None]:
-            communicate_timeouts.append(timeout)
-            if len(communicate_timeouts) == 1:
-                raise subprocess.TimeoutExpired(["worker"], timeout)
-            if len(communicate_timeouts) == 2:
-                time.sleep(0.01)
-                raise subprocess.TimeoutExpired(["worker"], timeout)
-            return "", None
-
-        process.communicate.side_effect = communicate
-
-        with self.assertRaises(BoundedCommandTimeout) as raised:
-            self._run_fake_process(process, cleanup_timeout_seconds=0.1)
-
-        self.assertNotIsInstance(raised.exception, BoundedCommandCleanupError)
-        self.assertEqual(len(communicate_timeouts), 3)
-        self.assertLess(communicate_timeouts[2], communicate_timeouts[1])
-        process.kill.assert_called_once_with()
-
     def test_slow_output_cleanup_cannot_overrun_cleanup_deadline(self) -> None:
         process = self._fake_process()
         communicate_calls = 0
@@ -188,8 +165,40 @@ class ReleaseSubprocessTests(unittest.TestCase):
             self._run_fake_process(process)
         elapsed = time.monotonic() - started_at
 
-        self.assertEqual(raised.exception.operation, "killing process")
+        self.assertEqual(raised.exception.operation, "collecting process output")
         self.assertLess(elapsed, 0.25)
+
+    def test_windows_job_close_failure_has_its_own_operation(self) -> None:
+        process = self._fake_process()
+        process.communicate.side_effect = subprocess.TimeoutExpired(["worker"], 0.01)
+        windows_job = mock.Mock()
+        windows_job.close.side_effect = OSError("close denied")
+
+        with (
+            mock.patch.object(release_subprocess_module.os, "name", "nt"),
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                release_subprocess_module,
+                "_WindowsJob",
+                return_value=windows_job,
+            ),
+        ):
+            with self.assertRaises(BoundedCommandCleanupError) as raised:
+                run_bounded_command(["worker"], timeout_seconds=0.01)
+
+        self.assertEqual(raised.exception.operation, "closing Windows job")
+        self.assertIn("close denied", str(raised.exception))
+
+    def test_keyboard_interrupt_is_not_reclassified_as_cleanup_failure(self) -> None:
+        process = self._fake_process()
+        process.communicate.side_effect = subprocess.TimeoutExpired(["worker"], 0.01)
+
+        with self.assertRaises(KeyboardInterrupt):
+            self._run_fake_process(process, terminate=KeyboardInterrupt())
 
 
 if __name__ == "__main__":
