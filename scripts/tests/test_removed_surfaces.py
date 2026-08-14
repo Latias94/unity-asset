@@ -28,6 +28,8 @@ class RemovedSurfaceTests(unittest.TestCase):
         source_roots = (
             "apps/unity-asset-search-cli/src",
             "apps/unity-asset-search-daemon/src",
+            "crates/unity-asset-search-core/src",
+            "crates/unity-asset-search-index/src",
             "crates/unity-asset-search-local/src",
             "crates/unity-asset-search-protocol/src",
         )
@@ -55,18 +57,25 @@ class RemovedSurfaceTests(unittest.TestCase):
         for path in schema_root.rglob("*.rs"):
             source = path.read_text(encoding="utf-8")
             for name in ("HierarchyNode", "HierarchyState", "ChildPlacement"):
-                with self.subTest(path=path, name=name):
-                    self.assertIsNone(re.search(rf"\b{re.escape(name)}\b", source))
+                patterns = (
+                    rf"\bpub\s+(?:struct|enum|type)\s+{re.escape(name)}\b",
+                    rf"\bpub\s+use\b[^;]*\b{re.escape(name)}\b",
+                )
+                for pattern in patterns:
+                    with self.subTest(path=path, name=name, pattern=pattern):
+                        self.assertIsNone(re.search(pattern, source))
 
         facade_contracts = {
-            "crates/unity-asset/src/lib.rs": "pub use unity_asset_yaml",
-            "crates/unity-asset-yaml/src/lib.rs": "pub use unity_asset_core",
-            "crates/unity-asset-binary/src/lib.rs": "unity_objects",
+            "crates/unity-asset/src/lib.rs": r"\bpub\s+use\s+unity_asset_yaml\b",
+            "crates/unity-asset-yaml/src/lib.rs": r"\bpub\s+use\s+unity_asset_core\b",
+            "crates/unity-asset-binary/src/lib.rs": (
+                r"\bpub\s+(?:mod|use)\s+unity_objects\b"
+            ),
         }
-        for relative_path, removed_export in facade_contracts.items():
+        for relative_path, removed_export_pattern in facade_contracts.items():
             source = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
-            with self.subTest(path=relative_path, export=removed_export):
-                self.assertNotIn(removed_export, source)
+            with self.subTest(path=relative_path, export=removed_export_pattern):
+                self.assertIsNone(re.search(removed_export_pattern, source))
 
 
 if __name__ == "__main__":

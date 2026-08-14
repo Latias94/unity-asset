@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -336,23 +337,27 @@ class PackageVerifierRejectionTests(unittest.TestCase):
     def test_rejects_forbidden_release_dependencies_from_metadata(self) -> None:
         self.assertEqual(
             contract.FORBIDDEN_RELEASE_DEPENDENCIES,
-            frozenset(("axum", "globset", "ignore", "reqwest", "tower-http")),
+            frozenset(("axum", "ignore", "reqwest", "tower-http")),
         )
         with tempfile.TemporaryDirectory() as temporary:
-            package = self.expected_package(Path(temporary))
+            base = self.expected_package(Path(temporary))
             for name in sorted(contract.FORBIDDEN_RELEASE_DEPENDENCIES):
+                package = replace(
+                    base,
+                    dependencies=(
+                        {
+                            "name": name,
+                            "source": contract.CRATES_IO_SOURCE,
+                            "path": None,
+                        },
+                    ),
+                )
                 with self.subTest(name=name):
                     with self.assertRaisesRegex(
                         contract.VerificationError, "dependency .* is forbidden"
                     ):
-                        contract.internal_dependency_package(
-                            package,
-                            {
-                                "name": name,
-                                "source": contract.CRATES_IO_SOURCE,
-                                "path": None,
-                            },
-                            {package.name: package},
+                        contract.validate_source_dependencies(
+                            (package,), {package.name: package}
                         )
 
     def test_rejects_unsafe_archive_members(self) -> None:

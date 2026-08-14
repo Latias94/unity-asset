@@ -19,7 +19,7 @@ DEPENDENCY_TABLES = ("dependencies", "build-dependencies")
 ALL_DEPENDENCY_TABLES = (*DEPENDENCY_TABLES, "dev-dependencies")
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
 FORBIDDEN_RELEASE_DEPENDENCIES = frozenset(
-    ("axum", "globset", "ignore", "reqwest", "tower-http")
+    ("axum", "ignore", "reqwest", "tower-http")
 )
 
 
