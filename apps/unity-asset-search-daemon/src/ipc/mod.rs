@@ -860,8 +860,15 @@ async fn write_dispatch_response(
         Ok(response) => ResponseEnvelope::success(request, response),
         Err(error) => ResponseEnvelope::error(request, error),
     };
+    let Some(response_frame) =
+        run_synchronous_before(deadline, || encode_response_frame(&response, request))?
+    else {
+        if let Some(shutdown_deadline) = shutdown_after_response {
+            dispatcher.begin_shutdown_at(shutdown_deadline);
+        }
+        return Ok(RequestDisposition::Close);
+    };
     let write = async {
-        let response_frame = encode_response_frame(&response, request)?;
         stream
             .write_frame_monitoring_inbound(
                 &response_frame,
@@ -887,6 +894,16 @@ async fn write_dispatch_response(
         return Ok(RequestDisposition::Close);
     }
     Ok(RequestDisposition::Continue)
+}
+
+fn run_synchronous_before<T, E>(
+    deadline: Option<SessionDeadline>,
+    operation: impl FnOnce() -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    let output = operation()?;
+    Ok(deadline
+        .is_none_or(|deadline| !deadline.expired())
+        .then_some(output))
 }
 
 async fn run_before<F, T>(deadline: Option<SessionDeadline>, future: F) -> Option<T>
@@ -944,7 +961,8 @@ mod tests {
         DispatchCapacity, DispatchClass, Dispatcher, MAX_CONTROL_IN_FLIGHT,
         MAX_LOCAL_IPC_CONNECTIONS_V1, MAX_WAIT_IN_FLIGHT, MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS,
         PRECLASSIFICATION_AND_CONTROL_TIMEOUT, ServeEvent, SessionCapacityLane, SessionDeadline,
-        SessionError, UNCLASSIFIED_CONNECTION_HEADROOM, drain_sessions, next_serve_event, session,
+        SessionError, UNCLASSIFIED_CONNECTION_HEADROOM, drain_sessions, next_serve_event,
+        run_synchronous_before, session,
     };
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
@@ -1273,6 +1291,24 @@ mod tests {
             Instant::now().duration_since(started),
             PRECLASSIFICATION_AND_CONTROL_TIMEOUT
         );
+    }
+
+    #[test]
+    fn synchronous_response_work_finishing_after_the_deadline_is_discarded() {
+        let deadline = SessionDeadline {
+            at: Instant::now() + Duration::from_millis(10),
+        };
+        let mut encoded = false;
+
+        let response = run_synchronous_before(Some(deadline), || {
+            std::thread::sleep(Duration::from_millis(20));
+            encoded = true;
+            Ok::<_, SessionError>([1_u8])
+        })
+        .unwrap();
+
+        assert!(encoded);
+        assert!(response.is_none());
     }
 
     #[tokio::test]
