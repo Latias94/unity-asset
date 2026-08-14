@@ -3,10 +3,8 @@
 //! These tests exercise the production budgeted parser against representative files.
 
 use std::path::Path;
-use unity_asset_core::{UnityDocument, UnityValue};
-use unity_asset_yaml::{
-    AssetLoadBudget, BudgetedYamlError, BudgetedYamlSource, load_budgeted_yaml_path,
-};
+use unity_asset_core::{AssetLoadBudget, UnityValue};
+use unity_asset_yaml::{BudgetedYamlError, BudgetedYamlSource, load_budgeted_yaml_path};
 
 fn load_fixture(path: &Path) -> Result<BudgetedYamlSource, BudgetedYamlError> {
     let mut budget = AssetLoadBudget::default();

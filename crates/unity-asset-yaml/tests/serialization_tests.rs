@@ -7,9 +7,7 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Arc;
-use unity_asset_core::{
-    AssetLoadBudget, LineEnding, UnityAssetError, UnityClass, UnityDocument, UnityValue,
-};
+use unity_asset_core::{AssetLoadBudget, LineEnding, UnityAssetError, UnityClass, UnityValue};
 use unity_asset_yaml::{
     BudgetedYamlSource, UnityYamlSerializer, YamlDocument, load_budgeted_yaml_path,
     parse_budgeted_yaml_source,

@@ -699,7 +699,7 @@ mod tests {
     use crate::parse_budgeted_yaml_source;
     use indexmap::indexmap;
     use std::sync::Arc;
-    use unity_asset_core::{AssetLoadLimits, UnityDocument};
+    use unity_asset_core::AssetLoadLimits;
 
     #[test]
     fn complex_inline_values_round_trip_without_placeholders() {

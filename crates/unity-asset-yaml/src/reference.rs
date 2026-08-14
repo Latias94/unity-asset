@@ -5,7 +5,7 @@ use std::mem::size_of;
 use thiserror::Error;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, ContractError, FieldPath, FieldPathError, FieldPathSegment,
-    UnityClass, UnityDocument, UnityValue, YamlDocumentSelector, YamlFileId,
+    UnityClass, UnityValue, YamlDocumentSelector, YamlFileId,
 };
 
 use crate::YamlDocument;

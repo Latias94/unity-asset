@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError, UnityDocument};
+use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError};
 use unity_asset_yaml::{BudgetedYamlError, load_budgeted_yaml_path};
 
 fn fixture_path() -> &'static Path {
@@ -73,7 +73,7 @@ async fn asynchronous_path_load_has_the_same_exact_budget_boundary() {
         .await
         .unwrap();
     let required = probe.usage().bytes;
-    assert!(!UnityDocument::entries(expected.document().as_ref()).is_empty());
+    assert!(!expected.document().entries().is_empty());
 
     let mut exact = AssetLoadBudget::new(AssetLoadLimits {
         max_bytes: required,
@@ -90,7 +90,7 @@ async fn asynchronous_path_load_has_the_same_exact_budget_boundary() {
         <YamlDocument as AsyncUnityDocument>::load_from_path_async(path, &mut trait_budget)
             .await
             .unwrap();
-    assert!(!UnityDocument::entries(&document).is_empty());
+    assert!(!document.entries().is_empty());
     assert_eq!(trait_budget.usage().bytes, required);
 
     let mut one_short = AssetLoadBudget::new(AssetLoadLimits {

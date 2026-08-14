@@ -4,10 +4,8 @@
 //! and provide the same functionality as the Python reference library.
 
 use std::path::Path;
-use unity_asset_core::{UnityClass, UnityDocument, UnityValue};
-use unity_asset_yaml::{
-    AssetLoadBudget, BudgetedYamlSource, YamlDocument, load_budgeted_yaml_path,
-};
+use unity_asset_core::{AssetLoadBudget, UnityClass, UnityValue};
+use unity_asset_yaml::{BudgetedYamlSource, YamlDocument, load_budgeted_yaml_path};
 
 fn load_fixture(path: &Path) -> BudgetedYamlSource {
     let mut budget = AssetLoadBudget::default();

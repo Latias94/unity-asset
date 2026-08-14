@@ -7,19 +7,14 @@
 //! # Budgeted parsing
 //!
 //! ```rust
-//! use unity_asset_yaml::{AssetLoadBudget, UnityDocument, load_budgeted_yaml_path};
+//! use unity_asset_core::AssetLoadBudget;
+//! use unity_asset_yaml::load_budgeted_yaml_path;
 //!
 //! let mut budget = AssetLoadBudget::default();
 //! let source = load_budgeted_yaml_path("Player.prefab", &mut budget)?;
 //! assert_eq!(source.document().entries().len(), 1);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
-
-// Re-export core types
-pub use unity_asset_core::{
-    AssetLoadBudget, AssetLoadLimits, BudgetError, BudgetedSourceBytes, DocumentFormat, Result,
-    UnityAssetError, UnityClass, UnityClassHeader, UnityDocument, UnityValue,
-};
 
 // Core modules
 mod budgeted;
@@ -47,6 +42,7 @@ pub use yaml_document::YamlDocument;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_core::AssetLoadBudget;
 
     #[test]
     fn test_basic_functionality() {

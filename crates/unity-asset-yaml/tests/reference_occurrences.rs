@@ -2,7 +2,7 @@ use indexmap::IndexMap;
 use std::sync::Arc;
 use unity_asset_core::{
     AssetLoadBudget, AssetLoadLimits, BudgetError, ContractError, FieldPath, UnityClass,
-    UnityDocument, UnityValue, YamlDocumentSelector, YamlFileId,
+    UnityValue, YamlDocumentSelector, YamlFileId,
 };
 use unity_asset_yaml::{
     YamlDocument, YamlReferenceClassification, YamlReferenceDiagnostic, YamlReferenceField,

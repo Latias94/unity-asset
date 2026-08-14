@@ -1787,7 +1787,7 @@ mod tests {
     use std::fs::FileTimes;
     #[cfg(unix)]
     use std::io::Write as _;
-    use unity_asset_core::{AssetLoadLimits, UnityDocument, arc_slice_allocation_bytes};
+    use unity_asset_core::{AssetLoadLimits, arc_slice_allocation_bytes};
 
     fn parse(input: impl AsRef<[u8]>) -> Result<BudgetedYamlSource, BudgetedYamlError> {
         let mut budget = AssetLoadBudget::default();

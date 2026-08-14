@@ -35,6 +35,36 @@ impl YamlDocument {
         }
     }
 
+    /// Returns the primary object when the document is not empty.
+    pub fn entry(&self) -> Option<&UnityClass> {
+        self.data.first()
+    }
+
+    /// Returns every object in document order.
+    pub fn entries(&self) -> &[UnityClass] {
+        &self.data
+    }
+
+    /// Returns the path used to load this document, when available.
+    pub fn file_path(&self) -> Option<&Path> {
+        self.metadata.file_path.as_deref()
+    }
+
+    /// Returns whether the document contains no objects.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Returns the number of objects in the document.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Returns the concrete document format.
+    pub const fn format(&self) -> DocumentFormat {
+        DocumentFormat::Yaml
+    }
+
     pub(crate) fn set_file_path(&mut self, path: PathBuf) {
         self.metadata.file_path = Some(path);
     }
@@ -67,7 +97,8 @@ impl YamlDocument {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use unity_asset_yaml::{AssetLoadBudget, load_budgeted_yaml_path};
+    /// use unity_asset_core::AssetLoadBudget;
+    /// use unity_asset_yaml::load_budgeted_yaml_path;
     ///
     /// let mut budget = AssetLoadBudget::default();
     /// let source = load_budgeted_yaml_path("scene.unity", &mut budget)?;
@@ -128,7 +159,8 @@ impl YamlDocument {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use unity_asset_yaml::{AssetLoadBudget, load_budgeted_yaml_path};
+    /// use unity_asset_core::AssetLoadBudget;
+    /// use unity_asset_yaml::load_budgeted_yaml_path;
     ///
     /// let mut budget = AssetLoadBudget::default();
     /// let source = load_budgeted_yaml_path("scene.unity", &mut budget)?;
