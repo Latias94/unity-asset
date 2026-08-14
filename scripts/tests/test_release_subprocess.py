@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_ROOT))
 
+import release_subprocess as release_subprocess_module  # noqa: E402
 from release_subprocess import (  # noqa: E402
+    BoundedCommandCleanupError,
     BoundedCommandTimeout,
     credential_free_environment,
     run_bounded_command,
@@ -19,6 +23,47 @@ from release_subprocess import (  # noqa: E402
 
 
 class ReleaseSubprocessTests(unittest.TestCase):
+    @staticmethod
+    def _fake_process() -> mock.Mock:
+        process = mock.Mock()
+        process.pid = 1234
+        process.returncode = -9
+        process.poll.return_value = None
+        process.kill.return_value = None
+        return process
+
+    def _run_fake_process(
+        self,
+        process: mock.Mock,
+        *,
+        terminate: object | None = None,
+        cleanup_timeout_seconds: float = 0.03,
+    ) -> None:
+        terminate_patch = mock.patch.object(
+            release_subprocess_module,
+            "_terminate_process_tree",
+            side_effect=terminate,
+        )
+        with (
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                release_subprocess_module,
+                "_WindowsJob",
+                return_value=mock.Mock(),
+            ),
+            mock.patch.object(
+                release_subprocess_module,
+                "_CLEANUP_TIMEOUT_SECONDS",
+                cleanup_timeout_seconds,
+            ),
+            terminate_patch,
+        ):
+            run_bounded_command(["worker"], timeout_seconds=0.01)
+
     def test_credential_free_environment_removes_release_and_cloud_secrets(self) -> None:
         environment = credential_free_environment(
             {
@@ -59,6 +104,92 @@ class ReleaseSubprocessTests(unittest.TestCase):
             self.assertTrue(ready.is_file(), "parent did not start its grandchild")
             time.sleep(3.5)
             self.assertFalse(escaped.exists())
+
+    def test_cleanup_failure_is_reported_as_a_typed_timeout(self) -> None:
+        process = self._fake_process()
+        process.communicate.side_effect = subprocess.TimeoutExpired(["worker"], 0.01)
+
+        with self.assertRaises(BoundedCommandCleanupError) as raised:
+            self._run_fake_process(process, terminate=OSError("kill denied"))
+
+        self.assertIsInstance(raised.exception, BoundedCommandTimeout)
+        self.assertEqual(raised.exception.operation, "terminating process tree")
+        self.assertIsInstance(raised.exception.__cause__, OSError)
+        self.assertIn("kill denied", str(raised.exception))
+
+    def test_cleanup_deadline_exhaustion_still_closes_windows_job(self) -> None:
+        process = self._fake_process()
+        process.communicate.side_effect = subprocess.TimeoutExpired(["worker"], 0.01)
+        windows_job = mock.Mock()
+
+        with (
+            mock.patch.object(release_subprocess_module.os, "name", "nt"),
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ),
+            mock.patch.object(
+                release_subprocess_module,
+                "_WindowsJob",
+                return_value=windows_job,
+            ),
+            mock.patch.object(
+                release_subprocess_module,
+                "_CLEANUP_TIMEOUT_SECONDS",
+                0.0,
+            ),
+        ):
+            with self.assertRaises(BoundedCommandCleanupError) as raised:
+                run_bounded_command(["worker"], timeout_seconds=0.01)
+
+        self.assertEqual(raised.exception.operation, "terminating process tree")
+        windows_job.close.assert_called_once_with()
+
+    def test_cleanup_retry_uses_the_remaining_deadline(self) -> None:
+        process = self._fake_process()
+        communicate_timeouts: list[float] = []
+
+        def communicate(*, timeout: float) -> tuple[str, None]:
+            communicate_timeouts.append(timeout)
+            if len(communicate_timeouts) == 1:
+                raise subprocess.TimeoutExpired(["worker"], timeout)
+            if len(communicate_timeouts) == 2:
+                time.sleep(0.01)
+                raise subprocess.TimeoutExpired(["worker"], timeout)
+            return "", None
+
+        process.communicate.side_effect = communicate
+
+        with self.assertRaises(BoundedCommandTimeout) as raised:
+            self._run_fake_process(process, cleanup_timeout_seconds=0.1)
+
+        self.assertNotIsInstance(raised.exception, BoundedCommandCleanupError)
+        self.assertEqual(len(communicate_timeouts), 3)
+        self.assertLess(communicate_timeouts[2], communicate_timeouts[1])
+        process.kill.assert_called_once_with()
+
+    def test_slow_output_cleanup_cannot_overrun_cleanup_deadline(self) -> None:
+        process = self._fake_process()
+        communicate_calls = 0
+
+        def communicate(*, timeout: float) -> tuple[str, None]:
+            nonlocal communicate_calls
+            communicate_calls += 1
+            if communicate_calls == 1:
+                raise subprocess.TimeoutExpired(["worker"], timeout)
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired(["worker"], timeout)
+
+        process.communicate.side_effect = communicate
+
+        started_at = time.monotonic()
+        with self.assertRaises(BoundedCommandCleanupError) as raised:
+            self._run_fake_process(process)
+        elapsed = time.monotonic() - started_at
+
+        self.assertEqual(raised.exception.operation, "killing process")
+        self.assertLess(elapsed, 0.25)
 
 
 if __name__ == "__main__":
