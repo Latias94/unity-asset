@@ -40,7 +40,6 @@ serde_json = { workspace = true }
 
 [features]
 default = ["mmap"]
-async = ["unity-asset/async"]
 decode = ["unity-asset/decode"]
 mmap = ["unity-asset/mmap", "unity-asset-binary/mmap"]
 full = ["decode", "mmap"]

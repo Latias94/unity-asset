@@ -121,7 +121,6 @@ jobs:
     - name: Run documented async and decode feature tests
       run: |
         cargo nextest run -p unity-asset --features async --test-threads 2
-        cargo nextest run -p unity-asset-cli --features async --test-threads 2 --no-tests=pass
         cargo nextest run -p unity-asset --features decode --test extraction_decode --test-threads 2
         cargo nextest run -p unity-asset-cli --features decode --test-threads 2
 
