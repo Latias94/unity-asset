@@ -159,9 +159,17 @@ impl<'a> BudgetedOutput<'a> {
     ) -> Result<Self> {
         let mut budget = load_budget.begin_decompression();
         budget.consume(usize_to_u64(compressed_size, "compressed size")?, 0)?;
+        let mut bytes = Vec::new();
+        if let Some(maximum_output) = maximum_output {
+            bytes.try_reserve_exact(maximum_output).map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {maximum_output} bounded decompressed bytes: {error}"
+                ))
+            })?;
+        }
         Ok(Self {
             budget,
-            bytes: Vec::new(),
+            bytes,
             maximum_output,
             write_failure: None,
         })
@@ -1531,6 +1539,31 @@ mod tests {
         let data = b"Hello, World!";
         let result = decompress(data, CompressionType::None, data.len()).unwrap();
         assert_eq!(result, data);
+    }
+
+    #[test]
+    fn declared_output_codecs_retain_only_the_declared_capacity() {
+        let original = vec![0x5a_u8; 4_093];
+        let encoded = [
+            (CompressionType::None, original.clone()),
+            (CompressionType::Lz4, lz4_flex::block::compress(&original)),
+            (CompressionType::Lzma, unity_lzma_compress(&original)),
+            (CompressionType::Brotli, brotli_compress(&original)),
+        ];
+
+        for (compression, encoded) in encoded {
+            let mut budget = AssetLoadBudget::default();
+            let decoded =
+                decompress_with_budget(&encoded, compression, original.len(), &mut budget).unwrap();
+
+            assert_eq!(decoded, original, "{} payload", compression.name());
+            assert_eq!(
+                decoded.capacity(),
+                original.len(),
+                "{} retained capacity",
+                compression.name()
+            );
+        }
     }
 
     #[test]

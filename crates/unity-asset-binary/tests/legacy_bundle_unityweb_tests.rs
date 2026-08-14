@@ -126,7 +126,7 @@ fn can_parse_minimal_unityweb_v3_bundle_and_extract_file() {
         ..AssetLoadLimits::default()
     })
     .unwrap();
-    let shared = parsed.data_arc_with_budget(&mut no_copy_budget).unwrap();
-    assert_eq!(shared.as_ref(), uncompressed_blob.as_slice());
+    let shared = parsed.data_shared_with_budget(&mut no_copy_budget).unwrap();
+    assert_eq!(shared.as_bytes(), uncompressed_blob.as_slice());
     assert_eq!(no_copy_budget.usage().bytes, 0);
 }

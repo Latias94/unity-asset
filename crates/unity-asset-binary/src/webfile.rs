@@ -1446,7 +1446,7 @@ fn has_webfile_signature_prefix(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unity_asset_core::{AssetLoadLimits, BudgetError};
+    use unity_asset_core::{AssetLoadLimits, BudgetError, arc_vec_allocation_bytes};
 
     fn minimal_webfile(head_length: i32, header_tail: &[u8]) -> Vec<u8> {
         let mut bytes = b"UnityWebData1.0\0".to_vec();
@@ -1994,7 +1994,7 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_bundle_entries_charge_their_own_source_lengths_in_order() {
+    fn duplicate_bundle_entries_charge_sources_and_retained_backings_in_order() {
         let first = minimal_unityfs_bundle("2020.3.0f1");
         let second = minimal_unityfs_bundle(
             "2021.3.0f1-with-a-deliberately-long-revision-for-a-distinct-size",
@@ -2009,7 +2009,8 @@ mod tests {
             + retained_directory_bytes(&["duplicate.bundle", "duplicate.bundle"]);
         let first_len = u64::try_from(first.len()).unwrap();
         let second_len = u64::try_from(second.len()).unwrap();
-        let limit = outer_cost + first_len;
+        let first_backing = arc_vec_allocation_bytes::<u8>(1).unwrap();
+        let limit = outer_cost + first_len + first_backing;
         let mut budget = AssetLoadBudget::new(AssetLoadLimits {
             max_bytes: limit,
             ..AssetLoadLimits::default()
@@ -2028,7 +2029,7 @@ mod tests {
                 resource: "bytes",
                 limit: actual_limit,
                 requested,
-            }) if actual_limit == limit && requested == outer_cost + first_len + second_len
+            }) if actual_limit == limit && requested == limit + second_len
         ));
         assert_eq!(budget.usage().bytes, limit);
     }

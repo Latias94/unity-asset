@@ -252,7 +252,7 @@ mod tests {
     fn source_binding_uses_backing_identity_without_a_comparison_budget() {
         let backing: Arc<[u8]> = Arc::from(V22_FIXTURE);
         let file = SerializedFileParser::from_shared_range(
-            SharedBytes::Arc(Arc::clone(&backing)),
+            SharedBytes::from_arc(Arc::clone(&backing)),
             0..backing.len(),
         )
         .unwrap();

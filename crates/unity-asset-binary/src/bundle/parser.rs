@@ -1035,7 +1035,7 @@ impl BundleParser {
         reader: &mut BinaryReader,
         options: &BundleLoadOptions,
         budget: &mut AssetLoadBudget,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<SharedBytes> {
         if let Some(limit) = options.max_compressed_block_size {
             for block in &bundle.blocks {
                 if (block.compressed_size as u64) > (limit as u64) {
@@ -1046,8 +1046,7 @@ impl BundleParser {
                 }
             }
         }
-        BundleCompression::decompress_data_blocks_limited_with_budget(
-            &bundle.header,
+        BundleCompression::decompress_data_blocks_shared_limited_with_budget(
             &bundle.blocks,
             reader,
             options.max_memory,
@@ -1058,7 +1057,7 @@ impl BundleParser {
     /// Parse files from decompressed block data
     fn parse_files(
         bundle: &mut AssetBundle,
-        blocks_data: Vec<u8>,
+        blocks_data: SharedBytes,
         budget: &mut AssetLoadBudget,
     ) -> Result<()> {
         let retained_bytes = retained_record_bytes::<BundleFileInfo>(
@@ -1083,7 +1082,7 @@ impl BundleParser {
         }
 
         // Publish the prepared data and directory mirror together.
-        bundle.set_decompressed_data(blocks_data);
+        bundle.set_decompressed_shared(blocks_data);
         bundle.files = files;
 
         Ok(())
@@ -1289,7 +1288,7 @@ impl BundleParser {
     ) -> Result<()> {
         let (backing, base_offset, visible_len) =
             if bundle.header.layout_kind()? == BundleLayoutKind::FileStream {
-                let backing = crate::shared_bytes::SharedBytes::from_arc(bundle.data_arc()?);
+                let backing = bundle.data_shared_with_budget(budget)?;
                 let visible_len = backing.len() as u64;
                 (backing, 0usize, visible_len)
             } else {
@@ -2238,6 +2237,49 @@ mod tests {
             ..BundleHeader::default()
         };
         assert!(!BundleParser::should_probe_legacy_alignment(&old));
+    }
+
+    #[test]
+    fn eager_unityfs_blocks_publish_one_budgeted_shared_backing() {
+        let retained_bytes = unity_asset_core::arc_vec_allocation_bytes::<u8>(8).unwrap();
+        let max_memory = usize::try_from(retained_bytes.checked_add(16).unwrap()).unwrap();
+        let header = BundleHeader {
+            signature: "UnityFS".to_string(),
+            ..Default::default()
+        };
+        let mut bundle = AssetBundle::new_empty(header);
+        bundle.blocks = vec![crate::compression::CompressionBlock::new(8, 8, 0)];
+        let encoded = [0x7b_u8; 8];
+        let mut reader = BinaryReader::new(&encoded, ByteOrder::Big);
+        let options = BundleLoadOptions {
+            max_memory: Some(max_memory),
+            ..Default::default()
+        };
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: retained_bytes,
+            max_compressed_bytes: 8,
+            max_decompressed_bytes: 8,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let shared =
+            BundleParser::read_blocks(&bundle, &mut reader, &options, &mut budget).unwrap();
+        assert_eq!(shared.as_bytes(), &encoded);
+        assert_eq!(budget.usage().bytes, retained_bytes);
+        assert_eq!(budget.usage().compressed_bytes, 8);
+        assert_eq!(budget.usage().decompressed_bytes, 8);
+
+        bundle.set_decompressed_shared(shared);
+        let usage_after_publish = budget.usage();
+        assert_eq!(
+            bundle
+                .data_shared_with_budget(&mut budget)
+                .unwrap()
+                .as_bytes(),
+            &encoded
+        );
+        assert_eq!(budget.usage(), usage_after_publish);
     }
 
     #[test]

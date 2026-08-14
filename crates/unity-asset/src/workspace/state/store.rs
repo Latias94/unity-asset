@@ -4,7 +4,6 @@ use std::sync::{Arc, Weak};
 
 use thiserror::Error;
 use unity_asset_binary::asset::SerializedFile;
-use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_core::{
     AssetLoadBudget, BudgetError, DigestV1, SourceId, SourceKind, VerifiedSourceImage,
     VerifiedSourceRebinding, WorkspaceId, arc_slice_allocation_bytes, arc_value_allocation_bytes,
@@ -216,11 +215,10 @@ impl SourceEntry {
         if let FrozenSourceParse::Serialized(parsed) = parse {
             let complete_backing = parsed.data_base_offset() == 0
                 && parsed.data().len() == image.as_bytes().len()
-                && match parsed.data_shared() {
-                    SharedBytes::Arc(backing) => Arc::ptr_eq(&backing, image.backing()),
-                    #[cfg(feature = "mmap")]
-                    SharedBytes::Mmap(_) => false,
-                };
+                && parsed
+                    .data_shared()
+                    .as_arc_slice()
+                    .is_some_and(|backing| Arc::ptr_eq(backing, image.backing()));
             if !complete_backing {
                 return Err(SourceStoreError::FrozenSerializedBackingMismatch {
                     source_id: source,
@@ -938,13 +936,12 @@ mod tests {
             parsed.data_identity_key(),
             (first_backing.as_ptr() as usize, 0, first_backing.len())
         );
-        match parsed.data_shared() {
-            SharedBytes::Arc(parsed_backing) => {
-                assert!(Arc::ptr_eq(&parsed_backing, &first_backing));
-            }
-            #[cfg(feature = "mmap")]
-            SharedBytes::Mmap(_) => panic!("the cached parse must use the canonical Arc"),
-        }
+        let parsed_backing = parsed
+            .data_shared()
+            .as_arc_slice()
+            .cloned()
+            .expect("the cached parse must use the canonical Arc");
+        assert!(Arc::ptr_eq(&parsed_backing, &first_backing));
         assert_eq!(Arc::strong_count(&second_backing), 1);
         validate(&store).unwrap();
     }

@@ -5,7 +5,6 @@ use unity_asset_binary::asset::{
     ObjectOffsetEncoding, ObjectTailEncoding, ObjectTypeReference, PathIdEncoding, SerializedFile,
     SerializedFileFormat, SerializedFileLayout,
 };
-use unity_asset_binary::shared_bytes::SharedBytes;
 use unity_asset_core::UnityAssetError;
 
 use crate::artifact::{ArtifactBatch, ArtifactPayload, ArtifactPayloadProvenance};
@@ -615,8 +614,9 @@ pub(crate) fn validate_source_binding(
         .data_base_offset()
         .checked_add(file.data().len())
         .ok_or_else(|| UnityAssetError::format("SerializedFile backing range overflow"))?;
-    if let SharedBytes::Arc(backing) = file.data_shared()
-        && source.payload.shares_shared_backing(&backing)
+    let file_backing = file.data_shared();
+    if let Some(backing) = file_backing.as_arc_slice()
+        && source.payload.shares_shared_backing(backing)
         && source.range == (file.data_base_offset()..file_end)
     {
         return Ok(());

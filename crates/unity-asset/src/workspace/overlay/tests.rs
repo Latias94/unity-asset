@@ -669,7 +669,7 @@ fn prepared_binary_objects_are_derived_from_the_exact_serialized_artifact() {
 
     let backing: Arc<[u8]> = Arc::from(V22_SERIALIZED_FILE);
     let file = SerializedFileParser::from_shared_range(
-        SharedBytes::Arc(Arc::clone(&backing)),
+        SharedBytes::from_arc(Arc::clone(&backing)),
         0..backing.len(),
     )
     .unwrap();

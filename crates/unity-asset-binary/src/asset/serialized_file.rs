@@ -273,11 +273,7 @@ impl SerializedFile {
         rebinding: VerifiedSourceRebinding,
     ) -> std::result::Result<VerifiedSourceImage, VerifiedSourceImageError> {
         let previous = self.data.backing_shared();
-        let previous_arc = match &previous {
-            SharedBytes::Arc(previous) => Some(previous),
-            #[cfg(feature = "mmap")]
-            SharedBytes::Mmap(_) => None,
-        };
+        let previous_arc = previous.as_arc_slice();
         rebinding.ensure_previous_backing(
             SourceKind::SerializedFile,
             previous_arc,
@@ -609,13 +605,12 @@ mod tests {
             parsed.data_identity_key(),
             (canonical.as_ptr() as usize, 0, canonical.len())
         );
-        match parsed.data_shared() {
-            SharedBytes::Arc(parsed_backing) => {
-                assert!(Arc::ptr_eq(&parsed_backing, &canonical));
-            }
-            #[cfg(feature = "mmap")]
-            SharedBytes::Mmap(_) => panic!("rebinding must install the canonical Arc"),
-        }
+        let parsed_backing = parsed
+            .data_shared()
+            .as_arc_slice()
+            .cloned()
+            .expect("rebinding must install the canonical Arc");
+        assert!(Arc::ptr_eq(&parsed_backing, &canonical));
         assert_eq!(Arc::strong_count(&previous), 1);
     }
 

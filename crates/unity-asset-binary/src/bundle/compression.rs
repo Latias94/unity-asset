@@ -9,7 +9,19 @@ use crate::compression::{
 };
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
-use unity_asset_core::AssetLoadBudget;
+use crate::shared_bytes::SharedBytes;
+use unity_asset_core::{AssetLoadBudget, arc_vec_allocation_bytes, vec_allocation_bytes};
+
+#[derive(Clone, Copy)]
+enum DataBlockOutputStorage {
+    Vec,
+    Shared,
+}
+
+struct DataBlockPreflight {
+    output_len: usize,
+    retained_bytes: u64,
+}
 
 /// Bundle compression handler
 ///
@@ -207,7 +219,53 @@ impl BundleCompression {
         max_memory: Option<usize>,
         budget: &mut AssetLoadBudget,
     ) -> Result<Vec<u8>> {
-        let total_uncompressed = Self::preflight_data_blocks(blocks, reader, max_memory, budget)?;
+        let preflight = Self::preflight_data_blocks_for_storage(
+            blocks,
+            reader,
+            max_memory,
+            budget,
+            DataBlockOutputStorage::Vec,
+        )?;
+        Self::decompress_preflighted_data_blocks(blocks, reader, preflight.output_len, budget)
+    }
+
+    pub(crate) fn decompress_data_blocks_shared_limited_with_budget(
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        max_memory: Option<usize>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SharedBytes> {
+        let preflight = Self::preflight_data_blocks_for_storage(
+            blocks,
+            reader,
+            max_memory,
+            budget,
+            DataBlockOutputStorage::Shared,
+        )?;
+        let data =
+            Self::decompress_preflighted_data_blocks(blocks, reader, preflight.output_len, budget)?;
+        let actual_retained_bytes =
+            arc_vec_allocation_bytes::<u8>(data.capacity()).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "Bundle shared output allocation size overflow".to_string(),
+                )
+            })?;
+        if actual_retained_bytes != preflight.retained_bytes {
+            return Err(BinaryError::ResourceLimitExceeded(format!(
+                "Bundle shared output retained allocation {actual_retained_bytes} differs from the preflight proof {}",
+                preflight.retained_bytes
+            )));
+        }
+        budget.consume_bytes(actual_retained_bytes)?;
+        Ok(SharedBytes::from_vec(data))
+    }
+
+    fn decompress_preflighted_data_blocks(
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        total_uncompressed: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<u8>> {
         let mut decompressed_data = Vec::new();
         decompressed_data
             .try_reserve_exact(total_uncompressed)
@@ -229,12 +287,30 @@ impl BundleCompression {
         Ok(decompressed_data)
     }
 
+    #[cfg(test)]
     pub(crate) fn preflight_data_blocks(
         blocks: &[CompressionBlock],
         reader: &BinaryReader<'_>,
         max_memory: Option<usize>,
         budget: &AssetLoadBudget,
     ) -> Result<usize> {
+        Self::preflight_data_blocks_for_storage(
+            blocks,
+            reader,
+            max_memory,
+            budget,
+            DataBlockOutputStorage::Vec,
+        )
+        .map(|preflight| preflight.output_len)
+    }
+
+    fn preflight_data_blocks_for_storage(
+        blocks: &[CompressionBlock],
+        reader: &BinaryReader<'_>,
+        max_memory: Option<usize>,
+        budget: &AssetLoadBudget,
+        output_storage: DataBlockOutputStorage,
+    ) -> Result<DataBlockPreflight> {
         let mut total_compressed = 0u64;
         let mut total_uncompressed = 0u64;
 
@@ -252,6 +328,29 @@ impl BundleCompression {
         }
 
         budget.check_decompression(total_compressed, total_uncompressed)?;
+        let output_len = usize::try_from(total_uncompressed).map_err(|_| {
+            BinaryError::ResourceLimitExceeded(format!(
+                "Bundle decompressed size {total_uncompressed} does not fit in usize"
+            ))
+        })?;
+        let (retained_storage_bytes, retained_budget_bytes) = match output_storage {
+            DataBlockOutputStorage::Vec => (
+                vec_allocation_bytes::<u8>(output_len).map_err(|_| {
+                    BinaryError::ResourceLimitExceeded(
+                        "Bundle Vec output allocation size overflow".to_string(),
+                    )
+                })?,
+                0,
+            ),
+            DataBlockOutputStorage::Shared => {
+                let bytes = arc_vec_allocation_bytes::<u8>(output_len).map_err(|_| {
+                    BinaryError::ResourceLimitExceeded(
+                        "Bundle shared output allocation size overflow".to_string(),
+                    )
+                })?;
+                (bytes, bytes)
+            }
+        };
 
         let compressed_len = usize::try_from(total_compressed).map_err(|_| {
             BinaryError::ResourceLimitExceeded(format!(
@@ -304,9 +403,16 @@ impl BundleCompression {
                 })?;
             max_block_working_set = max_block_working_set.max(block_working_set);
         }
-        budget.check_bytes(total_codec_scratch)?;
+        let budgeted_bytes = total_codec_scratch
+            .checked_add(retained_budget_bytes)
+            .ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(
+                    "Bundle retained and scratch byte total overflow".to_string(),
+                )
+            })?;
+        budget.check_bytes(budgeted_bytes)?;
 
-        let peak_memory = total_uncompressed
+        let peak_memory = retained_storage_bytes
             .checked_add(max_block_working_set)
             .ok_or_else(|| {
                 BinaryError::ResourceLimitExceeded(
@@ -324,10 +430,9 @@ impl BundleCompression {
             }
         }
 
-        usize::try_from(total_uncompressed).map_err(|_| {
-            BinaryError::ResourceLimitExceeded(format!(
-                "Bundle decompressed size {total_uncompressed} does not fit in usize"
-            ))
+        Ok(DataBlockPreflight {
+            output_len,
+            retained_bytes: retained_budget_bytes,
         })
     }
 

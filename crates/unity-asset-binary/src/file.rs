@@ -483,7 +483,7 @@ fn mmap_open_file(file: std::fs::File, declared_len: u64, path: &Path) -> Result
     }
     let mmap = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|error| BinaryError::generic(format!("Failed to mmap file {path:?}: {error}")))?;
-    Ok(SharedBytes::Mmap(std::sync::Arc::new(mmap)))
+    Ok(SharedBytes::from_mmap(std::sync::Arc::new(mmap)))
 }
 
 #[cfg(not(feature = "mmap"))]
