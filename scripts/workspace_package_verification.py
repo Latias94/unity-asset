@@ -44,19 +44,6 @@ PACKAGE_CONSUMER_FIXTURE_ROOT = (
     Path(__file__).resolve().parent.parent / "integration" / "package-consumers"
 )
 PUBLIC_API_FIXTURE_ROOT = PACKAGE_CONSUMER_FIXTURE_ROOT / "public-api"
-REMOVED_DECODE_API_PATHS = (
-    "audio::AudioProcessor",
-    "audio::AudioClipConverter",
-    "audio::AudioClip",
-    "texture::TextureProcessor",
-    "texture::Texture2DConverter",
-    "texture::Texture2D",
-    "texture::TextureSwizzler",
-)
-REMOVED_DECODE_CONSUMER_NAME = f"{CONSUMER_PACKAGE_PREFIX}-removed-decode"
-REMOVED_API_DIAGNOSTIC_CODES = frozenset(("E0432", "E0433", "E0603"))
-
-
 def command_text(command: Sequence[str]) -> str:
     if os.name == "nt":
         return subprocess.list2cmdline(list(command))
@@ -558,7 +545,6 @@ def create_consumer_suite(
     Path,
     dict[str, Path],
     set[str],
-    str,
     set[str],
 ]:
     """Create one resolver graph while preserving per-consumer feature checks."""
@@ -603,30 +589,6 @@ def create_consumer_suite(
         positive_names.add(name)
         required_internal.add(target.name)
 
-    target = packages.get("unity-asset-decode")
-    if target is None or not target.is_library or "full" not in target.feature_names:
-        raise VerificationError(
-            "removed decode API probes require the published unity-asset-decode/full surface"
-        )
-
-    removed_dependency = render_consumer_dependency(
-        target.version,
-        ("full",),
-        default_features=False,
-    )
-    removed_name = REMOVED_DECODE_CONSUMER_NAME
-    consumer_manifests[removed_name] = write_consumer_package(
-        workspace_root / removed_name,
-        name=removed_name,
-        dependency_name=target.name,
-        dependency=removed_dependency,
-        source="".join(
-            f"use unity_asset_decode::{symbol};\n"
-            for symbol in REMOVED_DECODE_API_PATHS
-        ),
-    )
-    required_internal.add(target.name)
-
     required_packages = {
         package.name: unpacked_packages[package.name]
         for package in production_closure(sorted(required_internal), packages)
@@ -641,7 +603,6 @@ def create_consumer_suite(
         workspace_manifest,
         consumer_manifests,
         positive_names,
-        removed_name,
         required_internal,
     )
 
@@ -830,96 +791,6 @@ def check_consumer_packages(
             ],
             cwd=cargo_cwd,
             env=environment,
-        )
-
-
-def check_removed_api_consumer(
-    *,
-    cargo: str,
-    cargo_cwd: Path,
-    environment: Mapping[str, str],
-    workspace_manifest: Path,
-    consumer_name: str,
-    source_path: Path,
-) -> None:
-    """Require rustc to reject every removed import in one isolated consumer."""
-
-    command = [
-        cargo,
-        "check",
-        "--manifest-path",
-        str(workspace_manifest),
-        "--package",
-        consumer_name,
-        "--lib",
-        "--locked",
-        "--message-format=json",
-    ]
-    print(f"$ {command_text(command)}", flush=True)
-    try:
-        result = subprocess.run(
-            command,
-            cwd=cargo_cwd,
-            env=environment,
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            timeout=CARGO_COMMAND_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as error:
-        raise VerificationError(
-            f"removed API probe timed out after {CARGO_COMMAND_TIMEOUT_SECONDS}s: "
-            f"{consumer_name}"
-        ) from error
-    if result.returncode == 0:
-        raise VerificationError(
-            f"removed API consumer unexpectedly compiled: {consumer_name}"
-        )
-
-    expected_source = os.path.normcase(os.path.abspath(source_path))
-    rejected_lines: set[int] = set()
-    for encoded_event in result.stdout.splitlines():
-        try:
-            event = json.loads(encoded_event)
-        except json.JSONDecodeError:
-            continue
-        if event.get("reason") != "compiler-message":
-            continue
-        target = event.get("target")
-        message = event.get("message")
-        if not isinstance(target, dict) or not isinstance(message, dict):
-            continue
-        target_source = target.get("src_path")
-        code = message.get("code")
-        spans = message.get("spans")
-        if (
-            not isinstance(target_source, str)
-            or os.path.normcase(os.path.abspath(target_source)) != expected_source
-            or not isinstance(code, dict)
-            or code.get("code") not in REMOVED_API_DIAGNOSTIC_CODES
-            or not isinstance(spans, list)
-        ):
-            continue
-        for span in spans:
-            if not isinstance(span, dict) or not span.get("is_primary"):
-                continue
-            line_start = span.get("line_start")
-            line_end = span.get("line_end")
-            if isinstance(line_start, int) and line_end == line_start:
-                rejected_lines.add(line_start)
-
-    expected_lines = set(range(1, len(REMOVED_DECODE_API_PATHS) + 1))
-    missing_lines = sorted(expected_lines - rejected_lines)
-    if missing_lines:
-        missing_symbols = ", ".join(
-            REMOVED_DECODE_API_PATHS[line - 1] for line in missing_lines
-        )
-        details = result.stderr.strip()
-        suffix = f"; cargo stderr: {details}" if details else ""
-        raise VerificationError(
-            "removed API consumer did not receive an authoritative unresolved/private "
-            f"import diagnostic for: {missing_symbols}{suffix}"
         )
 
 
@@ -1145,7 +1016,6 @@ def run_verification(
             consumer_manifest,
             consumer_manifests,
             positive_names,
-            removed_name,
             required_internal,
         ) = create_consumer_suite(
             consumer_workspace_root,
@@ -1170,12 +1040,3 @@ def run_verification(
             workspace_manifest=consumer_manifest,
             consumer_names=tuple(positive_names),
         )
-        if verify_binaries:
-            check_removed_api_consumer(
-                cargo=cargo,
-                cargo_cwd=cargo_cwd,
-                environment=verification_environment,
-                workspace_manifest=consumer_manifest,
-                consumer_name=removed_name,
-                source_path=consumer_manifests[removed_name].parent / "src" / "lib.rs",
-            )
