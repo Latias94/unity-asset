@@ -30,6 +30,9 @@ const CONTROL_RESERVED_CONNECTIONS: usize = 8;
 const ORDINARY_CONNECTIONS: usize = MAX_LOCAL_IPC_CONNECTIONS_V1 - CONTROL_RESERVED_CONNECTIONS;
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTROL_RESERVED_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(2);
+// One budget spans bootstrap and the single control request, leaving margin under the CLI's
+// default ten-second connect deadline even when every reserved connection is occupied.
+const CONTROL_RESERVED_SESSION_READ_TIMEOUT: Duration = Duration::from_secs(4);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const CONTROL_RESERVED_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const BODY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -139,6 +142,36 @@ impl SessionLease {
 enum SessionLane {
     Ordinary,
     ControlReserved,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SessionReadDeadline {
+    PerFrame,
+    Absolute(Instant),
+}
+
+impl SessionReadDeadline {
+    fn for_lane(lane: SessionLane) -> Result<Self, EndpointTransportError> {
+        match lane {
+            SessionLane::Ordinary => Ok(Self::PerFrame),
+            SessionLane::ControlReserved => Instant::now()
+                .checked_add(CONTROL_RESERVED_SESSION_READ_TIMEOUT)
+                .map(Self::Absolute)
+                .ok_or(EndpointTransportError::FrameDeadlineOverflow),
+        }
+    }
+
+    async fn run<F, T>(self, future: F) -> Result<T, EndpointTransportError>
+    where
+        F: Future<Output = Result<T, EndpointTransportError>>,
+    {
+        match self {
+            Self::PerFrame => future.await,
+            Self::Absolute(deadline) => tokio::time::timeout_at(deadline, future)
+                .await
+                .map_err(|_| EndpointTransportError::FrameReadDeadlineElapsed)?,
+        }
+    }
 }
 
 impl SessionLane {
@@ -539,11 +572,12 @@ async fn session(
 ) -> Result<(), SessionError> {
     let lane = connection.lane();
     let _connection = connection;
-    let bootstrap_frame = match stream
-        .read_frame(
+    let read_deadline = SessionReadDeadline::for_lane(lane)?;
+    let bootstrap_frame = match read_deadline
+        .run(stream.read_frame(
             FrameLimits::bootstrap(),
             FrameReadTimeoutsV1::new(lane.bootstrap_timeout(), BODY_TIMEOUT),
-        )
+        ))
         .await
     {
         Err(EndpointTransportError::FrameReadDeadlineElapsed) if lane.single_request() => {
@@ -581,11 +615,11 @@ async fn session(
     }
 
     loop {
-        let frame = match stream
-            .read_frame(
+        let frame = match read_deadline
+            .run(stream.read_frame(
                 FrameLimits::request_envelope(),
                 FrameReadTimeoutsV1::new(lane.request_timeout(), BODY_TIMEOUT),
-            )
+            ))
             .await
         {
             Err(EndpointTransportError::FrameReadDeadlineElapsed) if lane.single_request() => {
@@ -693,13 +727,14 @@ mod tests {
         time::{Duration, Instant as StdInstant},
     };
 
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::sync::watch;
     use tokio::time::Instant;
     use unity_asset_core::AssetLoadBudget;
     use unity_asset_search_index::{IndexPaths, SearchIndex, SearchIndexOptions};
     use unity_asset_search_local::{
-        EndpointCleanupV1, FrameReadTimeoutsV1, PrivateRootsV1, VerifiedFramedTransportV1,
-        generate_daemon_instance_id,
+        EndpointCleanupV1, EndpointTransportError, FrameReadTimeoutsV1, PrivateRootsV1,
+        VerifiedFramedTransportV1, generate_daemon_instance_id,
     };
     use unity_asset_search_protocol::{
         ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
@@ -711,10 +746,11 @@ mod tests {
     };
 
     use super::{
-        CONTROL_RESERVED_CONNECTIONS, ConnectionCapacity, DispatchCapacity, DispatchClass,
-        Dispatcher, MAX_CONTROL_IN_FLIGHT, MAX_LOCAL_IPC_CONNECTIONS_V1, MAX_WAIT_IN_FLIGHT,
-        MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS, ServeEvent, SessionError, SessionLane,
-        drain_sessions, next_serve_event, session,
+        CONTROL_RESERVED_CONNECTIONS, CONTROL_RESERVED_SESSION_READ_TIMEOUT, ConnectionCapacity,
+        DispatchCapacity, DispatchClass, Dispatcher, MAX_CONTROL_IN_FLIGHT,
+        MAX_LOCAL_IPC_CONNECTIONS_V1, MAX_WAIT_IN_FLIGHT, MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS,
+        ServeEvent, SessionError, SessionLane, SessionReadDeadline, drain_sessions,
+        next_serve_event, session,
     };
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
@@ -832,6 +868,93 @@ mod tests {
         drop(ordinary.pop().unwrap());
         let reclaimed_ordinary = capacity.acquire().await;
         assert_eq!(reclaimed_ordinary.lane(), SessionLane::Ordinary);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn full_control_lane_half_frames_release_before_the_cli_connect_deadline() {
+        const CLI_DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+        const BOOTSTRAP_ELAPSED: Duration = Duration::from_secs(3);
+
+        assert!(CONTROL_RESERVED_SESSION_READ_TIMEOUT < CLI_DEFAULT_CONNECT_TIMEOUT);
+        let capacity = ConnectionCapacity::production();
+        let mut ordinary = Vec::with_capacity(ORDINARY_CONNECTIONS);
+        for _ in 0..ORDINARY_CONNECTIONS {
+            let lease = capacity.acquire().await;
+            assert_eq!(lease.lane(), SessionLane::Ordinary);
+            ordinary.push(lease);
+        }
+
+        let started = Instant::now();
+        let mut stalled = tokio::task::JoinSet::new();
+        for _ in 0..CONTROL_RESERVED_CONNECTIONS {
+            let lease = capacity.acquire().await;
+            assert_eq!(lease.lane(), SessionLane::ControlReserved);
+            let deadline = SessionReadDeadline::for_lane(lease.lane()).unwrap();
+            let (mut client, mut server) = tokio::io::duplex(8);
+            stalled.spawn(async move {
+                let _lease = lease;
+                deadline
+                    .run(async {
+                        tokio::join!(
+                            async {
+                                tokio::time::sleep(BOOTSTRAP_ELAPSED).await;
+                                client.write_all(&[0, 0, 0, 1, 0]).await.unwrap();
+                            },
+                            async {
+                                let mut bootstrap = [0_u8; 5];
+                                server.read_exact(&mut bootstrap).await.unwrap();
+                            }
+                        );
+                        Ok::<(), EndpointTransportError>(())
+                    })
+                    .await
+                    .unwrap();
+                client.write_all(&[0, 0, 0, 2, 0]).await.unwrap();
+                let result = deadline
+                    .run(async {
+                        let mut frame = [0_u8; 6];
+                        server.read_exact(&mut frame).await.unwrap();
+                        Ok::<(), EndpointTransportError>(())
+                    })
+                    .await;
+                drop(client);
+                result
+            });
+        }
+        assert_eq!(capacity.ordinary.available_permits(), 0);
+        assert_eq!(capacity.control_reserved.available_permits(), 0);
+        tokio::task::yield_now().await;
+
+        let status = tokio::time::timeout(CLI_DEFAULT_CONNECT_TIMEOUT, capacity.acquire())
+            .await
+            .expect("a reserved status lane must reopen before the CLI connect deadline");
+        assert_eq!(status.lane(), SessionLane::ControlReserved);
+        assert!(
+            status
+                .lane()
+                .permits(DispatchClass::for_operation(OperationKind::Status))
+        );
+        assert!(Instant::now().duration_since(started) <= CONTROL_RESERVED_SESSION_READ_TIMEOUT);
+        drop(status);
+
+        let shutdown = tokio::time::timeout(CLI_DEFAULT_CONNECT_TIMEOUT, capacity.acquire())
+            .await
+            .expect("a reserved shutdown lane must reopen before the CLI connect deadline");
+        assert_eq!(shutdown.lane(), SessionLane::ControlReserved);
+        assert!(
+            shutdown
+                .lane()
+                .permits(DispatchClass::for_operation(OperationKind::Shutdown))
+        );
+        drop(shutdown);
+
+        while let Some(result) = stalled.join_next().await {
+            assert!(matches!(
+                result.unwrap(),
+                Err(EndpointTransportError::FrameReadDeadlineElapsed)
+            ));
+        }
+        drop(ordinary);
     }
 
     #[tokio::test]

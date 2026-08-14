@@ -16,7 +16,7 @@ use unity_asset_search_index::{
 };
 use unity_asset_search_protocol::ProjectId;
 
-use crate::operations::{OperationError, OperationOrigin, OperationService};
+use crate::operations::{OperationError, OperationOrigin, OperationService, OperationSnapshot};
 
 const WATCH_CHANNEL_CAPACITY: usize = 1_024;
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_millis(250);
@@ -209,14 +209,16 @@ fn remaining_millis(deadline: Option<Instant>) -> Option<u64> {
 }
 
 type AdmissionFuture<'a> = Pin<Box<dyn Future<Output = Result<(), OperationError>> + Send + 'a>>;
-type TimerFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+type MaintenanceFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
 
 trait MaintenanceOperations: Send + Sync {
     fn admit_watcher(&self, intent: FilesystemReindexIntent) -> AdmissionFuture<'_>;
 
     fn admit_watcher_overflow(&self) -> AdmissionFuture<'_>;
 
-    fn run_timer(&self) -> TimerFuture<'_>;
+    fn reconcile_watcher_gap(&self) -> MaintenanceFuture<'_>;
+
+    fn run_timer(&self) -> MaintenanceFuture<'_>;
 }
 
 impl MaintenanceOperations for OperationService {
@@ -234,24 +236,40 @@ impl MaintenanceOperations for OperationService {
         })
     }
 
-    fn run_timer(&self) -> TimerFuture<'_> {
+    fn reconcile_watcher_gap(&self) -> MaintenanceFuture<'_> {
+        Box::pin(async move {
+            let terminal = OperationService::admit_watcher_overflow_and_wait(self)
+                .await
+                .map_err(|error| error.to_string())?;
+            require_successful_maintenance("watcher recovery", terminal)
+        })
+    }
+
+    fn run_timer(&self) -> MaintenanceFuture<'_> {
         Box::pin(async move {
             let terminal = OperationService::admit_timer_and_wait(self)
                 .await
                 .map_err(|error| error.to_string())?;
-            match terminal.state {
-                unity_asset_search_protocol::ReindexOperationState::Succeeded => Ok(()),
-                unity_asset_search_protocol::ReindexOperationState::Failed => {
-                    Err(terminal.failure.map_or_else(
-                        || "timer reindex failed without terminal evidence".to_owned(),
-                        |failure| failure.to_string(),
-                    ))
-                }
-                state => Err(format!(
-                    "timer reindex reached unexpected terminal state {state:?}"
-                )),
-            }
+            require_successful_maintenance("timer reindex", terminal)
         })
+    }
+}
+
+fn require_successful_maintenance(
+    operation: &str,
+    terminal: OperationSnapshot,
+) -> Result<(), String> {
+    match terminal.state {
+        unity_asset_search_protocol::ReindexOperationState::Succeeded => Ok(()),
+        unity_asset_search_protocol::ReindexOperationState::Failed => {
+            Err(terminal.failure.map_or_else(
+                || format!("{operation} failed without terminal evidence"),
+                |failure| failure.to_string(),
+            ))
+        }
+        state => Err(format!(
+            "{operation} reached unexpected terminal state {state:?}"
+        )),
     }
 }
 
@@ -477,19 +495,35 @@ async fn supervise_watcher(
 
         let failure = match factory.open(&config) {
             Ok(mut session) => {
-                {
-                    let mut state = state.write().await;
-                    state.watcher = WatcherLifecycle::Healthy;
-                    state.watcher_next_retry = None;
-                }
-                backoff = INITIAL_RETRY_BACKOFF;
-                tokio::select! {
+                let recovered = tokio::select! {
                     biased;
                     () = shutdown_requested(&mut shutdown) => {
                         stop_watcher(&state).await;
                         return Ok(());
                     }
-                    failure = run_watcher_session(operations.as_ref(), session.as_mut()) => failure,
+                    recovered = operations.reconcile_watcher_gap() => recovered,
+                };
+                match recovered {
+                    Ok(()) => {
+                        {
+                            let mut state = state.write().await;
+                            state.watcher = WatcherLifecycle::Healthy;
+                            state.watcher_last_failure = None;
+                            state.watcher_next_retry = None;
+                        }
+                        backoff = INITIAL_RETRY_BACKOFF;
+                        tokio::select! {
+                            biased;
+                            () = shutdown_requested(&mut shutdown) => {
+                                stop_watcher(&state).await;
+                                return Ok(());
+                            }
+                            failure = run_watcher_session(operations.as_ref(), session.as_mut()) => failure,
+                        }
+                    }
+                    Err(error) => {
+                        bounded_failure(format!("watcher recovery reconcile failed: {error}"))
+                    }
                 }
             }
             Err(error) => bounded_failure(error.to_string()),
@@ -780,8 +814,8 @@ mod tests {
     };
 
     use super::{
-        AdmissionFuture, INITIAL_RETRY_BACKOFF, MaintenanceOperations, MaintenanceRuntime,
-        NotifyWatcherFactory, TimerFuture, TimerLifecycle, WatchSignal, WatcherConfig,
+        AdmissionFuture, INITIAL_RETRY_BACKOFF, MaintenanceFuture, MaintenanceOperations,
+        MaintenanceRuntime, NotifyWatcherFactory, TimerLifecycle, WatchSignal, WatcherConfig,
         WatcherEventFuture, WatcherEventStream, WatcherFactory, WatcherLifecycle, WatcherSession,
         WatcherSessionEvent, is_project_root_search_policy_path, project_root_watch_signal,
         report_backend_failure, run_watcher_session, send_watch_signal,
@@ -793,16 +827,20 @@ mod tests {
     struct ScriptedOperations {
         timer_results: Mutex<VecDeque<Result<(), String>>>,
         watcher_results: Mutex<VecDeque<Result<(), OperationError>>>,
+        watcher_recovery_results: Mutex<VecDeque<Result<(), String>>>,
         timer_calls: AtomicUsize,
         watcher_calls: AtomicUsize,
+        watcher_recovery_calls: AtomicUsize,
         admissions: Mutex<Vec<ScriptedAdmission>>,
         blocked_timer: Mutex<Option<oneshot::Receiver<Result<(), String>>>>,
+        blocked_watcher_recovery: Mutex<Option<oneshot::Receiver<Result<(), String>>>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ScriptedAdmission {
         Watcher(FilesystemReindexIntent),
         WatcherOverflow,
+        WatcherRecovery,
     }
 
     impl ScriptedOperations {
@@ -816,6 +854,22 @@ mod tests {
         fn with_blocked_timer(receiver: oneshot::Receiver<Result<(), String>>) -> Self {
             Self {
                 blocked_timer: Mutex::new(Some(receiver)),
+                ..Self::default()
+            }
+        }
+
+        fn with_blocked_watcher_recovery(receiver: oneshot::Receiver<Result<(), String>>) -> Self {
+            Self {
+                blocked_watcher_recovery: Mutex::new(Some(receiver)),
+                ..Self::default()
+            }
+        }
+
+        fn with_watcher_recovery_results(
+            results: impl IntoIterator<Item = Result<(), String>>,
+        ) -> Self {
+            Self {
+                watcher_recovery_results: Mutex::new(results.into_iter().collect()),
                 ..Self::default()
             }
         }
@@ -862,7 +916,34 @@ mod tests {
             Box::pin(std::future::ready(Ok(())))
         }
 
-        fn run_timer(&self) -> TimerFuture<'_> {
+        fn reconcile_watcher_gap(&self) -> MaintenanceFuture<'_> {
+            self.watcher_recovery_calls.fetch_add(1, Ordering::Relaxed);
+            self.admissions
+                .lock()
+                .expect("admission record should not be poisoned")
+                .push(ScriptedAdmission::WatcherRecovery);
+            let blocked = self
+                .blocked_watcher_recovery
+                .lock()
+                .expect("blocked watcher recovery script should not be poisoned")
+                .take();
+            let result = self
+                .watcher_recovery_results
+                .lock()
+                .expect("watcher recovery result script should not be poisoned")
+                .pop_front()
+                .unwrap_or(Ok(()));
+            Box::pin(async move {
+                let Some(blocked) = blocked else {
+                    return result;
+                };
+                blocked.await.unwrap_or_else(|_| {
+                    Err("scripted watcher recovery completion channel closed".to_owned())
+                })
+            })
+        }
+
+        fn run_timer(&self) -> MaintenanceFuture<'_> {
             self.timer_calls.fetch_add(1, Ordering::Relaxed);
             let blocked = self
                 .blocked_timer
@@ -1376,6 +1457,94 @@ mod tests {
             stream.next_event().await,
             WatcherSessionEvent::Failed(message) if message == "backend disconnected"
         ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_stays_starting_until_gap_recovery_completes() {
+        let fixture = WatcherFixture::new();
+        let (recovered, recovery) = oneshot::channel();
+        let operations = Arc::new(ScriptedOperations::with_blocked_watcher_recovery(recovery));
+        let (session_sender, session) = scripted_session();
+        let factory = Arc::new(ScriptedWatcherFactory::new([session]));
+        let mut maintenance = MaintenanceRuntime::start_with_dependencies(
+            operations.clone(),
+            Some(fixture.config.clone()),
+            None,
+            factory,
+        );
+        let handle = maintenance.handle();
+        settle().await;
+
+        assert_eq!(handle.snapshot().await.watcher, WatcherLifecycle::Starting);
+        assert_eq!(operations.watcher_recovery_calls.load(Ordering::Relaxed), 1);
+
+        let changed = fixture.changed_paths(["Assets/DuringRecovery.prefab"]);
+        session_sender
+            .send(WatcherSessionEvent::Changed(changed.clone()))
+            .unwrap();
+        settle().await;
+        assert_eq!(operations.watcher_calls.load(Ordering::Relaxed), 0);
+
+        recovered.send(Ok(())).unwrap();
+        settle().await;
+
+        assert_eq!(handle.snapshot().await.watcher, WatcherLifecycle::Healthy);
+        assert_eq!(
+            operations.admissions(),
+            vec![
+                ScriptedAdmission::WatcherRecovery,
+                ScriptedAdmission::Watcher(FilesystemReindexIntent::changed_paths(changed)),
+            ]
+        );
+
+        maintenance.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_gap_recovery_reopens_the_watcher_before_becoming_healthy() {
+        let fixture = WatcherFixture::new();
+        let (_first_sender, first_session) = scripted_session();
+        let (_second_sender, second_session) = scripted_session();
+        let factory = Arc::new(ScriptedWatcherFactory::new([first_session, second_session]));
+        let operations = Arc::new(ScriptedOperations::with_watcher_recovery_results([
+            Err("gap reconciliation failed".to_owned()),
+            Ok(()),
+        ]));
+        let mut maintenance = MaintenanceRuntime::start_with_dependencies(
+            operations.clone(),
+            Some(fixture.config.clone()),
+            None,
+            factory.clone(),
+        );
+        let handle = maintenance.handle();
+        settle().await;
+
+        let retrying = handle.snapshot().await;
+        assert_eq!(retrying.watcher, WatcherLifecycle::Retrying);
+        assert_eq!(retrying.watcher_retry_count, 1);
+        assert!(
+            retrying
+                .watcher_last_failure
+                .as_deref()
+                .is_some_and(|failure| failure.contains("gap reconciliation failed"))
+        );
+        assert_eq!(factory.open_count.load(Ordering::Relaxed), 1);
+
+        tokio::time::advance(INITIAL_RETRY_BACKOFF).await;
+        settle().await;
+
+        assert_eq!(handle.snapshot().await.watcher, WatcherLifecycle::Healthy);
+        assert_eq!(factory.open_count.load(Ordering::Relaxed), 2);
+        assert_eq!(operations.watcher_recovery_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            operations.admissions(),
+            vec![
+                ScriptedAdmission::WatcherRecovery,
+                ScriptedAdmission::WatcherRecovery,
+            ]
+        );
+
+        maintenance.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

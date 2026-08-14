@@ -348,6 +348,13 @@ impl OperationService {
             .await
     }
 
+    pub(crate) async fn admit_watcher_overflow_and_wait(
+        &self,
+    ) -> Result<OperationSnapshot, OperationError> {
+        let admitted = self.admit_watcher_overflow().await?;
+        self.wait_until_terminal(admitted.operation_id).await
+    }
+
     async fn admit_prepared(
         &self,
         origin: OperationOrigin,
