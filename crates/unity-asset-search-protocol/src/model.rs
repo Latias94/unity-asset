@@ -1191,6 +1191,21 @@ pub enum DaemonLifecycleState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum DaemonProcessComponent {
+    ReindexCoordinator,
+    FilesystemWatcher,
+    ReconcileTimer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonProcessFailure {
+    pub component: DaemonProcessComponent,
+    pub cause: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ServingAvailability {
     Unavailable,
     Queryable,
@@ -1300,6 +1315,7 @@ pub struct TimerStatus {
 #[serde(deny_unknown_fields)]
 pub struct DaemonLifecycleStatus {
     pub lifecycle: DaemonLifecycleState,
+    pub process_failure: Option<DaemonProcessFailure>,
     pub serving: ServingAvailability,
     pub freshness: GenerationFreshness,
     pub freshness_maintenance: FreshnessMaintenance,
@@ -1316,6 +1332,7 @@ impl DaemonLifecycleStatus {
         let (serving, freshness) = serving_and_freshness(generation);
         Self {
             lifecycle: DaemonLifecycleState::Serving,
+            process_failure: None,
             serving,
             freshness,
             freshness_maintenance: FreshnessMaintenance::Unmanaged,
@@ -1827,6 +1844,7 @@ impl StatusResponse {
                 field: "daemon generation freshness",
             });
         }
+        self.validate_process_failure()?;
         if matches!(
             self.daemon.generation_maintenance.state,
             GenerationMaintenanceState::RecoveryRequired
@@ -1907,6 +1925,47 @@ impl StatusResponse {
             }
         }
         Ok(())
+    }
+
+    fn validate_process_failure(&self) -> Result<(), ContractValidationError> {
+        let Some(failure) = &self.daemon.process_failure else {
+            return Ok(());
+        };
+        ensure_nonempty("daemon process failure cause", &failure.cause)?;
+        ensure_byte_limit(
+            "daemon process failure cause",
+            &failure.cause,
+            MAX_ERROR_MESSAGE_BYTES,
+        )?;
+        if self.daemon.lifecycle != DaemonLifecycleState::Draining
+            || self.daemon.reconcile != ReconcileLifecycle::Failed
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "daemon process failure lifecycle",
+            });
+        }
+        match failure.component {
+            DaemonProcessComponent::ReindexCoordinator => Ok(()),
+            DaemonProcessComponent::FilesystemWatcher
+                if self.daemon.watcher.state == WatcherLifecycleState::Failed
+                    && self.daemon.watcher.last_failure.as_deref()
+                        == Some(failure.cause.as_str()) =>
+            {
+                Ok(())
+            }
+            DaemonProcessComponent::ReconcileTimer
+                if self.daemon.timer.state == TimerLifecycleState::Failed
+                    && self.daemon.timer.last_failure.as_deref()
+                        == Some(failure.cause.as_str()) =>
+            {
+                Ok(())
+            }
+            DaemonProcessComponent::FilesystemWatcher | DaemonProcessComponent::ReconcileTimer => {
+                Err(ContractValidationError::Inconsistent {
+                    field: "daemon process failure component evidence",
+                })
+            }
+        }
     }
 
     pub fn validate_paths(

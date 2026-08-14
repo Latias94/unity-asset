@@ -33,6 +33,26 @@ namespace UnityAsset.SearchProtocol.Reference
         SemanticUpgrade,
     }
 
+    public enum DaemonProcessComponent
+    {
+        ReindexCoordinator,
+        FilesystemWatcher,
+        ReconcileTimer,
+    }
+
+    public sealed class DaemonProcessFailure
+    {
+        internal DaemonProcessFailure(DaemonProcessComponent component, string cause)
+        {
+            Component = component;
+            Cause = cause ?? throw new ArgumentNullException(nameof(cause));
+        }
+
+        public DaemonProcessComponent Component { get; }
+
+        public string Cause { get; }
+    }
+
     public enum ApiErrorCode
     {
         InvalidRequest,
@@ -358,6 +378,21 @@ namespace UnityAsset.SearchProtocol.Reference
             JsonElement daemon = response.GetProperty("daemon");
             return ContractValidator.MaterializeBackgroundReindexOperations(
                 daemon.GetProperty("background_reindex_operations"));
+        }
+
+        /// <summary>
+        /// Reads the process-lifetime task failure from a successful status response, if present.
+        /// </summary>
+        public DaemonProcessFailure? ReadDaemonProcessFailure()
+        {
+            if (IsError || !string.Equals(OperationKind, "status", StringComparison.Ordinal))
+            {
+                throw new ProtocolValidationException(
+                    "daemon process failure is available only on a successful status response");
+            }
+            JsonElement failure = Value.GetProperty("response").GetProperty("daemon")
+                .GetProperty("process_failure");
+            return ContractValidator.MaterializeDaemonProcessFailure(failure);
         }
 
         /// <summary>

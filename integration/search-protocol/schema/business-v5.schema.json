@@ -230,12 +230,22 @@
         "state": { "enum": ["queued", "coalesced", "running", "succeeded", "failed", "cancelled", "expired"] }
       }
     },
+    "daemonProcessFailure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["component", "cause"],
+      "properties": {
+        "component": { "enum": ["reindex_coordinator", "filesystem_watcher", "reconcile_timer"] },
+        "cause": { "type": "string", "minLength": 1, "maxLength": 16384 }
+      }
+    },
     "daemonStatus": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["lifecycle", "serving", "freshness", "freshness_maintenance", "reconcile", "generation_maintenance", "watcher", "timer", "background_reindex_operations"],
+      "required": ["lifecycle", "process_failure", "serving", "freshness", "freshness_maintenance", "reconcile", "generation_maintenance", "watcher", "timer", "background_reindex_operations"],
       "properties": {
         "lifecycle": { "enum": ["booting", "serving", "draining"] },
+        "process_failure": { "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/daemonProcessFailure" }] },
         "serving": { "enum": ["unavailable", "queryable"] },
         "freshness": { "enum": ["absent", "stale", "current"] },
         "freshness_maintenance": { "enum": ["managed", "unmanaged"] },

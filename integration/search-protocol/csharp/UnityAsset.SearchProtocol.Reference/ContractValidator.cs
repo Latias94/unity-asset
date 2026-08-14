@@ -134,6 +134,17 @@ namespace UnityAsset.SearchProtocol.Reference
             return result;
         }
 
+        internal static DaemonProcessFailure? MaterializeDaemonProcessFailure(JsonElement failure)
+        {
+            if (failure.ValueKind == JsonValueKind.Null)
+            {
+                return null;
+            }
+            return new DaemonProcessFailure(
+                ParseDaemonProcessComponent(failure.GetProperty("component").GetString()!),
+                failure.GetProperty("cause").GetString()!);
+        }
+
         internal static SearchCapabilities MaterializeSearchCapabilities(JsonElement capabilities)
         {
             return new SearchCapabilities(
@@ -535,6 +546,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 daemon,
                 path,
                 "lifecycle",
+                "process_failure",
                 "serving",
                 "freshness",
                 "freshness_maintenance",
@@ -543,7 +555,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "watcher",
                 "timer",
                 "background_reindex_operations");
-            StrictJson.Enum(
+            string lifecycle = StrictJson.Enum(
                 StrictJson.Required(daemon, "lifecycle", path),
                 path + ".lifecycle",
                 "booting",
@@ -565,13 +577,37 @@ namespace UnityAsset.SearchProtocol.Reference
                 path + ".freshness_maintenance",
                 "managed",
                 "unmanaged");
-            StrictJson.Enum(
+            string reconcile = StrictJson.Enum(
                 StrictJson.Required(daemon, "reconcile", path),
                 path + ".reconcile",
                 "idle",
                 "queued",
                 "running",
                 "failed");
+
+            JsonElement processFailure = StrictJson.Required(daemon, "process_failure", path);
+            string? failedComponent = null;
+            string? failedCause = null;
+            if (processFailure.ValueKind != JsonValueKind.Null)
+            {
+                StrictJson.Properties(processFailure, path + ".process_failure", "component", "cause");
+                failedComponent = StrictJson.Enum(
+                    StrictJson.Required(processFailure, "component", path + ".process_failure"),
+                    path + ".process_failure.component",
+                    "reindex_coordinator",
+                    "filesystem_watcher",
+                    "reconcile_timer");
+                failedCause = StrictJson.String(
+                    StrictJson.Required(processFailure, "cause", path + ".process_failure"),
+                    path + ".process_failure.cause",
+                    MaxErrorMessageBytes,
+                    allowEmpty: false);
+                if (lifecycle != "draining" || reconcile != "failed")
+                {
+                    throw new ProtocolValidationException(
+                        path + ".process_failure requires draining lifecycle and failed reconciliation");
+                }
+            }
 
             JsonElement generationMaintenance = StrictJson.Required(daemon, "generation_maintenance", path);
             StrictJson.Properties(
@@ -700,6 +736,22 @@ namespace UnityAsset.SearchProtocol.Reference
             if (timerState == "scheduled" && !timerHasNextRun)
             {
                 throw new ProtocolValidationException(path + ".timer must advertise its next run");
+            }
+            if (failedComponent == "filesystem_watcher"
+                && (watcherState != "failed"
+                    || !watcherHasFailure
+                    || !string.Equals(watcherFailure.GetString(), failedCause, StringComparison.Ordinal)))
+            {
+                throw new ProtocolValidationException(
+                    path + ".process_failure does not match watcher failure evidence");
+            }
+            if (failedComponent == "reconcile_timer"
+                && (timerState != "failed"
+                    || !timerHasFailure
+                    || !string.Equals(timerFailure.GetString(), failedCause, StringComparison.Ordinal)))
+            {
+                throw new ProtocolValidationException(
+                    path + ".process_failure does not match timer failure evidence");
             }
 
             ValidateBackgroundReindexOperations(
@@ -1669,6 +1721,18 @@ namespace UnityAsset.SearchProtocol.Reference
                 "semantic_upgrade" => BackgroundReindexOrigin.SemanticUpgrade,
                 _ => throw new ProtocolValidationException(
                     $"background reindex origin contains unsupported value '{value}'"),
+            };
+        }
+
+        private static DaemonProcessComponent ParseDaemonProcessComponent(string value)
+        {
+            return value switch
+            {
+                "reindex_coordinator" => DaemonProcessComponent.ReindexCoordinator,
+                "filesystem_watcher" => DaemonProcessComponent.FilesystemWatcher,
+                "reconcile_timer" => DaemonProcessComponent.ReconcileTimer,
+                _ => throw new ProtocolValidationException(
+                    $"daemon process component contains unsupported value '{value}'"),
             };
         }
 

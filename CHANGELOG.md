@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
-- Added business search protocol revision 5 with bounded background-reindex discovery, explicit control rejection for internal operations, published Draft 2020-12 structural schemas, and a deterministic SDK bundle containing the schema and fixture contract.
+- Added business search protocol revision 5 with bounded background-reindex discovery, structured process-lifetime task failure evidence, explicit control rejection for internal operations, published Draft 2020-12 structural schemas, and a deterministic SDK bundle containing the schema and fixture contract.
 
 - Added `AssetWorkspace` as the authoritative owner of immutable source catalogs, content-addressed backing bytes, workspace revisions, snapshots, and prepared views.
 - Added the versioned `WorkspaceInspector` source and object projections, exact structured lookup, streamed-resource resolution, and the allocation-free `workspace_capabilities` catalog.

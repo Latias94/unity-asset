@@ -254,6 +254,7 @@ internal static class ConformanceProgram
 
         ResponseEnvelopeV1 statusResponse = BusinessCodec.DecodeResponse(
             TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v5.json"))));
+        Require(statusResponse.ReadDaemonProcessFailure() is null, "Healthy status exposed a daemon process failure.");
         SearchCapabilities capabilities = statusResponse.ReadSearchCapabilities();
         Require(
             capabilities.ProtocolRevision == ProtocolConstants.BusinessProtocolRevision
@@ -272,6 +273,16 @@ internal static class ConformanceProgram
                 BackgroundReindexOrigin.SemanticUpgrade,
             }),
             "Revision 5 status fixture changed the canonical background operation order.");
+
+        ResponseEnvelopeV1 failedStatusResponse = BusinessCodec.DecodeResponse(
+            TrimTerminalNewline(ReadNonEmpty(
+                Path.Combine(fixtureRoot, "responses", "status-process-failure-v5.json"))));
+        DaemonProcessFailure processFailure = failedStatusResponse.ReadDaemonProcessFailure()
+            ?? throw new InvalidOperationException("Process-failure status omitted its failure evidence.");
+        Require(
+            processFailure.Component == DaemonProcessComponent.ReindexCoordinator
+                && processFailure.Cause == "reindex coordinator panicked",
+            "Process-failure status changed its structured failure evidence.");
 
         ResponseEnvelopeV1 structuredError = BusinessCodec.DecodeResponse(
             TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "structured-error-v5.json"))));
@@ -824,6 +835,21 @@ internal static class ConformanceProgram
         ExpectFailure(
             () => BusinessCodec.DecodeResponse(SerializeNode(disabledTimerWithDeadline)),
             "disabled timer next run");
+
+        JsonObject failureWhileServing = ParseObjectNode(
+            ReadFixtureText(fixtureRoot, "responses/status-process-failure-v5.json"));
+        failureWhileServing["value"]!["response"]!["daemon"]!["lifecycle"] = "serving";
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(failureWhileServing)),
+            "process failure serving lifecycle");
+
+        JsonObject mismatchedWatcherFailure = ParseObjectNode(
+            ReadFixtureText(fixtureRoot, "responses/status-process-failure-v5.json"));
+        JsonObject failedDaemon = mismatchedWatcherFailure["value"]!["response"]!["daemon"]!.AsObject();
+        failedDaemon["process_failure"]!["component"] = "filesystem_watcher";
+        ExpectFailure(
+            () => BusinessCodec.DecodeResponse(SerializeNode(mismatchedWatcherFailure)),
+            "process failure component evidence");
     }
 
     private static void AssertBackgroundReindexOperationContract(string fixtureRoot)

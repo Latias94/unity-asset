@@ -1,9 +1,10 @@
 use unity_asset_core::{DigestV1, WorkspaceId, WorkspaceRevision};
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, BackgroundReindexOperation, BackgroundReindexOrigin,
-    ContractValidationError, DaemonInstanceId, FilesystemReindexIntent, FreshnessMaintenance,
-    FuzzyWorkUsageV1, GenerationFreshness, GenerationIdV1, GenerationMaintenanceState,
-    GenerationStamp, GenerationStatus, MAX_API_ERROR_JSON_BYTES, MAX_BACKGROUND_REINDEX_OPERATIONS,
+    ContractValidationError, DaemonInstanceId, DaemonLifecycleState, DaemonProcessComponent,
+    DaemonProcessFailure, FilesystemReindexIntent, FreshnessMaintenance, FuzzyWorkUsageV1,
+    GenerationFreshness, GenerationIdV1, GenerationMaintenanceState, GenerationStamp,
+    GenerationStatus, MAX_API_ERROR_JSON_BYTES, MAX_BACKGROUND_REINDEX_OPERATIONS,
     MAX_ERROR_MESSAGE_BYTES, MAX_REINDEX_PUBLISH_WARNING_BYTES, MAX_REINDEX_PUBLISH_WARNINGS,
     MAX_SEARCH_HITS_JSON_BYTES, MatchCountRelationV1, MatchCountV1, OperationId, PortablePath,
     ProjectId, QueryPolicyId, ReferenceCoverage, ReferenceDiagnosticCoverage, ReferenceRequest,
@@ -282,6 +283,33 @@ fn daemon_status_requires_failure_evidence_and_consistent_maintenance() {
     response.daemon.timer.state = TimerLifecycleState::Disabled;
     response.daemon.timer.next_run_in_ms = Some(1);
     assert!(response.validate().is_err());
+}
+
+#[test]
+fn daemon_process_failure_is_structured_and_bound_to_component_evidence() {
+    let mut response = status(generation(5), query_policy(4));
+    response.daemon.lifecycle = DaemonLifecycleState::Draining;
+    response.daemon.reconcile = unity_asset_search_protocol::ReconcileLifecycle::Failed;
+    response.daemon.process_failure = Some(DaemonProcessFailure {
+        component: DaemonProcessComponent::FilesystemWatcher,
+        cause: "watcher panicked".to_owned(),
+    });
+    response.daemon.watcher.state = WatcherLifecycleState::Failed;
+    response.daemon.watcher.last_failure = Some("watcher panicked".to_owned());
+    response.daemon.freshness_maintenance = FreshnessMaintenance::Managed;
+    response.validate().unwrap();
+
+    let mut mismatched = response.clone();
+    mismatched.daemon.watcher.last_failure = Some("different failure".to_owned());
+    assert!(mismatched.validate().is_err());
+
+    let mut not_draining = response.clone();
+    not_draining.daemon.lifecycle = DaemonLifecycleState::Serving;
+    assert!(not_draining.validate().is_err());
+
+    let mut empty = response;
+    empty.daemon.process_failure.as_mut().unwrap().cause.clear();
+    assert!(empty.validate().is_err());
 }
 
 #[test]

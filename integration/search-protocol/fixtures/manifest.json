@@ -158,6 +158,13 @@
       "request": "requests/status-v5.json"
     },
     {
+      "name": "process-failure status response",
+      "kind": "response",
+      "operation": "status",
+      "path": "responses/status-process-failure-v5.json",
+      "request": "requests/status-v5.json"
+    },
+    {
       "name": "search response",
       "kind": "response",
       "operation": "search",

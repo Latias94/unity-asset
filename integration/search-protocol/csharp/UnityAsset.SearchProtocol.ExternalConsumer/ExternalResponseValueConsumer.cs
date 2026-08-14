@@ -111,6 +111,11 @@ public static class ExternalProtocolConsumer
         return response.ReadBackgroundReindexOperations();
     }
 
+    public static DaemonProcessFailure? ReadDaemonProcessFailure(ResponseEnvelopeV1 response)
+    {
+        return response.ReadDaemonProcessFailure();
+    }
+
     public static ApiErrorCode ReadApiErrorCode(ResponseEnvelopeV1 response)
     {
         return response.ReadApiErrorCode();

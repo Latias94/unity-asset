@@ -96,6 +96,7 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
         "semantics-stale status response",
         "configuration-stale status response",
         "recovery-required status response",
+        "process-failure status response",
     ] {
         assert!(
             valid_names.contains(expected),

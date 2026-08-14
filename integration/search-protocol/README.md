@@ -51,7 +51,7 @@ Business revision 5 contains these operations:
 
 Request and response envelopes bind every exchange to a protocol revision, request ID, project ID, daemon instance ID, and query-policy ID. A response is valid only in the context of its originating request.
 
-The current codec accepts and emits only business revision 5. It does not decode archived revision 1, 2, 3, or 4 fixtures, and peers that do not offer revision 5 receive `no_common_revision` during Bootstrap V2. Revision 2 added daemon lifecycle evidence to `status` and the closed `idempotency_conflict` API error code. Revision 3 adopted numeric nonzero YAML `file_id` object selectors and rejected the former string-anchor wire shape. Revision 4 added a required typed `source_object` to every reference hit. Revision 5 removes pre-rendered HTML highlight fields, adds structured UTF-8 ranges as the sole highlight representation, exposes a bounded list of background reindex operations, and makes cancellation of those internal operations explicitly forbidden. Anchored binary/YAML hits must mirror that address in `location.file_id` and each context `doc_file_id`; an unanchored YAML document uses `selector.kind: "unanchored"` plus `document_index` and omits those legacy numeric fields.
+The current codec accepts and emits only business revision 5. It does not decode archived revision 1, 2, 3, or 4 fixtures, and peers that do not offer revision 5 receive `no_common_revision` during Bootstrap V2. Revision 2 added daemon lifecycle evidence to `status` and the closed `idempotency_conflict` API error code. Revision 3 adopted numeric nonzero YAML `file_id` object selectors and rejected the former string-anchor wire shape. Revision 4 added a required typed `source_object` to every reference hit. Revision 5 removes pre-rendered HTML highlight fields, adds structured UTF-8 ranges as the sole highlight representation, exposes a bounded list of background reindex operations, makes cancellation of those internal operations explicitly forbidden, and reports the first process-lifetime task failure as `daemon.process_failure`. Healthy and ordinary draining states encode that field as `null`; a task failure carries a closed `component` plus a bounded non-empty `cause`. Anchored binary/YAML hits must mirror that address in `location.file_id` and each context `doc_file_id`; an unanchored YAML document uses `selector.kind: "unanchored"` plus `document_index` and omits those legacy numeric fields.
 
 ## Canonical JSON
 
@@ -63,7 +63,7 @@ Fixture payloads are compact JSON with Rust/Serde field order. A terminal CR/LF 
 - emit map entries in Unicode scalar-value ordinal key order;
 - emit integers without alternate number spellings.
 
-Decoders reject unknown, duplicate, and non-canonical-order properties. They also validate byte/count limits, portable paths, lifecycle state invariants, nested protocol revisions, query-policy bindings, reference request echoes, and reindex operation IDs.
+Decoders reject unknown, duplicate, and non-canonical-order properties. They also validate byte/count limits, portable paths, lifecycle state invariants, process-failure component evidence, nested protocol revisions, query-policy bindings, reference request echoes, and reindex operation IDs.
 
 Reference cursors bind the generation and query-policy ID and carry a SHA-256 binding over the direction plus canonical selector JSON. `coverage.complete` describes analysis/projection completeness, while `coverage.truncated` independently describes result pagination; complete coverage may therefore still return a `next_cursor`. A succeeded reindex operation must publish an applied or already-applied generation, report no active build, and identify the same generation in its completion receipt and status snapshot.
 
@@ -80,7 +80,7 @@ Aggregate limits are measured from canonical JSON, not from unescaped source str
 - `IProtocolTransportAdapter` as the platform connection boundary;
 - `ProtocolSession` as the public Bootstrap V2 and sequential exchange owner.
 
-Domain operation payloads are retained as schema-validated JSON rather than duplicated as a second public object model. This keeps the reference implementation aligned with the Rust DTOs while still rejecting invalid nested data. Use `BusinessCodec.CreateRequest`, `CreateSuccessResponse`, or `CreateErrorResponse` to construct outbound envelopes from operation payload JSON.
+Domain operation payloads are retained as schema-validated JSON rather than duplicated as a second public object model. This keeps the reference implementation aligned with the Rust DTOs while still rejecting invalid nested data. Use `BusinessCodec.CreateRequest`, `CreateSuccessResponse`, or `CreateErrorResponse` to construct outbound envelopes from operation payload JSON. `ResponseEnvelopeV1.ReadDaemonProcessFailure` exposes the typed status failure evidence without making the complete status payload a duplicate object graph.
 
 The C# `RequestEnvelopeV1` and `ResponseEnvelopeV1` class names are retained to avoid a mechanical source rename. Their wire revision always comes from `ProtocolConstants.BusinessProtocolRevision`, which is 5; the suffix does not imply revision 1 compatibility.
 
