@@ -25,7 +25,7 @@ use super::super::{AssetWorkspace, RecoveryLocator};
 use super::{
     MAX_PROTOCOL_DIRECTORY_ENTRY_NAME_BYTES, ObservationError, RecoveryBlockedReason,
     RecoveryError, RecoveryOutcome, RollbackReceipt, ascii_directory_entry_name, blocked,
-    io_reason, map_journal_open_error, map_observation_error, recovery_budget_error,
+    io_reason, map_journal_error, map_observation_error, recovery_budget_error,
     recovery_join_component, recovery_vec,
 };
 
@@ -39,14 +39,14 @@ pub(super) fn recover_prepared_transaction(
     match JournalPreparation::open_rollback_in_access(layout, access, budget) {
         Ok(_) => return recover_premanifest_rollback(workspace, layout, locator, access, budget),
         Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(map_journal_open_error(locator, error)),
+        Err(error) => return Err(map_journal_error(locator, error)),
     }
     let preparation = match JournalPreparation::open_in_access(layout, access, budget) {
         Ok(preparation) => preparation,
         Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             return recover_absent_prepared_transaction(layout, locator, access, budget);
         }
-        Err(error) => return Err(map_journal_open_error(locator, error)),
+        Err(error) => return Err(map_journal_error(locator, error)),
     };
     if let Some(workspace) = workspace {
         validate_preparation_workspace(preparation.document(), workspace, locator)?;
@@ -84,7 +84,7 @@ fn recover_premanifest_rollback(
     budget: &mut AssetLoadBudget,
 ) -> Result<RecoveryOutcome, RecoveryError> {
     let rollback = JournalPreparation::open_rollback_in_access(layout, access, budget)
-        .map_err(|error| map_journal_open_error(locator, error))?;
+        .map_err(|error| map_journal_error(locator, error))?;
     let duplicate_preparation = match JournalPreparation::open_in_access(layout, access, budget) {
         Ok(preparation) => {
             if preparation.document() != rollback.document() {
@@ -96,7 +96,7 @@ fn recover_premanifest_rollback(
             Some(preparation)
         }
         Err(JournalError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
-        Err(error) => return Err(map_journal_open_error(locator, error)),
+        Err(error) => return Err(map_journal_error(locator, error)),
     };
     ensure_premanifest_rollback_absence(access, layout, duplicate_preparation.is_none())
         .map_err(|reason| blocked(locator, reason))?;
@@ -105,7 +105,7 @@ fn recover_premanifest_rollback(
     }
     if let Some(preparation) = duplicate_preparation {
         let current = JournalPreparation::open_in_access(layout, access, budget)
-            .map_err(|error| map_journal_open_error(locator, error))?;
+            .map_err(|error| map_journal_error(locator, error))?;
         if current.identity() != preparation.identity()
             || current.document() != preparation.document()
         {
@@ -115,7 +115,7 @@ fn recover_premanifest_rollback(
             ));
         }
         let current_rollback = JournalPreparation::open_rollback_in_access(layout, access, budget)
-            .map_err(|error| map_journal_open_error(locator, error))?;
+            .map_err(|error| map_journal_error(locator, error))?;
         if current_rollback.identity() != rollback.identity()
             || current_rollback.document() != rollback.document()
         {
@@ -125,13 +125,13 @@ fn recover_premanifest_rollback(
             ));
         }
         remove_journal_regular(access, layout.preparation_path(), preparation.identity())
-            .map_err(|error| map_journal_open_error(locator, JournalError::Io(error)))?;
+            .map_err(|error| map_journal_error(locator, JournalError::Io(error)))?;
         sync_journal_access(access)
-            .map_err(|error| map_journal_open_error(locator, JournalError::Io(error)))?;
+            .map_err(|error| map_journal_error(locator, JournalError::Io(error)))?;
         ensure_premanifest_rollback_absence(access, layout, true)
             .map_err(|reason| blocked(locator, reason))?;
         let current_rollback = JournalPreparation::open_rollback_in_access(layout, access, budget)
-            .map_err(|error| map_journal_open_error(locator, error))?;
+            .map_err(|error| map_journal_error(locator, error))?;
         if current_rollback.identity() != rollback.identity()
             || current_rollback.document() != rollback.document()
         {
