@@ -288,8 +288,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn(
             'archive="target/distrib/$application-$target$extension"', native_probe
         )
-        self.assertIn("shutil.unpack_archive", native_probe)
-        self.assertIn('test "$executable_count" -eq 1', native_probe)
+        self.assertIn(
+            'executable="$(python scripts/release_binary_identity.py', native_probe
+        )
+        self.assertIn('--archive "$archive"', native_probe)
+        self.assertIn('--output-directory "$extract_directory"', native_probe)
+        self.assertNotIn('suffix="', native_probe)
+        self.assertNotIn("shutil.unpack_archive", native_probe)
+        self.assertNotIn('find "$extract_directory"', native_probe)
         self.assertIn('actual="$("$executable" --version', native_probe)
         self.assertIn("unity-asset.build-identity.v1{", native_probe)
         self.assertIn("test ! -s \"$stderr_file\"", native_probe)

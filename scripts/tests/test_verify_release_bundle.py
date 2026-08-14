@@ -24,6 +24,7 @@ from release_evidence import canonical_json_bytes  # noqa: E402
 from release_evidence_support import make_dist_plan, make_release_evidence  # noqa: E402
 from release_binary_identity import (  # noqa: E402
     ReleaseBinaryIdentityError,
+    extract_verified_release_binary,
     verify_release_binary_identity,
     version_report,
 )
@@ -296,6 +297,110 @@ class ReleaseBundleTests(unittest.TestCase):
                         version=VERSION,
                         source_commit=SOURCE_COMMIT,
                     )
+
+    def test_extracts_only_the_verified_executable(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="unity-asset-binary-extract-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        application = "unity-asset-search-cli"
+        target = "x86_64-pc-windows-msvc"
+        archive = root / f"{application}-{target}.zip"
+        payload = (
+            b"binary-prefix\0"
+            + version_report(application, VERSION, SOURCE_COMMIT, target).encode(
+                "ascii"
+            )
+            + b"\0binary-suffix"
+        )
+        write_executable_archive(
+            archive,
+            application,
+            target,
+            payload=payload,
+        )
+        with zipfile.ZipFile(
+            archive, mode="a", compression=zipfile.ZIP_DEFLATED
+        ) as bundle:
+            bundle.writestr("README.txt", b"not executable")
+        output = root / "native"
+        output.mkdir()
+
+        executable = extract_verified_release_binary(
+            archive,
+            application=application,
+            target=target,
+            version=VERSION,
+            source_commit=SOURCE_COMMIT,
+            output_directory=output,
+        )
+
+        self.assertEqual(executable.name, f"{application}.exe")
+        self.assertEqual(executable.read_bytes(), payload)
+        self.assertEqual(list(output.iterdir()), [executable])
+
+    def test_validates_every_tar_member_before_creating_the_executable(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="unity-asset-binary-late-member-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        application = "unity-asset-search-daemon"
+        target = "x86_64-unknown-linux-musl"
+        archive = root / f"{application}-{target}.tar.xz"
+        payload = (
+            b"binary-prefix\0"
+            + version_report(application, VERSION, SOURCE_COMMIT, target).encode(
+                "ascii"
+            )
+        )
+        with tarfile.open(archive, mode="w:xz") as bundle:
+            executable = tarfile.TarInfo(application)
+            executable.size = len(payload)
+            executable.mode = 0o755
+            bundle.addfile(executable, io.BytesIO(payload))
+            unsafe = tarfile.TarInfo("../outside")
+            unsafe.size = 1
+            bundle.addfile(unsafe, io.BytesIO(b"x"))
+        output = root / "native"
+        output.mkdir()
+
+        with self.assertRaisesRegex(ReleaseBinaryIdentityError, "unsafe member path"):
+            extract_verified_release_binary(
+                archive,
+                application=application,
+                target=target,
+                version=VERSION,
+                source_commit=SOURCE_COMMIT,
+                output_directory=output,
+            )
+
+        self.assertEqual(list(output.iterdir()), [])
+
+    def test_does_not_follow_an_existing_executable_symlink(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="unity-asset-binary-exclusive-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        application = "unity-asset-search-cli"
+        target = "x86_64-pc-windows-msvc"
+        archive = root / f"{application}-{target}.zip"
+        write_executable_archive(archive, application, target)
+        output = root / "native"
+        output.mkdir()
+        sentinel = root / "sentinel"
+        sentinel.write_bytes(b"existing")
+        executable = output / f"{application}.exe"
+        try:
+            executable.symlink_to(sentinel)
+        except OSError as error:
+            self.skipTest(f"symlinks are unavailable: {error}")
+
+        with self.assertRaisesRegex(ReleaseBinaryIdentityError, "cannot write"):
+            extract_verified_release_binary(
+                archive,
+                application=application,
+                target=target,
+                version=VERSION,
+                source_commit=SOURCE_COMMIT,
+                output_directory=output,
+            )
+
+        self.assertTrue(executable.is_symlink())
+        self.assertEqual(sentinel.read_bytes(), b"existing")
 
     def test_rejects_portable_member_aliases_in_zip_and_tar(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="unity-asset-binary-alias-"))

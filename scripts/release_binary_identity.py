@@ -2,19 +2,27 @@
 
 from __future__ import annotations
 
+import argparse
 import lzma
+import os
 import stat
+import sys
 import tarfile
+import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import BinaryIO
+from typing import BinaryIO, Sequence
 
 from release_contract import (
     DISTRIBUTION_TARGET_TRIPLES,
     distribution_archive_extension,
     distribution_executable_name,
 )
-from release_path_safety import ReleasePathSafetyError, portable_path_alias_key
+from release_path_safety import (
+    ReleasePathSafetyError,
+    portable_path_alias_key,
+    reject_link_components,
+)
 
 
 MAX_RELEASE_BINARY_BYTES = 512 * 1024 * 1024
@@ -26,6 +34,19 @@ BUILD_IDENTITY_DOMAIN = "unity-asset.build-identity.v1"
 
 class ReleaseBinaryIdentityError(RuntimeError):
     """A release archive does not contain the expected executable identity."""
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Verify a cargo-dist archive and extract only its native executable."
+    )
+    parser.add_argument("--archive", type=Path, required=True)
+    parser.add_argument("--application", required=True)
+    parser.add_argument("--target", required=True)
+    parser.add_argument("--version", required=True)
+    parser.add_argument("--source-commit", required=True)
+    parser.add_argument("--output-directory", type=Path, required=True)
+    return parser.parse_args(argv)
 
 
 def version_report(
@@ -47,6 +68,50 @@ def verify_release_binary_identity(
 ) -> None:
     """Verify one archive's executable embeds its exact package/source report."""
 
+    _validated_release_binary(
+        archive,
+        application=application,
+        target=target,
+        version=version,
+        source_commit=source_commit,
+        retained=None,
+    )
+
+
+def extract_verified_release_binary(
+    archive: Path,
+    *,
+    application: str,
+    target: str,
+    version: str,
+    source_commit: str,
+    output_directory: Path,
+) -> Path:
+    """Verify an archive, then extract only its expected executable."""
+
+    expected_name = distribution_executable_name(application, target)
+    with tempfile.TemporaryFile(prefix="unity-asset-release-binary-") as retained:
+        _validated_release_binary(
+            archive,
+            application=application,
+            target=target,
+            version=version,
+            source_commit=source_commit,
+            retained=retained,
+        )
+        retained.seek(0)
+        return _write_exclusive_binary(output_directory, expected_name, retained)
+
+
+def _validated_release_binary(
+    archive: Path,
+    *,
+    application: str,
+    target: str,
+    version: str,
+    source_commit: str,
+    retained: BinaryIO | None,
+) -> None:
     if target not in DISTRIBUTION_TARGET_TRIPLES:
         raise ReleaseBinaryIdentityError(
             f"release archive {archive.name} uses an unsupported executable target: {target}"
@@ -61,12 +126,28 @@ def verify_release_binary_identity(
             f"release target {target} requires a {expected_extension} archive: {archive.name}"
         )
     if expected_extension == ".zip":
-        _verify_zip(archive, expected_name, expected_report)
+        _verify_zip(
+            archive,
+            expected_name,
+            expected_report,
+            retained=retained,
+        )
     else:
-        _verify_tar_xz(archive, expected_name, expected_report)
+        _verify_tar_xz(
+            archive,
+            expected_name,
+            expected_report,
+            retained=retained,
+        )
 
 
-def _verify_zip(archive: Path, expected_name: str, expected_report: bytes) -> None:
+def _verify_zip(
+    archive: Path,
+    expected_name: str,
+    expected_report: bytes,
+    *,
+    retained: BinaryIO | None,
+) -> None:
     try:
         with zipfile.ZipFile(archive) as bundle:
             members = bundle.infolist()
@@ -101,6 +182,7 @@ def _verify_zip(archive: Path, expected_name: str, expected_report: bytes) -> No
                     expected_report,
                     archive.name,
                     member.file_size,
+                    retained=retained,
                 )
     except ReleaseBinaryIdentityError:
         raise
@@ -117,7 +199,13 @@ def _verify_zip(archive: Path, expected_name: str, expected_report: bytes) -> No
         ) from error
 
 
-def _verify_tar_xz(archive: Path, expected_name: str, expected_report: bytes) -> None:
+def _verify_tar_xz(
+    archive: Path,
+    expected_name: str,
+    expected_report: bytes,
+    *,
+    retained: BinaryIO | None,
+) -> None:
     try:
         with tarfile.open(archive, mode="r|xz") as bundle:
             aliases: set[tuple[str, ...]] = set()
@@ -165,6 +253,7 @@ def _verify_tar_xz(archive: Path, expected_name: str, expected_report: bytes) ->
                             expected_report,
                             archive.name,
                             member.size,
+                            retained=retained,
                         )
             if not found_executable:
                 raise ReleaseBinaryIdentityError(
@@ -265,11 +354,54 @@ def _validate_tar_mode(member: tarfile.TarInfo, archive_name: str) -> None:
         )
 
 
+def _write_exclusive_binary(
+    output_directory: Path,
+    expected_name: str,
+    retained: BinaryIO,
+) -> Path:
+    try:
+        parent = reject_link_components(
+            output_directory, "release executable output directory"
+        )
+    except ReleasePathSafetyError as error:
+        raise ReleaseBinaryIdentityError(str(error)) from error
+    if not parent.is_dir():
+        raise ReleaseBinaryIdentityError(
+            f"release executable output parent must be a real directory: {parent}"
+        )
+    destination = parent / expected_name
+    created = False
+    try:
+        with open(destination, "xb", opener=_exclusive_binary_opener) as output:
+            created = True
+            while chunk := retained.read(READ_CHUNK_BYTES):
+                output.write(chunk)
+            if hasattr(os, "fchmod"):
+                os.fchmod(output.fileno(), 0o700)
+            output.flush()
+    except OSError as error:
+        if created:
+            try:
+                destination.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise ReleaseBinaryIdentityError(
+            f"cannot write verified release executable {destination}: {error}"
+        ) from error
+    return destination
+
+
+def _exclusive_binary_opener(path: str, flags: int) -> int:
+    return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o700)
+
+
 def _require_binary(
     stream: BinaryIO,
     expected: bytes,
     archive_name: str,
     expected_size: int,
+    *,
+    retained: BinaryIO | None,
 ) -> None:
     found = False
     actual_size = 0
@@ -277,6 +409,8 @@ def _require_binary(
     overlap = b""
     while chunk := stream.read(READ_CHUNK_BYTES):
         actual_size += len(chunk)
+        if retained is not None:
+            retained.write(chunk)
         if not found:
             combined = overlap + chunk
             found = expected in combined
@@ -289,3 +423,25 @@ def _require_binary(
         raise ReleaseBinaryIdentityError(
             f"release archive {archive_name} executable omitted the expected build identity"
         )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    destination = extract_verified_release_binary(
+        args.archive,
+        application=args.application,
+        target=args.target,
+        version=args.version,
+        source_commit=args.source_commit,
+        output_directory=args.output_directory,
+    )
+    print(destination)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except ReleaseBinaryIdentityError as error:
+        print(f"error: {error}", file=sys.stderr)
+        raise SystemExit(1) from None
