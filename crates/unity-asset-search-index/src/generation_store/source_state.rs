@@ -517,47 +517,53 @@ impl SourceStateSnapshot {
             "assets",
             assets.iter().map(|analysis| analysis.source.coordinate),
         )?;
-        for analysis in &assets {
-            validate_source_state_relative_path(
-                &analysis.source.relative_path,
-                MAX_SOURCE_STATE_RELATIVE_PATH_BYTES,
-            )?;
-            validate_coordinate_display(
-                analysis.source.coordinate,
-                &analysis.source.relative_path,
-            )?;
-            if let IndexedSourceCoordinate::Workspace { source } = analysis.source.coordinate
-                && analysis.source.workspace_source != Some(source)
-            {
-                return Err(SourceStateError::WorkspaceCoordinateMismatch {
-                    coordinate: source,
-                    analysis_source: analysis.source.workspace_source,
-                });
-            }
-        }
-        let mut asset_index = 0;
-        for hint in &scan_hints {
-            while assets
-                .get(asset_index)
-                .is_some_and(|analysis| analysis.source.coordinate < hint.coordinate)
-            {
-                asset_index += 1;
-            }
-            let Some(analysis) = assets
-                .get(asset_index)
-                .filter(|analysis| analysis.source.coordinate == hint.coordinate)
-            else {
-                return Err(SourceStateError::OrphanScanHint {
-                    coordinate: hint.coordinate,
-                });
-            };
-            if analysis.source.relative_path != hint.relative_path {
-                return Err(SourceStateError::ScanHintDisplayMismatch {
-                    coordinate: hint.coordinate,
-                });
-            }
-        }
+        validate_source_state_relationships(&scan_hints, &assets)?;
 
+        Self::from_validated_parts(
+            workspace,
+            revision,
+            analysis_cache_identity,
+            scan_hints,
+            assets,
+        )
+    }
+
+    fn from_canonical_wire_parts(
+        workspace: WorkspaceId,
+        revision: WorkspaceRevision,
+        analysis_cache_identity: AnalysisCacheIdentityV1,
+        scan_hints: Vec<SourceScanHint>,
+        assets: Vec<AssetAnalysis>,
+    ) -> Result<Self, SourceStateError> {
+        validate_source_state_count("scan hints", scan_hints.len(), MAX_SOURCE_STATE_SCAN_HINTS)?;
+        validate_source_state_count("assets", assets.len(), MAX_SOURCE_STATE_ASSETS)?;
+        ensure_strictly_sorted_identities(
+            "scan hints",
+            scan_hints.iter().map(|hint| hint.coordinate),
+        )?;
+        ensure_strictly_sorted_identities(
+            "assets",
+            assets.iter().map(|analysis| analysis.source.coordinate),
+        )?;
+        ensure_source_state_assets_canonical(&assets)?;
+        validate_source_state_relationships(&scan_hints, &assets)?;
+
+        Self::from_validated_parts(
+            workspace,
+            revision,
+            analysis_cache_identity,
+            scan_hints,
+            assets,
+        )
+    }
+
+    fn from_validated_parts(
+        workspace: WorkspaceId,
+        revision: WorkspaceRevision,
+        analysis_cache_identity: AnalysisCacheIdentityV1,
+        scan_hints: Vec<SourceScanHint>,
+        assets: Vec<AssetAnalysis>,
+    ) -> Result<Self, SourceStateError> {
         let logical_digest =
             source_state_logical_digest(workspace, revision, analysis_cache_identity, &assets)?;
         Ok(Self {
@@ -797,17 +803,9 @@ impl<'de> Deserialize<'de> for SourceStateSnapshot {
                 },
             ));
         }
-        ensure_strictly_sorted_identities(
-            "assets",
-            wire.assets
-                .iter()
-                .map(|analysis| analysis.source.coordinate),
-        )
-        .map_err(serde::de::Error::custom)?;
-        ensure_source_state_assets_canonical(&wire.assets).map_err(serde::de::Error::custom)?;
         let scan_hints =
             decode_scan_hints(&wire.scan_hints, &wire.assets).map_err(serde::de::Error::custom)?;
-        let snapshot = Self::new_with_analysis_cache_identity(
+        let snapshot = Self::from_canonical_wire_parts(
             wire.workspace,
             wire.revision,
             wire.analysis_cache_identity,
@@ -1087,6 +1085,52 @@ fn ensure_source_state_assets_canonical(assets: &[AssetAnalysis]) -> Result<(), 
             });
         }
     }
+    Ok(())
+}
+
+fn validate_source_state_relationships(
+    scan_hints: &[SourceScanHint],
+    assets: &[AssetAnalysis],
+) -> Result<(), SourceStateError> {
+    for analysis in assets {
+        validate_source_state_relative_path(
+            &analysis.source.relative_path,
+            MAX_SOURCE_STATE_RELATIVE_PATH_BYTES,
+        )?;
+        validate_coordinate_display(analysis.source.coordinate, &analysis.source.relative_path)?;
+        if let IndexedSourceCoordinate::Workspace { source } = analysis.source.coordinate
+            && analysis.source.workspace_source != Some(source)
+        {
+            return Err(SourceStateError::WorkspaceCoordinateMismatch {
+                coordinate: source,
+                analysis_source: analysis.source.workspace_source,
+            });
+        }
+    }
+
+    let mut asset_index = 0;
+    for hint in scan_hints {
+        while assets
+            .get(asset_index)
+            .is_some_and(|analysis| analysis.source.coordinate < hint.coordinate)
+        {
+            asset_index += 1;
+        }
+        let Some(analysis) = assets
+            .get(asset_index)
+            .filter(|analysis| analysis.source.coordinate == hint.coordinate)
+        else {
+            return Err(SourceStateError::OrphanScanHint {
+                coordinate: hint.coordinate,
+            });
+        };
+        if analysis.source.relative_path != hint.relative_path {
+            return Err(SourceStateError::ScanHintDisplayMismatch {
+                coordinate: hint.coordinate,
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1956,6 +2000,44 @@ mod source_state_tests {
             unsupported["contract_version"] = serde_json::json!(unsupported_version);
             assert!(serde_json::from_value::<SourceStateSnapshot>(unsupported).is_err());
         }
+    }
+
+    #[test]
+    fn source_state_canonical_wire_path_rejects_noncanonical_order() {
+        let workspace = WorkspaceId::from_u128(0x51_02).unwrap();
+        let revision = WorkspaceRevision::new(digest("canonical wire order"));
+        let snapshot = source_state(workspace, revision);
+        let analysis_cache_identity = snapshot.analysis_cache_identity();
+
+        let mut assets = snapshot.assets().to_vec();
+        assets.reverse();
+        assert!(matches!(
+            SourceStateSnapshot::from_canonical_wire_parts(
+                workspace,
+                revision,
+                analysis_cache_identity,
+                snapshot.scan_hints().to_vec(),
+                assets,
+            ),
+            Err(SourceStateError::NonCanonicalOrder {
+                collection: "assets"
+            })
+        ));
+
+        let mut scan_hints = snapshot.scan_hints().to_vec();
+        scan_hints.reverse();
+        assert!(matches!(
+            SourceStateSnapshot::from_canonical_wire_parts(
+                workspace,
+                revision,
+                analysis_cache_identity,
+                scan_hints,
+                snapshot.assets().to_vec(),
+            ),
+            Err(SourceStateError::NonCanonicalOrder {
+                collection: "scan hints"
+            })
+        ));
     }
 
     #[test]
