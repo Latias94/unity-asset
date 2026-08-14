@@ -3,16 +3,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use serde_json::Value;
-use unity_asset::reference::{
-    REFERENCE_GRAPH_PROJECTION_SCHEMA, REFERENCE_GRAPH_PROJECTION_VERSION,
-};
+use serde_json::{Value, json};
+use unity_asset::extraction::{BUNDLE_CONTAINER_QUERY_VERSION, BUNDLE_CONTAINER_RESULT_VERSION};
+use unity_asset::reference::REFERENCE_GRAPH_PROJECTION_SCHEMA;
 use unity_asset::schema::SchemaRecipePlanner;
 use unity_asset::workspace::{
     AssetWorkspace, COMMIT_REPORT_VERSION, MUTATION_PLAN_VERSION, MutationPlanBuilder,
-    MutationValue, PREPARE_REPORT_VERSION, RECOVERY_DISCOVERY_VERSION, RECOVERY_OUTCOME_VERSION,
-    SourceOpenRequest, WORKSPACE_CAPABILITY_CATALOG_VERSION, WORKSPACE_OBJECT_INSPECTION_VERSION,
-    WorkspaceOptions, workspace_capabilities,
+    MutationValue, PREPARE_REPORT_VERSION, RECOVERY_DISCOVERY_VERSION, RECOVERY_LOCATOR_VERSION,
+    RECOVERY_OUTCOME_VERSION, SourceOpenRequest, WORKSPACE_OBJECT_INSPECTION_VERSION,
+    WORKSPACE_SOURCE_INSPECTION_VERSION, WorkspaceOptions,
 };
 use unity_asset::{
     AssetLoadBudget, FieldPath, ObjectAddress, SourceAlias, SourceKind, SourceLocator, WorkspaceId,
@@ -74,6 +73,23 @@ fn assert_cli_error(output: &Output, code: &str) -> Value {
     assert_eq!(report["code"], code);
     assert!(report["warnings"].is_array());
     report
+}
+
+fn capability_operation<'operations>(
+    operations: &'operations [Value],
+    id: &str,
+) -> &'operations Value {
+    let mut matching = operations
+        .iter()
+        .filter(|operation| operation["id"].as_str() == Some(id));
+    let operation = matching
+        .next()
+        .unwrap_or_else(|| panic!("capability operation {id} must exist"));
+    assert!(
+        matching.next().is_none(),
+        "capability operation {id} must be unique"
+    );
+    operation
 }
 
 fn write_workspace(root: &Path) -> PathBuf {
@@ -157,7 +173,7 @@ fn truncate_recovery_events_after(recovery: &Value, retained_type: &str) {
 }
 
 #[test]
-fn workspace_capabilities_emit_the_stable_library_contract() {
+fn workspace_capabilities_describe_only_routed_cli_operations() {
     let arguments = [OsStr::new("workspace"), OsStr::new("capabilities")];
     let first = run(&arguments);
     let second = run(&arguments);
@@ -165,26 +181,162 @@ fn workspace_capabilities_emit_the_stable_library_contract() {
     assert_success(&second);
     assert_eq!(first.stdout, second.stdout);
 
-    let mut expected =
-        serde_json::to_vec(&workspace_capabilities()).expect("capability catalog must serialize");
-    expected.push(b'\n');
-    assert_eq!(first.stdout, expected);
-
     let catalog: Value =
         serde_json::from_slice(&first.stdout).expect("capability output must be JSON");
-    assert_eq!(catalog["contract"], "unity_asset.workspace_capabilities");
     assert_eq!(
-        catalog["contract_version"],
-        WORKSPACE_CAPABILITY_CATALOG_VERSION
+        catalog["contract"],
+        "unity_asset.workspace_cli_capabilities"
     );
-    assert_eq!(catalog["contracts"]["mutation_plan"], MUTATION_PLAN_VERSION);
+    assert_eq!(catalog["version"], 1);
+    assert_eq!(catalog["stdin_structured_inputs_max"], 1);
+
+    let operations = catalog["operations"]
+        .as_array()
+        .expect("operations must be an array");
+    let inventory = operations
+        .iter()
+        .map(|operation| {
+            json!({
+                "id": operation["id"],
+                "command": operation["command"],
+            })
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
-        catalog["contracts"]["reference_graph_projection"],
-        REFERENCE_GRAPH_PROJECTION_VERSION
+        inventory,
+        vec![
+            json!({"id":"capabilities","command":["workspace","capabilities"]}),
+            json!({"id":"inspect_sources","command":["workspace","inspect","sources"]}),
+            json!({"id":"inspect_objects","command":["workspace","inspect","objects"]}),
+            json!({"id":"inspect_object","command":["workspace","inspect","object"]}),
+            json!({"id":"inspect_bundle_containers","command":["workspace","inspect","bundle-containers"]}),
+            json!({"id":"plan_validate","command":["workspace","plan","validate"]}),
+            json!({"id":"prepare","command":["workspace","prepare"]}),
+            json!({"id":"preview","command":["workspace","preview"]}),
+            json!({"id":"commit","command":["workspace","commit"]}),
+            json!({"id":"recover_discover","command":["workspace","recover","discover"]}),
+            json!({"id":"recover_resume","command":["workspace","recover","resume"]}),
+            json!({"id":"recover_abandon","command":["workspace","recover","abandon"]}),
+            json!({"id":"recover_finalize","command":["workspace","recover","finalize"]}),
+        ]
     );
-    assert_eq!(catalog["automation"]["structured_input"], true);
-    assert_eq!(catalog["automation"]["display_text_input"], false);
-    assert_eq!(catalog["automation"]["generic_command_bus"], false);
+
+    let inspect_sources = capability_operation(operations, "inspect_sources");
+    assert_eq!(
+        inspect_sources["workspace"],
+        json!({
+            "argument": "--input",
+            "accepted": ["file", "directory"]
+        })
+    );
+    assert_eq!(inspect_sources["publication_root"], Value::Null);
+    assert_eq!(inspect_sources["structured_inputs"], json!([]));
+    assert_eq!(
+        inspect_sources["stdout"],
+        json!({
+            "schema": "WorkspaceSourceInspection",
+            "wire_version": WORKSPACE_SOURCE_INSPECTION_VERSION,
+            "shape": "array"
+        })
+    );
+
+    let inspect_bundle_containers = capability_operation(operations, "inspect_bundle_containers");
+    assert_eq!(
+        inspect_bundle_containers["structured_inputs"],
+        json!([{
+            "argument": "--query-json",
+            "schema": "BundleContainerQuery",
+            "wire_version": BUNDLE_CONTAINER_QUERY_VERSION,
+            "sources": ["file", "stdin"]
+        }])
+    );
+    assert_eq!(
+        inspect_bundle_containers["stdout"],
+        json!({
+            "schema": "BundleContainerResult",
+            "wire_version": BUNDLE_CONTAINER_RESULT_VERSION,
+            "shape": "object"
+        })
+    );
+
+    let preview = capability_operation(operations, "preview");
+    assert_eq!(
+        preview["structured_inputs"],
+        json!([
+            {
+                "argument": "--plan",
+                "schema": "MutationPlan",
+                "wire_version": MUTATION_PLAN_VERSION,
+                "sources": ["file", "stdin"]
+            },
+            {
+                "argument": "--address-json",
+                "schema": "ObjectAddress",
+                "wire_version": Value::Null,
+                "sources": ["file", "stdin"]
+            }
+        ])
+    );
+    assert_eq!(preview["publication_root"], Value::Null);
+    assert_eq!(
+        preview["stdout"],
+        json!({
+            "schema": "WorkspaceObjectInspection",
+            "wire_version": WORKSPACE_OBJECT_INSPECTION_VERSION,
+            "shape": "object"
+        })
+    );
+
+    let commit = capability_operation(operations, "commit");
+    assert_eq!(
+        commit["publication_root"],
+        json!({
+            "argument": "--publication-root",
+            "must_exist": true,
+            "absolute": true
+        })
+    );
+    assert_eq!(
+        commit["stdout"],
+        json!({
+            "schema": "CommitReport",
+            "wire_version": COMMIT_REPORT_VERSION,
+            "shape": "object"
+        })
+    );
+
+    let recover_discover = capability_operation(operations, "recover_discover");
+    assert_eq!(recover_discover["workspace"], Value::Null);
+    assert_eq!(
+        recover_discover["stdout"]["wire_version"],
+        RECOVERY_DISCOVERY_VERSION
+    );
+    let recover_resume = capability_operation(operations, "recover_resume");
+    assert_eq!(recover_resume["workspace"], Value::Null);
+    assert_eq!(recover_resume["publication_root"], Value::Null);
+    assert_eq!(
+        recover_resume["structured_inputs"][0]["wire_version"],
+        RECOVERY_LOCATOR_VERSION
+    );
+    assert_eq!(
+        recover_resume["stdout"]["wire_version"],
+        RECOVERY_OUTCOME_VERSION
+    );
+
+    for false_capability in [
+        "capabilities",
+        "contracts",
+        "mutation",
+        "prepared_authority",
+        "reference",
+        "extraction",
+        "search_handoff",
+    ] {
+        assert!(
+            catalog.get(false_capability).is_none(),
+            "CLI catalog must not expose library-only field {false_capability}"
+        );
+    }
 }
 
 #[test]

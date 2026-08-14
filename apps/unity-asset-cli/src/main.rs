@@ -15,6 +15,7 @@ mod commands;
 mod fast_path;
 mod json_io;
 mod shared;
+mod workspace_contract;
 mod workspace_loader;
 
 const CLI_ERROR_CONTRACT: &str = "unity_asset.cli_error";

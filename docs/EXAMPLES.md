@@ -67,11 +67,16 @@ accepts stdin.
 The error version fixes the envelope and field meanings. Treat `code` and `details.kind` as
 non-exhaustive vocabularies: branch on values you understand and retain an unknown-value fallback.
 
-Discover the exact operation set and current wire versions:
+Discover the exact routed workspace operation set, current wire versions, accepted JSON input
+sources, and filesystem prerequisites:
 
 ```powershell
 cargo run -p unity-asset-cli --bin unity-asset -- workspace capabilities
 ```
+
+The resulting `unity_asset.workspace_cli_capabilities` v1 catalog is CLI-owned. It does not claim
+library-only mutation authoring, prepared authority, extraction, reference, or search handoff
+capabilities.
 
 Inspect committed sources and objects:
 

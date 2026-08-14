@@ -233,11 +233,15 @@ checks. Persist `CommitReport` and `RecoveryLocator`, not `PreparedChange`.
 The installed binary is `unity-asset`. Workspace commands emit JSON to stdout and diagnostics to
 stderr. Structured inputs accept a JSON file or `-` for stdin.
 
-Discover the exact capabilities and wire versions supported by the installed binary:
+Discover the exact workspace subcommands routed by the installed binary, together with their JSON
+inputs, stdout contracts, stdin limits, and filesystem prerequisites:
 
 ```bash
 unity-asset workspace capabilities
 ```
+
+This emits `unity_asset.workspace_cli_capabilities` v1. It intentionally describes only the CLI
+surface; use the Rust `workspace_capabilities()` API when embedding the broader library workflow.
 
 Inspect a file or a directory of supported sources:
 

@@ -4,20 +4,18 @@ use anyhow::{Context, Result};
 use unity_asset::extraction::{BundleContainerQuery, ExtractionPlanner};
 use unity_asset::workspace::{
     AssetWorkspace, MutationPlan, PrepareOptions, PublicationTarget, RecoveryLocator,
-    WorkspaceInspector, WorkspaceLookup, workspace_capabilities,
+    WorkspaceInspector, WorkspaceLookup,
 };
 use unity_asset::{AssetLoadBudget, ContractJsonLimits, ContractJsonResourceModel, ObjectAddress};
 
-use crate::cli::{
-    WorkspaceCommand, WorkspaceInspectSubcommand, WorkspacePlanSubcommand,
-    WorkspaceRecoverSubcommand, WorkspaceSubcommand,
-};
+use crate::cli::WorkspaceCommand;
 use crate::cli_error::{
     mark_commit_error, mark_prepare_error, mark_publication_target_error,
     mark_recovery_discovery_error, mark_recovery_error, resolve_lookup,
 };
 use crate::json_io::{read_small_contract, with_contract_reader, write_canonical, write_json};
 use crate::shared::AppContext;
+use crate::workspace_contract::{WorkspaceOperation, workspace_cli_capabilities};
 use crate::workspace_loader::{load_full_workspace, load_full_workspace_with_workspace_id};
 
 const OBJECT_ADDRESS_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
@@ -38,44 +36,38 @@ const RECOVERY_LOCATOR_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new
 );
 
 pub(crate) fn run(command: WorkspaceCommand, context: &AppContext) -> Result<()> {
-    match command.command {
-        WorkspaceSubcommand::Capabilities => write_json(&workspace_capabilities()),
-        WorkspaceSubcommand::Inspect(command) => match command.command {
-            WorkspaceInspectSubcommand::Sources { input } => inspect_sources(&input, context),
-            WorkspaceInspectSubcommand::Objects { input } => inspect_objects(&input, context),
-            WorkspaceInspectSubcommand::Object {
-                input,
-                address_json,
-            } => inspect_object(&input, &address_json, context),
-            WorkspaceInspectSubcommand::BundleContainers { input, query_json } => {
-                inspect_bundle_containers(&input, &query_json, context)
-            }
-        },
-        WorkspaceSubcommand::Plan(command) => match command.command {
-            WorkspacePlanSubcommand::Validate { plan } => validate_plan(&plan),
-        },
-        WorkspaceSubcommand::Prepare { input, plan } => prepare(&input, &plan, context),
-        WorkspaceSubcommand::Preview {
+    match WorkspaceOperation::from(command) {
+        WorkspaceOperation::Capabilities => write_json(&workspace_cli_capabilities()),
+        WorkspaceOperation::InspectSources { input } => inspect_sources(&input, context),
+        WorkspaceOperation::InspectObjects { input } => inspect_objects(&input, context),
+        WorkspaceOperation::InspectObject {
+            input,
+            address_json,
+        } => inspect_object(&input, &address_json, context),
+        WorkspaceOperation::InspectBundleContainers { input, query_json } => {
+            inspect_bundle_containers(&input, &query_json, context)
+        }
+        WorkspaceOperation::PlanValidate { plan } => validate_plan(&plan),
+        WorkspaceOperation::Prepare { input, plan } => prepare(&input, &plan, context),
+        WorkspaceOperation::Preview {
             input,
             plan,
             address_json,
         } => preview(&input, &plan, &address_json, context),
-        WorkspaceSubcommand::Commit {
+        WorkspaceOperation::Commit {
             input,
             plan,
             publication_root,
         } => commit(&input, &plan, &publication_root, context),
-        WorkspaceSubcommand::Recover(command) => match command.command {
-            WorkspaceRecoverSubcommand::Discover { publication_root } => {
-                discover_recoveries(&publication_root)
-            }
-            WorkspaceRecoverSubcommand::Resume { locator_json } => resume_recovery(&locator_json),
-            WorkspaceRecoverSubcommand::Abandon { locator_json } => abandon_recovery(&locator_json),
-            WorkspaceRecoverSubcommand::Finalize {
-                input,
-                locator_json,
-            } => finalize_recovery(&input, &locator_json, context),
-        },
+        WorkspaceOperation::RecoverDiscover { publication_root } => {
+            discover_recoveries(&publication_root)
+        }
+        WorkspaceOperation::RecoverResume { locator_json } => resume_recovery(&locator_json),
+        WorkspaceOperation::RecoverAbandon { locator_json } => abandon_recovery(&locator_json),
+        WorkspaceOperation::RecoverFinalize {
+            input,
+            locator_json,
+        } => finalize_recovery(&input, &locator_json, context),
     }
 }
 
