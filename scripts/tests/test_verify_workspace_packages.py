@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -18,6 +21,7 @@ sys.path.insert(0, str(SCRIPTS_ROOT))
 import workspace_package_contract as contract
 import workspace_package_verification as verifier
 import verify_workspace_packages as entrypoint
+from release_subprocess import BoundedCommandCleanupError, BoundedCommandTimeout
 
 
 class PackageVerifierRejectionTests(unittest.TestCase):
@@ -562,6 +566,84 @@ class PackageVerifierRejectionTests(unittest.TestCase):
         )
         for call in run_visible.call_args_list:
             self.assertEqual(call.kwargs, {"cwd": cargo_cwd, "env": environment})
+
+    def test_command_helpers_use_owned_process_tree_output_modes(self) -> None:
+        cargo_cwd = Path("clean-cargo-cwd")
+        environment = {"CARGO_HOME": "isolated"}
+        captured = subprocess.CompletedProcess(
+            args=["cargo", "metadata"],
+            returncode=0,
+            stdout="metadata\n",
+            stderr="warning\n",
+        )
+        stderr = io.StringIO()
+
+        with (
+            mock.patch.object(
+                verifier,
+                "run_bounded_command_visible",
+                return_value=0,
+            ) as run_visible,
+            mock.patch.object(
+                verifier,
+                "run_bounded_command_captured",
+                return_value=captured,
+            ) as run_captured,
+            contextlib.redirect_stderr(stderr),
+        ):
+            verifier.run_visible(
+                ["cargo", "check"], cwd=cargo_cwd, env=environment
+            )
+            stdout = verifier.run_captured(
+                ["cargo", "metadata"], cwd=cargo_cwd, env=environment
+            )
+
+        run_visible.assert_called_once_with(
+            ["cargo", "check"],
+            cwd=cargo_cwd,
+            env=environment,
+            timeout_seconds=verifier.CARGO_COMMAND_TIMEOUT_SECONDS,
+        )
+        run_captured.assert_called_once_with(
+            ["cargo", "metadata"],
+            cwd=cargo_cwd,
+            env=environment,
+            timeout_seconds=verifier.CARGO_COMMAND_TIMEOUT_SECONDS,
+        )
+        self.assertEqual(stdout, "metadata\n")
+        self.assertEqual(stderr.getvalue(), "warning\n")
+
+    def test_command_timeout_and_cleanup_fail_closed_as_verification_errors(self) -> None:
+        cargo_cwd = Path("clean-cargo-cwd")
+        environment = {"CARGO_HOME": "isolated"}
+
+        with mock.patch.object(
+            verifier,
+            "run_bounded_command_visible",
+            side_effect=BoundedCommandTimeout("deadline"),
+        ):
+            with self.assertRaisesRegex(
+                contract.VerificationError,
+                "command timed out after 1200s: cargo check",
+            ):
+                verifier.run_visible(
+                    ["cargo", "check"], cwd=cargo_cwd, env=environment
+                )
+
+        with mock.patch.object(
+            verifier,
+            "run_bounded_command_captured",
+            side_effect=BoundedCommandCleanupError(
+                "cleanup denied", operation="terminating process tree"
+            ),
+        ):
+            with self.assertRaisesRegex(
+                contract.VerificationError,
+                "command cleanup failed: cargo metadata: cleanup denied",
+            ):
+                verifier.run_captured(
+                    ["cargo", "metadata"], cwd=cargo_cwd, env=environment
+                )
 
     def test_metadata_proves_the_isolated_resolve_graph(self) -> None:
         cargo_cwd = Path("clean-cargo-cwd")

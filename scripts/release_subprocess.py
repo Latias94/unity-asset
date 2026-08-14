@@ -238,15 +238,15 @@ def _cleanup_started_process(
         ) from primary_error
 
 
-def run_bounded_command(
+def _run_bounded_command(
     command: Sequence[str],
     *,
     timeout_seconds: float,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    stdout: int | None,
+    stderr: int | None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a text command and own the complete process tree until completion."""
-
     if not command or timeout_seconds <= 0:
         raise ValueError("command and timeout must be non-empty and positive")
     popen_arguments: dict[str, object] = {}
@@ -267,8 +267,8 @@ def run_bounded_command(
             text=True,
             encoding="utf-8",
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stdout=stdout,
+            stderr=stderr,
             **popen_arguments,
         )
     except OSError:
@@ -287,7 +287,9 @@ def run_bounded_command(
             raise
 
     try:
-        stdout, _ = process.communicate(timeout=timeout_seconds)
+        captured_stdout, captured_stderr = process.communicate(
+            timeout=timeout_seconds
+        )
     except subprocess.TimeoutExpired as error:
         cleanup_job = windows_job
         windows_job = None
@@ -320,6 +322,63 @@ def run_bounded_command(
     return subprocess.CompletedProcess(
         args=list(command),
         returncode=process.returncode,
-        stdout=stdout,
-        stderr=None,
+        stdout=captured_stdout,
+        stderr=captured_stderr,
     )
+
+
+def run_bounded_command(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a text command with combined captured output and own its process tree."""
+
+    return _run_bounded_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def run_bounded_command_captured(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a text command with separate captured streams and own its process tree."""
+
+    return _run_bounded_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def run_bounded_command_visible(
+    command: Sequence[str],
+    *,
+    timeout_seconds: float,
+    cwd: Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Run a command on inherited streams and own its complete process tree."""
+
+    return _run_bounded_command(
+        command,
+        timeout_seconds=timeout_seconds,
+        cwd=cwd,
+        env=env,
+        stdout=None,
+        stderr=None,
+    ).returncode

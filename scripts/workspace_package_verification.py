@@ -24,6 +24,12 @@ from release_path_safety import (
 )
 from release_binary_identity import version_report
 from release_contract import GIT_OBJECT_PATTERN
+from release_subprocess import (
+    BoundedCommandCleanupError,
+    BoundedCommandTimeout,
+    run_bounded_command_captured,
+    run_bounded_command_visible,
+)
 from workspace_package_contract import (
     CRATES_IO_SOURCE,
     VerificationError,
@@ -55,21 +61,24 @@ def run_visible(
 ) -> None:
     print(f"$ {command_text(command)}", flush=True)
     try:
-        result = subprocess.run(
+        returncode = run_bounded_command_visible(
             command,
             cwd=cwd,
             env=env,
-            check=False,
-            timeout=CARGO_COMMAND_TIMEOUT_SECONDS,
+            timeout_seconds=CARGO_COMMAND_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired as error:
+    except BoundedCommandTimeout as error:
         raise VerificationError(
             f"command timed out after {CARGO_COMMAND_TIMEOUT_SECONDS}s: "
             f"{command_text(command)}"
         ) from error
-    if result.returncode != 0:
+    except BoundedCommandCleanupError as error:
         raise VerificationError(
-            f"command failed with exit code {result.returncode}: "
+            f"command cleanup failed: {command_text(command)}: {error}"
+        ) from error
+    if returncode != 0:
+        raise VerificationError(
+            f"command failed with exit code {returncode}: "
             f"{command_text(command)}"
         )
 
@@ -79,34 +88,35 @@ def run_captured(
 ) -> str:
     print(f"$ {command_text(command)}", flush=True)
     try:
-        result = subprocess.run(
+        result = run_bounded_command_captured(
             command,
             cwd=cwd,
             env=env,
-            check=False,
-            text=True,
-            encoding="utf-8",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=CARGO_COMMAND_TIMEOUT_SECONDS,
+            timeout_seconds=CARGO_COMMAND_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired as error:
+    except BoundedCommandTimeout as error:
         raise VerificationError(
             f"command timed out after {CARGO_COMMAND_TIMEOUT_SECONDS}s: "
             f"{command_text(command)}"
         ) from error
+    except BoundedCommandCleanupError as error:
+        raise VerificationError(
+            f"command cleanup failed: {command_text(command)}: {error}"
+        ) from error
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
     if result.returncode != 0:
         details = "\n".join(
-            part.rstrip() for part in (result.stdout, result.stderr) if part.strip()
+            part.rstrip() for part in (stdout, stderr) if part.strip()
         )
         suffix = f"\n{details}" if details else ""
         raise VerificationError(
             f"command failed with exit code {result.returncode}: "
             f"{command_text(command)}{suffix}"
         )
-    if result.stderr.strip():
-        print(result.stderr.rstrip(), file=sys.stderr)
-    return result.stdout
+    if stderr.strip():
+        print(stderr.rstrip(), file=sys.stderr)
+    return stdout
 
 
 def repository_source_commit(

@@ -19,6 +19,8 @@ from release_subprocess import (  # noqa: E402
     BoundedCommandTimeout,
     credential_free_environment,
     run_bounded_command,
+    run_bounded_command_captured,
+    run_bounded_command_visible,
 )
 
 
@@ -220,6 +222,57 @@ class ReleaseSubprocessTests(unittest.TestCase):
             creationflags & release_subprocess_module._CREATE_SUSPENDED,
             release_subprocess_module._CREATE_SUSPENDED,
         )
+
+    def test_captured_mode_keeps_stdout_and_stderr_separate(self) -> None:
+        process = self._fake_process()
+        process.returncode = 0
+        process.communicate.return_value = ("stdout\n", "stderr\n")
+
+        with (
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(
+                release_subprocess_module,
+                "_WindowsJob",
+                return_value=mock.Mock(),
+            ),
+        ):
+            result = run_bounded_command_captured(
+                ["worker"], timeout_seconds=1
+            )
+
+        self.assertEqual(result.stdout, "stdout\n")
+        self.assertEqual(result.stderr, "stderr\n")
+        self.assertEqual(popen.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.PIPE)
+
+    def test_visible_mode_inherits_stdout_and_stderr(self) -> None:
+        process = self._fake_process()
+        process.returncode = 7
+        process.communicate.return_value = (None, None)
+
+        with (
+            mock.patch.object(
+                release_subprocess_module.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+            mock.patch.object(
+                release_subprocess_module,
+                "_WindowsJob",
+                return_value=mock.Mock(),
+            ),
+        ):
+            returncode = run_bounded_command_visible(
+                ["worker"], timeout_seconds=1
+            )
+
+        self.assertEqual(returncode, 7)
+        self.assertIsNone(popen.call_args.kwargs["stdout"])
+        self.assertIsNone(popen.call_args.kwargs["stderr"])
 
     def test_keyboard_interrupt_cleans_up_before_it_is_reraised(self) -> None:
         process = self._fake_process()
