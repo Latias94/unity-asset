@@ -29,7 +29,7 @@ use super::representation::{
 use crate::reference::{ReferenceDirection, ReferenceTraversalLimits};
 
 pub const EXTRACTION_REQUEST_VERSION: u8 = 4;
-pub const EXTRACTION_PLAN_VERSION: u8 = 7;
+pub const EXTRACTION_PLAN_VERSION: u8 = 8;
 pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
 pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
 pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
@@ -1834,7 +1834,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v7_artifact_serializes_derived_kinds_and_semantics() {
+    fn plan_v8_artifact_serializes_derived_kinds_and_semantics() {
         let artifact = planned_text_artifact();
         let encoded = serde_json::to_value(&artifact).unwrap();
 
@@ -1868,7 +1868,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v7_digest_covers_representation_semantics() {
+    fn plan_v8_digest_covers_representation_semantics() {
         let plan = planned_text_plan();
         let canonical = plan.canonical_json().unwrap();
         assert_eq!(plan.digest().unwrap(), DigestV1::hash_bytes(&canonical));
@@ -1885,24 +1885,16 @@ mod tests {
     }
 
     #[test]
-    fn legacy_v6_plan_is_rejected_before_missing_semantics_are_interpreted() {
+    fn legacy_v7_plan_is_rejected() {
         let mut legacy = serde_json::to_value(planned_text_plan()).unwrap();
-        legacy["version"] = serde_json::json!(6);
-        legacy["artifacts"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("representation_semantics");
-        legacy["artifacts"][0]["fallback"]
-            .as_object_mut()
-            .unwrap()
-            .remove("representation_semantics");
+        legacy["version"] = serde_json::json!(7);
 
         let error = serde_json::from_value::<ExtractionPlan>(legacy).unwrap_err();
-        assert!(error.to_string().contains("plan version 6 is unsupported"));
+        assert!(error.to_string().contains("plan version 7 is unsupported"));
     }
 
     #[test]
-    fn v7_plan_rejects_missing_or_mismatched_semantics() {
+    fn v8_plan_rejects_missing_or_mismatched_semantics() {
         let encoded = serde_json::to_value(planned_text_plan()).unwrap();
 
         let mut missing = encoded.clone();
@@ -1999,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_v7_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+    fn plan_v8_artifact_rejects_tampered_preferred_and_fallback_kinds() {
         let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
 
         let mut preferred = encoded.clone();

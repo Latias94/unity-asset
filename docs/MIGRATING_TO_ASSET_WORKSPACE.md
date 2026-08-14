@@ -6,7 +6,7 @@ wrapping the removed APIs.
 
 This is the only non-historical document that names removed public symbols and commands.
 
-`ExtractionRequest` is now version 4 and `ExtractionPlan` is now version 7. Requests persist the
+`ExtractionRequest` is now version 4 and `ExtractionPlan` is now version 8. Requests persist the
 bundle-container query or reference-traversal intent rather than a caller-expanded object list.
 The request filter now owns a canonical `object_kinds` set so YAML-only plans cannot be changed into
 mixed YAML/binary extraction after planning. Plans bind that intent to a deterministic selection
@@ -16,6 +16,12 @@ the intended workspace revision. `ExtractionManifest` and `ExtractionReport` are
 bind the current request, plan, diagnostics, source proof, and recoverable publication semantics.
 Earlier manifests and reports are rejected. Create fresh resume evidence from a current request and
 plan; current evidence still requires an exact plan digest.
+
+Media descriptors are now version 2. Strict audio preparation covers validated WAV PCM/ADPCM and
+rebuilt FSB5 Vorbis only. MP3 and AAC metadata remains inspectable, but neither encoding is
+advertised as decoded output without a bounded full-codec validator. `PreferDecoded` plans select
+raw bytes with an `unsupported_media_encoding` diagnostic, while `RequireDecoded` returns a typed
+planning error.
 
 `ExtractionExecutionLimits::new` now accepts a cumulative `max_evidence_verification_bytes` limit
 between `max_output_bytes` and `max_report_bytes`, and rejects `max_open_files` values below
@@ -416,7 +422,7 @@ accept a serialized prepared session.
 ### Extraction
 
 Legacy export request JSON and manifests are not accepted. Build a current
-`ExtractionRequest` version 4, use `--dry-run` to obtain its canonical `ExtractionPlan` version 7,
+`ExtractionRequest` version 4, use `--dry-run` to obtain its canonical `ExtractionPlan` version 8,
 then execute that plan. The planner derives any required reference graph from its workspace view;
 the caller supplies only the persisted selection intent and limits:
 

@@ -1275,6 +1275,56 @@ mod tests {
 
     #[cfg(feature = "decode")]
     #[test]
+    fn unsupported_mp3_and_aac_follow_the_requested_fallback_policy() {
+        use unity_asset_decode::audio::AudioCompressionFormat;
+
+        let address = ObjectAddress::binary_direct(
+            unity_asset_core::SourceLocator::path("media.assets").unwrap(),
+            41,
+        )
+        .unwrap();
+
+        for format in [AudioCompressionFormat::MP3, AudioCompressionFormat::AAC] {
+            assert!(!PreparedAudioSource::supports(format));
+
+            let preferred = unavailable_choice_with(
+                &address,
+                ExtractionRepresentationPolicy::PreferDecoded,
+                RepresentationChoice::decoded(PlannedContent::RawBinary, 1, false),
+                ExtractionDiagnosticCode::UnsupportedMediaEncoding,
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap();
+            assert!(matches!(
+                preferred.preferred_content,
+                PlannedContent::RawBinary
+            ));
+            assert_eq!(preferred.diagnostics.len(), 1);
+            assert_eq!(
+                preferred.diagnostics[0].code(),
+                ExtractionDiagnosticCode::UnsupportedMediaEncoding
+            );
+
+            let required = unavailable_choice_with(
+                &address,
+                ExtractionRepresentationPolicy::RequireDecoded,
+                RepresentationChoice::decoded(PlannedContent::RawBinary, 1, false),
+                ExtractionDiagnosticCode::UnsupportedMediaEncoding,
+                &mut AssetLoadBudget::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                required,
+                ExtractionPlanError::RequiredDecodedUnavailable {
+                    reason: ExtractionDiagnosticCode::UnsupportedMediaEncoding,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[cfg(feature = "decode")]
+    #[test]
     fn decoded_resource_failures_never_downgrade_invalid_paths_or_ranges() {
         let owner = unity_asset_core::SourceLocator::path("media.assets").unwrap();
         let missing = ExtractionPlanError::MissingStreamResource {

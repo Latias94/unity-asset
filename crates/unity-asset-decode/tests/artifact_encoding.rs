@@ -79,103 +79,33 @@ fn standard_audio_source_rejects_headerless_pcm_and_adpcm() {
 }
 
 #[test]
-fn standard_audio_source_rejects_header_only_containers() {
-    let cases = [
-        (
-            AudioCompressionFormat::PCM,
-            b"RIFF\x04\0\0\0WAVE".as_slice(),
-        ),
-        (
-            AudioCompressionFormat::MP3,
-            b"ID3\x04\0\0\0\0\0\0".as_slice(),
-        ),
-        (
-            AudioCompressionFormat::AAC,
-            b"\xff\xf1\x50\x80\0\xff\xfc".as_slice(),
-        ),
-    ];
+fn standard_audio_source_rejects_header_only_wave() {
+    let Err(error) =
+        prepare_standard_source(AudioCompressionFormat::PCM, b"RIFF\x04\0\0\0WAVE".to_vec())
+    else {
+        panic!("a header-only WAVE source must be rejected");
+    };
 
-    for (format, bytes) in cases {
-        let Err(error) = prepare_standard_source(format, bytes.to_vec()) else {
-            panic!("a header without playable frames must be rejected");
-        };
-
-        assert!(match error {
-            AudioSourceError::InvalidData(_) => true,
-            AudioSourceError::UnsupportedFormat(actual) => actual == format,
-            _ => false,
-        });
-    }
+    assert!(matches!(error, AudioSourceError::InvalidData(_)));
 }
 
 #[test]
-fn standard_audio_source_rejects_reserved_adts_sample_rates() {
-    for sampling_frequency_index in [13_u8, 14] {
-        let bytes = adts_frame(
-            &[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C],
-            sampling_frequency_index,
-        );
-        let result = prepare_standard_source(AudioCompressionFormat::AAC, bytes);
+fn mp3_and_aac_do_not_claim_strict_preparation() {
+    let mut plausible_mp3 = vec![0_u8; 417];
+    plausible_mp3[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+    let plausible_adts = adts_frame(&[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C], 4);
 
-        assert!(matches!(result, Err(AudioSourceError::InvalidData(_))));
-    }
-}
-
-#[test]
-fn aac_passthrough_requires_complete_consistent_adts_framing() {
-    let payload = [0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C];
-
-    let mut complete = adts_frame(&payload, 4);
-    complete.extend_from_slice(&adts_frame(&payload, 4));
-    let expected = complete.clone();
-    let prepared = prepare_standard_source(AudioCompressionFormat::AAC, complete).unwrap();
-    let mut output = Vec::new();
-    prepared.write_to(&mut output).unwrap();
-    assert_eq!(output, expected);
-
-    let cases = [
-        adts_frame(&[0], 4),
-        {
-            let mut truncated = adts_frame(&payload, 4);
-            truncated.pop();
-            truncated
-        },
-        {
-            let mut multiple_raw_blocks = adts_frame(&payload, 4);
-            multiple_raw_blocks[6] |= 1;
-            multiple_raw_blocks
-        },
-        {
-            let mut crc_protected = adts_frame(&payload, 4);
-            crc_protected[1] &= !1;
-            crc_protected
-        },
-        {
-            let mut inconsistent = adts_frame(&payload, 4);
-            inconsistent.extend_from_slice(&adts_frame(&payload, 3));
-            inconsistent
-        },
-    ];
-
-    for bytes in cases {
+    for (format, bytes) in [
+        (AudioCompressionFormat::MP3, plausible_mp3),
+        (AudioCompressionFormat::AAC, plausible_adts),
+        (AudioCompressionFormat::AAC, minimal_m4a()),
+    ] {
+        assert!(!PreparedAudioSource::supports(format));
         assert!(matches!(
-            prepare_standard_source(AudioCompressionFormat::AAC, bytes),
-            Err(AudioSourceError::InvalidData(_))
+            prepare_standard_source(format, bytes),
+            Err(AudioSourceError::UnsupportedFormat(actual)) if actual == format
         ));
     }
-}
-
-#[test]
-fn m4a_aac_is_an_unsupported_container_not_corrupt_aac() {
-    let result = prepare_standard_source(AudioCompressionFormat::AAC, minimal_m4a());
-
-    assert!(matches!(
-        result,
-        Err(AudioSourceError::UnsupportedContainer {
-            format: AudioCompressionFormat::AAC,
-            container: "ISO BMFF/M4A AAC",
-        })
-    ));
 }
 
 #[test]
@@ -187,22 +117,13 @@ fn standard_audio_source_rejects_adpcm_without_codec_extension() {
 }
 
 #[test]
-fn standard_audio_source_accepts_complete_minimal_containers() {
+fn standard_audio_source_accepts_strict_wave_containers() {
     let wav = wave_fixture(1, 1, 8_000, 16_000, 2, 16, &[], &[0, 0]);
-
-    let mut mp3 = vec![0_u8; 417];
-    mp3[..4].copy_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
-
-    // AAC passthrough guarantees complete, consistent ADTS framing. It does
-    // not claim to validate the opaque raw AAC syntax without a decoder.
-    let aac = adts_frame(&[0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C], 4);
     let ima_adpcm = wave_fixture(0x11, 1, 8_000, 7_111, 8, 4, &[2, 0, 9, 0], &[0; 8]);
 
     for (format, bytes) in [
         (AudioCompressionFormat::PCM, wav),
         (AudioCompressionFormat::ADPCM, ima_adpcm),
-        (AudioCompressionFormat::MP3, mp3),
-        (AudioCompressionFormat::AAC, aac),
     ] {
         let expected = bytes.clone();
         let prepared = prepare_standard_source(format, bytes).unwrap();

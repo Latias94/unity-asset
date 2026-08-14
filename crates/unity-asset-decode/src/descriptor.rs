@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Current wire version of [`MediaDescriptor`].
-pub const MEDIA_DESCRIPTOR_VERSION: u8 = 1;
+pub const MEDIA_DESCRIPTOR_VERSION: u8 = 2;
 
 /// Unity media family represented by an artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,8 +22,6 @@ pub enum MediaContainer {
     Wave,
     Ogg,
     Fsb5,
-    Mp3,
-    AdtsAac,
     UnityTexture,
     Png,
 }
@@ -35,8 +33,6 @@ pub enum MediaEncoding {
     Pcm,
     Adpcm,
     Vorbis,
-    Mp3,
-    Aac,
     UnityTexture,
     Rgba8,
 }
@@ -72,8 +68,6 @@ pub enum UnityTextureEncoding {
 pub enum CanonicalMediaExtension {
     Wav,
     Ogg,
-    Mp3,
-    Aac,
     Png,
 }
 
@@ -83,8 +77,6 @@ impl CanonicalMediaExtension {
         match self {
             Self::Wav => "wav",
             Self::Ogg => "ogg",
-            Self::Mp3 => "mp3",
-            Self::Aac => "aac",
             Self::Png => "png",
         }
     }
@@ -96,8 +88,6 @@ impl CanonicalMediaExtension {
 pub enum MediaMime {
     AudioWav,
     AudioOgg,
-    AudioMpeg,
-    AudioAac,
     ImagePng,
 }
 
@@ -107,8 +97,6 @@ impl MediaMime {
         match self {
             Self::AudioWav => "audio/wav",
             Self::AudioOgg => "audio/ogg",
-            Self::AudioMpeg => "audio/mpeg",
-            Self::AudioAac => "audio/aac",
             Self::ImagePng => "image/png",
         }
     }
@@ -220,8 +208,6 @@ pub enum PreparedAudioSourceKind {
     WavePcm,
     WaveAdpcm,
     Fsb5Vorbis,
-    Mp3,
-    AdtsAac,
 }
 
 impl PreparedAudioSourceKind {
@@ -229,8 +215,6 @@ impl PreparedAudioSourceKind {
         match self {
             Self::WavePcm | Self::WaveAdpcm => MediaContainer::Wave,
             Self::Fsb5Vorbis => MediaContainer::Fsb5,
-            Self::Mp3 => MediaContainer::Mp3,
-            Self::AdtsAac => MediaContainer::AdtsAac,
         }
     }
 
@@ -239,8 +223,6 @@ impl PreparedAudioSourceKind {
             Self::WavePcm => MediaEncoding::Pcm,
             Self::WaveAdpcm => MediaEncoding::Adpcm,
             Self::Fsb5Vorbis => MediaEncoding::Vorbis,
-            Self::Mp3 => MediaEncoding::Mp3,
-            Self::AdtsAac => MediaEncoding::Aac,
         }
     }
 
@@ -248,8 +230,6 @@ impl PreparedAudioSourceKind {
         match self {
             Self::WavePcm | Self::WaveAdpcm => MediaContainer::Wave,
             Self::Fsb5Vorbis => MediaContainer::Ogg,
-            Self::Mp3 => MediaContainer::Mp3,
-            Self::AdtsAac => MediaContainer::AdtsAac,
         }
     }
 
@@ -257,8 +237,6 @@ impl PreparedAudioSourceKind {
         match self {
             Self::WavePcm | Self::WaveAdpcm => CanonicalMediaExtension::Wav,
             Self::Fsb5Vorbis => CanonicalMediaExtension::Ogg,
-            Self::Mp3 => CanonicalMediaExtension::Mp3,
-            Self::AdtsAac => CanonicalMediaExtension::Aac,
         }
     }
 
@@ -266,8 +244,6 @@ impl PreparedAudioSourceKind {
         match self {
             Self::WavePcm | Self::WaveAdpcm => MediaMime::AudioWav,
             Self::Fsb5Vorbis => MediaMime::AudioOgg,
-            Self::Mp3 => MediaMime::AudioMpeg,
-            Self::AdtsAac => MediaMime::AudioAac,
         }
     }
 }
@@ -449,8 +425,6 @@ impl MediaDescriptor {
             (MediaContainer::Wave, MediaEncoding::Pcm) => PreparedAudioSourceKind::WavePcm,
             (MediaContainer::Wave, MediaEncoding::Adpcm) => PreparedAudioSourceKind::WaveAdpcm,
             (MediaContainer::Fsb5, MediaEncoding::Vorbis) => PreparedAudioSourceKind::Fsb5Vorbis,
-            (MediaContainer::Mp3, MediaEncoding::Mp3) => PreparedAudioSourceKind::Mp3,
-            (MediaContainer::AdtsAac, MediaEncoding::Aac) => PreparedAudioSourceKind::AdtsAac,
             _ => {
                 return Err(MediaDescriptorError::InvalidShape(
                     "audio source container and encoding disagree",
@@ -578,17 +552,17 @@ mod tests {
     #[test]
     fn descriptor_deserialization_rejects_every_tampered_output_identity_field() {
         let descriptor = MediaDescriptor::audio(
-            PreparedAudioSourceKind::Mp3,
+            PreparedAudioSourceKind::WavePcm,
             4,
             MediaOutputEstimate::exact(4).unwrap(),
         )
         .unwrap();
         let encoded = serde_json::to_value(descriptor).unwrap();
         for (field, value) in [
-            ("output_container", "wave"),
-            ("output_encoding", "pcm"),
-            ("canonical_extension", "wav"),
-            ("mime", "audio_wav"),
+            ("output_container", "ogg"),
+            ("output_encoding", "adpcm"),
+            ("canonical_extension", "ogg"),
+            ("mime", "audio_ogg"),
         ] {
             let mut tampered = encoded.clone();
             tampered[field] = serde_json::Value::String(value.to_owned());
@@ -598,6 +572,47 @@ mod tests {
                 "{field} produced an unrelated error: {error}"
             );
         }
+    }
+
+    #[test]
+    fn descriptor_deserialization_rejects_unvalidated_mp3_and_aac_sources() {
+        let descriptor = MediaDescriptor::audio(
+            PreparedAudioSourceKind::WavePcm,
+            4,
+            MediaOutputEstimate::exact(4).unwrap(),
+        )
+        .unwrap();
+
+        for (container, encoding, extension, mime) in [
+            ("mp3", "mp3", "mp3", "audio_mpeg"),
+            ("adts_aac", "aac", "aac", "audio_aac"),
+        ] {
+            let mut encoded = serde_json::to_value(&descriptor).unwrap();
+            encoded["source_container"] = serde_json::Value::String(container.to_owned());
+            encoded["source_encoding"] = serde_json::Value::String(encoding.to_owned());
+            encoded["output_container"] = serde_json::Value::String(container.to_owned());
+            encoded["output_encoding"] = serde_json::Value::String(encoding.to_owned());
+            encoded["canonical_extension"] = serde_json::Value::String(extension.to_owned());
+            encoded["mime"] = serde_json::Value::String(mime.to_owned());
+
+            assert!(serde_json::from_value::<MediaDescriptor>(encoded).is_err());
+        }
+    }
+
+    #[test]
+    fn descriptor_v1_is_rejected_after_the_strict_audio_capability_break() {
+        let descriptor = MediaDescriptor::audio(
+            PreparedAudioSourceKind::WavePcm,
+            4,
+            MediaOutputEstimate::exact(4).unwrap(),
+        )
+        .unwrap();
+        let mut encoded = serde_json::to_value(descriptor).unwrap();
+        encoded["version"] = serde_json::json!(1);
+
+        let error = serde_json::from_value::<MediaDescriptor>(encoded).unwrap_err();
+
+        assert!(error.to_string().contains("version 1"));
     }
 
     #[test]

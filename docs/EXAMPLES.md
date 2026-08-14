@@ -143,7 +143,7 @@ or open additional files while answering a query.
 An `ExtractionRequest` v4 persists selection intent, object-kind/class/name filters, limits, and
 representation policy. A
 dry run resolves that intent against one immutable workspace revision and emits the canonical
-`ExtractionPlan` v7 without writing artifacts. Execution re-derives the selection before reading or
+`ExtractionPlan` v8 without writing artifacts. Execution re-derives the selection before reading or
 writing artifacts. The planner owns any `ReferenceGraph` needed for bundle-container or reference
 traversal selection; callers do not construct or pass one:
 

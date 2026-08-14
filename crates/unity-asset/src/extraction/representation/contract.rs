@@ -196,7 +196,7 @@ pub(in crate::extraction) enum TextAssetBytesSemantics {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(in crate::extraction) enum AudioPreparationSemantics {
-    PreparedStandardAudioSourceV1,
+    StrictWaveAndFsb5AudioSourceV2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -273,7 +273,7 @@ impl RepresentationSemantics {
 
     const fn audio() -> Self {
         Self::Audio {
-            preparation: AudioPreparationSemantics::PreparedStandardAudioSourceV1,
+            preparation: AudioPreparationSemantics::StrictWaveAndFsb5AudioSourceV2,
         }
     }
 
@@ -914,7 +914,7 @@ mod tests {
         );
         assert_eq!(
             serde_json::to_string(&RepresentationSemantics::audio()).unwrap(),
-            r#"{"kind":"audio","preparation":"prepared_standard_audio_source_v1"}"#
+            r#"{"kind":"audio","preparation":"strict_wave_and_fsb5_audio_source_v2"}"#
         );
         assert_eq!(
             serde_json::to_string(&RepresentationSemantics::texture_png()).unwrap(),
@@ -923,6 +923,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&RepresentationSemantics::sprite_png()).unwrap(),
             r#"{"kind":"sprite_png","pixels":"top_left_rgba8_v1","platform_transform":"serialized_file_build_target_closed_v1","crop":"top_left_texture_space_v1","encoder":"filter_none_stored_deflate_block_per_idat_rgba8_v1"}"#
+        );
+
+        assert!(
+            serde_json::from_str::<RepresentationSemantics>(
+                r#"{"kind":"audio","preparation":"prepared_standard_audio_source_v1"}"#,
+            )
+            .is_err(),
+            "superseded permissive audio semantics must not be executable"
         );
     }
 
