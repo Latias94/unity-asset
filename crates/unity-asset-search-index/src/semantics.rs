@@ -16,18 +16,30 @@ pub(crate) const REFERENCE_PROJECTION_SEMANTICS_VERSION: u16 = 4;
 /// Version of the persisted per-source analysis cache identity.
 pub(crate) const ANALYSIS_CACHE_IDENTITY_VERSION: u16 = 2;
 
-const ANALYSIS_SEMANTICS_DOMAIN: &[u8] = b"unity-asset:search:analysis-semantics:v4\0";
-const SEARCH_PROJECTION_SEMANTICS_DOMAIN: &[u8] =
-    b"unity-asset:search:search-projection-semantics:v2\0";
-const REFERENCE_PROJECTION_SEMANTICS_DOMAIN: &[u8] =
-    b"unity-asset:search:reference-projection-semantics:v4\0";
+// These frozen receipts are derived from deterministic behavior fixtures in
+// `semantics/behavior_receipts.rs`. They deliberately identify observable algorithm output rather
+// than source text or a manually maintained version label.
+const ANALYSIS_BEHAVIOR_RECEIPT: DigestV1 = DigestV1::from_bytes([
+    0xc7, 0x5f, 0x54, 0x1d, 0x33, 0x72, 0x15, 0x36, 0xc3, 0x56, 0x4a, 0xa2, 0x51, 0x3a, 0x94, 0x01,
+    0xd2, 0x2d, 0x0b, 0xa5, 0x83, 0xb1, 0x0e, 0x48, 0xce, 0xf0, 0x99, 0xe1, 0x25, 0x8b, 0x12, 0x48,
+]);
+const SEARCH_PROJECTION_BEHAVIOR_RECEIPT: DigestV1 = DigestV1::from_bytes([
+    0x3c, 0x2b, 0x8e, 0xa2, 0xd8, 0x67, 0xc6, 0x26, 0xfa, 0xa3, 0x3b, 0x11, 0xad, 0xb9, 0x89, 0x0f,
+    0x66, 0x4d, 0x60, 0xab, 0xaf, 0x8d, 0x54, 0x94, 0xd0, 0xbe, 0x13, 0xf2, 0xd6, 0x57, 0x91, 0xd3,
+]);
+const REFERENCE_PROJECTION_BEHAVIOR_RECEIPT: DigestV1 = DigestV1::from_bytes([
+    0x03, 0xfb, 0x9a, 0x86, 0xd0, 0x40, 0xc0, 0xd0, 0x9d, 0xb5, 0xdc, 0xa4, 0x06, 0x63, 0xc8, 0x97,
+    0xb2, 0x7d, 0xc1, 0x80, 0x00, 0xdf, 0x3e, 0x34, 0x49, 0xde, 0x38, 0xad, 0x18, 0x2c, 0xa4, 0x70,
+]);
 const ANALYSIS_CACHE_IDENTITY_DOMAIN: &[u8] = b"unity-asset:search:analysis-cache-identity:v2\0";
 
 /// Exact identity required before persisted per-source analysis may be reused.
 ///
-/// This identity deliberately binds every semantic rule that can influence persisted
-/// [`crate::analysis::AssetAnalysis`] together with the logical index configuration. It excludes
-/// generation content, activation provenance, retention policy, and physical artifact evidence.
+/// This identity deliberately binds the complete persisted semantic tuple together with the
+/// logical index configuration. A projection-only semantic change still invalidates cached
+/// analysis because semantic upgrades perform one full re-analysis instead of selectively reusing
+/// old source state. It excludes generation content, activation provenance, retention policy, and
+/// physical artifact evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct AnalysisCacheIdentityV1 {
     identity_version: u16,
@@ -89,13 +101,11 @@ impl SearchSemantics {
         Self {
             contract_version: SEARCH_SEMANTICS_WIRE_VERSION,
             analysis_version: ANALYSIS_SEMANTICS_VERSION,
-            analysis_digest: DigestV1::hash_bytes(ANALYSIS_SEMANTICS_DOMAIN),
+            analysis_digest: ANALYSIS_BEHAVIOR_RECEIPT,
             search_projection_version: SEARCH_PROJECTION_SEMANTICS_VERSION,
-            search_projection_digest: DigestV1::hash_bytes(SEARCH_PROJECTION_SEMANTICS_DOMAIN),
+            search_projection_digest: SEARCH_PROJECTION_BEHAVIOR_RECEIPT,
             reference_projection_version: REFERENCE_PROJECTION_SEMANTICS_VERSION,
-            reference_projection_digest: DigestV1::hash_bytes(
-                REFERENCE_PROJECTION_SEMANTICS_DOMAIN,
-            ),
+            reference_projection_digest: REFERENCE_PROJECTION_BEHAVIOR_RECEIPT,
         }
     }
 
@@ -151,10 +161,11 @@ impl SearchSemantics {
         self.reference_projection_version
     }
 
-    /// Returns whether persisted source-state values have the same structural semantic shape.
+    /// Returns whether persisted source-state values may be decoded across a semantic upgrade.
     ///
-    /// Digests may change while retaining the same wire layout; version changes are treated as
-    /// structural and require rebuilding without decoding the previous source-state payload.
+    /// Digests may change while retaining the same wire layout. Any persisted semantic version
+    /// change is treated as structural and requires rebuilding without decoding the previous
+    /// source-state payload.
     #[must_use]
     pub(crate) const fn source_state_layout_compatible_with(self, other: Self) -> bool {
         self.contract_version == other.contract_version
@@ -241,6 +252,9 @@ impl<'de> Deserialize<'de> for SearchSemantics {
         })
     }
 }
+
+#[cfg(test)]
+mod behavior_receipts;
 
 #[cfg(test)]
 mod tests {
