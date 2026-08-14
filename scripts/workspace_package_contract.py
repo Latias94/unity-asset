@@ -18,6 +18,9 @@ from release_contract import PUBLISHABLE_PACKAGE_NAMES
 DEPENDENCY_TABLES = ("dependencies", "build-dependencies")
 ALL_DEPENDENCY_TABLES = (*DEPENDENCY_TABLES, "dev-dependencies")
 CRATES_IO_SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
+FORBIDDEN_RELEASE_DEPENDENCIES = frozenset(
+    ("axum", "globset", "ignore", "reqwest", "tower-http")
+)
 
 
 class VerificationError(RuntimeError):
@@ -244,8 +247,8 @@ def internal_dependency_package(
     raw_path = dependency.get("path")
     if not isinstance(name, str) or not name:
         raise VerificationError(f"{location}: cargo metadata dependency name is invalid")
-    if name == "ignore":
-        raise VerificationError(f"{location}: dependency 'ignore' is forbidden")
+    if name in FORBIDDEN_RELEASE_DEPENDENCIES:
+        raise VerificationError(f"{location}: dependency {name!r} is forbidden")
 
     internal = packages.get(name)
     if internal is not None:

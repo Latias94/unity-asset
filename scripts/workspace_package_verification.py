@@ -32,6 +32,7 @@ from release_subprocess import (
 )
 from workspace_package_contract import (
     CRATES_IO_SOURCE,
+    FORBIDDEN_RELEASE_DEPENDENCIES,
     VerificationError,
     WorkspacePackage,
     dependency_tables,
@@ -366,9 +367,10 @@ def validate_packaged_manifest(package_root: Path, expected: WorkspacePackage) -
             raise VerificationError(
                 f"{manifest_path}: {location} retains a Git dependency"
             )
-        if package_name == "ignore":
+        if package_name in FORBIDDEN_RELEASE_DEPENDENCIES:
             raise VerificationError(
-                f"{manifest_path}: {location} depends on forbidden package 'ignore'"
+                f"{manifest_path}: {location} depends on forbidden package "
+                f"{package_name!r}"
             )
 
 
@@ -657,8 +659,10 @@ def validate_resolved_workspace(
             raise VerificationError(f"missing manifest path for {package_id}")
         manifest_path = Path(raw_manifest_path).resolve()
 
-        if name == "ignore":
-            raise VerificationError("resolved graph contains forbidden package 'ignore'")
+        if name in FORBIDDEN_RELEASE_DEPENDENCIES:
+            raise VerificationError(
+                f"resolved graph contains forbidden package {name!r}"
+            )
 
         local_manifest = resolved_local_manifests.get(name)
         if local_manifest is not None:

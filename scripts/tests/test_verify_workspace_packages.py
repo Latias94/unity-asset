@@ -333,6 +333,28 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 with self.assertRaisesRegex(contract.VerificationError, message):
                     contract.reject_root_source_overrides(document, Path("Cargo.toml"))
 
+    def test_rejects_forbidden_release_dependencies_from_metadata(self) -> None:
+        self.assertEqual(
+            contract.FORBIDDEN_RELEASE_DEPENDENCIES,
+            frozenset(("axum", "globset", "ignore", "reqwest", "tower-http")),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            package = self.expected_package(Path(temporary))
+            for name in sorted(contract.FORBIDDEN_RELEASE_DEPENDENCIES):
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(
+                        contract.VerificationError, "dependency .* is forbidden"
+                    ):
+                        contract.internal_dependency_package(
+                            package,
+                            {
+                                "name": name,
+                                "source": contract.CRATES_IO_SOURCE,
+                                "path": None,
+                            },
+                            {package.name: package},
+                        )
+
     def test_rejects_unsafe_archive_members(self) -> None:
         expected_root = "example-package-1.2.3"
         cases = {
@@ -367,8 +389,12 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                 '[dependencies]\nexample = { version = "1", git = "https://example.invalid/repo" }\n',
                 "retains a Git dependency",
             ),
-            "ignore": ('[dependencies]\nignore = "0.4"\n', "forbidden package 'ignore'"),
         }
+        for package_name in contract.FORBIDDEN_RELEASE_DEPENDENCIES:
+            cases[f"forbidden-{package_name}"] = (
+                f'[dependencies]\n{package_name} = "1"\n',
+                f"forbidden package '{package_name}'",
+            )
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -514,6 +540,43 @@ class PackageVerifierRejectionTests(unittest.TestCase):
                     root / "cargo-home" / "registry" / "src",
                     {target_name},
                 )
+
+    def test_rejects_forbidden_packages_from_the_resolved_graph(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            registry_source_root = root / "cargo-home" / "registry" / "src"
+            for name in sorted(contract.FORBIDDEN_RELEASE_DEPENDENCIES):
+                package_id = f"{name} 1.0.0 (registry+crates.io)"
+                metadata = {
+                    "packages": [
+                        {
+                            "id": package_id,
+                            "name": name,
+                            "version": "1.0.0",
+                            "source": contract.CRATES_IO_SOURCE,
+                            "manifest_path": str(
+                                registry_source_root / name / "Cargo.toml"
+                            ),
+                        },
+                    ],
+                    "resolve": {
+                        "root": package_id,
+                        "nodes": [{"id": package_id, "deps": []}],
+                    },
+                }
+
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(
+                        contract.VerificationError, "forbidden package"
+                    ):
+                        verifier.validate_resolved_workspace(
+                            json.dumps(metadata),
+                            {},
+                            {},
+                            {},
+                            registry_source_root,
+                            set(),
+                        )
 
     def test_checks_each_consumer_package_independently(self) -> None:
         cargo_cwd = Path("clean-cargo-cwd")
