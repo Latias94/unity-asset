@@ -33,7 +33,11 @@ from release_contract import (  # noqa: E402
     distribution_archive_name,
     distribution_executable_name,
 )
-from verify_release_bundle import ReleaseBundleError, verify_release_bundle  # noqa: E402
+from verify_release_bundle import (  # noqa: E402
+    ReleaseBundleError,
+    VerifiedReleaseAsset,
+    verify_release_bundle,
+)
 
 
 TARGETS = DISTRIBUTION_TARGET_TRIPLES
@@ -137,6 +141,15 @@ class ReleaseBundleTests(unittest.TestCase):
         )
         self.assertEqual(set(verified.assets), {path.name for path in root.iterdir()})
         self.assertEqual(verified.evidence.commit, SOURCE_COMMIT)
+        protocol_name = verified.evidence.protocol_sdk["artifact_name"]
+        protocol_bytes = (root / protocol_name).read_bytes()
+        self.assertEqual(
+            verified.assets[protocol_name],
+            VerifiedReleaseAsset(
+                size=len(protocol_bytes),
+                sha256=hashlib.sha256(protocol_bytes).hexdigest(),
+            ),
+        )
 
     def test_rejects_a_bundle_bound_to_another_expected_commit(self) -> None:
         root, evidence_digest, title, body = self.make_bundle()

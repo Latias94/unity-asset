@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from dataclasses import dataclass
 from datetime import date
@@ -146,30 +145,17 @@ def write_metadata_files(
 
 
 def verify_metadata_evidence(
-    evidence_path: Path,
+    github_release_evidence: Mapping[str, Any],
     title: str,
     body: str,
 ) -> ReleaseMetadata:
-    """Verify exact metadata bytes against canonical release evidence."""
+    """Verify exact metadata bytes against validated release evidence."""
 
     metadata = ReleaseMetadata(
         title=normalize_title(title),
         body=normalize_body(body),
     )
-    encoded = _read_regular_utf8(
-        evidence_path,
-        "release evidence",
-        CHANGELOG_MAX_BYTES,
-    )
-    try:
-        document = json.loads(encoded)
-    except json.JSONDecodeError as error:
-        raise ReleaseMetadataError("release evidence is not valid JSON") from error
-    if not isinstance(document, dict):
-        raise ReleaseMetadataError("release evidence root must be an object")
-    raw = document.get("github_release")
-    if not isinstance(raw, dict):
-        raise ReleaseMetadataError("release evidence omitted GitHub Release metadata")
+    raw = validate_metadata_evidence_shape(github_release_evidence)
     expected = metadata.evidence()
     if raw != expected:
         raise ReleaseMetadataError(
@@ -179,7 +165,7 @@ def verify_metadata_evidence(
 
 
 def verify_metadata_files(
-    evidence_path: Path,
+    github_release_evidence: Mapping[str, Any],
     title: str,
     body_path: Path,
 ) -> ReleaseMetadata:
@@ -190,13 +176,13 @@ def verify_metadata_files(
         "release body",
         RELEASE_BODY_MAX_BYTES,
     )
-    return verify_metadata_evidence(evidence_path, title, body)
+    return verify_metadata_evidence(github_release_evidence, title, body)
 
 
 def validate_metadata_evidence_shape(value: object) -> Mapping[str, Any]:
     """Validate a metadata evidence object before composing wider evidence."""
 
-    if not isinstance(value, dict):
+    if not isinstance(value, Mapping):
         raise ReleaseMetadataError("GitHub Release metadata evidence must be an object")
     expected_keys = {
         "schema",

@@ -16,11 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from release_contract import GIT_OBJECT_PATTERN
-from release_evidence import (
-    ReleaseEvidenceError,
-    TAG_PATTERN,
-    load_release_evidence,
-)
+from release_evidence import TAG_PATTERN
 from release_metadata import (
     ReleaseMetadata,
     ReleaseMetadataError,
@@ -81,7 +77,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expected-release-id", type=int)
     parser.add_argument("--expected-title", required=True)
     parser.add_argument("--expected-body-file", type=Path, required=True)
-    parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--expected-evidence-sha256", required=True)
     parser.add_argument("--github-output", type=Path)
     return parser.parse_args()
@@ -90,10 +85,10 @@ def parse_args() -> argparse.Namespace:
 def read_expected_release_metadata(
     title: str,
     body_path: Path,
-    evidence_path: Path,
+    github_release_evidence: Mapping[str, Any],
 ) -> ReleaseMetadata:
     try:
-        return verify_metadata_files(evidence_path, title, body_path)
+        return verify_metadata_files(github_release_evidence, title, body_path)
     except ReleaseMetadataError as error:
         raise ReleaseAssetError(f"invalid verified GitHub Release metadata: {error}") from error
 
@@ -561,26 +556,11 @@ def main() -> int:
         )
     except ReleaseBundleError as error:
         raise ReleaseAssetError(f"invalid local release bundle: {error}") from error
-    try:
-        proof_evidence = load_release_evidence(
-            args.evidence,
-            expected_sha256=args.expected_evidence_sha256,
-            expected_tag=args.tag,
-            expected_commit=commit,
-        )
-    except ReleaseEvidenceError as error:
-        raise ReleaseAssetError(
-            f"invalid verified release evidence: {error}"
-        ) from error
-    if proof_evidence != bundle.evidence:
-        raise ReleaseAssetError(
-            "verified release metadata evidence differs from the release bundle"
-        )
     expected = bundle.assets
     expected_metadata = read_expected_release_metadata(
         args.expected_title,
         args.expected_body_file,
-        args.evidence,
+        bundle.evidence.github_release,
     )
     release = fetch_release(args.github_repository, args.tag)
     state = examine_release(

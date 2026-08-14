@@ -427,7 +427,6 @@ jobs:
           --assets release-assets
           --expected-title "$RELEASE_TAG"
           --expected-body-file release-proof/release-notes.md
-          --evidence release-proof/release-evidence.json
           --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
           --phase staged
           --expected-release-id "${{ needs.github-draft.outputs.release_id }}"
@@ -731,7 +730,6 @@ jobs:
           --assets release-assets
           --expected-title "$RELEASE_TAG"
           --expected-body-file release-proof/release-notes.md
-          --evidence release-proof/release-evidence.json
           --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
           --phase preflight
           --github-output "$GITHUB_OUTPUT"
@@ -762,7 +760,6 @@ jobs:
           --assets release-assets
           --expected-title "$RELEASE_TAG"
           --expected-body-file release-proof/release-notes.md
-          --evidence release-proof/release-evidence.json
           --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
           --phase staged
           --github-output "$GITHUB_OUTPUT"
@@ -822,7 +819,6 @@ jobs:
           --assets release-assets
           --expected-title "$RELEASE_TAG"
           --expected-body-file release-proof/release-notes.md
-          --evidence release-proof/release-evidence.json
           --expected-evidence-sha256 "${{ needs.validate.outputs.evidence_sha256 }}"
           --phase publish
           --expected-release-id "${{ needs.github-draft.outputs.release_id }}"

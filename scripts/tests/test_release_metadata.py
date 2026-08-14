@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import MappingProxyType
 
 
 SCRIPTS_ROOT = Path(__file__).resolve().parents[1]
@@ -81,11 +81,7 @@ class ReleaseMetadataTests(unittest.TestCase):
             title = root / "title.txt"
             body = root / "body.md"
             write_metadata_files(metadata, title, body)
-            evidence = root / "release-evidence.json"
-            evidence.write_text(
-                json.dumps({"github_release": metadata.evidence()}),
-                encoding="utf-8",
-            )
+            evidence = MappingProxyType(metadata.evidence())
 
             verified = verify_metadata_evidence(
                 evidence,

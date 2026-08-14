@@ -176,10 +176,6 @@ def verify_release_bundle(
         raise ReleaseBundleError(f"invalid stable release tag: {tag!r}")
     version = ".".join(match.groups())
     files = regular_files(assets)
-    verified_assets = {
-        name: inspect_release_asset(path) for name, path in files.items()
-    }
-    digests = {name: asset.sha256 for name, asset in verified_assets.items()}
     required = {"release-evidence.json", "release-dist-plan.json", "SHA256SUMS"}
     if not required.issubset(files):
         raise ReleaseBundleError(
@@ -197,6 +193,16 @@ def verify_release_bundle(
         )
     except ReleaseEvidenceError as error:
         raise ReleaseBundleError(f"invalid release evidence: {error}") from error
+
+    protocol_name = evidence.protocol_sdk["artifact_name"]
+    if protocol_name not in files:
+        raise ReleaseBundleError("release bundle omitted the protocol SDK artifact")
+    verified_assets = {
+        name: inspect_release_asset(path)
+        for name, path in files.items()
+        if name != protocol_name
+    }
+    digests = {name: asset.sha256 for name, asset in verified_assets.items()}
 
     dist_plan_path = files["release-dist-plan.json"]
     if digests["release-dist-plan.json"] != evidence.dist_plan_sha256:
@@ -218,15 +224,18 @@ def verify_release_bundle(
     if evidence.dist_artifacts != tuple(dist_artifacts):
         raise ReleaseBundleError("release evidence does not bind the dist inventory")
 
-    protocol_name = evidence.protocol_sdk["artifact_name"]
-    if protocol_name not in files:
-        raise ReleaseBundleError("release bundle omitted the protocol SDK artifact")
     try:
         protocol = verify_protocol_sdk_bundle(files[protocol_name], tag)
     except ProtocolSdkBundleError as error:
         raise ReleaseBundleError(f"invalid protocol SDK artifact: {error}") from error
     if protocol.as_dict() != evidence.protocol_sdk:
         raise ReleaseBundleError("protocol SDK bytes do not match release evidence")
+    protocol_asset = VerifiedReleaseAsset(
+        size=protocol.encoded_bytes,
+        sha256=protocol.sha256,
+    )
+    verified_assets[protocol_name] = protocol_asset
+    digests[protocol_name] = protocol_asset.sha256
 
     if (release_title is None) != (release_body is None):
         raise ReleaseBundleError("release title and body proof paths must be provided together")
@@ -244,7 +253,7 @@ def verify_release_bundle(
         if title_bytes != f"{tag}\n".encode("utf-8"):
             raise ReleaseBundleError("release title proof does not match the release tag")
         try:
-            verify_metadata_files(evidence_path, tag, release_body)
+            verify_metadata_files(evidence.github_release, tag, release_body)
         except ReleaseMetadataError as error:
             raise ReleaseBundleError(
                 f"release title or body does not match release evidence: {error}"

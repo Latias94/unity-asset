@@ -50,7 +50,7 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
 
     def verified_bundle(self, expected: dict[str, object]) -> VerifiedReleaseBundle:
         return VerifiedReleaseBundle(
-            evidence=mock.sentinel.release_evidence,
+            evidence=SimpleNamespace(github_release=self.metadata().evidence()),
             assets=expected,
         )
 
@@ -93,7 +93,6 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             github_output=github_output,
             expected_title="v0.4.0",
             expected_body_file=Path("release-notes.md"),
-            evidence=Path("release-evidence.json"),
             expected_evidence_sha256=hashlib.sha256(b"evidence").hexdigest(),
         )
 
@@ -113,11 +112,6 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             "args": mock.patch.object(VERIFIER, "parse_args", return_value=args),
             "bundle": mock.patch.object(
                 VERIFIER, "verify_release_bundle", return_value=bundle
-            ),
-            "evidence": mock.patch.object(
-                VERIFIER,
-                "load_release_evidence",
-                return_value=bundle.evidence,
             ),
             "metadata": mock.patch.object(
                 VERIFIER,
@@ -269,11 +263,10 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             args.expected_evidence_sha256,
             expected_commit="a" * 40,
         )
-        entered["evidence"].assert_called_once_with(
-            Path("release-evidence.json"),
-            expected_sha256=args.expected_evidence_sha256,
-            expected_tag="v0.4.0",
-            expected_commit="a" * 40,
+        entered["metadata"].assert_called_once_with(
+            "v0.4.0",
+            Path("release-notes.md"),
+            self.metadata().evidence(),
         )
         self.assertEqual(fetch.call_count, 2)
 
@@ -635,16 +628,10 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
                 title="v0.4.0",
                 body="First line\nSecond line\n",
             )
-            evidence = root / "release-evidence.json"
-            evidence.write_text(
-                json.dumps({"github_release": expected.evidence()}),
-                encoding="utf-8",
-            )
-
             metadata = VERIFIER.read_expected_release_metadata(
                 "v0.4.0",
                 body,
-                evidence,
+                expected.evidence(),
             )
 
         self.assertEqual(metadata, expected)

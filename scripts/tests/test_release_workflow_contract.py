@@ -199,7 +199,6 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         for argument in (
             "--expected-title",
             "--expected-body-file",
-            "--evidence",
             "--expected-evidence-sha256",
         ):
             self.assertIn(argument, preflight)
@@ -237,7 +236,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("--assets release-assets", verification)
         self.assertIn("--phase staged", verification)
         self.assertIn("--expected-body-file", verification)
-        self.assertIn("--evidence", verification)
+        self.assertIn("--expected-evidence-sha256", verification)
         self.assertIn(
             '--expected-release-id "${{ needs.github-draft.outputs.release_id }}"',
             verification,
