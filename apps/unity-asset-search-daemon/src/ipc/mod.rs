@@ -14,15 +14,12 @@ use unity_asset_search_local::{
 };
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
-    FrameLimits, OperationKind, RequestEnvelope, ResponseEnvelope, decode_request_frame,
-    decode_validated_frame, encode_frame, encode_response_frame,
+    FrameLimits, RequestEnvelope, ResponseEnvelope, decode_request_frame, decode_validated_frame,
+    encode_frame, encode_response_frame,
 };
 
-use crate::service::{SearchService, SearchServiceResult, SearchServiceShutdown};
+use crate::service::{RequestClass, SearchService, SearchServiceResult, SearchServiceShutdown};
 
-const MAX_WORK_IN_FLIGHT: usize = 16;
-const MAX_WAIT_IN_FLIGHT: usize = 16;
-const MAX_CONTROL_IN_FLIGHT: usize = 16;
 const UNCLASSIFIED_CONNECTION_HEADROOM: usize = 8;
 const CONTROL_RESERVED_CONNECTIONS: usize = 8;
 const ORDINARY_CONNECTIONS: usize =
@@ -37,49 +34,6 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const BODY_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
 const FATAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
-
-#[derive(Clone)]
-struct DispatchCapacity {
-    work: Arc<Semaphore>,
-    wait: Arc<Semaphore>,
-    control: Arc<Semaphore>,
-}
-
-impl DispatchCapacity {
-    fn production() -> Self {
-        Self::new(
-            MAX_WORK_IN_FLIGHT,
-            MAX_WAIT_IN_FLIGHT,
-            MAX_CONTROL_IN_FLIGHT,
-        )
-    }
-
-    fn new(work: usize, wait: usize, control: usize) -> Self {
-        Self {
-            work: Arc::new(Semaphore::new(work)),
-            wait: Arc::new(Semaphore::new(wait)),
-            control: Arc::new(Semaphore::new(control)),
-        }
-    }
-
-    fn try_acquire(
-        &self,
-        class: DispatchClass,
-    ) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
-        match class {
-            DispatchClass::Work => Arc::clone(&self.work).try_acquire_owned(),
-            DispatchClass::Wait => Arc::clone(&self.wait).try_acquire_owned(),
-            DispatchClass::Control => Arc::clone(&self.control).try_acquire_owned(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DispatchClass {
-    Work,
-    Wait,
-    Control,
-}
 
 #[derive(Clone)]
 struct ConnectionCapacity {
@@ -119,10 +73,10 @@ impl ConnectionCapacity {
 
     async fn admit_classified(
         &self,
-        class: DispatchClass,
+        class: RequestClass,
         deadline: SessionDeadline,
     ) -> Option<SessionLease> {
-        if class != DispatchClass::Control {
+        if class != RequestClass::Control {
             return Arc::clone(&self.ordinary)
                 .try_acquire_owned()
                 .ok()
@@ -187,8 +141,8 @@ enum SessionCapacityLane {
 }
 
 impl SessionCapacityLane {
-    const fn permits(self, class: DispatchClass) -> bool {
-        matches!(self, Self::Ordinary) || matches!(class, DispatchClass::Control)
+    const fn permits(self, class: RequestClass) -> bool {
+        matches!(self, Self::Ordinary) || matches!(class, RequestClass::Control)
     }
 
     const fn absolute_deadline(self, initial: SessionDeadline) -> Option<SessionDeadline> {
@@ -230,39 +184,6 @@ impl SessionDeadline {
     }
 }
 
-impl DispatchClass {
-    const fn for_operation(kind: OperationKind) -> Self {
-        match kind {
-            OperationKind::Search
-            | OperationKind::Suggest
-            | OperationKind::References
-            | OperationKind::ReindexAdmit => Self::Work,
-            OperationKind::ReindexWait => Self::Wait,
-            OperationKind::Capabilities
-            | OperationKind::Status
-            | OperationKind::ReindexStatus
-            | OperationKind::ReindexCancel
-            | OperationKind::Shutdown => Self::Control,
-        }
-    }
-
-    const fn name(self) -> &'static str {
-        match self {
-            Self::Work => "work",
-            Self::Wait => "wait",
-            Self::Control => "control",
-        }
-    }
-
-    const fn maximum(self) -> usize {
-        match self {
-            Self::Work => MAX_WORK_IN_FLIGHT,
-            Self::Wait => MAX_WAIT_IN_FLIGHT,
-            Self::Control => MAX_CONTROL_IN_FLIGHT,
-        }
-    }
-}
-
 /// Process-lifetime owner for accepted local IPC sessions.
 ///
 /// This object deliberately outlives the serving future. If that future panics, the supervisor
@@ -271,7 +192,6 @@ impl DispatchClass {
 pub(crate) struct IpcService {
     service: SearchService,
     connections: ConnectionCapacity,
-    dispatch_capacity: DispatchCapacity,
     shutdown: watch::Receiver<Option<Instant>>,
     sessions: JoinSet<()>,
     rejection_log: PeerRejectionLog,
@@ -294,7 +214,6 @@ impl IpcService {
             shutdown: service.subscribe_shutdown(),
             service,
             connections: ConnectionCapacity::production(),
-            dispatch_capacity: DispatchCapacity::production(),
             sessions: JoinSet::new(),
             rejection_log: PeerRejectionLog::new(),
             #[cfg(test)]
@@ -375,13 +294,11 @@ impl IpcService {
                         };
                         let service = self.service.clone();
                         let connections = self.connections.clone();
-                        let dispatch_capacity = self.dispatch_capacity.clone();
                         self.sessions.spawn(async move {
                             if let Err(error) = session(
                                 stream,
                                 service,
                                 connections,
-                                dispatch_capacity,
                                 connection,
                                 project_id,
                                 daemon_instance_id,
@@ -600,7 +517,6 @@ async fn session(
     mut stream: VerifiedFramedTransportV1,
     service: SearchService,
     connections: ConnectionCapacity,
-    dispatch_capacity: DispatchCapacity,
     connection: ConnectionLease,
     project_id: unity_asset_search_protocol::ProjectId,
     daemon_instance_id: unity_asset_search_protocol::DaemonInstanceId,
@@ -671,7 +587,7 @@ async fn session(
     if preclassification_deadline.expired() {
         return Ok(());
     }
-    let first_class = DispatchClass::for_operation(first_request.operation().kind());
+    let first_class = RequestClass::for_operation(first_request.operation().kind());
     let classified = match connections
         .admit_classified(first_class, preclassification_deadline)
         .await
@@ -679,8 +595,8 @@ async fn session(
         Some(classified) => classified,
         None => {
             let maximum = match first_class {
-                DispatchClass::Control => ORDINARY_CONNECTIONS + CONTROL_RESERVED_CONNECTIONS,
-                DispatchClass::Work | DispatchClass::Wait => ORDINARY_CONNECTIONS,
+                RequestClass::Control => ORDINARY_CONNECTIONS + CONTROL_RESERVED_CONNECTIONS,
+                RequestClass::Work | RequestClass::Wait => ORDINARY_CONNECTIONS,
             };
             let saturated = SearchServiceResult {
                 response: Err(ApiError::new(
@@ -711,15 +627,8 @@ async fn session(
     let _connection = connection;
     let _classified = classified;
     let first_deadline =
-        (first_class == DispatchClass::Control).then_some(preclassification_deadline);
-    if handle_request(
-        &mut stream,
-        &service,
-        &dispatch_capacity,
-        first_request,
-        first_deadline,
-    )
-    .await?
+        (first_class == RequestClass::Control).then_some(preclassification_deadline);
+    if handle_request(&mut stream, &service, first_request, first_deadline).await?
         == RequestDisposition::Close
     {
         return Ok(());
@@ -746,7 +655,7 @@ async fn session(
         if frame_processing_deadline.expired() {
             return Ok(());
         }
-        let class = DispatchClass::for_operation(request.operation().kind());
+        let class = RequestClass::for_operation(request.operation().kind());
         if !capacity_lane.permits(class) {
             let rejected = SearchServiceResult {
                 response: Err(ApiError::new(
@@ -755,7 +664,7 @@ async fn session(
                     true,
                 )
                 .with_detail("lane", "control_reserved")
-                .with_detail("accepted_class", DispatchClass::Control.name())
+                .with_detail("accepted_class", RequestClass::Control.name())
                 .with_query_policy(service.query_policy_id())),
                 shutdown_after_response: None,
             };
@@ -772,12 +681,12 @@ async fn session(
         }
         let deadline = if let Some(deadline) = reserved_session_deadline {
             Some(deadline)
-        } else if class == DispatchClass::Control {
+        } else if class == RequestClass::Control {
             Some(frame_processing_deadline)
         } else {
             None
         };
-        if handle_request(&mut stream, &service, &dispatch_capacity, request, deadline).await?
+        if handle_request(&mut stream, &service, request, deadline).await?
             == RequestDisposition::Close
         {
             return Ok(());
@@ -794,31 +703,12 @@ enum RequestDisposition {
 async fn handle_request(
     stream: &mut VerifiedFramedTransportV1,
     service: &SearchService,
-    dispatch_capacity: &DispatchCapacity,
     request: RequestEnvelope,
     deadline: Option<SessionDeadline>,
 ) -> Result<RequestDisposition, SessionError> {
     let operation = request.operation().clone();
-    let dispatch_class = DispatchClass::for_operation(operation.kind());
     let request_service = service.clone();
-    let request_capacity = dispatch_capacity.clone();
-    let dispatch = async move {
-        let permit = request_capacity.try_acquire(dispatch_class);
-        match permit {
-            Ok(_permit) => request_service.execute(operation).await,
-            Err(_) => SearchServiceResult {
-                response: Err(ApiError::new(
-                    ApiErrorCode::Busy,
-                    "daemon in-flight request class limit reached",
-                    true,
-                )
-                .with_detail("class", dispatch_class.name())
-                .with_detail("maximum", dispatch_class.maximum().to_string())
-                .with_query_policy(request_service.query_policy_id())),
-                shutdown_after_response: None,
-            },
-        }
-    };
+    let dispatch = async move { request_service.execute(operation).await };
     let Some((dispatched, peer_state)) =
         run_before(deadline, stream.monitor_inbound_while(dispatch)).await
     else {
@@ -936,7 +826,7 @@ mod tests {
     use unity_asset_search_protocol::{
         ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2,
         CapabilitiesRequest, DaemonInstanceId, FilesystemReindexIntent, FrameLimits,
-        MAX_WAIT_TIMEOUT_MS, OperationKind, ProjectId, ReindexAdmitRequest, ReindexCancelRequest,
+        MAX_WAIT_TIMEOUT_MS, ProjectId, ReindexAdmitRequest, ReindexCancelRequest,
         ReindexStatusRequest, ReindexWaitRequest, RequestEnvelope, RequestId, RequestOperation,
         ResponseEnvelope, ResponseOperation, ResponseOutcome, SearchRequest, ShutdownRequest,
         StatusRequest, decode_response_frame, decode_validated_frame, encode_frame,
@@ -945,61 +835,16 @@ mod tests {
 
     use super::{
         CONTROL_ADMISSION_RESPONSE_RESERVE, CONTROL_RESERVED_CONNECTIONS, ConnectionCapacity,
-        DispatchCapacity, DispatchClass, MAX_CONTROL_IN_FLIGHT, MAX_LOCAL_IPC_CONNECTIONS_V1,
-        MAX_WAIT_IN_FLIGHT, MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS,
-        PRECLASSIFICATION_AND_CONTROL_TIMEOUT, ServeEvent, SessionCapacityLane, SessionDeadline,
-        SessionError, UNCLASSIFIED_CONNECTION_HEADROOM, drain_sessions, next_serve_event,
-        run_synchronous_before, session,
+        MAX_LOCAL_IPC_CONNECTIONS_V1, ORDINARY_CONNECTIONS, PRECLASSIFICATION_AND_CONTROL_TIMEOUT,
+        ServeEvent, SessionCapacityLane, SessionDeadline, SessionError,
+        UNCLASSIFIED_CONNECTION_HEADROOM, drain_sessions, next_serve_event, run_synchronous_before,
+        session,
     };
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
     use crate::operations::OperationServiceOwner;
-    use crate::service::SearchService;
+    use crate::service::{RequestClass, SearchService};
     use crate::watcher::MaintenanceRuntime;
-
-    #[tokio::test]
-    async fn saturated_long_polls_preserve_control_and_work_capacity() {
-        let capacity = DispatchCapacity::new(1, 1, 2);
-        let _wait = capacity.try_acquire(DispatchClass::Wait).unwrap();
-        assert!(capacity.try_acquire(DispatchClass::Wait).is_err());
-
-        assert_eq!(
-            DispatchClass::for_operation(OperationKind::ReindexStatus),
-            DispatchClass::Control
-        );
-        assert_eq!(
-            DispatchClass::for_operation(OperationKind::ReindexCancel),
-            DispatchClass::Control
-        );
-        assert_eq!(
-            DispatchClass::for_operation(OperationKind::Shutdown),
-            DispatchClass::Control
-        );
-        let _status = capacity.try_acquire(DispatchClass::Control).unwrap();
-        let _shutdown = capacity.try_acquire(DispatchClass::Control).unwrap();
-        assert!(capacity.try_acquire(DispatchClass::Control).is_err());
-
-        let _work = capacity.try_acquire(DispatchClass::Work).unwrap();
-        assert!(capacity.try_acquire(DispatchClass::Work).is_err());
-    }
-
-    #[test]
-    fn production_dispatch_capacity_enforces_each_declared_limit() {
-        let capacity = DispatchCapacity::production();
-
-        for (class, maximum) in [
-            (DispatchClass::Work, MAX_WORK_IN_FLIGHT),
-            (DispatchClass::Wait, MAX_WAIT_IN_FLIGHT),
-            (DispatchClass::Control, MAX_CONTROL_IN_FLIGHT),
-        ] {
-            let permits = (0..maximum)
-                .map(|_| capacity.try_acquire(class).unwrap())
-                .collect::<Vec<_>>();
-            assert!(capacity.try_acquire(class).is_err());
-            drop(permits);
-            assert!(capacity.try_acquire(class).is_ok());
-        }
-    }
 
     #[tokio::test]
     async fn control_reserved_capacity_is_unavailable_until_request_classification() {
@@ -1012,21 +857,21 @@ mod tests {
         assert_eq!(capacity.control_reserved.available_permits(), 1);
 
         let ordinary = capacity
-            .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         assert_eq!(ordinary.capacity_lane(), SessionCapacityLane::Ordinary);
         assert_eq!(capacity.control_reserved.available_permits(), 1);
         assert!(
             capacity
-                .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+                .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
                 .await
                 .is_none()
         );
         assert_eq!(capacity.control_reserved.available_permits(), 1);
 
         let reserved = capacity
-            .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1050,7 +895,7 @@ mod tests {
         for _ in 0..ORDINARY_CONNECTIONS {
             connections.push(capacity.acquire_connection().await);
             let lease = capacity
-                .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+                .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
                 .await
                 .unwrap();
             assert_eq!(lease.capacity_lane(), SessionCapacityLane::Ordinary);
@@ -1059,7 +904,7 @@ mod tests {
         for _ in 0..CONTROL_RESERVED_CONNECTIONS {
             connections.push(capacity.acquire_connection().await);
             let lease = capacity
-                .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+                .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
                 .await
                 .unwrap();
             assert_eq!(lease.capacity_lane(), SessionCapacityLane::ControlReserved);
@@ -1080,7 +925,7 @@ mod tests {
 
         drop(control_reserved.pop().unwrap());
         let reclaimed_control = capacity
-            .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1091,7 +936,7 @@ mod tests {
 
         drop(ordinary.pop().unwrap());
         let reclaimed_ordinary = capacity
-            .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1115,7 +960,7 @@ mod tests {
         for _ in 0..ORDINARY_CONNECTIONS {
             ordinary_connections.push(capacity.acquire_connection().await);
             let lease = capacity
-                .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+                .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
                 .await
                 .unwrap();
             ordinary.push(lease);
@@ -1164,7 +1009,7 @@ mod tests {
             CONTROL_RESERVED_CONNECTIONS
         );
         let status = capacity
-            .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
             .await
             .expect("a classified status request retains reserved admission");
         assert_eq!(status.capacity_lane(), SessionCapacityLane::ControlReserved);
@@ -1181,11 +1026,11 @@ mod tests {
     async fn assert_classified_control_uses_lane_reopened_first(expected: SessionCapacityLane) {
         let capacity = ConnectionCapacity::new(3, 1, 1);
         let ordinary = capacity
-            .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         let reserved = capacity
-            .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         assert_eq!(
@@ -1196,7 +1041,7 @@ mod tests {
         let waiting_capacity = capacity.clone();
         let waiting = tokio::spawn(async move {
             waiting_capacity
-                .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+                .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
                 .await
         });
         tokio::task::yield_now().await;
@@ -1232,11 +1077,11 @@ mod tests {
     async fn saturated_control_admission_leaves_time_for_a_structured_busy_response() {
         let capacity = ConnectionCapacity::new(3, 1, 1);
         let ordinary = capacity
-            .admit_classified(DispatchClass::Work, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Work, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         let reserved = capacity
-            .admit_classified(DispatchClass::Control, SessionDeadline::new().unwrap())
+            .admit_classified(RequestClass::Control, SessionDeadline::new().unwrap())
             .await
             .unwrap();
         let deadline = SessionDeadline::new().unwrap();
@@ -1244,7 +1089,7 @@ mod tests {
 
         assert!(
             capacity
-                .admit_classified(DispatchClass::Control, deadline)
+                .admit_classified(RequestClass::Control, deadline)
                 .await
                 .is_none()
         );
@@ -1593,7 +1438,6 @@ mod tests {
             accepted,
             service.clone(),
             connections,
-            DispatchCapacity::new(1, 1, 1),
             connection,
             project_id,
             instance_id,

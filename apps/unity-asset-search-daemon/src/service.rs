@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::watch;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::time::Instant;
 use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError};
 use unity_asset_search_index::{
@@ -13,7 +13,7 @@ use unity_asset_search_index::{
 use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, BackgroundReindexOperation, CapabilitiesResponse, DaemonLifecycleState,
     DaemonLifecycleStatus, DaemonProcessComponent, DaemonProcessFailure, FilesystemReindexIntent,
-    FilesystemReindexScope, FreshnessMaintenance, QueryPolicyId, ReconcileLifecycle,
+    FilesystemReindexScope, FreshnessMaintenance, OperationKind, QueryPolicyId, ReconcileLifecycle,
     ReindexCancelResponse, ReindexOperationStatus, RequestOperation, ResponseOperation,
     SearchCapabilities, ShutdownResponse, TimerLifecycleState, TimerStatus, WatcherLifecycleState,
     WatcherStatus,
@@ -36,6 +36,9 @@ const REFERENCE_QUERY_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const REFERENCE_QUERY_BUDGET_ENTRIES: u64 = 2 * 1024 * 1024;
 const REFERENCE_QUERY_BUDGET_MEMBERS: u64 = 2 * 1024 * 1024;
 const REFERENCE_QUERY_BUDGET_DEPTH: u32 = 32;
+const MAX_WORK_IN_FLIGHT: usize = 16;
+const MAX_WAIT_IN_FLIGHT: usize = 16;
+const MAX_CONTROL_IN_FLIGHT: usize = 16;
 
 #[derive(Clone)]
 pub(crate) struct SearchService {
@@ -49,6 +52,7 @@ struct SearchServiceInner {
     admission: AdmissionGate,
     blocking_tasks: BlockingTaskHandle,
     maintenance: MaintenanceHandle,
+    request_capacity: RequestCapacity,
     shutdown: watch::Sender<Option<Instant>>,
 }
 
@@ -61,6 +65,82 @@ pub(crate) struct SearchServiceShutdown {
 pub(crate) struct SearchServiceResult {
     pub(crate) response: Result<ResponseOperation, ApiError>,
     pub(crate) shutdown_after_response: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestClass {
+    Work,
+    Wait,
+    Control,
+}
+
+#[derive(Clone)]
+struct RequestCapacity {
+    work: Arc<Semaphore>,
+    wait: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+
+impl RequestCapacity {
+    fn production() -> Self {
+        Self::new(
+            MAX_WORK_IN_FLIGHT,
+            MAX_WAIT_IN_FLIGHT,
+            MAX_CONTROL_IN_FLIGHT,
+        )
+    }
+
+    fn new(work: usize, wait: usize, control: usize) -> Self {
+        Self {
+            work: Arc::new(Semaphore::new(work)),
+            wait: Arc::new(Semaphore::new(wait)),
+            control: Arc::new(Semaphore::new(control)),
+        }
+    }
+
+    fn try_acquire(
+        &self,
+        class: RequestClass,
+    ) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        match class {
+            RequestClass::Work => Arc::clone(&self.work).try_acquire_owned(),
+            RequestClass::Wait => Arc::clone(&self.wait).try_acquire_owned(),
+            RequestClass::Control => Arc::clone(&self.control).try_acquire_owned(),
+        }
+    }
+}
+
+impl RequestClass {
+    pub(crate) const fn for_operation(kind: OperationKind) -> Self {
+        match kind {
+            OperationKind::Search
+            | OperationKind::Suggest
+            | OperationKind::References
+            | OperationKind::ReindexAdmit => Self::Work,
+            OperationKind::ReindexWait => Self::Wait,
+            OperationKind::Capabilities
+            | OperationKind::Status
+            | OperationKind::ReindexStatus
+            | OperationKind::ReindexCancel
+            | OperationKind::Shutdown => Self::Control,
+        }
+    }
+
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Wait => "wait",
+            Self::Control => "control",
+        }
+    }
+
+    const fn maximum(self) -> usize {
+        match self {
+            Self::Work => MAX_WORK_IN_FLIGHT,
+            Self::Wait => MAX_WAIT_IN_FLIGHT,
+            Self::Control => MAX_CONTROL_IN_FLIGHT,
+        }
+    }
 }
 
 impl SearchService {
@@ -81,6 +161,7 @@ impl SearchService {
                 admission,
                 blocking_tasks,
                 maintenance,
+                request_capacity: RequestCapacity::production(),
                 shutdown,
             }),
         }
@@ -115,6 +196,23 @@ impl SearchService {
     }
 
     pub(crate) async fn execute(&self, operation: RequestOperation) -> SearchServiceResult {
+        let request_class = RequestClass::for_operation(operation.kind());
+        let _request_permit = match self.inner.request_capacity.try_acquire(request_class) {
+            Ok(permit) => permit,
+            Err(_) => {
+                return SearchServiceResult {
+                    response: Err(ApiError::new(
+                        ApiErrorCode::Busy,
+                        "daemon in-flight request class limit reached",
+                        true,
+                    )
+                    .with_detail("class", request_class.name())
+                    .with_detail("maximum", request_class.maximum().to_string())
+                    .with_query_policy(self.inner.query_policy_id)),
+                    shutdown_after_response: None,
+                };
+            }
+        };
         let shutdown_after_response = requested_shutdown_deadline(&operation);
         if matches!(operation, RequestOperation::Shutdown(_)) {
             self.inner.admission.close();
@@ -689,13 +787,14 @@ mod tests {
     use tokio::time::Instant;
     use unity_asset_search_protocol::{
         DaemonLifecycleState, DaemonLifecycleStatus, DaemonProcessComponent, FreshnessMaintenance,
-        GenerationFreshness, OperationId, QueryPolicyId, ReconcileLifecycle, ReindexOperationState,
-        ServingAvailability, TimerLifecycleState, TimerStatus, ValidateContract,
-        WatcherLifecycleState, WatcherStatus,
+        GenerationFreshness, OperationId, OperationKind, QueryPolicyId, ReconcileLifecycle,
+        ReindexOperationState, ServingAvailability, TimerLifecycleState, TimerStatus,
+        ValidateContract, WatcherLifecycleState, WatcherStatus,
     };
 
     use super::{
-        SearchServiceShutdown, daemon_lifecycle_status, operation_status,
+        MAX_CONTROL_IN_FLIGHT, MAX_WAIT_IN_FLIGHT, MAX_WORK_IN_FLIGHT, RequestCapacity,
+        RequestClass, SearchServiceShutdown, daemon_lifecycle_status, operation_status,
         requires_lifecycle_admission, tighten_shutdown,
     };
     use crate::coordinator::{
@@ -707,6 +806,50 @@ mod tests {
 
     fn query_policy() -> QueryPolicyId {
         QueryPolicyId::from_bytes([7; 32])
+    }
+
+    #[test]
+    fn saturated_long_polls_preserve_control_and_work_capacity() {
+        let capacity = RequestCapacity::new(1, 1, 2);
+        let _wait = capacity.try_acquire(RequestClass::Wait).unwrap();
+        assert!(capacity.try_acquire(RequestClass::Wait).is_err());
+
+        assert_eq!(
+            RequestClass::for_operation(OperationKind::ReindexStatus),
+            RequestClass::Control
+        );
+        assert_eq!(
+            RequestClass::for_operation(OperationKind::ReindexCancel),
+            RequestClass::Control
+        );
+        assert_eq!(
+            RequestClass::for_operation(OperationKind::Shutdown),
+            RequestClass::Control
+        );
+        let _status = capacity.try_acquire(RequestClass::Control).unwrap();
+        let _shutdown = capacity.try_acquire(RequestClass::Control).unwrap();
+        assert!(capacity.try_acquire(RequestClass::Control).is_err());
+
+        let _work = capacity.try_acquire(RequestClass::Work).unwrap();
+        assert!(capacity.try_acquire(RequestClass::Work).is_err());
+    }
+
+    #[test]
+    fn production_request_capacity_enforces_each_declared_limit() {
+        let capacity = RequestCapacity::production();
+
+        for (class, maximum) in [
+            (RequestClass::Work, MAX_WORK_IN_FLIGHT),
+            (RequestClass::Wait, MAX_WAIT_IN_FLIGHT),
+            (RequestClass::Control, MAX_CONTROL_IN_FLIGHT),
+        ] {
+            let permits = (0..maximum)
+                .map(|_| capacity.try_acquire(class).unwrap())
+                .collect::<Vec<_>>();
+            assert!(capacity.try_acquire(class).is_err());
+            drop(permits);
+            assert!(capacity.try_acquire(class).is_ok());
+        }
     }
 
     #[test]
