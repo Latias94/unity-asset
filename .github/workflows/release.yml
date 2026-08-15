@@ -506,11 +506,11 @@ jobs:
           UNITY_ASSET_RELEASE_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN_PRODUCTION }}
         run: |
           set -euo pipefail
-          read -r -a publish_crates <<< "$PUBLISH_CRATES"
+          read -r -a package_names <<< "$PUBLISH_CRATES"
           python scripts/publish_workspace_packages.py \
             --repository-root candidate \
             --version "$RELEASE_VERSION" \
-            --packages "${publish_crates[@]}"
+            --packages "${package_names[@]}"
           git -C candidate diff --exit-code -- Cargo.lock
 
   dist:

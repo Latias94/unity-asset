@@ -182,8 +182,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn('--expected-release-id "$EXPECTED_RELEASE_ID"', reverify)
         self.assertIn("--repository-root candidate", write)
         self.assertIn("PUBLISH_CRATES: ${{ needs.validate.outputs.publish_crates }}", write)
-        self.assertIn('read -r -a publish_crates <<< "$PUBLISH_CRATES"', write)
-        self.assertIn('--packages "${publish_crates[@]}"', write)
+        self.assertIn('read -r -a package_names <<< "$PUBLISH_CRATES"', write)
+        self.assertIn('--packages "${package_names[@]}"', write)
         self.assertIn(
             "RUSTUP_TOOLCHAIN: ${{ needs.validate.outputs.release_toolchain }}", write
         )
