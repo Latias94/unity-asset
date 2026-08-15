@@ -56,6 +56,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             name: job_block(cls.workflow, name)
             for name in (
                 "validate",
+                "protocol-sdk",
                 "msrv",
                 "test",
                 "package",
@@ -166,6 +167,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
     def test_unprivileged_package_verification_precedes_one_credentialed_write(self) -> None:
         package = self.jobs["package"]
         self.assertIn("runs-on: ubuntu-latest", package)
+        self.assertIn("needs: [validate, protocol-sdk]", package)
         self.assertIn("python scripts/verify_workspace_packages.py --mode full", package)
 
         publish = self.jobs["publish"]
@@ -176,8 +178,12 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         write = step_containing(publish, "python scripts/publish_workspace_packages.py")
         self.assertIn("--phase staged", reverify)
-        self.assertIn('--expected-release-id "${{ needs.github-draft.outputs.release_id }}"', reverify)
+        self.assertIn("EXPECTED_RELEASE_ID: ${{ needs.github-draft.outputs.release_id }}", reverify)
+        self.assertIn('--expected-release-id "$EXPECTED_RELEASE_ID"', reverify)
         self.assertIn("--repository-root candidate", write)
+        self.assertIn("PUBLISH_CRATES: ${{ needs.validate.outputs.publish_crates }}", write)
+        self.assertIn('read -r -a publish_crates <<< "$PUBLISH_CRATES"', write)
+        self.assertIn('--packages "${publish_crates[@]}"', write)
         self.assertIn(
             "RUSTUP_TOOLCHAIN: ${{ needs.validate.outputs.release_toolchain }}", write
         )
@@ -207,8 +213,9 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("needs: [validate, publish, github-draft, release-assets]", final)
         self.assertIn("--phase publish", final)
         self.assertIn(
-            '--expected-release-id "${{ needs.github-draft.outputs.release_id }}"', final
+            'EXPECTED_RELEASE_ID: ${{ needs.github-draft.outputs.release_id }}', final
         )
+        self.assertIn('--expected-release-id "$EXPECTED_RELEASE_ID"', final)
 
     def test_source_evidence_binds_distribution_sdk_and_native_artifacts(self) -> None:
         validate = self.jobs["validate"]
@@ -219,8 +226,26 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertIn("python scripts/build_protocol_sdk_bundle.py", validate)
         self.assertIn("--repository-root candidate", validate)
-        self.assertIn("Compile the exact generated search protocol SDK", validate)
+        self.assertNotIn("dotnet build", validate)
         self.assertIn("dist_plan_sha256: ${{ steps.source.outputs.dist_plan_sha256 }}", validate)
+
+        protocol_sdk = self.jobs["protocol-sdk"]
+        self.assertIn("ref: ${{ github.sha }}", protocol_sdk)
+        self.assertNotIn("path: candidate", protocol_sdk)
+        self.assertNotIn("environment:", protocol_sdk)
+        self.assertNotIn("outputs:", protocol_sdk)
+        self.assertNotIn("secrets.", protocol_sdk)
+        self.assertIn("name: release-evidence-${{ github.run_id }}", protocol_sdk)
+        self.assertIn(
+            "PROTOCOL_SDK_ARTIFACT: ${{ needs.validate.outputs.protocol_sdk_artifact }}",
+            protocol_sdk,
+        )
+        self.assertIn("--bundle \"release-proof/$PROTOCOL_SDK_ARTIFACT\"", protocol_sdk)
+        self.assertIn("dotnet build", protocol_sdk)
+        self.assertLess(
+            protocol_sdk.index("Download verified release evidence"),
+            protocol_sdk.index("dotnet build"),
+        )
 
         assembler = step_containing(release_assets, "python scripts/assemble_release_assets.py")
         self.assertIn("--expected-dist-plan-sha256", assembler)
@@ -244,6 +269,16 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn(
             "matrix: ${{ fromJSON(needs.validate.outputs.dist_matrix) }}", dist
         )
+
+    def test_privileged_shell_steps_treat_validated_outputs_as_data(self) -> None:
+        for job_name in ("github-draft", "publish", "github-release"):
+            for step in self.jobs[job_name].split("      - name:")[1:]:
+                if "\n        run:" not in step:
+                    continue
+                with self.subTest(job=job_name, step=step.splitlines()[0].strip()):
+                    run = step.split("        run:", 1)[1]
+                    self.assertNotIn("${{ needs.validate.outputs.", run)
+                    self.assertNotIn("${{ needs.github-draft.outputs.", run)
 
     def test_release_metadata_and_dry_run_use_the_verified_proof(self) -> None:
         validate = self.jobs["validate"]
