@@ -302,17 +302,7 @@ jobs:
           toolchain: ${{ needs.validate.outputs.release_toolchain }}
 
       - name: Package and build isolated archive consumers before credentials exist
-        run: >-
-          python scripts/verify_workspace_packages.py --mode full
-          --archive-output "$RUNNER_TEMP/prepared-crates"
-
-      - name: Upload unprivileged crate publication inputs
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: prepared-crates-${{ github.run_id }}
-          path: ${{ runner.temp }}/prepared-crates/
-          if-no-files-found: error
-          overwrite: true
+        run: python scripts/verify_workspace_packages.py --mode full
 
   platform-contracts:
     name: Local transport and protocol contracts / ${{ matrix.os }}
@@ -455,12 +445,6 @@ jobs:
           name: release-evidence-${{ github.run_id }}
           path: release-proof
 
-      - name: Download unprivileged crate publication inputs
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: prepared-crates-${{ github.run_id }}
-          path: prepared-crates
-
       - name: Reverify staged GitHub Release after production approval
         env:
           GH_TOKEN: ${{ github.token }}
@@ -485,7 +469,6 @@ jobs:
           set -euo pipefail
           python scripts/publish_workspace_packages.py \
             --repository-root candidate \
-            --prepared-crates-directory prepared-crates \
             --version "${{ needs.validate.outputs.version }}" \
             --packages ${{ needs.validate.outputs.publish_crates }}
           git -C candidate diff --exit-code -- Cargo.lock

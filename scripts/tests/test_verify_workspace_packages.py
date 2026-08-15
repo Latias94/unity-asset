@@ -339,28 +339,6 @@ class PackageVerifierRejectionTests(unittest.TestCase):
         self.assertEqual(args.mode, "packages")
         self.assertFalse(hasattr(args, "workspace_root"))
 
-    def test_exports_only_the_verified_crate_archives(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "source"
-            source.mkdir()
-            archives = {
-                "package-b": source / "package-b-1.2.3.crate",
-                "package-a": source / "package-a-1.2.3.crate",
-            }
-            archives["package-a"].write_bytes(b"a")
-            archives["package-b"].write_bytes(b"b")
-            output = root / "publication"
-
-            verifier.export_verified_archives(archives, output)
-
-            self.assertEqual(
-                sorted(path.name for path in output.iterdir()),
-                ["package-a-1.2.3.crate", "package-b-1.2.3.crate"],
-            )
-            self.assertEqual((output / "package-a-1.2.3.crate").read_bytes(), b"a")
-            self.assertEqual((output / "package-b-1.2.3.crate").read_bytes(), b"b")
-
     def test_rejects_root_source_overrides(self) -> None:
         cases = {
             "patch": (

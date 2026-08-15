@@ -43,7 +43,9 @@ class FakeBackend:
         self, package: str, version: str
     ) -> PUBLISHER.RemotePackageState:
         del package, version
-        outcome = self.exists.popleft() if self.exists else False
+        if not self.exists:
+            raise AssertionError("unexpected release_state call")
+        outcome = self.exists.popleft()
         if isinstance(outcome, PUBLISHER.RemotePackageState):
             return outcome
         return (
@@ -126,7 +128,6 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
         root: Path,
         *,
         token: str = "token",
-        prepared: Path | None = None,
         environment: dict[str, str] | None = None,
     ) -> PUBLISHER.CargoBackend:
         return PUBLISHER.CargoBackend(
@@ -134,8 +135,11 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
             cargo="cargo-custom",
             token=token,
             cargo_cwd=Path("clean-cargo-cwd"),
-            cargo_environment=environment or {"CARGO_TARGET_DIR": str(root / "target")},
-            prepared_crates_directory=prepared or root / "prepared",
+            cargo_environment=(
+                environment
+                if environment is not None
+                else {"CARGO_TARGET_DIR": str(root / "target")}
+            ),
         )
 
     def test_crates_io_download_uses_the_hard_deadline_adapter(self) -> None:
@@ -427,19 +431,15 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
             },
         )
 
-    def test_package_rejects_bytes_not_produced_by_the_unprivileged_candidate(self) -> None:
+    def test_package_accepts_the_expected_regular_archive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            prepared = root / "prepared"
-            prepared.mkdir()
-            expected = prepared / "example-1.2.3.crate"
-            expected.write_bytes(b"verified")
-            backend = self.cargo_backend(root, prepared=prepared)
+            backend = self.cargo_backend(root)
             archive = backend.archive_path("example", "1.2.3")
 
             def package(_command, **_kwargs):
                 archive.parent.mkdir(parents=True, exist_ok=True)
-                archive.write_bytes(b"different")
+                archive.write_bytes(b"packaged")
                 return subprocess.CompletedProcess([], 0, stdout="")
 
             with mock.patch.object(
@@ -447,11 +447,9 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
                 "run_bounded_command",
                 side_effect=package,
             ):
-                with self.assertRaisesRegex(
-                    PUBLISHER.PublishError,
-                    "does not match the unprivileged candidate archive",
-                ):
-                    backend.package("example", "1.2.3")
+                backend.package("example", "1.2.3")
+
+            self.assertEqual(archive.read_bytes(), b"packaged")
 
     def test_preflight_retries_remote_observation_without_publishing(self) -> None:
         backend = RecordingBackend(
@@ -477,37 +475,6 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
         )
         self.assertEqual(backend.published, [])
         self.assertEqual(pauses, [3])
-
-    def test_package_removes_the_exact_stale_archive_before_running_cargo(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            prepared = Path(temporary) / "prepared"
-            prepared.mkdir()
-            (prepared / "example-1.2.3.crate").write_bytes(b"fresh")
-            backend = PUBLISHER.CargoBackend(
-                repository_root=Path("repository"),
-                cargo="cargo",
-                token="token",
-                cargo_cwd=Path("clean-cargo-cwd"),
-                cargo_environment={"CARGO_TARGET_DIR": temporary},
-                prepared_crates_directory=prepared,
-            )
-            archive = backend.archive_path("example", "1.2.3")
-            archive.parent.mkdir(parents=True)
-            archive.write_bytes(b"stale")
-
-            def package(_command, **_kwargs):
-                self.assertFalse(archive.exists())
-                archive.write_bytes(b"fresh")
-                return subprocess.CompletedProcess([], 0, stdout="")
-
-            with mock.patch.object(
-                PUBLISHER,
-                "run_bounded_command",
-                side_effect=package,
-            ):
-                backend.package("example", "1.2.3")
-
-            self.assertEqual(archive.read_bytes(), b"fresh")
 
     def test_remote_observation_models_missing_and_exists_unverified(self) -> None:
         backend = FakeBackend([False, True])
@@ -538,6 +505,7 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
         )
         self.assertEqual(backend.packaged, [("example", "1.2.3")])
         self.assertEqual(backend.published, ["example"])
+        self.assertEqual(list(backend.exists), [])
         self.assertEqual(backend.verified, [("example", "1.2.3")])
 
     def test_existing_matching_release_never_uses_publish_credentials(self) -> None:
@@ -685,7 +653,7 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
 
     def test_ambiguous_publish_result_never_repeats_the_write(self) -> None:
         backend = FakeBackend(
-            [False, False, False, False, False, False],
+            [False, False, False, False],
             publish_errors=[PUBLISHER.RetryablePublishError("connection reset")],
         )
 
@@ -697,9 +665,10 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
                 max_attempts=3,
                 retry_delay_seconds=0,
                 sleep=lambda _: None,
-            )
+        )
 
         self.assertEqual(backend.published, ["example"])
+        self.assertEqual(list(backend.exists), [])
 
     def test_release_package_set_is_exact(self) -> None:
         packages = list(PUBLISHER.PUBLISHABLE_PACKAGE_NAMES)

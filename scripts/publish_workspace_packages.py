@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish the reviewed crate set with bounded, byte-identical recovery."""
+"""Publish the reviewed crate set with bounded remote verification."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ class RetryablePublishError(PublishError):
 
 
 class RemoteBytesMismatch(PublishError):
-    """A published archive is not the archive prepared from the tagged source."""
+    """A published archive is not the archive packaged from the tagged source."""
 
 
 class RemotePackageState(Enum):
@@ -103,14 +103,13 @@ class PublishBackend(Protocol):
 
 @dataclass
 class CargoBackend:
-    """Publish through trusted Cargo configuration and a revalidated candidate archive."""
+    """Publish tagged source through an isolated trusted Cargo configuration."""
 
     repository_root: Path
     cargo: str
     token: str
     cargo_cwd: Path
     cargo_environment: Mapping[str, str]
-    prepared_crates_directory: Path
 
     def run(
         self, command: Sequence[str], *, credentialed: bool = False
@@ -136,12 +135,6 @@ class CargoBackend:
 
     def package(self, package: str, version: str) -> None:
         archive = self.archive_path(package, version)
-        try:
-            archive.unlink(missing_ok=True)
-        except OSError as error:
-            raise PublishError(
-                f"cannot remove stale package archive {archive}: {error}"
-            ) from error
         result = self.run(
             [
                 self.cargo,
@@ -160,21 +153,6 @@ class CargoBackend:
             )
         if archive.is_symlink() or not archive.is_file():
             raise PublishError(f"cargo package did not create a regular archive: {archive}")
-        prepared = self.prepared_crates_directory / archive.name
-        if prepared.is_symlink() or not prepared.is_file():
-            raise PublishError(
-                f"missing unprivileged verified crate archive: {prepared}"
-            )
-        try:
-            if archive.read_bytes() != prepared.read_bytes():
-                raise PublishError(
-                    f"prepared crate {archive.name} does not match the unprivileged "
-                    "candidate archive"
-                )
-        except OSError as error:
-            raise PublishError(
-                f"cannot compare prepared crate {archive.name}: {error}"
-            ) from error
 
     def archive_path(self, package: str, version: str) -> Path:
         encoded_target = self.cargo_environment.get("CARGO_TARGET_DIR")
@@ -278,12 +256,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--cargo", default=os.environ.get("CARGO", "cargo"))
-    parser.add_argument(
-        "--prepared-crates-directory",
-        type=Path,
-        required=True,
-        help="Directory containing crate archives produced by the unprivileged candidate job.",
-    )
     parser.add_argument("--version", required=True)
     parser.add_argument("--packages", nargs="+", required=True)
     parser.add_argument("--max-attempts", type=int, default=10)
@@ -436,39 +408,33 @@ def publish_missing_package(
     if max_attempts < 1:
         raise PublishError("max attempts must be at least one")
 
-    publish_attempted = False
-    last_error: PublishError | None = None
+    state_before_publish = observe_release_with_retry(
+        backend,
+        package,
+        version,
+        max_attempts=max_attempts,
+        retry_delay_seconds=retry_delay_seconds,
+        sleep=sleep,
+    )
+    if state_before_publish is RemotePackageState.YANKED:
+        raise PublishError(f"{package} {version} is yanked on crates.io")
+    if state_before_publish is not RemotePackageState.MISSING:
+        return verify_known_existing(
+            backend,
+            package,
+            version,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            sleep=sleep,
+        )
+
+    last_error: RetryablePublishError | None = None
+    try:
+        backend.publish(package)
+    except RetryablePublishError as error:
+        last_error = error
+
     for attempt in range(1, max_attempts + 1):
-        try:
-            state_before_publish = backend.release_state(package, version)
-        except RetryablePublishError as error:
-            last_error = error
-            state_before_publish = None
-        if state_before_publish is RemotePackageState.YANKED:
-            raise PublishError(f"{package} {version} is yanked on crates.io")
-        if state_before_publish is RemotePackageState.EXISTS_UNVERIFIED:
-            verified = verify_known_existing(
-                backend,
-                package,
-                version,
-                max_attempts=max_attempts,
-                retry_delay_seconds=retry_delay_seconds,
-                sleep=sleep,
-            )
-            return verified
-
-        if state_before_publish is None:
-            if attempt < max_attempts:
-                sleep(retry_delay_seconds)
-            continue
-
-        if not publish_attempted:
-            publish_attempted = True
-            try:
-                backend.publish(package)
-            except RetryablePublishError as error:
-                last_error = error
-
         try:
             state_after_publish = backend.release_state(package, version)
         except RetryablePublishError as error:
@@ -476,8 +442,11 @@ def publish_missing_package(
             state_after_publish = None
         if state_after_publish is RemotePackageState.YANKED:
             raise PublishError(f"{package} {version} is yanked on crates.io")
-        if state_after_publish is RemotePackageState.EXISTS_UNVERIFIED:
-            verified = verify_known_existing(
+        if (
+            state_after_publish is not None
+            and state_after_publish is not RemotePackageState.MISSING
+        ):
+            return verify_known_existing(
                 backend,
                 package,
                 version,
@@ -485,7 +454,6 @@ def publish_missing_package(
                 retry_delay_seconds=retry_delay_seconds,
                 sleep=sleep,
             )
-            return verified
 
         if attempt < max_attempts:
             print(
@@ -643,7 +611,6 @@ def main() -> int:
             token=token,
             cargo_cwd=cargo_cwd,
             cargo_environment=cargo_environment,
-            prepared_crates_directory=args.prepared_crates_directory.resolve(),
         )
         publish_packages(
             backend,

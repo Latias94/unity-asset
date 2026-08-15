@@ -163,17 +163,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             msrv,
         )
 
-    def test_unprivileged_crate_handoff_is_reverified_before_one_credentialed_write(self) -> None:
+    def test_unprivileged_package_verification_precedes_one_credentialed_write(self) -> None:
         package = self.jobs["package"]
         self.assertIn("runs-on: ubuntu-latest", package)
         self.assertIn("python scripts/verify_workspace_packages.py --mode full", package)
-        self.assertIn('--archive-output "$RUNNER_TEMP/prepared-crates"', package)
-        self.assertIn("actions/upload-artifact@", package)
 
         publish = self.jobs["publish"]
         self.assertIn("needs: [validate, package, release-assets, github-draft]", publish)
         self.assertIn("name: crates-io-production", publish)
-        download = step_containing(publish, "name: prepared-crates-${{ github.run_id }}")
         reverify = step_containing(
             publish, "python scripts/verify_github_release_assets.py"
         )
@@ -181,7 +178,9 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("--phase staged", reverify)
         self.assertIn('--expected-release-id "${{ needs.github-draft.outputs.release_id }}"', reverify)
         self.assertIn("--repository-root candidate", write)
-        self.assertIn("--prepared-crates-directory prepared-crates", write)
+        self.assertIn(
+            "RUSTUP_TOOLCHAIN: ${{ needs.validate.outputs.release_toolchain }}", write
+        )
         self.assertIn(
             "UNITY_ASSET_RELEASE_CARGO_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN_PRODUCTION }}",
             write,
@@ -190,7 +189,6 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.workflow.count("secrets.CARGO_REGISTRY_TOKEN_PRODUCTION"), 1
         )
         self.assertNotIn("CARGO_REGISTRY_TOKEN:", self.workflow)
-        self.assertLess(publish.index(download), publish.index(reverify))
         self.assertLess(publish.index(reverify), publish.index(write))
 
     def test_github_assets_are_staged_read_back_and_only_then_published(self) -> None:

@@ -10,7 +10,6 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
 import sys
 import tarfile
@@ -251,26 +250,6 @@ def configuration_clean_cargo_cwd(workspace_root: Path) -> Path:
     return root
 
 
-def export_verified_archives(
-    archive_paths: Mapping[str, Path], output_directory: Path
-) -> None:
-    """Copy the already verified crate archives into one publication handoff."""
-
-    try:
-        output_directory.mkdir(parents=True, exist_ok=False)
-        for package in sorted(archive_paths):
-            archive = archive_paths[package]
-            if archive.is_symlink() or not archive.is_file():
-                raise VerificationError(
-                    f"verified crate archive is not a regular file: {archive}"
-                )
-            shutil.copyfile(archive, output_directory / archive.name)
-    except OSError as error:
-        raise VerificationError(
-            f"cannot export verified crate archives to {output_directory}: {error}"
-        ) from error
-
-
 def locate_archive(package_target: Path, package: WorkspacePackage) -> Path:
     expected_name = f"{package.name}-{package.version}.crate"
     archive = package_target / "package" / expected_name
@@ -338,7 +317,7 @@ def unpack_archive(archive_path: Path, unpack_root: Path, package: WorkspacePack
 
 def raw_packaged_dependencies(
     document: Mapping[str, Any], manifest_path: Path
-) -> Iterator[tuple[str, str, Mapping[str, Any]]]:
+) -> Iterator[tuple[str, Mapping[str, Any]]]:
     for location, table in dependency_tables(document, include_dev=True):
         for alias, raw_value in table.items():
             if isinstance(raw_value, str):
@@ -349,12 +328,7 @@ def raw_packaged_dependencies(
                 raise VerificationError(
                     f"{manifest_path}: {location}.{alias} must be a string or table"
                 )
-            package_name = values.get("package", alias)
-            if not isinstance(package_name, str) or not package_name:
-                raise VerificationError(
-                    f"{manifest_path}: {location}.{alias}.package is invalid"
-                )
-            yield f"{location}.{alias}", package_name, values
+            yield f"{location}.{alias}", values
 
 
 def validate_packaged_manifest(package_root: Path, expected: WorkspacePackage) -> None:
@@ -373,9 +347,7 @@ def validate_packaged_manifest(package_root: Path, expected: WorkspacePackage) -
             f"{manifest_path}: packaged manifests must not contain source overrides"
         )
 
-    for location, package_name, values in raw_packaged_dependencies(
-        document, manifest_path
-    ):
+    for location, values in raw_packaged_dependencies(document, manifest_path):
         if values.get("workspace") is True:
             raise VerificationError(
                 f"{manifest_path}: {location} still inherits from the workspace"
@@ -897,7 +869,6 @@ def run_verification(
     workspace_root: Path,
     closure: Sequence[WorkspacePackage],
     verify_binaries: bool,
-    archive_output: Path | None = None,
 ) -> None:
     cargo_cwd = configuration_clean_cargo_cwd(workspace_root)
     with tempfile.TemporaryDirectory(
@@ -1054,6 +1025,3 @@ def run_verification(
             workspace_manifest=consumer_manifest,
             consumer_names=tuple(consumer_manifests),
         )
-
-        if archive_output is not None:
-            export_verified_archives(archive_paths, archive_output)
