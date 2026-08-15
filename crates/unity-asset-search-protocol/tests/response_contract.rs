@@ -232,6 +232,17 @@ fn search_hit_guids_are_canonical_at_every_location() {
 }
 
 #[test]
+fn reference_location_guids_are_canonical_at_every_location() {
+    let mut response = fixture_references_response();
+    response.hits[0].location.guid = Some("not-a-guid".to_owned());
+    assert!(response.validate().is_err());
+
+    let mut response = fixture_references_response();
+    response.hits[0].objects[0].location.guid = Some("A".repeat(32));
+    assert!(response.validate().is_err());
+}
+
+#[test]
 fn status_paths_are_collectively_frame_bounded() {
     let mut response = status(generation(5), query_policy(4));
     response.scan_roots = (0..8)

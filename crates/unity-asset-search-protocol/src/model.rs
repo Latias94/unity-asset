@@ -1575,6 +1575,15 @@ impl ValidateContract for SearchCapabilities {
     }
 }
 
+impl ValidateContract for Location {
+    fn validate(&self) -> Result<(), ContractValidationError> {
+        if let Some(guid) = &self.guid {
+            validate_guid("location GUID", guid)?;
+        }
+        Ok(())
+    }
+}
+
 impl ValidateContract for SearchResponse {
     fn validate(&self) -> Result<(), ContractValidationError> {
         ensure_revision(
@@ -1618,9 +1627,7 @@ impl ValidateContract for SearchResponse {
             if let Some(guid) = &hit.guid {
                 validate_guid("search hit GUID", guid)?;
             }
-            if let Some(guid) = &hit.location.guid {
-                validate_guid("search hit location GUID", guid)?;
-            }
+            hit.location.validate()?;
         }
         validate_json_limit(
             "search response hits JSON",
@@ -1700,6 +1707,10 @@ impl ValidateContract for ReferencesResponse {
             });
         }
         for hit in &self.hits {
+            hit.location.validate()?;
+            for object in &hit.objects {
+                object.location.validate()?;
+            }
             let file_id = hit.source_object.binary_path_id().or_else(|| {
                 hit.source_object
                     .yaml_file_id()
