@@ -167,6 +167,7 @@ def proxy_without_credentials(value: str) -> str | None:
 def isolated_cargo_environment(cargo_home: Path, target_dir: Path) -> dict[str, str]:
     passthrough = (
         "PATH",
+        "RUSTUP_TOOLCHAIN",
         "SystemRoot",
         "WINDIR",
         "COMSPEC",

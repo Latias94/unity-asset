@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import subprocess
 import sys
 import tarfile
@@ -35,6 +36,28 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             is_library=False,
             feature_names=(),
         )
+
+    def test_isolated_cargo_environment_preserves_the_selected_toolchain(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cargo_home = root / "cargo-home"
+            target_dir = root / "target"
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "RUSTUP_TOOLCHAIN": "1.85.0",
+                    "CARGO_REGISTRY_TOKEN": "ambient-secret",
+                },
+                clear=True,
+            ):
+                environment = verifier.isolated_cargo_environment(
+                    cargo_home, target_dir
+                )
+
+            self.assertEqual(environment["RUSTUP_TOOLCHAIN"], "1.85.0")
+            self.assertEqual(environment["CARGO_HOME"], str(cargo_home))
+            self.assertEqual(environment["CARGO_TARGET_DIR"], str(target_dir))
+            self.assertNotIn("CARGO_REGISTRY_TOKEN", environment)
 
     def test_derives_a_dependency_first_closure_for_every_publishable_package(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
