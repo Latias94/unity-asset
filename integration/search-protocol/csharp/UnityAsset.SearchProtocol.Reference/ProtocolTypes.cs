@@ -6,7 +6,6 @@ namespace UnityAsset.SearchProtocol.Reference
 {
     public static class ProtocolConstants
     {
-        public const ushort BootstrapVersion = 2;
         public const ushort BusinessProtocolRevision = 5;
         public const uint CoreDiagnosticVersion = 2;
         public const int MaxBackgroundReindexOperations = 5;
@@ -171,78 +170,6 @@ namespace UnityAsset.SearchProtocol.Reference
         public DaemonInstanceId DaemonInstanceId { get; }
 
         public QueryPolicyId QueryPolicyId { get; }
-    }
-
-    public sealed class BootstrapHelloV2
-    {
-        public BootstrapHelloV2(
-            ushort bootstrapVersion,
-            ProjectId projectId,
-            DaemonInstanceId daemonInstanceId,
-            IReadOnlyList<ushort> supportedRevisions)
-        {
-            BootstrapVersion = bootstrapVersion;
-            ProjectId = projectId ?? throw new ArgumentNullException(nameof(projectId));
-            DaemonInstanceId = daemonInstanceId ?? throw new ArgumentNullException(nameof(daemonInstanceId));
-            SupportedRevisions = supportedRevisions ?? throw new ArgumentNullException(nameof(supportedRevisions));
-        }
-
-        public ushort BootstrapVersion { get; }
-
-        public ProjectId ProjectId { get; }
-
-        public DaemonInstanceId DaemonInstanceId { get; }
-
-        public IReadOnlyList<ushort> SupportedRevisions { get; }
-    }
-
-    public abstract class BootstrapReplyV2
-    {
-        protected BootstrapReplyV2(string result, ushort bootstrapVersion)
-        {
-            Result = result;
-            BootstrapVersion = bootstrapVersion;
-        }
-
-        public string Result { get; }
-
-        public ushort BootstrapVersion { get; }
-    }
-
-    public sealed class BootstrapAcceptedV2 : BootstrapReplyV2
-    {
-        public BootstrapAcceptedV2(
-            ushort bootstrapVersion,
-            ProjectId projectId,
-            DaemonInstanceId daemonInstanceId,
-            QueryPolicyId queryPolicyId,
-            ushort selectedRevision)
-            : base("accepted", bootstrapVersion)
-        {
-            ProjectId = projectId ?? throw new ArgumentNullException(nameof(projectId));
-            DaemonInstanceId = daemonInstanceId ?? throw new ArgumentNullException(nameof(daemonInstanceId));
-            QueryPolicyId = queryPolicyId ?? throw new ArgumentNullException(nameof(queryPolicyId));
-            SelectedRevision = selectedRevision;
-        }
-
-        public ProjectId ProjectId { get; }
-
-        public DaemonInstanceId DaemonInstanceId { get; }
-
-        public QueryPolicyId QueryPolicyId { get; }
-
-        public ushort SelectedRevision { get; }
-    }
-
-    public sealed class BootstrapRejectedV2 : BootstrapReplyV2
-    {
-        public BootstrapRejectedV2(ushort bootstrapVersion, string code)
-            : base("rejected", bootstrapVersion)
-        {
-            Code = code ?? throw new ArgumentNullException(nameof(code));
-        }
-
-        public string Code { get; }
     }
 
     public sealed class RequestEnvelopeV1
@@ -456,7 +383,7 @@ namespace UnityAsset.SearchProtocol.Reference
             {
                 throw new ProtocolValidationException("response operation kind does not match request");
             }
-            int maximum = FrameLimits.ForResponse(request.OperationKind);
+            int maximum = ProtocolLimits.ForResponse(request.OperationKind);
             if (EncodedLength > maximum)
             {
                 throw new ProtocolValidationException(

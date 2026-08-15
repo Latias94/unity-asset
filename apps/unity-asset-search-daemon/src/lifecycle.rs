@@ -12,11 +12,13 @@ use tokio::time::Instant;
 use unity_asset_search_index::{
     AssetLoadBudget, FilesystemReindexIntent, SearchIndex, SearchIndexError,
 };
-use unity_asset_search_local::{ClaimedEndpointV1, EndpointClaimV1, EndpointCleanupV1};
+use unity_asset_search_local::{
+    LoopbackEndpointClaim, LoopbackEndpointCleanup, PublishedLoopbackEndpoint,
+};
 use unity_asset_search_protocol::{DaemonInstanceId, ProjectId};
 
 use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution};
-use crate::ipc::IpcService;
+use crate::http_transport::{BoundLoopbackHttp, LoopbackHttpServer, LoopbackHttpServerError};
 use crate::operations::{OperationOrigin, OperationServiceOwner, SemanticUpgradeRuntime};
 use crate::service::{SearchService, SearchServiceShutdown};
 use crate::watcher::{MaintenanceRuntime, WatcherConfig};
@@ -136,8 +138,8 @@ impl AdmissionGate {
         }
     }
 
-    pub async fn begin_draining(&self) {
-        self.close();
+    pub async fn wait_for_admission_linearization(&self) {
+        debug_assert!(self.state.closed.load(Ordering::Acquire));
         let _linearization = self.state.linearization.lock().await;
     }
 
@@ -156,7 +158,7 @@ pub struct DaemonRuntime {
 
 /// Immutable inputs used to assemble the complete daemon resource graph.
 pub struct DaemonRuntimeConfig {
-    endpoint_claim: EndpointClaimV1,
+    endpoint_claim: LoopbackEndpointClaim,
     daemon_instance_id: DaemonInstanceId,
     startup_reindex: Option<FilesystemReindexIntent>,
     index: SearchIndex,
@@ -168,7 +170,7 @@ pub struct DaemonRuntimeConfig {
 impl DaemonRuntimeConfig {
     #[must_use]
     pub fn new(
-        endpoint_claim: EndpointClaimV1,
+        endpoint_claim: LoopbackEndpointClaim,
         daemon_instance_id: DaemonInstanceId,
         index: SearchIndex,
         coordinator: ReindexCoordinatorConfig,
@@ -204,10 +206,11 @@ impl DaemonRuntimeConfig {
 }
 
 struct DaemonRuntimeParts {
-    endpoint_claim: EndpointClaimV1,
+    endpoint_claim: LoopbackEndpointClaim,
     daemon_instance_id: DaemonInstanceId,
     startup_reindex: Option<FilesystemReindexIntent>,
     service: SearchService,
+    http: LoopbackHttpServer,
     maintenance: MaintenanceRuntime,
     semantic_upgrade: SemanticUpgradeRuntime,
     coordinator: ReindexCoordinatorRuntime,
@@ -216,8 +219,6 @@ struct DaemonRuntimeParts {
     index: SearchIndex,
     #[cfg(test)]
     panic_stage: Option<SupervisorPanicStage>,
-    #[cfg(test)]
-    session_panic_gate: Option<crate::ipc::SessionPanicTestGate>,
 }
 
 #[cfg(test)]
@@ -225,13 +226,12 @@ struct DaemonRuntimeParts {
 enum SupervisorPanicStage {
     BeforePublication,
     AfterPublication,
-    AfterSessionSpawn,
     DuringCleanup,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DaemonShutdownReport {
-    pub endpoint_cleanup: EndpointCleanupV1,
+    pub endpoint_cleanup: LoopbackEndpointCleanup,
 }
 
 impl DaemonRuntime {
@@ -348,6 +348,7 @@ fn assemble_runtime(
             .is_some_and(|generation| {
                 !generation.semantics_current || !generation.configuration_current
             });
+    let bound_http = BoundLoopbackHttp::bind()?;
     let blocking_tasks = BlockingTaskOwner::new();
     let admission = AdmissionGate::default();
     let build_index = index.clone();
@@ -390,11 +391,19 @@ fn assemble_runtime(
         admission,
         maintenance.handle(),
     );
+    let http = bound_http.into_server(
+        endpoint_project_id,
+        daemon_instance_id,
+        endpoint_claim.capability().clone(),
+        blocking_tasks.handle(),
+        service.clone(),
+    );
     Ok(DaemonRuntimeParts {
         endpoint_claim,
         daemon_instance_id,
         startup_reindex,
         service,
+        http,
         maintenance,
         semantic_upgrade,
         coordinator,
@@ -403,8 +412,6 @@ fn assemble_runtime(
         index,
         #[cfg(test)]
         panic_stage: None,
-        #[cfg(test)]
-        session_panic_gate: None,
     })
 }
 
@@ -443,6 +450,8 @@ enum DaemonAssemblyError {
     SearchIndex(#[from] SearchIndexError),
     #[error("start reindex coordinator: {0}")]
     Coordinator(#[from] crate::coordinator::CoordinatorError),
+    #[error("bind loopback HTTP listener: {0}")]
+    Http(#[from] LoopbackHttpServerError),
 }
 
 impl Drop for DaemonRuntime {
@@ -581,12 +590,13 @@ impl RuntimeComponents {
 
 /// Owns authority for the full supervisor lifetime, outside every fallible serving future.
 struct SupervisorState {
-    endpoint_claim: EndpointClaimV1,
-    endpoint: Option<ClaimedEndpointV1>,
-    endpoint_cleanup: Option<EndpointCleanupV1>,
+    endpoint_claim: LoopbackEndpointClaim,
+    endpoint: Option<PublishedLoopbackEndpoint>,
+    endpoint_cleanup: Option<LoopbackEndpointCleanup>,
     daemon_instance_id: DaemonInstanceId,
     startup_reindex: Option<FilesystemReindexIntent>,
-    ipc: IpcService,
+    service: SearchService,
+    http: LoopbackHttpServer,
     components: RuntimeComponents,
     #[cfg(test)]
     panic_stage: Option<SupervisorPanicStage>,
@@ -599,6 +609,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             daemon_instance_id,
             startup_reindex,
             service,
+            http,
             maintenance,
             semantic_upgrade,
             coordinator,
@@ -607,19 +618,15 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             index,
             #[cfg(test)]
             panic_stage,
-            #[cfg(test)]
-            session_panic_gate,
         } = parts;
-        let ipc = IpcService::new(service);
-        #[cfg(test)]
-        let ipc = ipc.with_session_panic_gate(session_panic_gate);
         Self {
             endpoint_claim,
             endpoint: None,
             endpoint_cleanup: None,
             daemon_instance_id,
             startup_reindex,
-            ipc,
+            service,
+            http,
             components: RuntimeComponents {
                 maintenance,
                 semantic_upgrade,
@@ -636,11 +643,11 @@ impl From<DaemonRuntimeParts> for SupervisorState {
 
 impl SupervisorState {
     fn shutdown_handle(&self) -> SearchServiceShutdown {
-        self.ipc.shutdown_handle()
+        self.service.shutdown_handle()
     }
 
     async fn run(&mut self) -> Result<(), DaemonRuntimeError> {
-        if self.ipc.requested_shutdown_deadline().is_some() {
+        if self.service.requested_shutdown_deadline().is_some() {
             return Ok(());
         }
 
@@ -672,7 +679,11 @@ impl SupervisorState {
             .revalidate_project_root("before endpoint publication")?;
         let endpoint = self
             .endpoint_claim
-            .publish(self.daemon_instance_id)
+            .publish(
+                self.daemon_instance_id,
+                self.http.address().port(),
+                self.service.query_policy_id(),
+            )
             .map_err(|error| {
                 DaemonRuntimeError::single(format!("endpoint publication: {error}"))
             })?;
@@ -693,55 +704,70 @@ impl SupervisorState {
         #[cfg(test)]
         self.panic_if_requested(SupervisorPanicStage::AfterPublication);
 
-        let serve_result = {
-            let endpoint = self
-                .endpoint
-                .as_mut()
-                .expect("supervisor retains a published endpoint before serving");
-            self.ipc.serve(endpoint).await
-        };
-        match serve_result {
-            Ok(cleanup) => {
-                self.record_endpoint_cleanup(cleanup);
-                Ok(())
+        let mut shutdown = self.service.subscribe_shutdown();
+        if shutdown.borrow().is_some() {
+            return Ok(());
+        }
+        tokio::select! {
+            result = self.http.wait_for_exit() => {
+                if self.service.requested_shutdown_deadline().is_some() {
+                    return result.map_err(|error| {
+                        DaemonRuntimeError::single(format!("loopback HTTP server: {error}"))
+                    });
+                }
+                Err(match result {
+                    Ok(()) => DaemonRuntimeError::single(
+                        "loopback HTTP server exited before shutdown was requested",
+                    ),
+                    Err(error) => DaemonRuntimeError::single(format!(
+                        "loopback HTTP server: {error}"
+                    )),
+                })
             }
-            Err(error) => Err(DaemonRuntimeError::single(format!("IPC server: {error:#}"))),
+            requested = shutdown.wait_for(Option::is_some) => {
+                requested.map(|_| ()).map_err(|_| DaemonRuntimeError::single(
+                    "loopback HTTP shutdown channel closed unexpectedly",
+                ))
+            }
         }
     }
 
     async fn shutdown(&mut self) -> Vec<String> {
-        self.ipc.begin_shutdown_at(Instant::now());
+        if self.service.requested_shutdown_deadline().is_none() {
+            self.service.begin_shutdown_at(Instant::now());
+        }
         #[cfg(test)]
         self.panic_if_requested(SupervisorPanicStage::DuringCleanup);
         let mut failures = Vec::new();
-        if let Err(error) = self.withdraw_endpoint() {
-            failures.push(format!("endpoint cleanup: {error}"));
-        }
-        if let Err(error) = self.ipc.shutdown().await {
-            failures.push(format!("IPC sessions: {error:#}"));
-        }
+        collect_shutdown_failure(&mut failures, "endpoint cleanup", self.withdraw_endpoint());
+        let http_result = self
+            .http
+            .shutdown_until(self.service.subscribe_shutdown())
+            .await;
+        collect_shutdown_failure(&mut failures, "loopback HTTP requests", http_result);
+        self.service.wait_for_admission_linearization().await;
         failures.extend(self.components.shutdown().await);
         failures
     }
 
-    fn endpoint_cleanup(&self) -> EndpointCleanupV1 {
+    fn endpoint_cleanup(&self) -> LoopbackEndpointCleanup {
         self.endpoint_cleanup
-            .unwrap_or(EndpointCleanupV1::AlreadyAbsent)
+            .unwrap_or(LoopbackEndpointCleanup::AlreadyAbsent)
     }
 
     fn withdraw_endpoint(
         &mut self,
-    ) -> Result<EndpointCleanupV1, unity_asset_search_local::EndpointStoreError> {
+    ) -> Result<LoopbackEndpointCleanup, unity_asset_search_local::EndpointStoreError> {
         let cleanup = match self.endpoint.as_mut() {
             Some(endpoint) => endpoint.withdraw(),
-            None => Ok(EndpointCleanupV1::AlreadyAbsent),
+            None => Ok(LoopbackEndpointCleanup::AlreadyAbsent),
         }?;
         self.record_endpoint_cleanup(cleanup);
         Ok(cleanup)
     }
 
-    fn record_endpoint_cleanup(&mut self, cleanup: EndpointCleanupV1) {
-        if cleanup == EndpointCleanupV1::Removed || self.endpoint_cleanup.is_none() {
+    fn record_endpoint_cleanup(&mut self, cleanup: LoopbackEndpointCleanup) {
+        if cleanup == LoopbackEndpointCleanup::Removed || self.endpoint_cleanup.is_none() {
             self.endpoint_cleanup = Some(cleanup);
         }
     }
@@ -749,14 +775,16 @@ impl SupervisorState {
     fn release_authority(self) {
         let Self {
             components,
-            ipc,
+            service,
+            http,
             endpoint_claim,
             endpoint,
             ..
         } = self;
         // SearchIndex clones and every task owner release before either daemon lease holder.
         drop(components);
-        drop(ipc);
+        drop(http);
+        drop(service);
         drop(endpoint_claim);
         drop(endpoint);
     }
@@ -770,7 +798,7 @@ impl SupervisorState {
 }
 
 fn finish_shutdown(
-    endpoint_cleanup: EndpointCleanupV1,
+    endpoint_cleanup: LoopbackEndpointCleanup,
     failures: Vec<String>,
 ) -> Result<DaemonShutdownReport, DaemonRuntimeError> {
     if failures.is_empty() {
@@ -780,10 +808,10 @@ fn finish_shutdown(
     }
 }
 
-fn collect_shutdown_failure<E>(
+fn collect_shutdown_failure<T, E>(
     failures: &mut Vec<String>,
     component: &'static str,
-    result: Result<(), E>,
+    result: Result<T, E>,
 ) where
     E: std::fmt::Display,
 {
@@ -978,14 +1006,10 @@ mod tests {
     use tokio::sync::oneshot;
     use unity_asset_search_index::{AssetLoadBudget, IndexPaths, SearchIndex};
     use unity_asset_search_local::{
-        EndpointClaimV1, EndpointNamespaceV1, EndpointStoreError, EndpointTransportError,
-        FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorV1, VerifiedFramedTransportV1,
-        generate_daemon_instance_id,
+        EndpointNamespaceV1, EndpointStoreError, LoopbackEndpointClaim, PrivateRootsV1,
+        ProjectLocatorV1, generate_daemon_instance_id,
     };
-    use unity_asset_search_protocol::{
-        BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, DaemonInstanceId,
-        FrameLimits, decode_validated_frame, encode_frame,
-    };
+    use unity_asset_search_protocol::DaemonInstanceId;
 
     use super::{
         AdmissionGate, AdmissionLifecycle, BlockingTaskError, BlockingTaskOwner,
@@ -995,7 +1019,7 @@ mod tests {
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution,
     };
-    use crate::ipc::SessionPanicTestGate;
+    use crate::http_transport::BoundLoopbackHttp;
     use crate::operations::{OperationServiceOwner, SemanticUpgradeRuntime};
     use crate::service::SearchService;
     use crate::watcher::{MaintenanceRuntime, WatcherConfig};
@@ -1045,7 +1069,7 @@ mod tests {
             .endpoint_namespace(endpoint_locator.project_id())
             .unwrap();
         let cleanup_path = namespace.path().to_path_buf();
-        let endpoint_claim = namespace.claim_daemon_endpoint().unwrap();
+        let endpoint_claim = namespace.claim_loopback_endpoint().unwrap();
         let endpoint_paths = IndexPaths::for_project(
             endpoint_locator.root().to_path_buf(),
             Some(endpoint_project.path().join(".endpoint-index")),
@@ -1101,19 +1125,14 @@ mod tests {
                 && actual_component == component.label()
         ));
         assert!(matches!(
-            namespace.discover_endpoint(),
+            namespace.discover_loopback_endpoint(),
             Err(EndpointStoreError::DescriptorMissing)
         ));
-        let replacement = namespace.claim_daemon_endpoint().unwrap();
+        let replacement = namespace.claim_loopback_endpoint().unwrap();
         drop(replacement);
         drop(namespace);
         drop(roots);
-        for name in [
-            "binding.v1",
-            ".binding-v1.lock",
-            ".daemon-v1.lock",
-            "windows-pipe-slot.v1.json",
-        ] {
+        for name in ["binding.v1", ".binding-v1.lock", ".daemon-v1.lock"] {
             let result = fs::remove_file(cleanup_path.join(name));
             assert!(
                 result.is_ok()
@@ -1170,35 +1189,6 @@ mod tests {
                 message: "coordinator runner panicked".to_owned(),
             })
         );
-    }
-
-    async fn bootstrap_fixture_client(
-        client: &mut VerifiedFramedTransportV1,
-        descriptor: unity_asset_search_local::EndpointDescriptorV1,
-    ) {
-        let hello = BootstrapHelloV2::new(
-            descriptor.project_id(),
-            descriptor.daemon_instance_id(),
-            vec![BUSINESS_PROTOCOL_REVISION],
-        )
-        .unwrap();
-        let frame = encode_frame(&hello, FrameLimits::bootstrap()).unwrap();
-        client
-            .write_frame(&frame, FrameLimits::bootstrap(), Duration::from_secs(5))
-            .await
-            .unwrap();
-        let frame = client
-            .read_frame(
-                FrameLimits::bootstrap(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
-            )
-            .await
-            .unwrap()
-            .expect("daemon returned a bootstrap reply");
-        let mut budget = AssetLoadBudget::default();
-        let reply: BootstrapReplyV2 =
-            decode_validated_frame(&frame, &mut budget, FrameLimits::bootstrap()).unwrap();
-        assert_eq!(reply.selected_revision(), Some(BUSINESS_PROTOCOL_REVISION));
     }
 
     #[tokio::test]
@@ -1306,56 +1296,8 @@ mod tests {
         let report = fixture.runtime_mut().run().await.unwrap();
         assert_eq!(
             report.endpoint_cleanup,
-            unity_asset_search_local::EndpointCleanupV1::Removed
+            unity_asset_search_local::LoopbackEndpointCleanup::Removed
         );
-        fixture.finish();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn drain_deadline_aborts_an_idle_session_before_blocking_work_releases_authority() {
-        let mut fixture = RuntimeFixture::new(generate_daemon_instance_id().unwrap());
-        fixture.wait_for_publication().await;
-        let descriptor = fixture.namespace().discover_endpoint().unwrap();
-        let mut client = descriptor
-            .connect_verified(fixture.namespace(), Instant::now() + Duration::from_secs(5))
-            .await
-            .unwrap();
-        bootstrap_fixture_client(&mut client, descriptor.descriptor()).await;
-
-        fixture.runtime().begin_shutdown(Duration::ZERO);
-        let closed = client
-            .read_frame(
-                FrameLimits::response(unity_asset_search_protocol::OperationKind::Status),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(5)),
-            )
-            .await;
-        match closed {
-            Ok(None) => {}
-            Err(EndpointTransportError::Io { source, .. })
-                if matches!(
-                    source.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::NotConnected
-                ) || source.raw_os_error() == Some(233) => {}
-            Ok(Some(_)) => panic!("draining session returned unexpected response bytes"),
-            Err(error) => panic!("draining session failed unexpectedly: {error}"),
-        }
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), fixture.runtime_mut().run())
-                .await
-                .is_err()
-        );
-        fixture.assert_authority_is_still_held();
-
-        fixture.release_blocking_work();
-        let report = fixture.runtime_mut().run().await.unwrap();
-        assert_eq!(
-            report.endpoint_cleanup,
-            unity_asset_search_local::EndpointCleanupV1::Removed
-        );
-        drop(client);
         fixture.finish();
     }
 
@@ -1417,41 +1359,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn service_loop_panic_joins_spawned_session_before_releasing_authority() {
-        let mut fixture = RuntimeFixture::new_with_panic(
-            generate_daemon_instance_id().unwrap(),
-            SupervisorPanicStage::AfterSessionSpawn,
-        );
-        fixture.wait_for_publication().await;
-        let descriptor = fixture.namespace().discover_endpoint().unwrap();
-        let mut client = descriptor
-            .connect_verified(fixture.namespace(), Instant::now() + Duration::from_secs(5))
-            .await
-            .unwrap();
-        fixture.wait_for_session_spawn().await;
-        bootstrap_fixture_client(&mut client, descriptor.descriptor()).await;
-        fixture.trigger_session_panic();
-        fixture.wait_for_sessions_drained().await;
-        assert!(matches!(
-            fixture.namespace().discover_endpoint(),
-            Err(EndpointStoreError::DescriptorMissing)
-        ));
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), fixture.runtime_mut().run())
-                .await
-                .is_err()
-        );
-        fixture.assert_authority_is_still_held();
-
-        fixture.release_blocking_work();
-        let error = fixture.runtime_mut().run().await.unwrap_err();
-        assert!(error.to_string().contains("supervisor panicked"));
-        drop(client);
-        fixture.finish();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cleanup_panic_retains_authority_until_process_exit() {
         let mut fixture = RuntimeFixture::new_with_panic(
             generate_daemon_instance_id().unwrap(),
@@ -1475,6 +1382,31 @@ mod tests {
         // This branch intentionally retains authority until this test process exits. The fixture
         // uses unique project and endpoint roots, so preserving it cannot block another test.
         std::mem::forget(fixture);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_withdraws_discovery_before_waiting_for_prior_admission() {
+        let mut fixture = RuntimeFixture::new(generate_daemon_instance_id().unwrap());
+        fixture.wait_for_publication().await;
+        let admission = fixture.admission().admit().await.unwrap();
+        fixture.runtime().begin_shutdown(Duration::from_secs(5));
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), fixture.runtime_mut().run())
+                .await
+                .is_err(),
+            "the retained admission must keep shutdown incomplete"
+        );
+        assert!(matches!(
+            fixture.namespace().discover_loopback_endpoint(),
+            Err(EndpointStoreError::DescriptorMissing)
+        ));
+        fixture.assert_authority_is_still_held();
+
+        drop(admission);
+        fixture.release_blocking_work();
+        fixture.runtime_mut().run().await.unwrap();
+        fixture.finish();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1517,14 +1449,8 @@ mod tests {
         cleanup_path: PathBuf,
         index_paths: IndexPaths,
         runtime: Option<DaemonRuntime>,
+        admission: AdmissionGate,
         release: Option<mpsc::Sender<()>>,
-        session_panic: Option<SessionPanicControl>,
-    }
-
-    struct SessionPanicControl {
-        spawned: Option<oneshot::Receiver<()>>,
-        release: Option<oneshot::Sender<()>>,
-        drained: Option<oneshot::Receiver<()>>,
     }
 
     impl RuntimeFixture {
@@ -1553,7 +1479,7 @@ mod tests {
                 .endpoint_namespace(locator.project_id())
                 .unwrap();
             let cleanup_path = namespace.path().to_path_buf();
-            let endpoint_claim = namespace.claim_daemon_endpoint().unwrap();
+            let endpoint_claim = namespace.claim_loopback_endpoint().unwrap();
             let index_paths = IndexPaths::for_project(
                 locator.root().to_path_buf(),
                 Some(project.path().join(".lifecycle-index")),
@@ -1566,27 +1492,7 @@ mod tests {
 
             let (started_sender, started_receiver) = mpsc::sync_channel(1);
             let (release_sender, release_receiver) = mpsc::channel();
-            let (session_panic_gate, session_panic) =
-                if panic_stage == Some(SupervisorPanicStage::AfterSessionSpawn) {
-                    let (spawned_sender, spawned) = oneshot::channel();
-                    let (release, release_receiver) = oneshot::channel();
-                    let (drained_sender, drained) = oneshot::channel();
-                    (
-                        Some(SessionPanicTestGate {
-                            spawned: spawned_sender,
-                            release: release_receiver,
-                            drained: drained_sender,
-                        }),
-                        Some(SessionPanicControl {
-                            spawned: Some(spawned),
-                            release: Some(release),
-                            drained: Some(drained),
-                        }),
-                    )
-                } else {
-                    (None, None)
-                };
-            let runtime = start_fixture_runtime(
+            let (runtime, admission) = start_fixture_runtime(
                 endpoint_claim,
                 daemon_instance_id,
                 query_policy_id,
@@ -1594,7 +1500,6 @@ mod tests {
                 started_sender,
                 release_receiver,
                 panic_stage,
-                session_panic_gate,
             );
             started_receiver
                 .recv_timeout(Duration::from_secs(5))
@@ -1606,54 +1511,15 @@ mod tests {
                 cleanup_path,
                 index_paths,
                 runtime: Some(runtime),
+                admission,
                 release: Some(release_sender),
-                session_panic,
             }
-        }
-
-        async fn wait_for_session_spawn(&mut self) {
-            let spawned = self
-                .session_panic
-                .as_mut()
-                .expect("fixture has a session panic control")
-                .spawned
-                .take()
-                .expect("session spawn is observed once");
-            tokio::time::timeout(Duration::from_secs(5), spawned)
-                .await
-                .expect("session spawn observation timed out")
-                .expect("IPC service dropped the session spawn observation");
-        }
-
-        fn trigger_session_panic(&mut self) {
-            self.session_panic
-                .as_mut()
-                .expect("fixture has a session panic control")
-                .release
-                .take()
-                .expect("session panic is triggered once")
-                .send(())
-                .expect("IPC service retains the session panic gate");
-        }
-
-        async fn wait_for_sessions_drained(&mut self) {
-            let drained = self
-                .session_panic
-                .as_mut()
-                .expect("fixture has a session panic control")
-                .drained
-                .take()
-                .expect("session drain is observed once");
-            tokio::time::timeout(Duration::from_secs(5), drained)
-                .await
-                .expect("session drain observation timed out")
-                .expect("IPC service dropped the session drain observation");
         }
 
         async fn wait_for_publication(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                match self.namespace().discover_endpoint() {
+                match self.namespace().discover_loopback_endpoint() {
                     Ok(_) => return,
                     Err(EndpointStoreError::DescriptorMissing) => {}
                     Err(error) => panic!("wait for lifecycle endpoint publication: {error}"),
@@ -1665,7 +1531,7 @@ mod tests {
 
         fn assert_authority_is_still_held(&self) {
             assert!(matches!(
-                self.namespace().claim_daemon_endpoint(),
+                self.namespace().claim_loopback_endpoint(),
                 Err(EndpointStoreError::LeaseHeld)
             ));
             let mut budget = AssetLoadBudget::default();
@@ -1682,7 +1548,7 @@ mod tests {
         fn wait_for_authority_release(&self) {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             let replacement = loop {
-                match self.namespace().claim_daemon_endpoint() {
+                match self.namespace().claim_loopback_endpoint() {
                     Ok(claim) => break claim,
                     Err(EndpointStoreError::LeaseHeld) => {}
                     Err(error) => panic!("reacquire endpoint after detached shutdown: {error}"),
@@ -1711,7 +1577,7 @@ mod tests {
         }
 
         fn finish(mut self) {
-            let replacement = self.namespace().claim_daemon_endpoint().unwrap();
+            let replacement = self.namespace().claim_loopback_endpoint().unwrap();
             drop(replacement);
             let mut budget = AssetLoadBudget::default();
             let reopened =
@@ -1719,12 +1585,7 @@ mod tests {
             drop(reopened);
             drop(self.runtime.take());
             drop(self.namespace.take());
-            for name in [
-                "binding.v1",
-                ".binding-v1.lock",
-                ".daemon-v1.lock",
-                "windows-pipe-slot.v1.json",
-            ] {
+            for name in ["binding.v1", ".binding-v1.lock", ".daemon-v1.lock"] {
                 let result = fs::remove_file(self.cleanup_path.join(name));
                 assert!(
                     result.is_ok()
@@ -1744,6 +1605,10 @@ mod tests {
 
         fn runtime_mut(&mut self) -> &mut DaemonRuntime {
             self.runtime.as_mut().unwrap()
+        }
+
+        fn admission(&self) -> &AdmissionGate {
+            &self.admission
         }
     }
 
@@ -1773,16 +1638,20 @@ mod tests {
     }
 
     fn start_fixture_runtime(
-        endpoint_claim: EndpointClaimV1,
+        endpoint_claim: LoopbackEndpointClaim,
         daemon_instance_id: DaemonInstanceId,
         query_policy_id: unity_asset_search_protocol::QueryPolicyId,
         index: SearchIndex,
         started: mpsc::SyncSender<()>,
         release: mpsc::Receiver<()>,
         panic_stage: Option<SupervisorPanicStage>,
-        session_panic_gate: Option<SessionPanicTestGate>,
-    ) -> DaemonRuntime {
-        DaemonRuntime::start_with_factory(move || -> anyhow::Result<_> {
+    ) -> (DaemonRuntime, AdmissionGate) {
+        let admission = AdmissionGate::default();
+        let runtime_admission = admission.clone();
+        let runtime = DaemonRuntime::start_with_factory(move || -> anyhow::Result<_> {
+            let endpoint_project_id = endpoint_claim.project_id();
+            let capability = endpoint_claim.capability().clone();
+            let bound_http = BoundLoopbackHttp::bind()?;
             let blocking_tasks = BlockingTaskOwner::new();
             let blocking_handle = blocking_tasks.handle();
             drop(tokio::spawn(async move {
@@ -1802,11 +1671,10 @@ mod tests {
                     ))
                 },
             )?;
-            let admission = AdmissionGate::default();
             let operations = OperationServiceOwner::new(
                 daemon_instance_id,
                 coordinator.coordinator(),
-                admission.clone(),
+                runtime_admission.clone(),
             );
             let semantic_upgrade = SemanticUpgradeRuntime::start(false, operations.service());
             let maintenance = MaintenanceRuntime::start(operations.service(), None, None);
@@ -1815,14 +1683,22 @@ mod tests {
                 blocking_tasks.handle(),
                 operations.service(),
                 query_policy_id,
-                admission,
+                runtime_admission,
                 maintenance.handle(),
+            );
+            let http = bound_http.into_server(
+                endpoint_project_id,
+                daemon_instance_id,
+                capability,
+                blocking_tasks.handle(),
+                service.clone(),
             );
             Ok(DaemonRuntimeParts {
                 endpoint_claim,
                 daemon_instance_id,
                 startup_reindex: None,
                 service,
+                http,
                 maintenance,
                 semantic_upgrade,
                 coordinator,
@@ -1830,19 +1706,14 @@ mod tests {
                 blocking_tasks,
                 index,
                 panic_stage,
-                session_panic_gate,
             })
         })
-        .unwrap()
+        .unwrap();
+        (runtime, admission)
     }
 
     impl Drop for RuntimeFixture {
         fn drop(&mut self) {
-            if let Some(session_panic) = self.session_panic.as_mut()
-                && let Some(release) = session_panic.release.take()
-            {
-                let _ = release.send(());
-            }
             if let Some(release) = self.release.take() {
                 let _ = release.send(());
             }

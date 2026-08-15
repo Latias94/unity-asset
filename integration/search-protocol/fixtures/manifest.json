@@ -30,21 +30,6 @@
   },
   "valid": [
     {
-      "name": "bootstrap hello",
-      "kind": "bootstrap_hello",
-      "path": "bootstrap/hello-v2.json"
-    },
-    {
-      "name": "bootstrap accepted",
-      "kind": "bootstrap_reply",
-      "path": "bootstrap/accepted-v2.json"
-    },
-    {
-      "name": "bootstrap rejected",
-      "kind": "bootstrap_reply",
-      "path": "bootstrap/rejected-v2.json"
-    },
-    {
       "name": "capabilities request",
       "kind": "request",
       "operation": "capabilities",
@@ -236,54 +221,6 @@
     }
   ],
   "invalid": [
-    {
-      "name": "bootstrap empty revisions",
-      "kind": "bootstrap_hello",
-      "path": "invalid/bootstrap-empty-revisions-v2.json",
-      "expected_error": "supported_revisions"
-    },
-    {
-      "name": "bootstrap duplicate revisions",
-      "kind": "bootstrap_hello",
-      "path": "invalid/bootstrap-duplicate-revisions-v2.json",
-      "expected_error": "strictly increasing"
-    },
-    {
-      "name": "bootstrap unsorted revisions",
-      "kind": "bootstrap_hello",
-      "path": "invalid/bootstrap-unsorted-revisions-v2.json",
-      "expected_error": "strictly increasing"
-    },
-    {
-      "name": "bootstrap wrong version",
-      "kind": "bootstrap_hello",
-      "path": "invalid/bootstrap-wrong-version-v2.json",
-      "expected_error": "bootstrap"
-    },
-    {
-      "name": "bootstrap project mismatch",
-      "kind": "bootstrap_reply",
-      "path": "invalid/bootstrap-project-mismatch-v2.json",
-      "expected_error": "project"
-    },
-    {
-      "name": "bootstrap daemon instance mismatch",
-      "kind": "bootstrap_reply",
-      "path": "invalid/bootstrap-instance-mismatch-v2.json",
-      "expected_error": "daemon instance"
-    },
-    {
-      "name": "bootstrap zero selected revision",
-      "kind": "bootstrap_reply",
-      "path": "invalid/bootstrap-zero-revision-v2.json",
-      "expected_error": "revision"
-    },
-    {
-      "name": "bootstrap zero query policy",
-      "kind": "bootstrap_reply",
-      "path": "invalid/bootstrap-zero-policy-v2.json",
-      "expected_error": "query_policy_id"
-    },
     {
       "name": "request cross revision",
       "kind": "request",

@@ -1,27 +1,18 @@
 //! Strict, transport-independent contracts shared by local search clients and daemons.
 
-mod bootstrap;
-mod framing;
 mod ids;
 mod json;
 mod model;
 mod operation;
 mod validation;
 
-pub use bootstrap::{
-    BOOTSTRAP_VERSION, BootstrapErrorCode, BootstrapHelloV2, BootstrapReplyV2,
-    MAX_BOOTSTRAP_REVISIONS,
-};
-pub use framing::{
-    FrameLimits, FramingError, decode_frame, decode_request_frame, decode_response_frame,
-    decode_validated_frame, encode_frame, encode_request_frame, encode_response_frame,
-};
 pub use ids::{
     DaemonInstanceId, FixedIdParseError, OperationId, ProjectId, QueryPolicyId, RequestId,
 };
 pub use json::{
-    MAX_REQUEST_JSON_BYTES, ProtocolJsonError, decode_request_json, decode_response_json,
-    encode_request_json, encode_response_json,
+    MAX_REQUEST_JSON_BYTES, ProtocolJsonError, ResponseEncoder, ValidatedRequest,
+    decode_request_json, decode_response_json, encode_request_json, encode_response_json,
+    max_response_json_bytes,
 };
 pub use model::{
     ApiError, ApiErrorCode, CandidateFieldV1, DaemonLifecycleState, DaemonLifecycleStatus,

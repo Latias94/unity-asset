@@ -751,7 +751,11 @@ impl OperationServiceOwner {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), anyhow::Error> {
-        self.service.lifecycle_admission.begin_draining().await;
+        self.service.lifecycle_admission.close();
+        self.service
+            .lifecycle_admission
+            .wait_for_admission_linearization()
+            .await;
         if self.draining.is_none() {
             let _admission = self.service.admission_gate.lock().await;
             let mut tasks = self.service.tasks.lock().await;

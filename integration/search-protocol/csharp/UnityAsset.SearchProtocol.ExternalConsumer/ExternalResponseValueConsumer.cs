@@ -17,27 +17,6 @@ public static class ExternalProtocolConsumer
             QueryPolicyId.Parse(queryPolicyId));
     }
 
-    public static BootstrapReplyV2 RoundTripBootstrap(ProtocolBinding binding)
-    {
-        var hello = new BootstrapHelloV2(
-            ProtocolConstants.BootstrapVersion,
-            binding.ProjectId,
-            binding.DaemonInstanceId,
-            new[] { ProtocolConstants.BusinessProtocolRevision });
-        BootstrapHelloV2 decodedHello = FrameCodec.DecodeBootstrapHello(
-            FrameCodec.EncodeBootstrapHello(
-                BootstrapCodec.DecodeHello(BootstrapCodec.EncodeHello(hello))));
-        BootstrapReplyV2 reply = BootstrapNegotiator.Negotiate(
-            decodedHello,
-            binding.ProjectId,
-            binding.DaemonInstanceId,
-            binding.QueryPolicyId,
-            new[] { ProtocolConstants.BusinessProtocolRevision });
-        return FrameCodec.DecodeBootstrapReply(
-            FrameCodec.EncodeBootstrapReply(
-                BootstrapCodec.DecodeReply(BootstrapCodec.EncodeReply(reply))));
-    }
-
     public static RequestEnvelopeV1 RoundTripRequest(
         ProtocolBinding binding,
         string requestId,
@@ -49,10 +28,9 @@ public static class ExternalProtocolConsumer
             RequestId.Parse(requestId),
             operationKind,
             requestPayloadJson);
-        RequestEnvelopeV1 decoded = BusinessCodec.DecodeRequest(
+        return BusinessCodec.DecodeRequest(
             BusinessCodec.EncodeRequest(request),
             binding);
-        return FrameCodec.DecodeRequest(FrameCodec.EncodeRequest(decoded), binding);
     }
 
     public static ResponseEnvelopeV1 RoundTripSuccess(
@@ -74,20 +52,30 @@ public static class ExternalProtocolConsumer
     }
 
     public static async Task<JsonElement> ExchangeAsync(
-        IProtocolTransportAdapter transport,
-        ProtocolBinding expectedBinding,
+        ProtocolHttpClient client,
         RequestEnvelopeV1 request,
         CancellationToken cancellationToken)
     {
-        using ProtocolSession session = await ProtocolSession.ConnectAsync(
-            transport,
-            expectedBinding.ProjectId,
-            expectedBinding.DaemonInstanceId,
-            cancellationToken).ConfigureAwait(false);
-        ResponseEnvelopeV1 response = await session.ExchangeAsync(request, cancellationToken)
+        if (client == null)
+        {
+            throw new ArgumentNullException(nameof(client));
+        }
+        ResponseEnvelopeV1 response = await client.ExchangeAsync(request, cancellationToken)
             .ConfigureAwait(false);
         response.ValidateFor(request);
         return response.Value.Clone();
+    }
+
+    public static ProtocolHttpClient OpenHttpClient(
+        Func<byte[]?> readCurrentCanonicalDescriptor,
+        ProjectId expectedProjectId,
+        QueryPolicyId expectedQueryPolicyId)
+    {
+        LoopbackEndpointDescriptor endpoint = LoopbackEndpointDescriptor.ReadFromSource(
+            readCurrentCanonicalDescriptor,
+            expectedProjectId,
+            expectedQueryPolicyId);
+        return ProtocolHttpClient.Open(endpoint);
     }
 
     public static OperationId ParseOperationId(string operationId)
@@ -121,33 +109,13 @@ public static class ExternalProtocolConsumer
         return response.ReadApiErrorCode();
     }
 
-    public static string ReadBootstrapRejectionCode(ProtocolBootstrapRejectedException error)
-    {
-        return error.Code;
-    }
-
     private static ResponseEnvelopeV1 RoundTripResponse(
         RequestEnvelopeV1 request,
         ResponseEnvelopeV1 response)
     {
         response.ValidateFor(request);
-        ResponseEnvelopeV1 decoded = BusinessCodec.DecodeResponse(
-            BusinessCodec.EncodeResponse(response));
-        return FrameCodec.DecodeResponse(FrameCodec.EncodeResponse(decoded, request), request);
-    }
-}
-
-public sealed class DelegatingTransportAdapter : IProtocolTransportAdapter
-{
-    private readonly Func<CancellationToken, Task<Stream>> connect;
-
-    public DelegatingTransportAdapter(Func<CancellationToken, Task<Stream>> connect)
-    {
-        this.connect = connect ?? throw new ArgumentNullException(nameof(connect));
-    }
-
-    public Task<Stream> ConnectAsync(CancellationToken cancellationToken)
-    {
-        return connect(cancellationToken);
+        ResponseEnvelopeV1 decoded = BusinessCodec.DecodeResponse(BusinessCodec.EncodeResponse(response));
+        decoded.ValidateFor(request);
+        return decoded;
     }
 }

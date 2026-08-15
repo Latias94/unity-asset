@@ -5,11 +5,10 @@ use std::fs;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::time::Instant;
 
 use serde_json::{Value, json};
 use support::{SearchDaemonFixture, TEST_TIMEOUT};
-use unity_asset_search_local::{EndpointStoreError, EndpointTransportError};
+use unity_asset_search_local::EndpointStoreError;
 use unity_asset_search_protocol::{
     DaemonLifecycleState, FilesystemReindexIntent, FreshnessMaintenance, GenerationFreshness,
     GenerationMaintenanceState, GenerationStamp, ReconcileLifecycle, ReferenceRequest,
@@ -72,20 +71,14 @@ async fn json_agent_drives_a_real_daemon_across_generation_and_process_replaceme
     fixture.write_asset("Target.prefab", TARGET, TARGET_GUID);
     fixture.write_asset("TargetTwo.prefab", TARGET_TWO, TARGET_TWO_GUID);
 
-    let project_id = fixture.project().project_id().to_string();
+    let project_id = fixture.namespace().project_id().to_string();
     let namespace = fixture.namespace();
     let mut daemon = fixture.spawn_daemon(false);
     let discovered = fixture.wait_for_endpoint(&mut daemon).await;
-    let stale_discovered = discovered;
     let original_instance = discovered.descriptor().daemon_instance_id();
 
-    let (capabilities_document, capabilities) = successful_operation(run_agent_request(
-        &fixture,
-        json!({
-            "kind": "capabilities",
-            "request": {},
-        }),
-    ));
+    let (capabilities_document, capabilities) =
+        successful_operation(run_convenience_capabilities(&fixture));
     let ResponseOperation::Capabilities(capabilities) = capabilities else {
         panic!("JSON agent received a non-capabilities response");
     };
@@ -199,7 +192,7 @@ async fn json_agent_drives_a_real_daemon_across_generation_and_process_replaceme
         daemon.stderr()
     );
     assert!(matches!(
-        namespace.discover_endpoint(),
+        namespace.discover_loopback_endpoint(),
         Err(EndpointStoreError::DescriptorMissing)
     ));
 
@@ -207,14 +200,6 @@ async fn json_agent_drives_a_real_daemon_across_generation_and_process_replaceme
     let replacement_discovered = fixture.wait_for_endpoint(&mut replacement).await;
     let replacement_instance = replacement_discovered.descriptor().daemon_instance_id();
     assert_ne!(replacement_instance, original_instance);
-    assert!(matches!(
-        stale_discovered
-            .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
-            .await,
-        Err(EndpointTransportError::Store(
-            EndpointStoreError::EndpointChanged
-        ))
-    ));
 
     let (replacement_document, replacement_capabilities) = successful_operation(run_agent_request(
         &fixture,
@@ -273,7 +258,7 @@ async fn json_agent_drives_a_real_daemon_across_generation_and_process_replaceme
         replacement.stderr()
     );
     assert!(matches!(
-        namespace.discover_endpoint(),
+        namespace.discover_loopback_endpoint(),
         Err(EndpointStoreError::DescriptorMissing)
     ));
 }
@@ -458,6 +443,23 @@ fn runner_daemon_binary() -> PathBuf {
         std::env::var_os(DAEMON_BINARY_ENV)
             .expect("explicit harness must set UNITY_ASSET_SEARCH_DAEMON"),
     )
+}
+
+fn run_convenience_capabilities(fixture: &SearchDaemonFixture) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_unity-asset-search-cli"))
+        .arg("--project-root")
+        .arg(fixture.project_root())
+        .arg("--index-dir")
+        .arg(fixture.index_directory())
+        .arg("--connect-timeout-ms")
+        .arg(TEST_TIMEOUT.as_millis().to_string())
+        .arg("--request-timeout-ms")
+        .arg(TEST_TIMEOUT.as_millis().to_string())
+        .arg("--daemon-binary")
+        .arg(runner_daemon_binary())
+        .arg("capabilities")
+        .output()
+        .expect("run convenience capabilities command")
 }
 
 fn run_agent_request<T>(fixture: &SearchDaemonFixture, operation: T) -> Output

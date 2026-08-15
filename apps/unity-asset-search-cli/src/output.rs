@@ -5,7 +5,7 @@ use unity_asset_search_protocol::{
     ApiError, ApiErrorCode, DaemonInstanceId, ProjectId, QueryPolicyId, ResponseOperation,
 };
 
-use crate::client::SessionBinding;
+use crate::client::EndpointBinding;
 
 pub const CLI_CONTRACT_VERSION: u16 = 2;
 const LOCAL_ERROR_SOURCE: &str = "unity_asset_search_cli";
@@ -129,21 +129,11 @@ impl CliFailure {
     pub const fn exit_code(&self) -> i32 {
         self.category.exit_code()
     }
-
-    #[cfg(test)]
-    #[must_use]
-    pub const fn is_retryable(&self) -> bool {
-        self.error.retryable
-    }
 }
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum CliSuccess {
-    Bootstrap {
-        selected_revision: u16,
-        daemon_started: bool,
-    },
     Operation(Box<ResponseOperation>),
 }
 
@@ -163,7 +153,7 @@ struct FailureDocument<'a> {
     error: &'a ApiError,
 }
 
-pub fn write_success(binding: SessionBinding, result: CliSuccess) -> Result<(), CliFailure> {
+pub fn write_success(binding: EndpointBinding, result: CliSuccess) -> Result<(), CliFailure> {
     let document = SuccessDocument {
         cli_contract_version: CLI_CONTRACT_VERSION,
         project_id: binding.project_id,

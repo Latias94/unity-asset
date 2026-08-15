@@ -15,8 +15,8 @@ and agent clients.
 
 The existing transport coupled those product requirements to a stronger and substantially more
 expensive security contract: platform-specific endpoint discovery, Unix peer credentials, Windows
-named-pipe slot rotation and impersonation, process-start identity, exact Windows execution-context
-identity, four-byte framed sessions, and a principal check around every inbound frame. That contract
+named-pipe slot rotation and impersonation, exact Windows execution-context identity, four-byte
+framed sessions, and a principal check around every inbound frame. That contract
 is not portable as a true per-message sender proof on every supported platform. It also forces the
 external Unity plugin to implement native endpoint and peer-verification adapters even though the
 search daemon exposes only a replaceable derived read model and never owns Workspace mutation.
@@ -64,20 +64,33 @@ The endpoint descriptor is a secret capability document rather than non-secret r
 It contains the loopback port, capability, project identity, daemon instance identity, current
 business revision, query-policy identity, and diagnostic process ID. Publication remains atomic and
 lease-bound. Readers use the private runtime authority, reject unexpected file identity or permission
-changes, and revalidate the descriptor generation around connection establishment.
+changes, and revalidate the descriptor generation around connection establishment. The Rust client
+owns that platform authority directly. Cross-language reference clients accept canonical descriptor
+bytes plus expected project/query-policy bindings from a caller-owned authority source; they do not
+claim to prove filesystem ownership or permissions themselves.
 
 ### Define The Local Trust Boundary Honestly
 
 The supported authorization boundary is the local operating-system user that owns the private
-runtime directory. The design prevents unauthenticated access by other local users and remote
-network clients. It does not claim to distinguish mutually hostile processes already executing as
-the same user, prevent deliberate capability delegation, or resist an administrator, debugger, or
-malware that can read the user's files or process memory.
+runtime directory. A correctly published live daemon rejects requests from remote clients and from
+local clients that do not possess the capability. It does not claim to distinguish mutually hostile
+processes already executing as the same user, prevent deliberate capability delegation, or resist
+an administrator, debugger, or malware that can read the user's files or process memory.
+
+Plain loopback HTTP also does not cryptographically authenticate the server before the client sends
+the bearer capability. If a daemon crashes while a stale descriptor remains and another local user
+actively binds the same numeric port, that process could receive the capability before descriptor
+revalidation detects the stale generation. Lease ownership, private atomic descriptor publication,
+withdrawal-before-drain, and generation revalidation close ordinary replacement races but do not
+eliminate that active port-squatting case. This residual risk is accepted for a derived read model
+that cannot mutate Workspace state. If cross-user server authenticity becomes a product requirement,
+the next design must pin an ephemeral TLS public key in the private descriptor; it must not add a
+custom challenge protocol.
 
 Exact Windows logon, integrity, elevation, restricted-token, and AppContainer equality is no longer
-part of the search transport contract. Process-start identity remains optional diagnostic and stale
-discovery evidence; it is not authorization. No request depends on Unix peer credentials, Windows
-pipe impersonation, or per-message operating-system principal evidence.
+part of the search transport contract. The descriptor's server PID is diagnostic metadata only; it
+is not authorization. No request depends on Unix peer credentials, Windows pipe impersonation, or
+per-message operating-system principal evidence.
 
 ### Harden The Standard HTTP Surface
 
@@ -87,8 +100,9 @@ The server and clients enforce the following boundary:
 - authenticate every request before business JSON parsing or dispatch;
 - reject browser-originated requests and unexpected `Host` values;
 - disable CORS and client proxy discovery for local daemon traffic;
-- apply explicit header, body, decode, dispatch, response, idle, and shutdown deadlines;
-- apply global connection and dispatch concurrency limits;
+- apply an explicit request-body deadline and operation-specific client deadlines;
+- enforce bounded request and response JSON before domain decoding or allocation growth;
+- apply class-specific dispatch concurrency limits inside the transport-neutral search service;
 - never place the capability in a URL, query string, trace span, diagnostic, or process argument;
 - publish discovery only after the service is ready and withdraw it before shutdown draining;
 - preserve project, daemon instance, request, query-policy, and response bindings in every exchange.
@@ -137,6 +151,7 @@ Costs:
 
 - the private endpoint descriptor becomes secret material and must retain strict filesystem handling;
 - loopback TCP is shared by local users, so the capability and private descriptor are mandatory;
+- plain loopback HTTP does not prove server identity before the first credential-bearing request;
 - same-user malicious processes are explicitly outside the authorization boundary;
 - the Rust, C#, CLI, daemon, fixtures, SDK bundle, and external Unity plugin require one coordinated
   breaking release;

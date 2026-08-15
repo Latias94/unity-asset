@@ -36,11 +36,10 @@ use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_ATTRIBUTE_TAG_INFO, FILE_DELETE_CHILD, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
     FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
-    FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
-    FILE_TRAVERSE, FILE_WRITE_DATA, FileAttributeTagInfo, FileDispositionInfo, FileIdInfo,
-    FileStandardInfo, GetDriveTypeW, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
-    OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS,
-    WRITE_DAC, WRITE_OWNER,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE,
+    FileAttributeTagInfo, FileDispositionInfo, FileIdInfo, FileStandardInfo, GetDriveTypeW,
+    GetFileInformationByHandleEx, GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL,
+    SYNCHRONIZE, SetFileInformationByHandle, VOLUME_NAME_DOS, WRITE_DAC, WRITE_OWNER,
 };
 use windows_sys::Win32::System::Com::CoTaskMemFree;
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
@@ -57,7 +56,7 @@ use windows_sys::Win32::System::WindowsProgramming::{
 use windows_sys::Win32::UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath};
 
 use super::{DiscoveredRoots, PRODUCT_DIRECTORY, PrivateRootsError};
-use crate::security_context::CurrentSecurityContextSnapshot;
+use crate::security_context::CurrentFilesystemAuthority;
 
 const DIRECTORY_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
 const STRICT_DIRECTORY_SHARE: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE;
@@ -70,8 +69,6 @@ const STABLE_PARENT_DIRECTORY_ACCESS: u32 =
 const ANCESTOR_VALIDATION_ACCESS: u32 =
     FILE_TRAVERSE | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
 const PRIVATE_OBJECT_ACCESS: u32 = FILE_ALL_ACCESS & !WRITE_OWNER;
-pub(crate) const WINDOWS_NAMED_PIPE_CLIENT_ACCESS: u32 =
-    FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const MAX_WINDOWS_ROOT_UTF16_UNITS: usize = 1_024;
 const MAX_WINDOWS_COMPONENT_UTF16_UNITS: usize = 255;
 const WINDOWS_ROOT_BUFFER_UTF16_UNITS: usize = MAX_WINDOWS_ROOT_UTF16_UNITS + 2;
@@ -104,37 +101,13 @@ pub(super) struct PrivateDirectory {
     handle: OwnedHandle,
     identity: DirectoryIdentity,
     ancestor_binding: AncestorBinding,
-    security_boundary: DirectorySecurityBoundary,
     canonical_path: PathBuf,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DirectorySecurityBoundary {
-    ExactSecurityContext,
-    PersistentUser,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StrictPathTerminal {
     TrustedAncestor,
     PrivateDirectory,
-}
-
-impl DirectorySecurityBoundary {
-    fn descriptor(
-        self,
-        security_context: &CurrentSecurityContextSnapshot,
-    ) -> io::Result<PrivateSecurityDescriptor> {
-        match self {
-            Self::ExactSecurityContext => PrivateSecurityDescriptor::new(
-                security_context.windows_user_sid(),
-                security_context.windows_logon_sid(),
-            ),
-            Self::PersistentUser => {
-                PrivateSecurityDescriptor::for_persistent_user(security_context.windows_user_sid())
-            }
-        }
-    }
 }
 
 struct StableParentDirectory {
@@ -154,14 +127,12 @@ impl StableParentDirectory {
         &self,
         name: &OsStr,
         security: &PrivateSecurityDescriptor,
-        security_boundary: DirectorySecurityBoundary,
     ) -> io::Result<PrivateDirectory> {
         create_or_open_private_directory_with_policy(
             self.handle.raw(),
             name,
             security,
             AncestorBinding::Standard,
-            security_boundary,
         )
     }
 }
@@ -174,9 +145,11 @@ impl PrivateDirectory {
     pub(super) fn revalidate(
         &self,
         path: &Path,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<()> {
-        let security = self.security_boundary.descriptor(security_context)?;
+        let security = PrivateSecurityDescriptor::for_persistent_user(
+            filesystem_authority.windows_user_sid(),
+        )?;
         if validate_secured_directory(self.handle.raw(), &security)? != self.identity {
             return Err(io::Error::other(
                 "private directory identity changed during revalidation",
@@ -193,8 +166,7 @@ impl PrivateDirectory {
             AncestorBinding::Strict { .. } => {
                 let reopened = open_strict_directory_path(
                     path,
-                    security_context,
-                    self.security_boundary,
+                    filesystem_authority,
                     StrictPathTerminal::PrivateDirectory,
                 )?;
                 (
@@ -214,15 +186,16 @@ impl PrivateDirectory {
     pub(super) fn create_private_child(
         &self,
         name: &OsStr,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<Self> {
-        let security = self.security_boundary.descriptor(security_context)?;
+        let security = PrivateSecurityDescriptor::for_persistent_user(
+            filesystem_authority.windows_user_sid(),
+        )?;
         create_or_open_private_directory_with_policy(
             self.handle.raw(),
             name,
             &security,
             self.ancestor_binding.clone(),
-            self.security_boundary,
         )
     }
 
@@ -230,11 +203,13 @@ impl PrivateDirectory {
         &self,
         directory_path: &Path,
         name: &OsStr,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<File> {
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         validate_leaf_component(name)?;
-        let security = self.security_boundary.descriptor(security_context)?;
+        let security = PrivateSecurityDescriptor::for_persistent_user(
+            filesystem_authority.windows_user_sid(),
+        )?;
         let (handle, information) = nt_create_file_at(
             self.handle.raw(),
             name,
@@ -249,7 +224,7 @@ impl PrivateDirectory {
         }
         let file = handle.into_file();
         validate_private_file(&file, &security)?;
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         Ok(file)
     }
 
@@ -257,12 +232,14 @@ impl PrivateDirectory {
         &self,
         directory_path: &Path,
         name: &OsStr,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
         writable: bool,
     ) -> io::Result<File> {
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         validate_leaf_component(name)?;
-        let security = self.security_boundary.descriptor(security_context)?;
+        let security = PrivateSecurityDescriptor::for_persistent_user(
+            filesystem_authority.windows_user_sid(),
+        )?;
         let access = FILE_READ_ATTRIBUTES
             | windows_sys::Win32::Foundation::GENERIC_READ
             | READ_CONTROL
@@ -274,7 +251,7 @@ impl PrivateDirectory {
         let (handle, _) = nt_create_file_at(self.handle.raw(), name, access, FILE_OPEN, None)?;
         let file = handle.into_file();
         validate_private_file(&file, &security)?;
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         Ok(file)
     }
 
@@ -284,12 +261,14 @@ impl PrivateDirectory {
         source: &OsStr,
         destination: &OsStr,
         replace: bool,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<()> {
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         validate_leaf_component(source)?;
         validate_leaf_component(destination)?;
-        let security = self.security_boundary.descriptor(security_context)?;
+        let security = PrivateSecurityDescriptor::for_persistent_user(
+            filesystem_authority.windows_user_sid(),
+        )?;
         let (source, _) = nt_create_file_at(
             self.handle.raw(),
             source,
@@ -309,7 +288,7 @@ impl PrivateDirectory {
                 RenameBehavior::NoReplace
             },
         )?;
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         Ok(())
     }
 
@@ -317,11 +296,13 @@ impl PrivateDirectory {
         &self,
         directory_path: &Path,
         name: &OsStr,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<()> {
-        self.revalidate(directory_path, security_context)?;
+        self.revalidate(directory_path, filesystem_authority)?;
         validate_leaf_component(name)?;
-        let security = self.security_boundary.descriptor(security_context)?;
+        let security = PrivateSecurityDescriptor::for_persistent_user(
+            filesystem_authority.windows_user_sid(),
+        )?;
         let (file, _) = nt_create_file_at(
             self.handle.raw(),
             name,
@@ -345,7 +326,7 @@ impl PrivateDirectory {
             return Err(io::Error::last_os_error());
         }
         drop(file);
-        self.revalidate(directory_path, security_context)
+        self.revalidate(directory_path, filesystem_authority)
     }
 
     pub(super) fn sync(&self) -> io::Result<()> {
@@ -512,18 +493,17 @@ struct DirectoryIdentity {
 
 pub(super) fn open_or_create_persistent_path(
     path: &Path,
-    security_context: &CurrentSecurityContextSnapshot,
+    filesystem_authority: &CurrentFilesystemAuthority,
 ) -> io::Result<PrivateDirectory> {
     let parent_path = path.parent().ok_or_else(invalid_root)?;
     let name = path.file_name().ok_or_else(invalid_component)?;
-    let security_boundary = DirectorySecurityBoundary::PersistentUser;
     let parent = open_strict_directory_path(
         parent_path,
-        security_context,
-        security_boundary,
+        filesystem_authority,
         StrictPathTerminal::TrustedAncestor,
     )?;
-    let security = security_boundary.descriptor(security_context)?;
+    let security =
+        PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())?;
     let ancestor_guards: Arc<[OwnedHandle]> = Arc::from(parent.handles);
     let parent_handle = ancestor_guards
         .last()
@@ -536,49 +516,36 @@ pub(super) fn open_or_create_persistent_path(
         AncestorBinding::Strict {
             _guards: ancestor_guards,
         },
-        security_boundary,
     )?;
-    directory.revalidate(&directory.canonical_path, security_context)?;
+    directory.revalidate(&directory.canonical_path, filesystem_authority)?;
     Ok(directory)
 }
 
 pub(super) fn discover(
-    security_context: &CurrentSecurityContextSnapshot,
+    filesystem_authority: &CurrentFilesystemAuthority,
 ) -> Result<DiscoveredRoots, PrivateRootsError> {
-    let security_context_id = security_context.id();
     let base_path = local_app_data_path().map_err(|source| PrivateRootsError::Filesystem {
         kind: super::PrivateRootKind::Runtime,
         operation: "resolve LocalAppData",
         path: PathBuf::from("<LocalAppData>"),
         source,
     })?;
-    let runtime_security = PrivateSecurityDescriptor::new(
-        security_context.windows_user_sid(),
-        security_context.windows_logon_sid(),
-    )
-    .map_err(|source| PrivateRootsError::Filesystem {
-        kind: super::PrivateRootKind::Runtime,
-        operation: "construct private Windows security descriptor",
-        path: base_path.clone(),
-        source,
-    })?;
     let persistent_security =
-        PrivateSecurityDescriptor::for_persistent_user(security_context.windows_user_sid())
+        PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())
             .map_err(|source| PrivateRootsError::Filesystem {
                 kind: super::PrivateRootKind::Cache,
                 operation: "construct persistent Windows user security descriptor",
                 path: base_path.clone(),
                 source,
             })?;
-    let stable_parent_security = PrivateSecurityDescriptor::for_shared_parent(
-        security_context.windows_user_sid(),
-    )
-    .map_err(|source| PrivateRootsError::Filesystem {
-        kind: super::PrivateRootKind::Runtime,
-        operation: "construct stable Windows parent security descriptor",
-        path: base_path.clone(),
-        source,
-    })?;
+    let stable_parent_security =
+        PrivateSecurityDescriptor::for_shared_parent(filesystem_authority.windows_user_sid())
+            .map_err(|source| PrivateRootsError::Filesystem {
+                kind: super::PrivateRootKind::Runtime,
+                operation: "construct stable Windows parent security descriptor",
+                path: base_path.clone(),
+                source,
+            })?;
     let base =
         open_directory_path(&base_path, STABLE_PARENT_DIRECTORY_ACCESS).map_err(|source| {
             PrivateRootsError::Filesystem {
@@ -629,36 +596,28 @@ pub(super) fn discover(
             source,
         })?;
 
-    let context_component = security_context_id.path_component();
-    let context_name = OsStr::new(&context_component);
-    let runtime_path = runtime_parent_path.join(context_name);
+    let persistent_user_component =
+        persistent_user_component(filesystem_authority.windows_user_sid()).map_err(|source| {
+            PrivateRootsError::Filesystem {
+                kind: super::PrivateRootKind::Runtime,
+                operation: "derive persistent Windows user namespace",
+                path: product_path.clone(),
+                source,
+            }
+        })?;
+    let persistent_user_name = OsStr::new(&persistent_user_component);
+    let runtime_path = runtime_parent_path.join(persistent_user_name);
     let runtime = runtime_parent
-        .create_private_child(
-            context_name,
-            &runtime_security,
-            DirectorySecurityBoundary::ExactSecurityContext,
-        )
+        .create_private_child(persistent_user_name, &persistent_security)
         .map_err(|source| PrivateRootsError::Filesystem {
             kind: super::PrivateRootKind::Runtime,
-            operation: "create security-context runtime root",
+            operation: "create persistent-user runtime root",
             path: runtime_path.clone(),
             source,
         })?;
-    let persistent_user_component = persistent_user_component(security_context.windows_user_sid())
-        .map_err(|source| PrivateRootsError::Filesystem {
-            kind: super::PrivateRootKind::Cache,
-            operation: "derive persistent Windows user namespace",
-            path: cache_parent_path.clone(),
-            source,
-        })?;
-    let persistent_user_name = OsStr::new(&persistent_user_component);
     let cache_path = cache_parent_path.join(persistent_user_name);
     let cache = cache_parent
-        .create_private_child(
-            persistent_user_name,
-            &persistent_security,
-            DirectorySecurityBoundary::PersistentUser,
-        )
+        .create_private_child(persistent_user_name, &persistent_security)
         .map_err(|source| PrivateRootsError::Filesystem {
             kind: super::PrivateRootKind::Cache,
             operation: "create persistent-user cache root",
@@ -752,12 +711,12 @@ fn open_directory_path(path: &Path, final_access: u32) -> io::Result<OwnedHandle
 
 fn open_strict_directory_path(
     path: &Path,
-    security_context: &CurrentSecurityContextSnapshot,
-    security_boundary: DirectorySecurityBoundary,
+    filesystem_authority: &CurrentFilesystemAuthority,
     terminal: StrictPathTerminal,
 ) -> io::Result<StrictDirectoryPath> {
     let mut parts = AbsolutePathParts::new(path)?;
-    let security = security_boundary.descriptor(security_context)?;
+    let security =
+        PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())?;
     let mut display_path = PathBuf::from(parts.root());
     display_path.push(Path::new(std::path::MAIN_SEPARATOR_STR));
     let root = open_root_with_access_and_share(
@@ -824,13 +783,7 @@ fn create_or_open_private_directory(
     name: &OsStr,
     security: &PrivateSecurityDescriptor,
 ) -> io::Result<PrivateDirectory> {
-    create_or_open_private_directory_with_policy(
-        parent,
-        name,
-        security,
-        AncestorBinding::Standard,
-        DirectorySecurityBoundary::ExactSecurityContext,
-    )
+    create_or_open_private_directory_with_policy(parent, name, security, AncestorBinding::Standard)
 }
 
 fn create_or_open_private_directory_with_policy(
@@ -838,7 +791,6 @@ fn create_or_open_private_directory_with_policy(
     name: &OsStr,
     security: &PrivateSecurityDescriptor,
     ancestor_binding: AncestorBinding,
-    security_boundary: DirectorySecurityBoundary,
 ) -> io::Result<PrivateDirectory> {
     let share = match &ancestor_binding {
         AncestorBinding::Standard => DIRECTORY_SHARE,
@@ -856,7 +808,6 @@ fn create_or_open_private_directory_with_policy(
         handle,
         identity,
         ancestor_binding,
-        security_boundary,
         canonical_path,
     })
 }
@@ -1182,26 +1133,6 @@ unsafe impl Send for PrivateSecurityDescriptor {}
 unsafe impl Sync for PrivateSecurityDescriptor {}
 
 impl PrivateSecurityDescriptor {
-    pub(crate) fn new(owner_bytes: &[u8], principal_bytes: &[u8]) -> io::Result<Self> {
-        Self::with_access(
-            owner_bytes,
-            principal_bytes,
-            PRIVATE_OBJECT_ACCESS,
-            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-            READ_CONTROL,
-        )
-    }
-
-    pub(crate) fn for_named_pipe(owner_bytes: &[u8], principal_bytes: &[u8]) -> io::Result<Self> {
-        Self::with_access(
-            owner_bytes,
-            principal_bytes,
-            WINDOWS_NAMED_PIPE_CLIENT_ACCESS,
-            0,
-            READ_CONTROL,
-        )
-    }
-
     pub(crate) fn for_shared_parent(user_bytes: &[u8]) -> io::Result<Self> {
         Self::with_access(
             user_bytes,
@@ -1306,10 +1237,9 @@ impl PrivateSecurityDescriptor {
         if unsafe { InitializeAcl(dacl_ptr, dacl_length, ACL_REVISION) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        // Any OWNER_RIGHTS ACE suppresses the owner's implicit READ_CONTROL and WRITE_DAC. Exact
-        // runtime objects intentionally keep WRITE_DAC tied to the logon principal. Persistent
-        // user objects grant it to the owner so a later login by the same user can normalize the
-        // protected DACL without widening the storage trust boundary.
+        // Any OWNER_RIGHTS ACE suppresses the owner's implicit READ_CONTROL and WRITE_DAC. Private
+        // user objects grant explicit repair authority so another process for the same persistent
+        // user can normalize the protected DACL without widening the storage trust boundary.
         // SAFETY: the DACL allocation includes the complete retained OWNER_RIGHTS SID.
         if unsafe {
             AddAccessAllowedAceEx(
@@ -1376,7 +1306,8 @@ impl PrivateSecurityDescriptor {
         &raw const self.descriptor
     }
 
-    pub(crate) fn verify_handle(&self, handle: HANDLE) -> io::Result<()> {
+    #[cfg(test)]
+    fn verify_handle(&self, handle: HANDLE) -> io::Result<()> {
         self.verify(handle)
     }
 
@@ -1551,7 +1482,7 @@ fn is_trusted_ancestor_sid(
 ) -> bool {
     // Windows protects the volume root with the stable TrustedInstaller service SID. It belongs
     // to the same operating-system trust domain as SYSTEM and Administrators for ancestor checks;
-    // final private directories still require the exact user/logon descriptor.
+    // final private directories still require the protected persistent-user descriptor.
     (unsafe { EqualSid(sid, owner_sid) }) != 0
         || (unsafe { EqualSid(sid, principal_sid) }) != 0
         || (unsafe { EqualSid(sid, trusted_installer_sid) }) != 0
@@ -2151,6 +2082,26 @@ mod tests {
         unsafe { ace.cast::<ACCESS_ALLOWED_ACE>().read_unaligned().Mask }
     }
 
+    fn builtin_administrators_sid() -> Vec<u8> {
+        let mut sid = vec![0_u8; usize::try_from(SECURITY_MAX_SID_SIZE).unwrap()];
+        let mut length = u32::try_from(sid.len()).unwrap();
+        // SAFETY: the output buffer is writable for `length` bytes and no domain SID is required
+        // for the built-in Administrators SID.
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr().cast(),
+                    &raw mut length,
+                )
+            },
+            0
+        );
+        sid.truncate(usize::try_from(length).unwrap());
+        sid
+    }
+
     #[test]
     fn native_leaf_rejects_win32_trailing_dot_and_space_aliases() {
         let mut encoded = [0_u16; MAX_WINDOWS_COMPONENT_UTF16_UNITS];
@@ -2164,54 +2115,41 @@ mod tests {
     }
 
     #[test]
-    fn persistent_user_namespace_is_stable_and_distinct_from_runtime_context() {
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let first = persistent_user_component(security_context.windows_user_sid()).unwrap();
-        let second = persistent_user_component(security_context.windows_user_sid()).unwrap();
+    fn persistent_user_namespace_is_stable_and_sid_scoped() {
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
+        let first = persistent_user_component(filesystem_authority.windows_user_sid()).unwrap();
+        let second = persistent_user_component(filesystem_authority.windows_user_sid()).unwrap();
+        let foreign = persistent_user_component(&builtin_administrators_sid()).unwrap();
 
         assert_eq!(first, second);
         assert!(first.starts_with("user-"));
-        assert_ne!(first, security_context.id().path_component());
+        assert_ne!(first, foreign);
     }
 
     #[test]
-    fn discovery_wires_runtime_and_cache_to_different_authorities() {
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let discovered = discover(&security_context).unwrap();
+    fn discovery_scopes_runtime_and_cache_to_the_persistent_user() {
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
+        let discovered = discover(&filesystem_authority).unwrap();
         let persistent_user =
-            persistent_user_component(security_context.windows_user_sid()).unwrap();
+            persistent_user_component(filesystem_authority.windows_user_sid()).unwrap();
 
         assert_eq!(
             discovered.runtime_path.file_name(),
-            Some(OsStr::new(&security_context.id().path_component()))
+            Some(OsStr::new(&persistent_user))
         );
         assert_eq!(
             discovered.cache_path.file_name(),
             Some(OsStr::new(&persistent_user))
         );
-        assert_eq!(
-            discovered.runtime.security_boundary,
-            DirectorySecurityBoundary::ExactSecurityContext
-        );
-        assert_eq!(
-            discovered.cache.security_boundary,
-            DirectorySecurityBoundary::PersistentUser
-        );
     }
 
     #[test]
     fn persistent_user_descriptor_retains_owner_acl_repair_authority() {
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let exact = PrivateSecurityDescriptor::new(
-            security_context.windows_user_sid(),
-            security_context.windows_logon_sid(),
-        )
-        .unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
         let persistent =
-            PrivateSecurityDescriptor::for_persistent_user(security_context.windows_user_sid())
+            PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())
                 .unwrap();
 
-        assert_eq!(first_allowed_ace_mask(&exact), READ_CONTROL);
         assert_eq!(
             first_allowed_ace_mask(&persistent),
             READ_CONTROL | WRITE_DAC
@@ -2222,21 +2160,19 @@ mod tests {
     fn persistent_directory_rejects_a_foreign_sid_descriptor() {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
         let persistent =
-            PrivateSecurityDescriptor::for_persistent_user(security_context.windows_user_sid())
+            PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())
                 .unwrap();
         let directory = create_or_open_private_directory_with_policy(
             base.raw(),
             OsStr::new("persistent"),
             &persistent,
             AncestorBinding::Standard,
-            DirectorySecurityBoundary::PersistentUser,
         )
         .unwrap();
         let foreign =
-            PrivateSecurityDescriptor::for_persistent_user(security_context.windows_logon_sid())
-                .unwrap();
+            PrivateSecurityDescriptor::for_persistent_user(&builtin_administrators_sid()).unwrap();
 
         assert!(foreign.verify_handle(directory.handle.raw()).is_err());
         persistent.verify_handle(directory.handle.raw()).unwrap();
@@ -2252,9 +2188,9 @@ mod tests {
         let actual_parent = temporary.path().join("CanonicalParent");
         std::fs::create_dir(&actual_parent).unwrap();
         let requested = temporary.path().join("canonicalparent").join("IndexBase");
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
 
-        let private = open_or_create_persistent_path(&requested, &security_context).unwrap();
+        let private = open_or_create_persistent_path(&requested, &filesystem_authority).unwrap();
         let canonical = private.canonical_path(&requested);
 
         assert_eq!(canonical.file_name(), Some(OsStr::new("IndexBase")));
@@ -2282,17 +2218,17 @@ mod tests {
             .prefix("unity-asset-strict-child-")
             .tempdir_in(local_app_data)
             .unwrap();
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
         let requested_base = temporary.path().join("IndexBase");
-        let base = open_or_create_persistent_path(&requested_base, &security_context).unwrap();
+        let base = open_or_create_persistent_path(&requested_base, &filesystem_authority).unwrap();
         let canonical_base = base.canonical_path(&requested_base);
         let requested_child = canonical_base.join("ProjectIndex");
         let child = base
-            .create_private_child(OsStr::new("ProjectIndex"), &security_context)
+            .create_private_child(OsStr::new("ProjectIndex"), &filesystem_authority)
             .unwrap();
 
         child
-            .revalidate(&requested_child, &security_context)
+            .revalidate(&requested_child, &filesystem_authority)
             .unwrap();
         assert_eq!(child.canonical_path(&requested_child), requested_child);
     }
@@ -2370,9 +2306,9 @@ mod tests {
     fn stable_parent_grants_only_cross_session_directory_creation_rights() {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
         let security =
-            PrivateSecurityDescriptor::for_shared_parent(security_context.windows_user_sid())
+            PrivateSecurityDescriptor::for_shared_parent(filesystem_authority.windows_user_sid())
                 .unwrap();
         let stable =
             create_or_open_stable_parent_directory(base.raw(), OsStr::new("stable"), &security)
@@ -2397,18 +2333,16 @@ mod tests {
     }
 
     #[test]
-    fn stable_parent_creates_an_exact_logon_private_context_child() {
+    fn stable_parent_creates_a_persistent_user_private_child() {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
         let stable_security =
-            PrivateSecurityDescriptor::for_shared_parent(security_context.windows_user_sid())
+            PrivateSecurityDescriptor::for_shared_parent(filesystem_authority.windows_user_sid())
                 .unwrap();
-        let private_security = PrivateSecurityDescriptor::new(
-            security_context.windows_user_sid(),
-            security_context.windows_logon_sid(),
-        )
-        .unwrap();
+        let private_security =
+            PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())
+                .unwrap();
         let stable = create_or_open_stable_parent_directory(
             base.raw(),
             OsStr::new("stable"),
@@ -2416,13 +2350,9 @@ mod tests {
         )
         .unwrap();
         let private = stable
-            .create_private_child(
-                OsStr::new("context"),
-                &private_security,
-                DirectorySecurityBoundary::ExactSecurityContext,
-            )
+            .create_private_child(OsStr::new("user"), &private_security)
             .unwrap();
-        let private_path = temporary.path().join("stable").join("context");
+        let private_path = temporary.path().join("stable").join("user");
 
         private_security
             .verify_handle(private.handle.raw())
@@ -2439,16 +2369,14 @@ mod tests {
     fn private_windows_child_revalidates_without_exposing_its_handle() {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let security = PrivateSecurityDescriptor::new(
-            security_context.windows_user_sid(),
-            security_context.windows_logon_sid(),
-        )
-        .unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
+        let security =
+            PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())
+                .unwrap();
         let private =
             create_or_open_private_directory(base.raw(), OsStr::new("private"), &security).unwrap();
         private
-            .revalidate(&temporary.path().join("private"), &security_context)
+            .revalidate(&temporary.path().join("private"), &filesystem_authority)
             .unwrap();
     }
 
@@ -2456,12 +2384,10 @@ mod tests {
     fn existing_insecure_windows_child_is_rejected_without_acl_repair() {
         let temporary = tempfile::tempdir().unwrap();
         let base = open_directory_path(temporary.path(), DIRECTORY_CREATE_ACCESS).unwrap();
-        let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-        let security = PrivateSecurityDescriptor::new(
-            security_context.windows_user_sid(),
-            security_context.windows_logon_sid(),
-        )
-        .unwrap();
+        let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
+        let security =
+            PrivateSecurityDescriptor::for_persistent_user(filesystem_authority.windows_user_sid())
+                .unwrap();
         std::fs::create_dir(temporary.path().join("private")).unwrap();
         assert!(
             create_or_open_private_directory(base.raw(), OsStr::new("private"), &security).is_err()

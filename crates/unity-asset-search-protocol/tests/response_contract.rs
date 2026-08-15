@@ -13,7 +13,7 @@ use unity_asset_search_protocol::{
     RequestEnvelope, RequestId, RequestOperation, ResponseEnvelope, ResponseOperation,
     ResponseOutcome, SEARCH_PROTOCOL_REVISION, SearchCapabilities, SearchRequest, SearchResponse,
     ServingAvailability, ShutdownRequest, StatusResponse, SuggestRequest, SuggestResponse,
-    TimerLifecycleState, ValidateContract, WatcherLifecycleState, encode_response_frame,
+    TimerLifecycleState, ValidateContract, WatcherLifecycleState, encode_response_json,
 };
 
 const GUID: &str = "0123456789abcdef0123456789abcdef";
@@ -645,7 +645,7 @@ fn structured_errors_validate_protocol_and_query_policy_binding() {
 }
 
 #[test]
-fn maximum_error_message_fits_every_response_frame() {
+fn maximum_error_message_fits_every_response_document() {
     let request = request(RequestOperation::Shutdown(ShutdownRequest {
         drain_timeout_ms: 0,
     }));
@@ -656,7 +656,7 @@ fn maximum_error_message_fits_every_response_frame() {
     );
     let response = ResponseEnvelope::error(&request, error);
 
-    assert!(encode_response_frame(&response, &request).is_ok());
+    assert!(encode_response_json(&response, &request).is_ok());
 }
 
 #[test]

@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added one revision-bound `ReferenceGraph` with typed field paths, coverage, resolution states, incoming/outgoing/closure queries, caching, and deterministic JSON, JSON Lines, and DOT projections.
 - Added typed extraction request v4, plan v8, manifest v6, and report v6 contracts with bundle-container and reference-traversal queries, deterministic artifact paths, caller-budgeted execution, recoverable publication, verified resume, and explicit representation-semantics identities.
 - Added a YAML-only extraction request profile and identity-first `file-id-*`/`ordinal-*` artifact paths for agent-safe document export.
-- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, project-bound local IPC Bootstrap V2, and bounded idempotent reindex operations.
+- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, capability-authenticated loopback HTTP discovery, and bounded idempotent reindex operations.
 - Added deterministic tag-release evidence, exact cargo-dist artifact-plan validation, isolated archive-consumer verification, real MSRV validation, pinned release inputs, checksums, GitHub Draft Release byte read-back, and build provenance attestations.
 - Added schema-aware mutation recipes that inspect exact YAML or binary provenance and lower guarded field, reference, schema, sequence, hierarchy, UnityEvent, material, transform, and streamed-audio changes into plan fragments.
 - Added deterministic performance contracts for unified TypeTree traversal and segmented prepared artifacts.
@@ -34,7 +34,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Breaking:** Removed the legacy media Processor/Converter APIs, owned AudioClip/Texture2D/Sprite carriers, context-free quick decoders, generic image/audio exporters, and public swizzler utilities. Strict `AudioClipLayout`, `Texture2DLayout`, `SpriteLayout`, and `Prepared*` artifacts are now the only media preparation path.
 - **Breaking:** Removed MP3 and AAC from strict prepared-audio descriptors until a bounded full-codec validator exists; decoded-preferred extraction now falls back to raw bytes and decoded-required extraction reports typed unsupported encoding.
 - Consolidated prepared YAML inspection on the canonical `unity-asset-yaml` parser and removed the duplicate writer-owned YAML frontend and budget model.
-- **Breaking:** Replaced the 0.3 search HTTP `/v1` and unreleased `/v2`/`/v3` development transports with project-bound local IPC and Bootstrap V2; business revision 3 now carries numeric YAML object selectors, while revisions 1 and 2 remain byte-frozen archives. Removed bearer-token configuration, `IndexProgress`, and compatibility fallback.
+- **Breaking:** Replaced the earlier search transports with one project-bound loopback HTTP request endpoint discovered through a private, atomically published per-process capability descriptor. Removed transport negotiation, session framing, configurable bearer tokens, `IndexProgress`, and compatibility fallback.
 - **Breaking:** Unified TypeTree read, skip, PPtr scan, validation, encoding, and byte-preserving rewrite on one compiled `TypeTreeSchema`; TypeTree write errors now use `TypeTreeWriteError`, and `unity_asset_write::Endian` was replaced by the shared `ByteOrder`.
 - Made JSON and TPK TypeTree ingestion caller-budgeted, deterministic, depth-bounded, and immutable; workspace loads retain only required schemas in frozen per-source registries.
 - Reworked source loading, archive/WebFile/bundle expansion, edits, serialization, and publication to stage complete candidate state before one authority-changing commit.
@@ -60,6 +60,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - **Breaking:** Removed obsolete CLI commands whose behavior is now represented by typed workspace inspection, reference projection, extraction, or low-level format examples.
 - **Breaking:** Removed the duplicate library-level YAML split planner, executor, plan, report, and capability contract; YAML splitting now uses the generic extraction plan and publication journal.
 - **Breaking:** Removed placeholder Mesh decoding/export, fabricated binary metadata summaries, cached Bundle loader facades, and implicit Unity version defaults rather than reporting capabilities or observations the library cannot prove.
+- **Breaking:** Removed the Unix-domain-socket and Windows named-pipe search transports, Bootstrap negotiation, four-byte framing, peer-process authorization, and the C# framed-session adapter.
 - Removed production dependence on callback-based script-schema generation; immutable JSON/TPK registries are now the workspace boundary.
 
 ## [0.3.0] - 2026-01-27

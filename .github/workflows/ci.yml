@@ -188,7 +188,6 @@ jobs:
         --test workspace_commands
         --test workspace_json
         --test structured_errors
-        --test ipc_commands
         --test process_contract
 
     - name: Run the real daemon JSON-agent harness
@@ -217,23 +216,11 @@ jobs:
         --test-threads 2
         -p unity-asset-search-local
 
-    - name: Prove Unix secondary-principal rejection
-      if: runner.os != 'Windows'
-      env:
-        UNITY_ASSET_CROSS_PRINCIPAL_USER: nobody
-      run: >-
-        cargo nextest run
-        --test-threads 1
-        --run-ignored ignored-only
-        -p unity-asset-search-local
-        --lib
-        -E 'test(/secondary_effective_uid_is_rejected_by_peer_credentials$/)'
-
     - name: Run cross-language search protocol conformance
       run: |
         dotnet build integration/search-protocol/csharp/UnityAsset.SearchProtocol.ExternalConsumer/UnityAsset.SearchProtocol.ExternalConsumer.csproj --configuration Release
         dotnet run --project integration/search-protocol/csharp/UnityAsset.SearchProtocol.Conformance/UnityAsset.SearchProtocol.Conformance.csproj --configuration Release
-        cargo nextest run -p unity-asset-search-daemon --test csharp_protocol_session --run-ignored ignored-only --test-threads 1
+        cargo nextest run -p unity-asset-search-daemon --test csharp_protocol_http --run-ignored ignored-only --test-threads 1
 
     - name: Run Windows CLI unit contracts
       if: runner.os == 'Windows'

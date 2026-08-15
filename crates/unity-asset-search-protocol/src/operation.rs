@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
 
 use crate::validation::{ContractValidationError, ValidateContract};
@@ -279,6 +281,15 @@ impl RequestEnvelope {
         expected_query_policy: QueryPolicyId,
     ) -> Result<(), ContractValidationError> {
         self.validate()?;
+        self.ensure_binding(expected_project, expected_instance, expected_query_policy)
+    }
+
+    pub(crate) fn ensure_binding(
+        &self,
+        expected_project: ProjectId,
+        expected_instance: DaemonInstanceId,
+        expected_query_policy: QueryPolicyId,
+    ) -> Result<(), ContractValidationError> {
         if self.project_id != expected_project {
             return Err(ContractValidationError::Inconsistent {
                 field: "request project",
@@ -346,6 +357,149 @@ impl ValidateContract for RequestEnvelope {
             });
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ResponseExpectation {
+    binding: ResponseBinding,
+    operation: ExpectedResponseOperation<'static>,
+}
+
+impl ResponseExpectation {
+    pub(crate) fn from_validated_request(request: &RequestEnvelope) -> Self {
+        Self {
+            binding: ResponseBinding::from_request(request),
+            operation: ExpectedResponseOperation::from_request(&request.operation).into_owned(),
+        }
+    }
+
+    pub(crate) fn operation_kind(&self) -> OperationKind {
+        self.operation.kind()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ResponseBinding {
+    protocol_revision: u16,
+    request_id: RequestId,
+    project_id: ProjectId,
+    daemon_instance_id: DaemonInstanceId,
+    query_policy_id: QueryPolicyId,
+}
+
+impl ResponseBinding {
+    const fn from_request(request: &RequestEnvelope) -> Self {
+        Self {
+            protocol_revision: request.protocol_revision,
+            request_id: request.request_id,
+            project_id: request.project_id,
+            daemon_instance_id: request.daemon_instance_id,
+            query_policy_id: request.query_policy_id,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ExpectedResponseOperation<'request> {
+    Capabilities,
+    Status,
+    Search {
+        query: Cow<'request, str>,
+        limit: u32,
+    },
+    Suggest {
+        prefix: Cow<'request, str>,
+        limit: u32,
+    },
+    References {
+        request: Cow<'request, ReferenceRequest>,
+    },
+    ReindexAdmit,
+    ReindexStatus {
+        operation_id: OperationId,
+    },
+    ReindexWait {
+        operation_id: OperationId,
+    },
+    ReindexCancel {
+        operation_id: OperationId,
+    },
+    Shutdown,
+}
+
+impl<'request> ExpectedResponseOperation<'request> {
+    fn from_request(operation: &'request RequestOperation) -> Self {
+        match operation {
+            RequestOperation::Capabilities(_) => Self::Capabilities,
+            RequestOperation::Status(_) => Self::Status,
+            RequestOperation::Search(request) => Self::Search {
+                query: Cow::Borrowed(&request.query),
+                limit: request.limit,
+            },
+            RequestOperation::Suggest(request) => Self::Suggest {
+                prefix: Cow::Borrowed(&request.prefix),
+                limit: request.limit,
+            },
+            RequestOperation::References(request) => Self::References {
+                request: Cow::Borrowed(request),
+            },
+            RequestOperation::ReindexAdmit(_) => Self::ReindexAdmit,
+            RequestOperation::ReindexStatus(request) => Self::ReindexStatus {
+                operation_id: request.operation_id,
+            },
+            RequestOperation::ReindexWait(request) => Self::ReindexWait {
+                operation_id: request.operation_id,
+            },
+            RequestOperation::ReindexCancel(request) => Self::ReindexCancel {
+                operation_id: request.operation_id,
+            },
+            RequestOperation::Shutdown(_) => Self::Shutdown,
+        }
+    }
+
+    fn into_owned(self) -> ExpectedResponseOperation<'static> {
+        match self {
+            Self::Capabilities => ExpectedResponseOperation::Capabilities,
+            Self::Status => ExpectedResponseOperation::Status,
+            Self::Search { query, limit } => ExpectedResponseOperation::Search {
+                query: Cow::Owned(query.into_owned()),
+                limit,
+            },
+            Self::Suggest { prefix, limit } => ExpectedResponseOperation::Suggest {
+                prefix: Cow::Owned(prefix.into_owned()),
+                limit,
+            },
+            Self::References { request } => ExpectedResponseOperation::References {
+                request: Cow::Owned(request.into_owned()),
+            },
+            Self::ReindexAdmit => ExpectedResponseOperation::ReindexAdmit,
+            Self::ReindexStatus { operation_id } => {
+                ExpectedResponseOperation::ReindexStatus { operation_id }
+            }
+            Self::ReindexWait { operation_id } => {
+                ExpectedResponseOperation::ReindexWait { operation_id }
+            }
+            Self::ReindexCancel { operation_id } => {
+                ExpectedResponseOperation::ReindexCancel { operation_id }
+            }
+            Self::Shutdown => ExpectedResponseOperation::Shutdown,
+        }
+    }
+
+    const fn kind(&self) -> OperationKind {
+        match self {
+            Self::Capabilities => OperationKind::Capabilities,
+            Self::Status => OperationKind::Status,
+            Self::Search { .. } => OperationKind::Search,
+            Self::Suggest { .. } => OperationKind::Suggest,
+            Self::References { .. } => OperationKind::References,
+            Self::ReindexAdmit => OperationKind::ReindexAdmit,
+            Self::ReindexStatus { .. } => OperationKind::ReindexStatus,
+            Self::ReindexWait { .. } => OperationKind::ReindexWait,
+            Self::ReindexCancel { .. } => OperationKind::ReindexCancel,
+            Self::Shutdown => OperationKind::Shutdown,
+        }
     }
 }
 
@@ -628,20 +782,29 @@ impl ResponseOperation {
             Self::Capabilities(_) | Self::ReindexCancel(_) | Self::Shutdown(_) => None,
         }
     }
+}
 
-    fn validate_for_request(
+impl ExpectedResponseOperation<'_> {
+    fn validate_response(
         &self,
-        request: &RequestOperation,
+        response: &ResponseOperation,
     ) -> Result<(), ContractValidationError> {
-        let operation_ids_match = match (request, self) {
-            (RequestOperation::ReindexStatus(expected), Self::ReindexStatus(actual)) => {
-                expected.operation_id == actual.operation_id
+        if response.kind() != self.kind() {
+            return Err(ContractValidationError::Inconsistent {
+                field: "response operation kind",
+            });
+        }
+        response.validate()?;
+
+        let operation_ids_match = match (self, response) {
+            (Self::ReindexStatus { operation_id }, ResponseOperation::ReindexStatus(actual)) => {
+                *operation_id == actual.operation_id
             }
-            (RequestOperation::ReindexWait(expected), Self::ReindexWait(actual)) => {
-                expected.operation_id == actual.operation_id
+            (Self::ReindexWait { operation_id }, ResponseOperation::ReindexWait(actual)) => {
+                *operation_id == actual.operation_id
             }
-            (RequestOperation::ReindexCancel(expected), Self::ReindexCancel(actual)) => {
-                expected.operation_id == actual.operation_id
+            (Self::ReindexCancel { operation_id }, ResponseOperation::ReindexCancel(actual)) => {
+                *operation_id == actual.operation_id
             }
             _ => true,
         };
@@ -650,40 +813,91 @@ impl ResponseOperation {
                 field: "response operation ID",
             });
         }
-        if let (RequestOperation::References(expected), Self::References(actual)) = (request, self)
-            && expected != &actual.request
+        if let (Self::References { request }, ResponseOperation::References(actual)) =
+            (self, response)
+            && request.as_ref() != &actual.request
         {
             return Err(ContractValidationError::Inconsistent {
                 field: "references response request echo",
             });
         }
-        match (request, self) {
-            (RequestOperation::Search(expected), Self::Search(actual))
-                if actual.query != expected.query
-                    || actual.returned_hits > expected.limit
-                    || exceeds_u32_limit(actual.hits.len(), expected.limit) =>
+        match (self, response) {
+            (Self::Search { query, limit }, ResponseOperation::Search(actual))
+                if actual.query != query.as_ref()
+                    || actual.returned_hits > *limit
+                    || exceeds_u32_limit(actual.hits.len(), *limit) =>
             {
                 return Err(ContractValidationError::Inconsistent {
                     field: "search response request binding",
                 });
             }
-            (RequestOperation::Suggest(expected), Self::Suggest(actual))
-                if actual.prefix != expected.prefix
-                    || exceeds_u32_limit(actual.suggestions.len(), expected.limit) =>
+            (Self::Suggest { prefix, limit }, ResponseOperation::Suggest(actual))
+                if actual.prefix != prefix.as_ref()
+                    || exceeds_u32_limit(actual.suggestions.len(), *limit) =>
             {
                 return Err(ContractValidationError::Inconsistent {
                     field: "suggest response request binding",
                 });
             }
-            (RequestOperation::References(expected), Self::References(actual))
-                if actual.coverage.returned > expected.limit
-                    || exceeds_u32_limit(actual.hits.len(), expected.limit) =>
+            (Self::References { request }, ResponseOperation::References(actual))
+                if actual.coverage.returned > request.as_ref().limit
+                    || exceeds_u32_limit(actual.hits.len(), request.as_ref().limit) =>
             {
                 return Err(ContractValidationError::Inconsistent {
                     field: "references response request limit",
                 });
             }
             _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl ResponseEnvelope {
+    fn from_binding(binding: ResponseBinding, outcome: ResponseOutcome) -> Self {
+        Self {
+            protocol_revision: binding.protocol_revision,
+            request_id: binding.request_id,
+            project_id: binding.project_id,
+            daemon_instance_id: binding.daemon_instance_id,
+            query_policy_id: binding.query_policy_id,
+            outcome,
+        }
+    }
+
+    fn validate_for_expectation(
+        &self,
+        binding: ResponseBinding,
+        operation: &ExpectedResponseOperation<'_>,
+    ) -> Result<(), ContractValidationError> {
+        ensure_protocol_revision(self.protocol_revision)?;
+        if self.request_id != binding.request_id
+            || self.project_id != binding.project_id
+            || self.daemon_instance_id != binding.daemon_instance_id
+            || self.query_policy_id != binding.query_policy_id
+        {
+            return Err(ContractValidationError::Inconsistent {
+                field: "response request/project/instance/query-policy binding",
+            });
+        }
+        if let ResponseOutcome::Success(response) = &self.outcome {
+            operation.validate_response(response)?;
+            if let Some(query_policy_id) = response.query_policy_id()
+                && query_policy_id != self.query_policy_id
+            {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "response query-policy binding",
+                });
+            }
+        } else if let ResponseOutcome::Error(error) = &self.outcome {
+            error.validate()?;
+            if let Some(query_policy_id) = error.query_policy_id
+                && query_policy_id != self.query_policy_id
+            {
+                return Err(ContractValidationError::Inconsistent {
+                    field: "error query-policy binding",
+                });
+            }
         }
         Ok(())
     }
@@ -720,66 +934,24 @@ pub struct ResponseEnvelope {
 impl ResponseEnvelope {
     #[must_use]
     pub fn success(request: &RequestEnvelope, response: ResponseOperation) -> Self {
-        Self {
-            protocol_revision: request.protocol_revision,
-            request_id: request.request_id,
-            project_id: request.project_id,
-            daemon_instance_id: request.daemon_instance_id,
-            query_policy_id: request.query_policy_id,
-            outcome: ResponseOutcome::Success(Box::new(response)),
-        }
+        Self::from_binding(
+            ResponseBinding::from_request(request),
+            ResponseOutcome::Success(Box::new(response)),
+        )
     }
 
     #[must_use]
     pub fn error(request: &RequestEnvelope, error: ApiError) -> Self {
-        Self {
-            protocol_revision: request.protocol_revision,
-            request_id: request.request_id,
-            project_id: request.project_id,
-            daemon_instance_id: request.daemon_instance_id,
-            query_policy_id: request.query_policy_id,
-            outcome: ResponseOutcome::Error(Box::new(error)),
-        }
+        Self::from_binding(
+            ResponseBinding::from_request(request),
+            ResponseOutcome::Error(Box::new(error)),
+        )
     }
 
     pub fn validate_for(&self, request: &RequestEnvelope) -> Result<(), ContractValidationError> {
         request.validate()?;
-        ensure_protocol_revision(self.protocol_revision)?;
-        if self.request_id != request.request_id
-            || self.project_id != request.project_id
-            || self.daemon_instance_id != request.daemon_instance_id
-            || self.query_policy_id != request.query_policy_id
-        {
-            return Err(ContractValidationError::Inconsistent {
-                field: "response request/project/instance/query-policy binding",
-            });
-        }
-        if let ResponseOutcome::Success(response) = &self.outcome {
-            if response.kind() != request.operation.kind() {
-                return Err(ContractValidationError::Inconsistent {
-                    field: "response operation kind",
-                });
-            }
-            response.validate()?;
-            response.validate_for_request(&request.operation)?;
-            if let Some(query_policy_id) = response.query_policy_id()
-                && query_policy_id != self.query_policy_id
-            {
-                return Err(ContractValidationError::Inconsistent {
-                    field: "response query-policy binding",
-                });
-            }
-        } else if let ResponseOutcome::Error(error) = &self.outcome {
-            error.validate()?;
-            if let Some(query_policy_id) = error.query_policy_id
-                && query_policy_id != self.query_policy_id
-            {
-                return Err(ContractValidationError::Inconsistent {
-                    field: "error query-policy binding",
-                });
-            }
-        }
-        Ok(())
+        let operation = ExpectedResponseOperation::from_request(&request.operation);
+        self.validate_for_expectation(ResponseBinding::from_request(request), &operation)
     }
 
     #[must_use]
@@ -790,6 +962,26 @@ impl ResponseEnvelope {
     #[must_use]
     pub fn into_outcome(self) -> ResponseOutcome {
         self.outcome
+    }
+}
+
+impl ResponseExpectation {
+    pub(crate) fn response_envelope(
+        &self,
+        result: Result<ResponseOperation, ApiError>,
+    ) -> ResponseEnvelope {
+        let outcome = match result {
+            Ok(response) => ResponseOutcome::Success(Box::new(response)),
+            Err(error) => ResponseOutcome::Error(Box::new(error)),
+        };
+        ResponseEnvelope::from_binding(self.binding, outcome)
+    }
+
+    pub(crate) fn validate_response(
+        &self,
+        response: &ResponseEnvelope,
+    ) -> Result<(), ContractValidationError> {
+        response.validate_for_expectation(self.binding, &self.operation)
     }
 }
 

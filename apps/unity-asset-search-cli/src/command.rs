@@ -108,8 +108,6 @@ impl Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Verify endpoint identity and negotiate protocol capabilities.
-    Bootstrap,
     Capabilities,
     Status,
     Search(SearchArgs),
@@ -128,7 +126,6 @@ enum Command {
 impl Command {
     fn lower(&self) -> Result<Action, CliFailure> {
         let operation = match self {
-            Self::Bootstrap => return Ok(Action::Bootstrap),
             Self::Capabilities => RequestOperation::Capabilities(CapabilitiesRequest::default()),
             Self::Status => RequestOperation::Status(StatusRequest::default()),
             Self::Search(args) => RequestOperation::Search(SearchRequest {
@@ -146,7 +143,7 @@ impl Command {
             } => return Ok(Action::DaemonStart(args.settings())),
             Self::Daemon {
                 command: DaemonCommand::Attach,
-            } => return Ok(Action::Bootstrap),
+            } => RequestOperation::Capabilities(CapabilitiesRequest::default()),
             Self::Daemon {
                 command: DaemonCommand::Stop(args),
             } => RequestOperation::Shutdown(ShutdownRequest {
@@ -162,7 +159,6 @@ impl Command {
 
 #[derive(Debug)]
 pub enum Action {
-    Bootstrap,
     DaemonStart(DaemonStartSettings),
     Operation(RequestOperation),
 }

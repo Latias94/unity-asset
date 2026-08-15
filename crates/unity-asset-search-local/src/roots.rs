@@ -14,8 +14,7 @@ use unity_asset_search_protocol::ProjectId;
 
 use crate::project::ProjectIdentityV1;
 use crate::publication::{self, PublicationSlots};
-use crate::security_context::CurrentSecurityContextSnapshot;
-use crate::{SecurityContextError, SecurityContextIdV1};
+use crate::security_context::{CurrentFilesystemAuthority, FilesystemAuthorityError};
 
 const PRODUCT_DIRECTORY: &str = "unity-asset-search-v5";
 const ENDPOINT_NAMESPACE_DOMAIN: &[u8] = b"unity-asset:endpoint-namespace:v1\0";
@@ -35,35 +34,6 @@ pub enum PrivateRootKind {
     Cache,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PrivateRootAuthority {
-    Runtime(SecurityContextIdV1),
-    PersistentUserCache,
-}
-
-impl PrivateRootAuthority {
-    const fn kind(self) -> PrivateRootKind {
-        match self {
-            Self::Runtime(_) => PrivateRootKind::Runtime,
-            Self::PersistentUserCache => PrivateRootKind::Cache,
-        }
-    }
-
-    const fn runtime_security_context(self) -> Option<SecurityContextIdV1> {
-        match self {
-            Self::Runtime(security_context_id) => Some(security_context_id),
-            Self::PersistentUserCache => None,
-        }
-    }
-
-    fn validate_current(self, current: &CurrentSecurityContextSnapshot) -> bool {
-        match self {
-            Self::Runtime(security_context_id) => current.id() == security_context_id,
-            Self::PersistentUserCache => true,
-        }
-    }
-}
-
 impl fmt::Display for PrivateRootKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -74,7 +44,7 @@ impl fmt::Display for PrivateRootKind {
 }
 
 pub struct PrivateRootV1 {
-    authority_kind: PrivateRootAuthority,
+    kind: PrivateRootKind,
     path: PathBuf,
     authority: Arc<platform::PrivateDirectory>,
 }
@@ -82,7 +52,7 @@ pub struct PrivateRootV1 {
 impl PrivateRootV1 {
     #[must_use]
     pub const fn kind(&self) -> PrivateRootKind {
-        self.authority_kind.kind()
+        self.kind
     }
 
     #[must_use]
@@ -91,8 +61,8 @@ impl PrivateRootV1 {
     }
 
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
-        let current = CurrentSecurityContextSnapshot::current()?;
-        self.revalidate_for_context(&current)
+        let current = CurrentFilesystemAuthority::current()?;
+        self.revalidate_for_authority(&current)
     }
 
     pub fn endpoint_namespace(
@@ -106,9 +76,9 @@ impl PrivateRootV1 {
             });
         }
         require_nonzero_project_id(project_id)?;
-        let current = CurrentSecurityContextSnapshot::current()?;
-        self.revalidate_for_context(&current)?;
-        let component = endpoint_namespace_component(project_id, current.id());
+        let current = CurrentFilesystemAuthority::current()?;
+        self.revalidate_for_authority(&current)?;
+        let component = endpoint_namespace_component(project_id);
         let path = self.path.join(&component);
         let authority = self
             .authority
@@ -123,12 +93,6 @@ impl PrivateRootV1 {
             path,
             component,
             project_id,
-            security_context_id: self.authority_kind.runtime_security_context().ok_or(
-                PrivateRootsError::WrongRootKind {
-                    expected: PrivateRootKind::Runtime,
-                    actual: self.kind(),
-                },
-            )?,
             authority: Arc::new(authority),
         };
         namespace.bind(&current)?;
@@ -147,8 +111,8 @@ impl PrivateRootV1 {
         }
         let project_id = project_identity.project_id();
         require_nonzero_project_id(project_id)?;
-        let current = CurrentSecurityContextSnapshot::current()?;
-        self.revalidate_for_context(&current)?;
+        let current = CurrentFilesystemAuthority::current()?;
+        self.revalidate_for_authority(&current)?;
         let component = private_index_root_component(project_id);
         let path = self.path.join(&component);
         let authority = self
@@ -167,17 +131,14 @@ impl PrivateRootV1 {
             parent_authority: Arc::clone(&self.authority),
             authority: Arc::new(authority),
         };
-        root.revalidate_for_context(&current)?;
+        root.revalidate_for_authority(&current)?;
         Ok(root)
     }
 
-    fn revalidate_for_context(
+    fn revalidate_for_authority(
         &self,
-        current: &CurrentSecurityContextSnapshot,
+        current: &CurrentFilesystemAuthority,
     ) -> Result<(), PrivateRootsError> {
-        if !self.authority_kind.validate_current(current) {
-            return Err(PrivateRootsError::SecurityContextChanged);
-        }
         self.authority
             .revalidate(&self.path, current)
             .map_err(|source| PrivateRootsError::Filesystem {
@@ -194,7 +155,6 @@ pub struct EndpointNamespaceV1 {
     path: PathBuf,
     component: String,
     project_id: ProjectId,
-    security_context_id: SecurityContextIdV1,
     authority: Arc<platform::PrivateDirectory>,
 }
 
@@ -210,20 +170,12 @@ impl EndpointNamespaceV1 {
     }
 
     #[must_use]
-    pub const fn security_context_id(&self) -> SecurityContextIdV1 {
-        self.security_context_id
-    }
-
-    #[must_use]
     pub fn component(&self) -> &str {
         &self.component
     }
 
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
-        let current = CurrentSecurityContextSnapshot::current()?;
-        if current.id() != self.security_context_id {
-            return Err(PrivateRootsError::SecurityContextChanged);
-        }
+        let current = CurrentFilesystemAuthority::current()?;
         self.authority
             .revalidate(&self.path, &current)
             .map_err(|source| PrivateRootsError::Filesystem {
@@ -234,11 +186,10 @@ impl EndpointNamespaceV1 {
             })
     }
 
-    fn bind(&self, current: &CurrentSecurityContextSnapshot) -> Result<(), PrivateRootsError> {
+    fn bind(&self, current: &CurrentFilesystemAuthority) -> Result<(), PrivateRootsError> {
         let expected = EndpointNamespaceBindingV1 {
             binding_version: ENDPOINT_BINDING_VERSION,
             project_id: self.project_id,
-            security_context_id: self.security_context_id,
         };
         let encoded = serde_json::to_vec(&expected).map_err(PrivateRootsError::BindingJson)?;
         let binding_path = self.path.join(ENDPOINT_BINDING_FILE);
@@ -301,7 +252,7 @@ impl EndpointNamespaceV1 {
 
     fn open_or_create_binding_lock(
         &self,
-        current: &CurrentSecurityContextSnapshot,
+        current: &CurrentFilesystemAuthority,
     ) -> Result<File, PrivateRootsError> {
         let path = self.path.join(ENDPOINT_BINDING_LOCK_FILE);
         match self.authority.create_private_file(
@@ -335,7 +286,7 @@ impl EndpointNamespaceV1 {
 
     fn read_binding(
         &self,
-        current: &CurrentSecurityContextSnapshot,
+        current: &CurrentFilesystemAuthority,
         binding_path: &Path,
     ) -> Result<Option<Vec<u8>>, PrivateRootsError> {
         let mut file = match self.authority.open_private_file(
@@ -396,25 +347,13 @@ impl EndpointNamespaceV1 {
     }
 
     pub(crate) fn create_file(&self, name: &OsStr) -> io::Result<File> {
-        let current = CurrentSecurityContextSnapshot::current().map_err(io::Error::other)?;
-        if current.id() != self.security_context_id {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "effective security context changed",
-            ));
-        }
+        let current = CurrentFilesystemAuthority::current().map_err(io::Error::other)?;
         self.authority
             .create_private_file(&self.path, name, &current)
     }
 
     pub(crate) fn open_file(&self, name: &OsStr, writable: bool) -> io::Result<File> {
-        let current = CurrentSecurityContextSnapshot::current().map_err(io::Error::other)?;
-        if current.id() != self.security_context_id {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "effective security context changed",
-            ));
-        }
+        let current = CurrentFilesystemAuthority::current().map_err(io::Error::other)?;
         self.authority
             .open_private_file(&self.path, name, &current, writable)
     }
@@ -429,25 +368,13 @@ impl EndpointNamespaceV1 {
         destination: &OsStr,
         replace: bool,
     ) -> io::Result<()> {
-        let current = CurrentSecurityContextSnapshot::current().map_err(io::Error::other)?;
-        if current.id() != self.security_context_id {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "effective security context changed",
-            ));
-        }
+        let current = CurrentFilesystemAuthority::current().map_err(io::Error::other)?;
         self.authority
             .rename_private_file(&self.path, source, destination, replace, &current)
     }
 
     pub(crate) fn remove_file(&self, name: &OsStr) -> io::Result<()> {
-        let current = CurrentSecurityContextSnapshot::current().map_err(io::Error::other)?;
-        if current.id() != self.security_context_id {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "effective security context changed",
-            ));
-        }
+        let current = CurrentFilesystemAuthority::current().map_err(io::Error::other)?;
         self.authority
             .remove_private_file(&self.path, name, &current)
     }
@@ -478,7 +405,6 @@ impl fmt::Debug for EndpointNamespaceV1 {
             .field("path", &self.path)
             .field("component", &self.component)
             .field("project_id", &self.project_id)
-            .field("security_context_id", &self.security_context_id)
             .finish_non_exhaustive()
     }
 }
@@ -488,17 +414,12 @@ impl fmt::Debug for EndpointNamespaceV1 {
 struct EndpointNamespaceBindingV1 {
     binding_version: u16,
     project_id: ProjectId,
-    security_context_id: SecurityContextIdV1,
 }
 
-fn endpoint_namespace_component(
-    project_id: ProjectId,
-    security_context_id: SecurityContextIdV1,
-) -> String {
+fn endpoint_namespace_component(project_id: ProjectId) -> String {
     let mut hasher = Sha256::new();
     hasher.update(ENDPOINT_NAMESPACE_DOMAIN);
     hasher.update(project_id.as_bytes());
-    hasher.update(security_context_id.as_bytes());
     let digest = hasher.finalize();
     format!("p-{}", hex::encode(&digest[..ENDPOINT_NAMESPACE_KEY_BYTES]))
 }
@@ -518,10 +439,10 @@ fn require_nonzero_project_id(project_id: ProjectId) -> Result<(), PrivateRootsE
     }
 }
 
-fn current_private_security_context() -> Result<CurrentSecurityContextSnapshot, PrivateRootsError> {
-    CurrentSecurityContextSnapshot::current().map_err(|error| match error {
-        SecurityContextError::UnsupportedPlatform => PrivateRootsError::UnsupportedPlatform,
-        error => PrivateRootsError::SecurityContext(error),
+fn current_filesystem_authority() -> Result<CurrentFilesystemAuthority, PrivateRootsError> {
+    CurrentFilesystemAuthority::current().map_err(|error| match error {
+        FilesystemAuthorityError::UnsupportedPlatform => PrivateRootsError::UnsupportedPlatform,
+        error => PrivateRootsError::FilesystemAuthority(error),
     })
 }
 
@@ -548,7 +469,7 @@ impl fmt::Debug for PrivateRootV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PrivateRootV1")
-            .field("authority_kind", &self.authority_kind)
+            .field("kind", &self.kind)
             .field("path", &self.path)
             .finish_non_exhaustive()
     }
@@ -578,8 +499,8 @@ impl PrivateIndexRootV1 {
 
     fn open_override_base(path: &Path) -> Result<PrivateIndexOverrideBase, PrivateRootsError> {
         let path = absolute_private_path(path)?;
-        let security_context = current_private_security_context()?;
-        let authority = platform::open_or_create_persistent_path(&path, &security_context)
+        let filesystem_authority = current_filesystem_authority()?;
+        let authority = platform::open_or_create_persistent_path(&path, &filesystem_authority)
             .map_err(|source| PrivateRootsError::Filesystem {
                 kind: PrivateRootKind::Cache,
                 operation: "open or create explicit private index root",
@@ -591,7 +512,7 @@ impl PrivateIndexRootV1 {
             path,
             authority: Arc::new(authority),
         };
-        base.revalidate_for_context(&security_context)?;
+        base.revalidate_for_authority(&filesystem_authority)?;
         Ok(base)
     }
 
@@ -608,7 +529,7 @@ impl PrivateIndexRootV1 {
         let project_id = project_identity.project_id();
         require_nonzero_project_id(project_id)?;
         let base = Self::open_override_base(path.as_ref())?;
-        let current = CurrentSecurityContextSnapshot::current()?;
+        let current = CurrentFilesystemAuthority::current()?;
         let component = private_index_root_component(project_id);
         let requested_path = base.path.join(&component);
         let authority = base
@@ -628,7 +549,7 @@ impl PrivateIndexRootV1 {
             parent_authority: base.authority,
             authority: Arc::new(authority),
         };
-        root.revalidate_for_context(&current)?;
+        root.revalidate_for_authority(&current)?;
         Ok(root)
     }
 
@@ -652,13 +573,13 @@ impl PrivateIndexRootV1 {
     }
 
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
-        let current = CurrentSecurityContextSnapshot::current()?;
-        self.revalidate_for_context(&current)
+        let current = CurrentFilesystemAuthority::current()?;
+        self.revalidate_for_authority(&current)
     }
 
-    fn revalidate_for_context(
+    fn revalidate_for_authority(
         &self,
-        current: &CurrentSecurityContextSnapshot,
+        current: &CurrentFilesystemAuthority,
     ) -> Result<(), PrivateRootsError> {
         self.parent_authority
             .revalidate(&self.parent_path, current)
@@ -706,9 +627,9 @@ struct PrivateIndexOverrideBase {
 }
 
 impl PrivateIndexOverrideBase {
-    fn revalidate_for_context(
+    fn revalidate_for_authority(
         &self,
-        current: &CurrentSecurityContextSnapshot,
+        current: &CurrentFilesystemAuthority,
     ) -> Result<(), PrivateRootsError> {
         self.authority
             .revalidate(&self.path, current)
@@ -722,34 +643,26 @@ impl PrivateIndexOverrideBase {
 }
 
 pub struct PrivateRootsV1 {
-    security_context_id: SecurityContextIdV1,
     runtime: PrivateRootV1,
     cache: PrivateRootV1,
 }
 
 impl PrivateRootsV1 {
     pub fn discover_for_current_context() -> Result<Self, PrivateRootsError> {
-        let security_context = current_private_security_context()?;
-        let security_context_id = security_context.id();
-        let discovered = platform::discover(&security_context)?;
+        let filesystem_authority = current_filesystem_authority()?;
+        let discovered = platform::discover(&filesystem_authority)?;
         Ok(Self {
-            security_context_id,
             runtime: PrivateRootV1 {
-                authority_kind: PrivateRootAuthority::Runtime(security_context_id),
+                kind: PrivateRootKind::Runtime,
                 path: discovered.runtime_path,
                 authority: Arc::new(discovered.runtime),
             },
             cache: PrivateRootV1 {
-                authority_kind: PrivateRootAuthority::PersistentUserCache,
+                kind: PrivateRootKind::Cache,
                 path: discovered.cache_path,
                 authority: Arc::new(discovered.cache),
             },
         })
-    }
-
-    #[must_use]
-    pub const fn security_context_id(&self) -> SecurityContextIdV1 {
-        self.security_context_id
     }
 
     #[must_use]
@@ -770,9 +683,9 @@ impl PrivateRootsV1 {
     }
 
     pub fn revalidate(&self) -> Result<(), PrivateRootsError> {
-        let current = CurrentSecurityContextSnapshot::current()?;
-        self.runtime.revalidate_for_context(&current)?;
-        self.cache.revalidate_for_context(&current)
+        let current = CurrentFilesystemAuthority::current()?;
+        self.runtime.revalidate_for_authority(&current)?;
+        self.cache.revalidate_for_authority(&current)
     }
 }
 
@@ -780,7 +693,6 @@ impl fmt::Debug for PrivateRootsV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PrivateRootsV1")
-            .field("security_context_id", &self.security_context_id)
             .field("runtime", &self.runtime)
             .field("cache", &self.cache)
             .finish()
@@ -790,7 +702,7 @@ impl fmt::Debug for PrivateRootsV1 {
 #[derive(Debug, Error)]
 pub enum PrivateRootsError {
     #[error(transparent)]
-    SecurityContext(#[from] SecurityContextError),
+    FilesystemAuthority(#[from] FilesystemAuthorityError),
     #[error("private local roots are unsupported on this platform")]
     UnsupportedPlatform,
     #[error("environment variable {variable} {reason}")]
@@ -804,10 +716,6 @@ pub enum PrivateRootsError {
     MissingHomeDirectory,
     #[error("project ID must not be zero")]
     ZeroProjectId,
-    #[error("private runtime root at {path} cannot represent a local endpoint path")]
-    EndpointPathTooLong { path: PathBuf },
-    #[error("the effective security context changed while private roots were in use")]
-    SecurityContextChanged,
     #[error("private {actual} root cannot provide a {expected} namespace")]
     WrongRootKind {
         expected: PrivateRootKind,
@@ -866,14 +774,14 @@ mod binding_tests {
         staging.sync_all().unwrap();
         drop(staging);
 
-        let current = CurrentSecurityContextSnapshot::current().unwrap();
+        let current = CurrentFilesystemAuthority::current().unwrap();
         namespace.bind(&current).unwrap();
 
         assert!(!cleanup_path.join(ENDPOINT_BINDING_STAGING_FILE).exists());
         let binding = std::fs::read(cleanup_path.join(ENDPOINT_BINDING_FILE)).unwrap();
         let parsed: EndpointNamespaceBindingV1 = serde_json::from_slice(&binding).unwrap();
         assert_eq!(parsed.project_id, namespace.project_id());
-        assert_eq!(parsed.security_context_id, namespace.security_context_id());
+        assert_eq!(parsed.binding_version, ENDPOINT_BINDING_VERSION);
 
         drop(namespace);
         drop(roots);
@@ -919,10 +827,9 @@ mod platform {
     use rustix::io::Errno;
 
     use super::{
-        DiscoveredRoots, ENDPOINT_NAMESPACE_KEY_BYTES, PRODUCT_DIRECTORY, PrivateRootKind,
-        PrivateRootsError, filesystem_error,
+        DiscoveredRoots, PRODUCT_DIRECTORY, PrivateRootKind, PrivateRootsError, filesystem_error,
     };
-    use crate::security_context::CurrentSecurityContextSnapshot;
+    use crate::security_context::CurrentFilesystemAuthority;
 
     fn directory_flags() -> OFlags {
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
@@ -953,9 +860,9 @@ mod platform {
         pub(super) fn revalidate(
             &self,
             path: &Path,
-            security_context: &CurrentSecurityContextSnapshot,
+            filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<()> {
-            let expected_uid = security_context.effective_uid();
+            let expected_uid = filesystem_authority.effective_uid();
             if validate_private_directory(&self.descriptor, expected_uid)? != self.identity {
                 return Err(io::Error::other(
                     "private directory identity changed during revalidation",
@@ -976,12 +883,12 @@ mod platform {
         pub(super) fn create_private_child(
             &self,
             name: &OsStr,
-            security_context: &CurrentSecurityContextSnapshot,
+            filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<Self> {
             create_or_open_private_child_with_policy(
                 &self.descriptor,
                 name,
-                security_context.effective_uid(),
+                filesystem_authority.effective_uid(),
                 self.ancestor_policy,
             )
         }
@@ -990,7 +897,7 @@ mod platform {
             &self,
             _directory_path: &Path,
             name: &OsStr,
-            security_context: &CurrentSecurityContextSnapshot,
+            filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<File> {
             validate_leaf(name)?;
             let descriptor = openat(
@@ -1001,7 +908,7 @@ mod platform {
             )
             .map_err(io::Error::from)?;
             fchmod(&descriptor, private_file_mode()).map_err(io::Error::from)?;
-            validate_private_file(&descriptor, security_context.effective_uid())?;
+            validate_private_file(&descriptor, filesystem_authority.effective_uid())?;
             Ok(File::from(descriptor))
         }
 
@@ -1009,7 +916,7 @@ mod platform {
             &self,
             _directory_path: &Path,
             name: &OsStr,
-            security_context: &CurrentSecurityContextSnapshot,
+            filesystem_authority: &CurrentFilesystemAuthority,
             writable: bool,
         ) -> io::Result<File> {
             validate_leaf(name)?;
@@ -1025,7 +932,7 @@ mod platform {
                 Mode::empty(),
             )
             .map_err(io::Error::from)?;
-            validate_private_file(&descriptor, security_context.effective_uid())?;
+            validate_private_file(&descriptor, filesystem_authority.effective_uid())?;
             Ok(File::from(descriptor))
         }
 
@@ -1035,7 +942,7 @@ mod platform {
             source: &OsStr,
             destination: &OsStr,
             replace: bool,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<()> {
             validate_leaf(source)?;
             validate_leaf(destination)?;
@@ -1057,7 +964,7 @@ mod platform {
             &self,
             _directory_path: &Path,
             name: &OsStr,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<()> {
             validate_leaf(name)?;
             unlinkat(&self.descriptor, name, AtFlags::empty()).map_err(io::Error::from)
@@ -1076,11 +983,11 @@ mod platform {
 
     pub(super) fn open_or_create_persistent_path(
         path: &Path,
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<PrivateDirectory> {
         let parent_path = path.parent().ok_or_else(invalid_path)?;
         let name = path.file_name().ok_or_else(invalid_path)?;
-        let expected_uid = security_context.effective_uid();
+        let expected_uid = filesystem_authority.effective_uid();
         let parent = open_strict_path(parent_path, expected_uid)?;
         let directory = create_or_open_private_child_with_policy(
             &parent,
@@ -1088,14 +995,14 @@ mod platform {
             expected_uid,
             AncestorPolicy::Strict,
         )?;
-        directory.revalidate(path, security_context)?;
+        directory.revalidate(path, filesystem_authority)?;
         Ok(directory)
     }
 
     pub(super) fn discover(
-        security_context: &CurrentSecurityContextSnapshot,
+        filesystem_authority: &CurrentFilesystemAuthority,
     ) -> Result<DiscoveredRoots, PrivateRootsError> {
-        let expected_uid = security_context.effective_uid();
+        let expected_uid = filesystem_authority.effective_uid();
         let (runtime_path, runtime) = discover_runtime(expected_uid)?;
         let (cache_path, cache) = discover_cache(expected_uid)?;
         Ok(DiscoveredRoots {
@@ -1158,7 +1065,6 @@ mod platform {
         })?;
         let name = OsString::from(format!("{PRODUCT_DIRECTORY}-{expected_uid}"));
         let path = temporary_path.join(&name);
-        validate_runtime_endpoint_capacity(&path)?;
         let root =
             create_or_open_private_child(&temporary, &name, expected_uid).map_err(|source| {
                 filesystem_error(kind, "create private runtime root", &path, source)
@@ -1231,25 +1137,9 @@ mod platform {
         expected_uid: u32,
     ) -> Result<(PathBuf, PrivateDirectory), PrivateRootsError> {
         let path = base_path.join(PRODUCT_DIRECTORY);
-        if kind == PrivateRootKind::Runtime {
-            validate_runtime_endpoint_capacity(&path)?;
-        }
         let root = create_or_open_private_child(base, OsStr::new(PRODUCT_DIRECTORY), expected_uid)
             .map_err(|source| filesystem_error(kind, "create product root", &path, source))?;
         Ok((path, root))
-    }
-
-    fn validate_runtime_endpoint_capacity(path: &Path) -> Result<(), PrivateRootsError> {
-        let component = format!(
-            "p-{}",
-            "0".repeat(ENDPOINT_NAMESPACE_KEY_BYTES.saturating_mul(2))
-        );
-        let namespace_path = path.join(component);
-        crate::transport::validate_endpoint_namespace_path(&namespace_path).map_err(|_| {
-            PrivateRootsError::EndpointPathTooLong {
-                path: path.to_path_buf(),
-            }
-        })
     }
 
     #[cfg(target_os = "linux")]
@@ -1749,23 +1639,23 @@ mod platform {
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let base = open_path(temporary.path()).unwrap();
             let path = temporary.path().join("private");
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
             let private = create_or_open_private_child(
                 &base,
                 OsStr::new("private"),
-                security_context.effective_uid(),
+                filesystem_authority.effective_uid(),
             )
             .unwrap();
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o700
             );
-            private.revalidate(&path, &security_context).unwrap();
+            private.revalidate(&path, &filesystem_authority).unwrap();
 
             fs::set_permissions(&path, fs::Permissions::from_mode(0o750)).unwrap();
             assert_eq!(
                 private
-                    .revalidate(&path, &security_context)
+                    .revalidate(&path, &filesystem_authority)
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::PermissionDenied
@@ -1789,9 +1679,9 @@ mod platform {
             fs::create_dir(&unsafe_parent).unwrap();
             fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(0o777)).unwrap();
             let override_path = unsafe_parent.join("index-base");
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
 
-            let error = open_or_create_persistent_path(&override_path, &security_context)
+            let error = open_or_create_persistent_path(&override_path, &filesystem_authority)
                 .err()
                 .unwrap();
 
@@ -1806,15 +1696,15 @@ mod platform {
             fs::create_dir(&stable_parent).unwrap();
             fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o700)).unwrap();
             let override_path = stable_parent.join("index-base");
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
             let private =
-                open_or_create_persistent_path(&override_path, &security_context).unwrap();
+                open_or_create_persistent_path(&override_path, &filesystem_authority).unwrap();
 
             fs::set_permissions(&stable_parent, fs::Permissions::from_mode(0o777)).unwrap();
 
             assert_eq!(
                 private
-                    .revalidate(&override_path, &security_context)
+                    .revalidate(&override_path, &filesystem_authority)
                     .unwrap_err()
                     .kind(),
                 io::ErrorKind::PermissionDenied
@@ -1834,7 +1724,7 @@ mod platform {
                 create_or_open_private_child(
                     &base,
                     OsStr::new("insecure"),
-                    CurrentSecurityContextSnapshot::current()
+                    CurrentFilesystemAuthority::current()
                         .unwrap()
                         .effective_uid(),
                 )
@@ -1872,23 +1762,6 @@ mod platform {
             assert!(open_path(&bound_leaf).is_err());
         }
 
-        #[test]
-        fn runtime_root_must_leave_capacity_for_the_transport_endpoint() {
-            #[cfg(target_os = "linux")]
-            let temporary_path = Path::new("/tmp");
-            #[cfg(target_os = "macos")]
-            let temporary_path = Path::new("/private/tmp");
-            let maximum_uid_root = temporary_path.join(format!("{PRODUCT_DIRECTORY}-{}", u32::MAX));
-
-            validate_runtime_endpoint_capacity(&maximum_uid_root).unwrap();
-            let oversized = Path::new("/").join("x".repeat(512));
-
-            assert!(matches!(
-                validate_runtime_endpoint_capacity(&oversized),
-                Err(PrivateRootsError::EndpointPathTooLong { path }) if path == oversized
-            ));
-        }
-
         #[cfg(target_os = "macos")]
         #[test]
         fn private_directory_rejects_an_extended_acl_even_with_mode_0700() {
@@ -1896,16 +1769,18 @@ mod platform {
             fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let base = open_path(temporary.path()).unwrap();
             let path = temporary.path().join("private");
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
             let private = create_or_open_private_child(
                 &base,
                 OsStr::new("private"),
-                security_context.effective_uid(),
+                filesystem_authority.effective_uid(),
             )
             .unwrap();
             add_macos_acl(&path, "everyone allow list,search");
 
-            let error = private.revalidate(&path, &security_context).unwrap_err();
+            let error = private
+                .revalidate(&path, &filesystem_authority)
+                .unwrap_err();
 
             assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
             assert_eq!(
@@ -1927,9 +1802,9 @@ mod platform {
                 "everyone allow add_file,add_subdirectory,delete_child,file_inherit,directory_inherit",
             );
             let override_path = ancestor.join("index-base");
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
 
-            let error = open_or_create_persistent_path(&override_path, &security_context)
+            let error = open_or_create_persistent_path(&override_path, &filesystem_authority)
                 .err()
                 .unwrap();
 
@@ -1947,13 +1822,13 @@ mod platform {
             fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700)).unwrap();
             add_macos_acl(&ancestor, "everyone deny delete");
             let override_path = ancestor.join("index-base");
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
 
             let private =
-                open_or_create_persistent_path(&override_path, &security_context).unwrap();
+                open_or_create_persistent_path(&override_path, &filesystem_authority).unwrap();
 
             private
-                .revalidate(&override_path, &security_context)
+                .revalidate(&override_path, &filesystem_authority)
                 .unwrap();
         }
 
@@ -1995,8 +1870,8 @@ mod platform {
             fs::set_permissions(&runtime_base, fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&cache_base, fs::Permissions::from_mode(0o755)).unwrap();
 
-            let security_context = CurrentSecurityContextSnapshot::current().unwrap();
-            let expected_uid = security_context.effective_uid();
+            let filesystem_authority = CurrentFilesystemAuthority::current().unwrap();
+            let expected_uid = filesystem_authority.effective_uid();
             let (runtime_path, runtime) =
                 discover_linux_runtime(Some(runtime_base.into_os_string()), expected_uid).unwrap();
             let (cache_path, cache) =
@@ -2017,9 +1892,11 @@ mod platform {
                 0o700
             );
             runtime
-                .revalidate(&runtime_path, &security_context)
+                .revalidate(&runtime_path, &filesystem_authority)
                 .unwrap();
-            cache.revalidate(&cache_path, &security_context).unwrap();
+            cache
+                .revalidate(&cache_path, &filesystem_authority)
+                .unwrap();
         }
 
         #[cfg(target_os = "linux")]
@@ -2033,7 +1910,7 @@ mod platform {
             assert!(
                 discover_linux_runtime(
                     Some(runtime_base.clone().into_os_string()),
-                    CurrentSecurityContextSnapshot::current()
+                    CurrentFilesystemAuthority::current()
                         .unwrap()
                         .effective_uid(),
                 )
@@ -2048,11 +1925,6 @@ mod platform {
 #[path = "roots_windows.rs"]
 mod platform;
 
-#[cfg(windows)]
-pub(crate) use platform::{
-    PrivateSecurityDescriptor as WindowsPrivateSecurityDescriptor, WINDOWS_NAMED_PIPE_CLIENT_ACCESS,
-};
-
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod platform {
     use std::fs::File;
@@ -2060,7 +1932,7 @@ mod platform {
     use std::path::Path;
 
     use super::{DiscoveredRoots, PrivateRootsError};
-    use crate::security_context::CurrentSecurityContextSnapshot;
+    use crate::security_context::CurrentFilesystemAuthority;
 
     pub(super) struct PrivateDirectory;
 
@@ -2072,7 +1944,7 @@ mod platform {
         pub(super) fn revalidate(
             &self,
             _path: &Path,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2083,7 +1955,7 @@ mod platform {
         pub(super) fn create_private_child(
             &self,
             _name: &std::ffi::OsStr,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<Self> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2095,7 +1967,7 @@ mod platform {
             &self,
             _directory_path: &Path,
             _name: &std::ffi::OsStr,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<File> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2107,7 +1979,7 @@ mod platform {
             &self,
             _directory_path: &Path,
             _name: &std::ffi::OsStr,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
             _writable: bool,
         ) -> io::Result<File> {
             Err(io::Error::new(
@@ -2122,7 +1994,7 @@ mod platform {
             _source: &std::ffi::OsStr,
             _destination: &std::ffi::OsStr,
             _replace: bool,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2134,7 +2006,7 @@ mod platform {
             &self,
             _directory_path: &Path,
             _name: &std::ffi::OsStr,
-            _security_context: &CurrentSecurityContextSnapshot,
+            _filesystem_authority: &CurrentFilesystemAuthority,
         ) -> io::Result<()> {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -2152,7 +2024,7 @@ mod platform {
 
     pub(super) fn open_or_create_persistent_path(
         _path: &Path,
-        _security_context: &CurrentSecurityContextSnapshot,
+        _filesystem_authority: &CurrentFilesystemAuthority,
     ) -> io::Result<PrivateDirectory> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -2161,7 +2033,7 @@ mod platform {
     }
 
     pub(super) fn discover(
-        _security_context: &CurrentSecurityContextSnapshot,
+        _filesystem_authority: &CurrentFilesystemAuthority,
     ) -> Result<DiscoveredRoots, PrivateRootsError> {
         Err(PrivateRootsError::UnsupportedPlatform)
     }

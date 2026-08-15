@@ -1,62 +1,39 @@
-using System.Buffers.Binary;
 using System.Net;
-using System.Net.Sockets;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using UnityAsset.SearchProtocol.Reference;
 
 internal static class LiveDaemonConformance
 {
-    private static readonly string[] ExpectedOperations =
-    {
-        "capabilities",
-        "status",
-        "search",
-        "suggest",
-        "references",
-        "reindex_admit",
-        "reindex_status",
-        "reindex_wait",
-        "reindex_cancel",
-        "shutdown",
-    };
-
     internal static async Task RunAsync(string[] args)
     {
-        Require(args.Length == 3, "Real-daemon mode requires relay port, project ID, and daemon instance ID.");
         Require(
-            int.TryParse(args[0], out int relayPort) && relayPort is > 0 and <= ushort.MaxValue,
-            "Real-daemon relay port is invalid.");
-        ProjectId projectId = ProjectId.Parse(args[1]);
-        DaemonInstanceId daemonInstanceId = DaemonInstanceId.Parse(args[2]);
+            args.Length == 3,
+            "Real-daemon mode requires a descriptor path, expected project ID, and expected query-policy ID.");
+        string descriptorPath = Path.GetFullPath(args[0]);
+        byte[]? ReadCurrentDescriptor()
+        {
+            try
+            {
+                return File.ReadAllBytes(descriptorPath);
+            }
+            catch (Exception error) when (
+                error is FileNotFoundException
+                || error is DirectoryNotFoundException)
+            {
+                return null;
+            }
+        }
+
+        LoopbackEndpointDescriptor endpoint = LoopbackEndpointDescriptor.ReadFromSource(
+            ReadCurrentDescriptor,
+            ProjectId.Parse(args[1]),
+            QueryPolicyId.Parse(args[2]));
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-
-        await AssertBootstrapRejectedAsync(
-            relayPort,
-            DifferentProjectId(projectId),
-            daemonInstanceId,
-            new[] { ProtocolConstants.BusinessProtocolRevision },
-            "project_mismatch",
+        await AssertHttpBoundaryRejectsUnauthenticatedAndBrowserRequestsAsync(
+            endpoint,
             cancellation.Token).ConfigureAwait(false);
-        await AssertBootstrapRejectedAsync(
-            relayPort,
-            projectId,
-            DifferentDaemonInstanceId(daemonInstanceId),
-            new[] { ProtocolConstants.BusinessProtocolRevision },
-            "instance_mismatch",
-            cancellation.Token).ConfigureAwait(false);
-        await AssertBootstrapRejectedAsync(
-            relayPort,
-            projectId,
-            daemonInstanceId,
-            new[] { checked((ushort)(ProtocolConstants.BusinessProtocolRevision - 1)) },
-            "no_common_revision",
-            cancellation.Token).ConfigureAwait(false);
-
-        using ProtocolSession session = await ProtocolSession.ConnectAsync(
-            new LoopbackProtocolTransportAdapter(relayPort),
-            projectId,
-            daemonInstanceId,
-            cancellation.Token).ConfigureAwait(false);
+        using ProtocolHttpClient client = ProtocolHttpClient.Open(endpoint);
 
         var observedOperations = new HashSet<string>(StringComparer.Ordinal);
         int requestOrdinal = 1;
@@ -64,11 +41,11 @@ internal static class LiveDaemonConformance
         {
             RequestId requestId = RequestId.Parse($"request-v1:{requestOrdinal++:x32}");
             RequestEnvelopeV1 request = BusinessCodec.CreateRequest(
-                session.Binding,
+                client.Binding,
                 requestId,
                 operation,
                 JsonSerializer.SerializeToUtf8Bytes(payload));
-            ResponseEnvelopeV1 response = await session.ExchangeAsync(
+            ResponseEnvelopeV1 response = await client.ExchangeAsync(
                 request,
                 cancellation.Token).ConfigureAwait(false);
             observedOperations.Add(operation);
@@ -103,7 +80,7 @@ internal static class LiveDaemonConformance
         JsonElement initialStatus = initialStatusResponse.Value.GetProperty("response");
         Require(
             initialStatus.GetProperty("daemon").GetProperty("lifecycle").GetString() == "serving",
-            "Real daemon was not serving after Bootstrap.");
+            "Real daemon was not serving after endpoint discovery.");
 
         ResponseEnvelopeV1 admissionResponse = await ExchangeResponseAsync(
             "reindex_admit",
@@ -202,93 +179,55 @@ internal static class LiveDaemonConformance
             new { drain_timeout_ms = 5_000 }).ConfigureAwait(false);
         Require(shutdown.GetProperty("accepted").GetBoolean(), "Real daemon rejected structured shutdown.");
         Require(
-            observedOperations.Count == ExpectedOperations.Length
-                && observedOperations.SetEquals(ExpectedOperations),
-            "Public C# session did not reach every real daemon operation.");
+            observedOperations.Count == ConformanceOperations.All.Count
+                && observedOperations.SetEquals(ConformanceOperations.All),
+            "Public C# HTTP client did not reach every real daemon operation.");
     }
 
-    private static async Task AssertBootstrapRejectedAsync(
-        int relayPort,
-        ProjectId projectId,
-        DaemonInstanceId daemonInstanceId,
-        IReadOnlyList<ushort> supportedRevisions,
-        string expectedCode,
+    private static async Task AssertHttpBoundaryRejectsUnauthenticatedAndBrowserRequestsAsync(
+        LoopbackEndpointDescriptor endpoint,
         CancellationToken cancellationToken)
     {
-        using Stream stream = await new LoopbackProtocolTransportAdapter(relayPort)
-            .ConnectAsync(cancellationToken).ConfigureAwait(false);
-        var hello = new BootstrapHelloV2(
-            ProtocolConstants.BootstrapVersion,
-            projectId,
-            daemonInstanceId,
-            supportedRevisions);
-        byte[] request = FrameCodec.EncodeBootstrapHello(hello);
-        await stream.WriteAsync(request, 0, request.Length, cancellationToken).ConfigureAwait(false);
-        await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
-
-        byte[] replyFrame = await ReadFrameAsync(
-            stream,
-            FrameLimits.BootstrapMaxEncodedBytes,
-            cancellationToken).ConfigureAwait(false);
-        BootstrapReplyV2 reply = FrameCodec.DecodeBootstrapReply(replyFrame);
-        BootstrapCodec.ValidateReplyFor(reply, hello);
-        Require(
-            reply is BootstrapRejectedV2 rejected
-                && string.Equals(rejected.Code, expectedCode, StringComparison.Ordinal),
-            $"Real daemon did not reject Bootstrap with {expectedCode}.");
-    }
-
-    private static async Task<byte[]> ReadFrameAsync(
-        Stream stream,
-        int maximumEncodedBytes,
-        CancellationToken cancellationToken)
-    {
-        var header = new byte[4];
-        await ReadExactlyAsync(stream, header, cancellationToken).ConfigureAwait(false);
-        uint declared = BinaryPrimitives.ReadUInt32BigEndian(header);
-        Require(declared <= maximumEncodedBytes, "Real daemon returned an oversized Bootstrap frame.");
-        var frame = new byte[checked((int)declared + header.Length)];
-        Buffer.BlockCopy(header, 0, frame, 0, header.Length);
-        if (declared > 0)
+        using HttpClientHandler handler = ProtocolHttpClient.CreateHandler();
+        using var client = new HttpClient(handler);
+        using (var unauthenticated = BoundaryRequest(endpoint))
+        using (HttpResponseMessage response = await client.SendAsync(
+            unauthenticated,
+            HttpCompletionOption.ResponseHeadersRead,
+            cancellationToken).ConfigureAwait(false))
         {
-            var payload = new byte[checked((int)declared)];
-            await ReadExactlyAsync(stream, payload, cancellationToken).ConfigureAwait(false);
-            Buffer.BlockCopy(payload, 0, frame, header.Length, payload.Length);
+            Require(
+                response.StatusCode == HttpStatusCode.Unauthorized,
+                "Loopback HTTP boundary parsed an unauthenticated request.");
         }
-        return frame;
-    }
 
-    private static async Task ReadExactlyAsync(
-        Stream stream,
-        byte[] buffer,
-        CancellationToken cancellationToken)
-    {
-        try
+        using (var browserRequest = BoundaryRequest(endpoint))
         {
-            await stream.ReadExactlyAsync(buffer, cancellationToken).ConfigureAwait(false);
-        }
-        catch (EndOfStreamException error)
-        {
-            throw new EndOfStreamException(
-                "Real daemon closed before completing Bootstrap.",
-                error);
+            browserRequest.Headers.Authorization = new AuthenticationHeaderValue(
+                "Bearer",
+                endpoint.Capability);
+            browserRequest.Headers.TryAddWithoutValidation("Origin", "https://example.invalid");
+            using HttpResponseMessage response = await client.SendAsync(
+                browserRequest,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+            Require(
+                response.StatusCode == HttpStatusCode.Forbidden,
+                "Loopback HTTP boundary accepted a browser-origin request.");
         }
     }
 
-    private static ProjectId DifferentProjectId(ProjectId projectId)
+    private static HttpRequestMessage BoundaryRequest(LoopbackEndpointDescriptor endpoint)
     {
-        return ProjectId.Parse(DifferentFixedId(projectId.ToString()));
-    }
-
-    private static DaemonInstanceId DifferentDaemonInstanceId(DaemonInstanceId daemonInstanceId)
-    {
-        return DaemonInstanceId.Parse(DifferentFixedId(daemonInstanceId.ToString()));
-    }
-
-    private static string DifferentFixedId(string value)
-    {
-        char replacement = value[value.Length - 1] == '0' ? '1' : '0';
-        return value.Substring(0, value.Length - 1) + replacement;
+        var request = new HttpRequestMessage(HttpMethod.Post, endpoint.RequestUri)
+        {
+            Version = HttpVersion.Version11,
+            Content = new ByteArrayContent(new byte[] { (byte)'{' }),
+        };
+        request.Headers.Host = endpoint.HostHeader;
+        request.Headers.ConnectionClose = true;
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+        return request;
     }
 
     private static bool ArrayContainsString(JsonElement array, string expected)
@@ -320,36 +259,6 @@ internal static class LiveDaemonConformance
         if (!condition)
         {
             throw new InvalidOperationException(message);
-        }
-    }
-}
-
-internal sealed class LoopbackProtocolTransportAdapter : IProtocolTransportAdapter
-{
-    private readonly int port;
-
-    internal LoopbackProtocolTransportAdapter(int port)
-    {
-        this.port = port;
-    }
-
-    public async Task<Stream> ConnectAsync(CancellationToken cancellationToken)
-    {
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
-        {
-            NoDelay = true,
-        };
-        try
-        {
-            await socket.ConnectAsync(
-                new IPEndPoint(IPAddress.Loopback, port),
-                cancellationToken).ConfigureAwait(false);
-            return new NetworkStream(socket, ownsSocket: true);
-        }
-        catch
-        {
-            socket.Dispose();
-            throw;
         }
     }
 }

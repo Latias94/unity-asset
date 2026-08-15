@@ -44,22 +44,6 @@ pub enum ContractValidationError {
     },
 }
 
-pub(crate) fn ensure_version(
-    contract: &'static str,
-    actual: u16,
-    expected: u16,
-) -> Result<(), ContractValidationError> {
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(ContractValidationError::UnsupportedVersion {
-            contract,
-            actual,
-            expected,
-        })
-    }
-}
-
 pub(crate) fn ensure_revision(
     contract: &'static str,
     actual: u16,

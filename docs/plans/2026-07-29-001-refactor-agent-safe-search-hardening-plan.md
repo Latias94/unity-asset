@@ -11,6 +11,13 @@ execution: code
 
 # Agent-Safe Search And Workspace Hardening - Plan
 
+> **Transport supersession (2026-08-15):** [ADR 0005](../adr/0005-local-search-http-capability.md)
+> replaces this plan's principal-scoped IPC, Bootstrap V2 session, framed-stream, native C#
+> transport-adapter, and per-message OS-principal requirements. Do not implement or restore those
+> parts of R1, R21-R22, KTD2-KTD3, KTD17, U2, or U11. The remaining search-domain, lifecycle,
+> generation, workspace, media, release, and verification requirements continue to apply where they
+> do not depend on the superseded transport.
+
 ## Goal Capsule
 
 | Field | Contract |

@@ -4,12 +4,12 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
-description = "Versioned local IPC contracts for unity-asset search clients and daemons"
+description = "Versioned JSON contracts for unity-asset search clients and daemons"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-search-protocol"
-keywords = ["unity", "search", "protocol", "ipc"]
+keywords = ["unity", "search", "protocol", "json"]
 categories = ["command-line-utilities", "game-development"]
 
 [dependencies]

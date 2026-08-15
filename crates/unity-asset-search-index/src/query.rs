@@ -1664,8 +1664,7 @@ mod tests {
     use super::*;
     use unity_asset_core::{AssetLoadLimits, AssetLoadUsage, BudgetError};
     use unity_asset_search_protocol::{
-        RequestEnvelope, ResponseEnvelope, ResponseOperation, ResponseOutcome,
-        encode_response_frame,
+        RequestEnvelope, ResponseEnvelope, ResponseOperation, ResponseOutcome, encode_response_json,
     };
 
     fn generous_asset_load_budget() -> AssetLoadBudget {
@@ -1737,8 +1736,8 @@ mod tests {
         response.validate().unwrap();
 
         let envelope = ResponseEnvelope::success(&request, ResponseOperation::Search(response));
-        let frame = encode_response_frame(&envelope, &request).unwrap();
-        assert!(frame.len() <= 16 * 1024 * 1024 + std::mem::size_of::<u32>());
+        let encoded = encode_response_json(&envelope, &request).unwrap();
+        assert!(encoded.len() <= 16 * 1024 * 1024);
     }
 
     #[test]

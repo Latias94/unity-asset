@@ -5,14 +5,14 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use unity_asset_search_local::{
-    DiscoveredEndpointV1, EndpointNamespaceV1, EndpointStoreError, PrivateRootsV1, ProjectLocatorV1,
+    DiscoveredLoopbackEndpoint, EndpointNamespaceV1, EndpointStoreError, PrivateRootsV1,
+    ProjectLocatorV1,
 };
 
 pub const TEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct SearchDaemonFixture {
     project_directory: tempfile::TempDir,
-    project: ProjectLocatorV1,
     _roots: PrivateRootsV1,
     namespace: EndpointNamespaceV1,
     index_directory: PathBuf,
@@ -33,7 +33,6 @@ impl SearchDaemonFixture {
         let index_directory = project.root().join(".process-contract-index");
         Self {
             project_directory,
-            project,
             _roots: roots,
             namespace,
             index_directory,
@@ -50,10 +49,6 @@ impl SearchDaemonFixture {
 
     pub fn index_directory(&self) -> &Path {
         &self.index_directory
-    }
-
-    pub const fn project(&self) -> &ProjectLocatorV1 {
-        &self.project
     }
 
     pub const fn namespace(&self) -> &EndpointNamespaceV1 {
@@ -74,11 +69,11 @@ impl SearchDaemonFixture {
         DaemonChild::spawn(self.project_root(), self.index_directory(), startup_reindex)
     }
 
-    pub async fn wait_for_endpoint(&self, daemon: &mut DaemonChild) -> DiscoveredEndpointV1 {
+    pub async fn wait_for_endpoint(&self, daemon: &mut DaemonChild) -> DiscoveredLoopbackEndpoint {
         let deadline = Instant::now() + TEST_TIMEOUT;
         loop {
             daemon.assert_running();
-            match self.namespace.discover_endpoint() {
+            match self.namespace.discover_loopback_endpoint() {
                 Ok(discovered) => return discovered,
                 Err(
                     EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged,

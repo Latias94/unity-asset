@@ -1137,6 +1137,11 @@ pub enum StreamedResourceResolution {
     },
 }
 
+enum StreamedResourceOwnerClassification {
+    Resolved(WorkspaceSource),
+    Terminal(StreamedResourceResolution),
+}
+
 /// Versioned streamed-resource query result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct StreamedResourceQueryResult {
@@ -1355,25 +1360,15 @@ impl<'view, 'source> StreamedResourceResolver<'view, 'source> {
         })
     }
 
+    #[cfg(feature = "decode")]
     pub(crate) fn resolve_request(
         &self,
         request: &StreamedResourceRequest,
         budget: &mut AssetLoadBudget,
     ) -> Result<StreamedResourceResolution, WorkspaceError> {
-        let owner = match self.view.resolve_source(request.owner(), budget)? {
-            WorkspaceLookup::Resolved(source) => source,
-            WorkspaceLookup::Unloaded => return Ok(StreamedResourceResolution::OwnerUnloaded),
-            WorkspaceLookup::Missing => return Ok(StreamedResourceResolution::OwnerMissing),
-            WorkspaceLookup::Ambiguous { .. } => {
-                return invalid_stream_resolution(
-                    "WORKSPACE_STREAM_OWNER_AMBIGUOUS",
-                    "stream owner resolves to multiple loaded sources",
-                    budget,
-                );
-            }
-            WorkspaceLookup::Invalid { diagnostic } => {
-                return Ok(StreamedResourceResolution::Invalid { diagnostic });
-            }
+        let owner = match classify_streamed_resource_owner(self.view, request.owner(), budget)? {
+            StreamedResourceOwnerClassification::Resolved(owner) => owner,
+            StreamedResourceOwnerClassification::Terminal(resolution) => return Ok(resolution),
         };
         self.resolve(
             &owner,
@@ -1490,9 +1485,21 @@ impl<'view> WorkspaceInspector<'view> {
         budget: &mut AssetLoadBudget,
     ) -> Result<StreamedResourceQueryResult, WorkspaceError> {
         let request_copy = request.try_clone_with_budget(budget)?;
-        let sources = self.view.sources(budget)?;
-        let resolver = StreamedResourceResolver::new(self.view, &sources, budget)?;
-        let resolution = resolver.resolve_request(request, budget)?;
+        let resolution = match classify_streamed_resource_owner(self.view, request.owner(), budget)?
+        {
+            StreamedResourceOwnerClassification::Resolved(owner) => {
+                let sources = self.view.sources(budget)?;
+                let resolver = StreamedResourceResolver::new(self.view, &sources, budget)?;
+                resolver.resolve(
+                    &owner,
+                    request.stream_path(),
+                    request.offset(),
+                    request.size(),
+                    budget,
+                )?
+            }
+            StreamedResourceOwnerClassification::Terminal(resolution) => resolution,
+        };
         Ok(self.stream_result(request_copy, resolution))
     }
 
@@ -1841,6 +1848,35 @@ fn stream_source_score(owner: &WorkspaceSource, candidate: &WorkspaceSource) -> 
     } else {
         3
     }
+}
+
+fn classify_streamed_resource_owner(
+    view: &dyn WorkspaceView,
+    owner: &SourceLocator,
+    budget: &mut AssetLoadBudget,
+) -> Result<StreamedResourceOwnerClassification, WorkspaceError> {
+    let classification = match view.resolve_source(owner, budget)? {
+        WorkspaceLookup::Resolved(source) => StreamedResourceOwnerClassification::Resolved(source),
+        WorkspaceLookup::Unloaded => {
+            StreamedResourceOwnerClassification::Terminal(StreamedResourceResolution::OwnerUnloaded)
+        }
+        WorkspaceLookup::Missing => {
+            StreamedResourceOwnerClassification::Terminal(StreamedResourceResolution::OwnerMissing)
+        }
+        WorkspaceLookup::Ambiguous { .. } => {
+            StreamedResourceOwnerClassification::Terminal(invalid_stream_resolution(
+                "WORKSPACE_STREAM_OWNER_AMBIGUOUS",
+                "stream owner resolves to multiple loaded sources",
+                budget,
+            )?)
+        }
+        WorkspaceLookup::Invalid { diagnostic } => {
+            StreamedResourceOwnerClassification::Terminal(StreamedResourceResolution::Invalid {
+                diagnostic,
+            })
+        }
+    };
+    Ok(classification)
 }
 
 fn invalid_stream_resolution(

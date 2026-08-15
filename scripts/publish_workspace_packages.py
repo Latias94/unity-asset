@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence
 from urllib.parse import quote
 
 from release_contract import PUBLISHABLE_PACKAGE_NAMES
@@ -23,6 +23,11 @@ from release_subprocess import (
     BoundedCommandTimeout,
     credential_free_environment,
     run_bounded_command,
+)
+from workspace_package_contract import VerificationError as WorkspaceVerificationError
+from workspace_package_verification import (
+    configuration_clean_cargo_cwd,
+    isolated_cargo_environment,
 )
 
 
@@ -98,20 +103,25 @@ class PublishBackend(Protocol):
 
 @dataclass
 class CargoBackend:
+    """Publish through trusted Cargo configuration and a revalidated candidate archive."""
+
     repository_root: Path
     cargo: str
     token: str
+    cargo_cwd: Path
+    cargo_environment: Mapping[str, str]
+    prepared_crates_directory: Path
 
     def run(
         self, command: Sequence[str], *, credentialed: bool = False
     ) -> subprocess.CompletedProcess[str]:
-        environment = credential_free_environment()
+        environment = credential_free_environment(self.cargo_environment)
         if credentialed:
             environment["CARGO_REGISTRY_TOKEN"] = self.token
         try:
             return run_bounded_command(
                 command,
-                cwd=self.repository_root,
+                cwd=self.cargo_cwd,
                 env=environment,
                 timeout_seconds=COMMAND_TIMEOUT_SECONDS,
             )
@@ -133,7 +143,16 @@ class CargoBackend:
                 f"cannot remove stale package archive {archive}: {error}"
             ) from error
         result = self.run(
-            [self.cargo, "package", "--locked", "--no-verify", "-p", package]
+            [
+                self.cargo,
+                "package",
+                "--locked",
+                "--no-verify",
+                "--manifest-path",
+                str(self.repository_root / "Cargo.toml"),
+                "-p",
+                package,
+            ]
         )
         if result.returncode != 0:
             raise PublishError(
@@ -141,11 +160,29 @@ class CargoBackend:
             )
         if archive.is_symlink() or not archive.is_file():
             raise PublishError(f"cargo package did not create a regular archive: {archive}")
+        prepared = self.prepared_crates_directory / archive.name
+        if prepared.is_symlink() or not prepared.is_file():
+            raise PublishError(
+                f"missing unprivileged verified crate archive: {prepared}"
+            )
+        try:
+            if archive.read_bytes() != prepared.read_bytes():
+                raise PublishError(
+                    f"prepared crate {archive.name} does not match the unprivileged "
+                    "candidate archive"
+                )
+        except OSError as error:
+            raise PublishError(
+                f"cannot compare prepared crate {archive.name}: {error}"
+            ) from error
 
     def archive_path(self, package: str, version: str) -> Path:
-        target_dir = Path(os.environ.get("CARGO_TARGET_DIR", "target"))
+        encoded_target = self.cargo_environment.get("CARGO_TARGET_DIR")
+        if encoded_target is None:
+            raise PublishError("isolated Cargo environment is missing CARGO_TARGET_DIR")
+        target_dir = Path(encoded_target)
         if not target_dir.is_absolute():
-            target_dir = self.repository_root / target_dir
+            raise PublishError("isolated CARGO_TARGET_DIR must be absolute")
         return target_dir / "package" / f"{package}-{version}.crate"
 
     def release_state(self, package: str, version: str) -> RemotePackageState:
@@ -218,6 +255,8 @@ class CargoBackend:
                 "--no-verify",
                 "--registry",
                 "crates-io",
+                "--manifest-path",
+                str(self.repository_root / "Cargo.toml"),
                 "-p",
                 package,
             ],
@@ -236,9 +275,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--repository-root",
         type=Path,
-        default=Path(__file__).resolve().parent.parent,
+        required=True,
     )
     parser.add_argument("--cargo", default=os.environ.get("CARGO", "cargo"))
+    parser.add_argument(
+        "--prepared-crates-directory",
+        type=Path,
+        required=True,
+        help="Directory containing crate archives produced by the unprivileged candidate job.",
+    )
     parser.add_argument("--version", required=True)
     parser.add_argument("--packages", nargs="+", required=True)
     parser.add_argument("--max-attempts", type=int, default=10)
@@ -571,14 +616,42 @@ def main() -> int:
         )
     if os.environ.get("CARGO_REGISTRY_TOKEN"):
         raise PublishError("CARGO_REGISTRY_TOKEN must not be exported to the publication step")
-    backend = CargoBackend(args.repository_root.resolve(), args.cargo, token)
-    publish_packages(
-        backend,
-        packages,
-        args.version,
-        max_attempts=args.max_attempts,
-        retry_delay_seconds=args.retry_delay_seconds,
-    )
+    repository_root = args.repository_root.resolve()
+    try:
+        cargo_cwd = configuration_clean_cargo_cwd(repository_root)
+    except WorkspaceVerificationError as error:
+        raise PublishError(
+            f"cannot establish a configuration-clean Cargo working directory: {error}"
+        ) from error
+    with tempfile.TemporaryDirectory(
+        prefix="unity-asset-trusted-publish-", ignore_cleanup_errors=True
+    ) as temporary:
+        temporary_root = Path(temporary).resolve()
+        cargo_home = temporary_root / "cargo-home"
+        try:
+            cargo_home.mkdir()
+            cargo_environment = isolated_cargo_environment(
+                cargo_home, temporary_root / "target"
+            )
+        except OSError as error:
+            raise PublishError(
+                f"cannot establish the isolated Cargo publication environment: {error}"
+            ) from error
+        backend = CargoBackend(
+            repository_root=repository_root,
+            cargo=args.cargo,
+            token=token,
+            cargo_cwd=cargo_cwd,
+            cargo_environment=cargo_environment,
+            prepared_crates_directory=args.prepared_crates_directory.resolve(),
+        )
+        publish_packages(
+            backend,
+            packages,
+            args.version,
+            max_attempts=args.max_attempts,
+            retry_delay_seconds=args.retry_delay_seconds,
+        )
     return 0
 
 

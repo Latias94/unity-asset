@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-search-local"
-keywords = ["unity", "search", "ipc"]
+keywords = ["unity", "search", "http"]
 categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
@@ -21,14 +21,13 @@ serde_json.workspace = true
 sha2.workspace = true
 subtle = "2.6.0"
 thiserror.workspace = true
-tokio.workspace = true
 unity-asset-search-protocol = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-rustix = { workspace = true, features = ["fs", "net", "process"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
@@ -43,7 +42,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Com",
     "Win32_System_IO",
-    "Win32_System_Pipes",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",

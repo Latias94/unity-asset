@@ -45,10 +45,6 @@ class ProtocolSdkBundleTests(unittest.TestCase):
             b'{"operation":"search"}\n',
         )
         self.write(
-            schemas / "bootstrap-v2.schema.json",
-            b'{"$id":"bootstrap","$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
-        )
-        self.write(
             schemas / "business-v5.schema.json",
             b'{"$id":"business","$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
         )
@@ -116,7 +112,6 @@ class ProtocolSdkBundleTests(unittest.TestCase):
                     "UnityAsset.SearchProtocol.Reference.csproj",
                     "fixtures/manifest.json",
                     "fixtures/requests/search-v2.json",
-                    "schema/bootstrap-v2.schema.json",
                     "schema/business-v5.schema.json",
                 ],
             )
@@ -251,10 +246,6 @@ class ProtocolSdkBundleTests(unittest.TestCase):
                 b"<Project />\n",
             ),
             BUNDLE._SourceFile("fixtures/manifest.json", b"{}\n"),
-            BUNDLE._SourceFile(
-                "schema/bootstrap-v2.schema.json",
-                b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
-            ),
             BUNDLE._SourceFile(
                 "schema/business-v5.schema.json",
                 b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n',

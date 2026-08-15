@@ -205,12 +205,12 @@ Index AssetBundle container paths:
 cargo run -p unity-asset-search-daemon -- --project-root D:\GameProject --watch --index-bundle-container-entries
 ```
 
-The CLI discovers the project-bound local IPC endpoint, verifies the daemon process and execution
-principal, and negotiates the versioned protocol before any business request. There is no TCP
-listener, URL, or bearer token.
+The CLI reads the private project-bound endpoint descriptor and sends one capability-authenticated
+HTTP request over IPv4 loopback. The port and ephemeral bearer capability are never supplied on the
+command line, and the client disables proxies and redirects.
 
 ```powershell
-cargo run -p unity-asset-search-cli -- --project-root D:\GameProject bootstrap
+cargo run -p unity-asset-search-cli -- --project-root D:\GameProject capabilities
 cargo run -p unity-asset-search-cli -- --project-root D:\GameProject status
 cargo run -p unity-asset-search-cli -- --project-root D:\GameProject search "type:Prefab in:Assets/UI start button" --limit 20
 cargo run -p unity-asset-search-cli -- --project-root D:\GameProject suggest "t:pr" --limit 10

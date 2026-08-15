@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -32,7 +33,6 @@ from release_subprocess import (
 )
 from workspace_package_contract import (
     CRATES_IO_SOURCE,
-    FORBIDDEN_RELEASE_DEPENDENCIES,
     VerificationError,
     WorkspacePackage,
     dependency_tables,
@@ -250,6 +250,26 @@ def configuration_clean_cargo_cwd(workspace_root: Path) -> Path:
     return root
 
 
+def export_verified_archives(
+    archive_paths: Mapping[str, Path], output_directory: Path
+) -> None:
+    """Copy the already verified crate archives into one publication handoff."""
+
+    try:
+        output_directory.mkdir(parents=True, exist_ok=False)
+        for package in sorted(archive_paths):
+            archive = archive_paths[package]
+            if archive.is_symlink() or not archive.is_file():
+                raise VerificationError(
+                    f"verified crate archive is not a regular file: {archive}"
+                )
+            shutil.copyfile(archive, output_directory / archive.name)
+    except OSError as error:
+        raise VerificationError(
+            f"cannot export verified crate archives to {output_directory}: {error}"
+        ) from error
+
+
 def locate_archive(package_target: Path, package: WorkspacePackage) -> Path:
     expected_name = f"{package.name}-{package.version}.crate"
     archive = package_target / "package" / expected_name
@@ -367,12 +387,6 @@ def validate_packaged_manifest(package_root: Path, expected: WorkspacePackage) -
             raise VerificationError(
                 f"{manifest_path}: {location} retains a Git dependency"
             )
-        if package_name in FORBIDDEN_RELEASE_DEPENDENCIES:
-            raise VerificationError(
-                f"{manifest_path}: {location} depends on forbidden package "
-                f"{package_name!r}"
-            )
-
 
 def validate_package_vcs_info(
     package_root: Path,
@@ -659,11 +673,6 @@ def validate_resolved_workspace(
             raise VerificationError(f"missing manifest path for {package_id}")
         manifest_path = Path(raw_manifest_path).resolve()
 
-        if name in FORBIDDEN_RELEASE_DEPENDENCIES:
-            raise VerificationError(
-                f"resolved graph contains forbidden package {name!r}"
-            )
-
         local_manifest = resolved_local_manifests.get(name)
         if local_manifest is not None:
             if manifest_path != local_manifest or source is not None:
@@ -887,6 +896,7 @@ def run_verification(
     workspace_root: Path,
     closure: Sequence[WorkspacePackage],
     verify_binaries: bool,
+    archive_output: Path | None = None,
 ) -> None:
     cargo_cwd = configuration_clean_cargo_cwd(workspace_root)
     with tempfile.TemporaryDirectory(
@@ -1043,3 +1053,6 @@ def run_verification(
             workspace_manifest=consumer_manifest,
             consumer_names=tuple(consumer_manifests),
         )
+
+        if archive_output is not None:
+            export_verified_archives(archive_paths, archive_output)

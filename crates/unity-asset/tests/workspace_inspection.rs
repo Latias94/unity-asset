@@ -496,6 +496,53 @@ fn streamed_resource_resolution_keeps_missing_and_range_failures_distinct() {
 }
 
 #[test]
+fn missing_stream_owner_does_not_spend_budget_on_global_resource_indexing() {
+    let request = StreamedResourceRequest::new(
+        SourceLocator::archive_member("resources.zip", "missing.prefab").unwrap(),
+        "missing.resS",
+        0,
+        1,
+    )
+    .unwrap();
+
+    let baseline_archive = zip_with_entries(&[("scene.prefab", YAML.as_bytes())]);
+    let (_baseline_directory, baseline_workspace, _baseline_archive_id) =
+        workspace_with_file("resources.zip", &baseline_archive);
+    let baseline_snapshot = baseline_workspace.snapshot();
+    let mut measured = AssetLoadBudget::default();
+    let baseline = WorkspaceInspector::new(&baseline_snapshot)
+        .resolve_streamed_resource(&request, &mut measured)
+        .unwrap();
+    assert!(matches!(
+        baseline.resolution(),
+        StreamedResourceResolution::OwnerMissing
+    ));
+
+    let archive = zip_with_entries(&[
+        ("scene.prefab", YAML.as_bytes()),
+        ("folder-a/shared.resS", b"AAAA"),
+        ("folder-b/shared.resS", b"BBBB"),
+    ]);
+    let (_directory, populated_workspace, _archive_id) =
+        workspace_with_file("resources.zip", &archive);
+    let populated_snapshot = populated_workspace.snapshot();
+    let mut exact = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: measured.usage().bytes,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    let result = WorkspaceInspector::new(&populated_snapshot)
+        .resolve_streamed_resource(&request, &mut exact)
+        .unwrap();
+
+    assert!(matches!(
+        result.resolution(),
+        StreamedResourceResolution::OwnerMissing
+    ));
+    assert_eq!(exact.usage(), measured.usage());
+}
+
+#[test]
 fn committed_and_prepared_views_use_the_same_streamed_resource_rules() {
     let (directory, workspace, _source_id) = workspace_with_file(SOURCE_ALIAS, YAML.as_bytes());
     let archive = zip_with_entries(&[

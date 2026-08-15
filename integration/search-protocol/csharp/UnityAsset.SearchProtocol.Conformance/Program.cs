@@ -1,8 +1,9 @@
+using System.Collections.Frozen;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
-using System.Security.Cryptography;
 using UnityAsset.SearchProtocol.Reference;
 
 return await ConformanceProgram.RunAsync(args);
@@ -18,38 +19,19 @@ internal static class ConformanceProgram
     private const string FrozenBusinessV4InventorySha256 =
         "43a825a10cf984122d4c6fd4f8d6d33e9d9a09cdbce17711924df46fa21b00c7";
 
-    private static readonly string[] OperationNames =
-    {
-        "capabilities",
-        "status",
-        "search",
-        "suggest",
-        "references",
-        "reindex_admit",
-        "reindex_status",
-        "reindex_wait",
-        "reindex_cancel",
-        "shutdown",
-    };
-
     public static async Task<int> RunAsync(string[] args)
     {
         try
         {
-            if (args.Length > 0 && string.Equals(args[0], "--real-daemon-relay", StringComparison.Ordinal))
+            if (args.Length > 0 && string.Equals(args[0], "--real-daemon-http", StringComparison.Ordinal))
             {
                 await LiveDaemonConformance.RunAsync(args[1..]).ConfigureAwait(false);
-                Console.WriteLine("PASS: public C# session reached every real daemon operation");
+                Console.WriteLine("PASS: public C# HTTP client reached every real daemon operation");
                 return 0;
             }
 
             string fixtureRoot = ResolveFixtureRoot(args);
             Run(fixtureRoot);
-            await AssertPublicProtocolSessionAsync(fixtureRoot).ConfigureAwait(false);
-            await AssertPublicProtocolSessionPoisoningAsync(fixtureRoot).ConfigureAwait(false);
-            await AssertPublicProtocolSessionSerializesExchangesAsync(fixtureRoot).ConfigureAwait(false);
-            await AssertPublicProtocolSessionDisposeAsync(fixtureRoot).ConfigureAwait(false);
-            await AssertFramedStreamPoisoningAsync().ConfigureAwait(false);
             Console.WriteLine($"PASS: search protocol v5 fixtures conform; business v1, v2, v3, and v4 remain frozen ({fixtureRoot})");
             return 0;
         }
@@ -84,100 +66,167 @@ internal static class ConformanceProgram
         AssertCoverage(manifest);
         AssertRevisionFiveFixtureSemantics(fixtureRoot);
         AssertManifestOwnsAllJson(fixtureRoot, manifest, frozen);
-        AssertPublishedSchemas(fixtureRoot);
+        AssertPublishedSchema(fixtureRoot);
 
         foreach (FixtureEntry fixture in manifest.Valid)
         {
             byte[] payload = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, fixture.Path)));
             byte[] encoded;
-            int maximum;
-
-            switch (fixture.Kind)
+            if (fixture.Kind == "request")
             {
-                case "bootstrap_hello":
-                    BootstrapHelloV2 hello = BootstrapCodec.DecodeHello(payload);
-                    encoded = BootstrapCodec.EncodeHello(hello);
-                    maximum = FrameLimits.BootstrapMaxEncodedBytes;
-                    break;
-                case "bootstrap_reply":
-                    BootstrapReplyV2 reply = BootstrapCodec.DecodeReply(payload);
-                    BootstrapHelloV2 offeredHello = BootstrapCodec.DecodeHello(
-                        TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "hello-v2.json"))));
-                    BootstrapCodec.ValidateReplyFor(reply, offeredHello);
-                    encoded = BootstrapCodec.EncodeReply(reply);
-                    maximum = FrameLimits.BootstrapMaxEncodedBytes;
-                    break;
-                case "request":
-                    RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(payload, binding);
-                    Require(request.OperationKind == fixture.Operation, $"{fixture.Name}: request operation mismatch.");
-                    encoded = BusinessCodec.EncodeRequest(request);
-                    maximum = FrameLimits.ForRequest(request.OperationKind);
-                    break;
-                case "response":
-                    string requestPath = fixture.Request
-                        ?? throw new InvalidOperationException($"{fixture.Name}: response fixture has no request fixture.");
-                    RequestEnvelopeV1 pairedRequest = BusinessCodec.DecodeRequest(
-                        TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, requestPath))),
-                        binding);
-                    ResponseEnvelopeV1 response = BusinessCodec.DecodeResponse(payload);
-                    response.ValidateFor(pairedRequest);
-                    if (response.IsError)
-                    {
-                        Require(fixture.Name == "structured error response", $"{fixture.Name}: unexpected error outcome.");
-                    }
-                    else
-                    {
-                        Require(response.OperationKind == fixture.Operation, $"{fixture.Name}: response operation mismatch.");
-                    }
-                    encoded = BusinessCodec.EncodeResponse(response);
-                    maximum = FrameLimits.ForResponse(pairedRequest.OperationKind);
-                    break;
-                default:
-                    throw new InvalidOperationException($"{fixture.Name}: unknown fixture kind '{fixture.Kind}'.");
+                RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(payload, binding);
+                Require(request.OperationKind == fixture.Operation, $"{fixture.Name}: request operation mismatch.");
+                encoded = BusinessCodec.EncodeRequest(request);
+            }
+            else if (fixture.Kind == "response")
+            {
+                string requestPath = fixture.Request
+                    ?? throw new InvalidOperationException($"{fixture.Name}: response fixture has no request fixture.");
+                RequestEnvelopeV1 pairedRequest = BusinessCodec.DecodeRequest(
+                    TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, requestPath))),
+                    binding);
+                ResponseEnvelopeV1 response = BusinessCodec.DecodeResponse(payload);
+                response.ValidateFor(pairedRequest);
+                if (response.IsError)
+                {
+                    Require(fixture.Name == "structured error response", $"{fixture.Name}: unexpected error outcome.");
+                }
+                else
+                {
+                    Require(response.OperationKind == fixture.Operation, $"{fixture.Name}: response operation mismatch.");
+                }
+                encoded = BusinessCodec.EncodeResponse(response);
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"{fixture.Name}: unknown fixture kind '{fixture.Kind}'.");
             }
 
             Require(payload.AsSpan().SequenceEqual(encoded), $"{fixture.Name}: canonical encode did not reproduce fixture bytes.");
-            byte[] frame = FrameCodec.Encode(payload, maximum);
-            Require(payload.AsSpan().SequenceEqual(FrameCodec.Decode(frame, maximum)), $"{fixture.Name}: frame round trip failed.");
         }
 
         foreach (FixtureEntry fixture in manifest.Invalid)
         {
-            byte[] payload = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, fixture.Path)));
-            Exception error;
-            switch (fixture.Kind)
+            if (fixture.Kind != "request")
             {
-                case "bootstrap_hello":
-                    error = ExpectFailure(() => BootstrapCodec.DecodeHello(payload), fixture.Name);
-                    break;
-                case "bootstrap_reply":
-                    error = ExpectFailure(() =>
-                    {
-                        BootstrapReplyV2 reply = BootstrapCodec.DecodeReply(payload);
-                        BootstrapHelloV2 hello = BootstrapCodec.DecodeHello(
-                            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "hello-v2.json"))));
-                        BootstrapCodec.ValidateReplyFor(reply, hello);
-                    }, fixture.Name);
-                    break;
-                case "request":
-                    error = ExpectFailure(() => BusinessCodec.DecodeRequest(payload, binding), fixture.Name);
-                    break;
-                default:
-                    throw new InvalidOperationException($"{fixture.Name}: unknown invalid fixture kind '{fixture.Kind}'.");
+                throw new InvalidOperationException(
+                    $"{fixture.Name}: unknown invalid fixture kind '{fixture.Kind}'.");
             }
+            byte[] payload = TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, fixture.Path)));
+            Exception error = ExpectFailure(
+                () => BusinessCodec.DecodeRequest(payload, binding),
+                fixture.Name);
             Require(
                 error.Message.Contains(fixture.ExpectedError!, StringComparison.OrdinalIgnoreCase),
                 $"{fixture.Name}: rejection did not identify '{fixture.ExpectedError}': {error.Message}");
         }
 
-        AssertFramingRejectsLengthMismatch();
-        AssertFramingHonorsExactLimit();
         AssertFixedIdsRejectNonCanonicalHex();
+        AssertLoopbackEndpointDescriptorContract(binding);
+        AssertHttpOperationTimeouts(fixtureRoot, binding);
         AssertJsonRequiresCanonicalEncoding(fixtureRoot, binding);
         AssertPortablePathSecondCharacterColonSemantics();
-        AssertBootstrapRejectsBindingMismatches(fixtureRoot);
-        AssertBootstrapRejectsNoCommonRevision(fixtureRoot);
         AssertContractHardening(fixtureRoot, binding);
+    }
+
+    private static void AssertLoopbackEndpointDescriptorContract(ProtocolBinding binding)
+    {
+        string projectIdValue = binding.ProjectId.Value;
+        string daemonInstanceIdValue = binding.DaemonInstanceId.Value;
+        string queryPolicyIdValue = binding.QueryPolicyId.Value;
+        string descriptorJson =
+            "{\"descriptor_version\":2,"
+            + $"\"project_id\":\"{projectIdValue}\","
+            + $"\"daemon_instance_id\":\"{daemonInstanceIdValue}\","
+            + "\"port\":42424,"
+            + $"\"capability\":\"{new string('5', 64)}\","
+            + $"\"business_protocol_revision\":{binding.ProtocolRevision},"
+            + $"\"query_policy_id\":\"{queryPolicyIdValue}\","
+            + "\"server_pid\":42}";
+        byte[]? currentDescriptor = Encoding.UTF8.GetBytes(descriptorJson);
+        byte[]? ReadCurrentDescriptor() => currentDescriptor;
+
+        LoopbackEndpointDescriptor descriptor = LoopbackEndpointDescriptor.ReadFromSource(
+            ReadCurrentDescriptor,
+            binding.ProjectId,
+            binding.QueryPolicyId);
+        descriptor.RequireUnchanged();
+
+        currentDescriptor = null;
+        descriptor.RequireUnchangedOrMissingAfterShutdown();
+
+        currentDescriptor = Encoding.UTF8.GetBytes(ReplaceExactly(
+            descriptorJson,
+            new string('5', 64),
+            new string('6', 64),
+            "endpoint capability"));
+        ExpectEndpointChanged(
+            descriptor.RequireUnchangedOrMissingAfterShutdown,
+            "shutdown endpoint replacement");
+
+        currentDescriptor = Encoding.UTF8.GetBytes(descriptorJson);
+        ExpectFailure(
+            () => LoopbackEndpointDescriptor.ReadFromSource(
+                ReadCurrentDescriptor,
+                ProjectId.Parse(
+                    "project-v1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                binding.QueryPolicyId),
+            "unexpected endpoint project");
+        ExpectFailure(
+            () => LoopbackEndpointDescriptor.ReadFromSource(
+                ReadCurrentDescriptor,
+                binding.ProjectId,
+                QueryPolicyId.Parse(
+                    "query-policy-v1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")),
+            "unexpected endpoint query policy");
+
+        foreach ((string field, string value) in new[]
+        {
+            ("project_id", projectIdValue),
+            ("daemon_instance_id", daemonInstanceIdValue),
+            ("query_policy_id", queryPolicyIdValue),
+        })
+        {
+            int separator = value.IndexOf(':');
+            string zeroValue = value[..(separator + 1)] + new string('0', value.Length - separator - 1);
+            currentDescriptor = Encoding.UTF8.GetBytes(ReplaceExactly(
+                descriptorJson,
+                value,
+                zeroValue,
+                "endpoint " + field));
+            ExpectFailure(
+                () => LoopbackEndpointDescriptor.ReadFromSource(
+                    ReadCurrentDescriptor,
+                    binding.ProjectId,
+                    binding.QueryPolicyId),
+                "zero endpoint " + field);
+        }
+    }
+
+    private static void AssertHttpOperationTimeouts(
+        string fixtureRoot,
+        ProtocolBinding binding)
+    {
+        RequestEnvelopeV1 status = BusinessCodec.DecodeRequest(
+            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "requests/status-v5.json"))),
+            binding);
+        Require(
+            ProtocolHttpClient.OperationTimeout(status) == TimeSpan.FromSeconds(60),
+            "ordinary HTTP operation deadline changed");
+
+        string reindexWait = ReadFixtureText(
+            fixtureRoot,
+            "requests/reindex-wait-v5.json").Replace(
+                "\"timeout_ms\":30000",
+                "\"timeout_ms\":300000",
+                StringComparison.Ordinal);
+        RequestEnvelopeV1 wait = BusinessCodec.DecodeRequest(
+            Encoding.UTF8.GetBytes(reindexWait),
+            binding);
+        Require(
+            ProtocolHttpClient.OperationTimeout(wait) == TimeSpan.FromSeconds(302),
+            "reindex-wait HTTP deadline lost its response margin");
     }
 
     private static void AssertCoverage(FixtureManifest manifest)
@@ -191,17 +240,13 @@ internal static class ConformanceProgram
             .Select(entry => entry.Operation)
             .ToHashSet(StringComparer.Ordinal);
 
-        Require(requestOperations.SetEquals(OperationNames), "Request fixtures do not cover every current operation.");
-        Require(responseOperations.SetEquals(OperationNames), "Response fixtures do not cover every current operation.");
+        Require(requestOperations.SetEquals(ConformanceOperations.All), "Request fixtures do not cover every current operation.");
+        Require(responseOperations.SetEquals(ConformanceOperations.All), "Response fixtures do not cover every current operation.");
         Require(manifest.Valid.Count(entry => entry.Name == "structured error response") == 1, "Structured error fixture is missing or duplicated.");
         Require(manifest.Valid.Count(entry => entry.Name == "unanchored YAML document references response") == 1, "Unanchored YAML document fixture is missing or duplicated.");
         Require(manifest.Valid.Count(entry => entry.Name == "semantics-stale status response") == 1, "Semantics-stale status fixture is missing or duplicated.");
         Require(manifest.Valid.Count(entry => entry.Name == "configuration-stale status response") == 1, "Configuration-stale status fixture is missing or duplicated.");
         Require(manifest.Valid.Count(entry => entry.Name == "recovery-required status response") == 1, "Recovery-required status fixture is missing or duplicated.");
-        Require(manifest.Valid.Any(entry => entry.Kind == "bootstrap_hello"), "Bootstrap hello fixture is missing.");
-        Require(manifest.Valid.Count(entry => entry.Kind == "bootstrap_reply") == 2, "Bootstrap accepted/rejected fixtures are incomplete.");
-        Require(manifest.Invalid.Count(entry => entry.Kind == "bootstrap_hello") >= 4, "Bootstrap hello negative fixtures are incomplete.");
-        Require(manifest.Invalid.Count(entry => entry.Kind == "bootstrap_reply") >= 4, "Bootstrap negative fixtures are incomplete.");
     }
 
     private static void AssertRevisionFiveFixtureSemantics(string fixtureRoot)
@@ -320,43 +365,40 @@ internal static class ConformanceProgram
         }
     }
 
-    private static void AssertPublishedSchemas(string fixtureRoot)
+    private static void AssertPublishedSchema(string fixtureRoot)
     {
         string schemaRoot = Path.GetFullPath(Path.Combine(fixtureRoot, "..", "schema"));
-        foreach (string name in new[] { "bootstrap-v2.schema.json", "business-v5.schema.json" })
+        string path = Path.Combine(schemaRoot, "business-v5.schema.json");
+        byte[] bytes = ReadNonEmpty(path);
+        string text;
+        try
         {
-            string path = Path.Combine(schemaRoot, name);
-            byte[] bytes = ReadNonEmpty(path);
-            string text;
-            try
-            {
-                text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
-                    .GetString(bytes);
-            }
-            catch (DecoderFallbackException error)
-            {
-                throw new InvalidOperationException($"Schema is not valid UTF-8: {path}", error);
-            }
-
-            using JsonDocument document = JsonDocument.Parse(text);
-            JsonElement root = document.RootElement;
-            Require(root.ValueKind == JsonValueKind.Object, $"Schema root is not an object: {path}");
-            Require(
-                root.TryGetProperty("$schema", out JsonElement schema)
-                    && schema.ValueKind == JsonValueKind.String
-                    && schema.GetString() == "https://json-schema.org/draft/2020-12/schema",
-                $"Schema does not declare Draft 2020-12: {path}");
-            Require(
-                root.TryGetProperty("$id", out JsonElement id)
-                    && id.ValueKind == JsonValueKind.String
-                    && !string.IsNullOrWhiteSpace(id.GetString()),
-                $"Schema does not declare a stable $id: {path}");
-            Require(
-                root.TryGetProperty("$defs", out JsonElement definitions)
-                    && definitions.ValueKind == JsonValueKind.Object
-                    && definitions.EnumerateObject().Any(),
-                $"Schema does not expose reusable definitions: {path}");
+            text = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true)
+                .GetString(bytes);
         }
+        catch (DecoderFallbackException error)
+        {
+            throw new InvalidOperationException($"Schema is not valid UTF-8: {path}", error);
+        }
+
+        using JsonDocument document = JsonDocument.Parse(text);
+        JsonElement root = document.RootElement;
+        Require(root.ValueKind == JsonValueKind.Object, $"Schema root is not an object: {path}");
+        Require(
+            root.TryGetProperty("$schema", out JsonElement schema)
+                && schema.ValueKind == JsonValueKind.String
+                && schema.GetString() == "https://json-schema.org/draft/2020-12/schema",
+            $"Schema does not declare Draft 2020-12: {path}");
+        Require(
+            root.TryGetProperty("$id", out JsonElement id)
+                && id.ValueKind == JsonValueKind.String
+                && !string.IsNullOrWhiteSpace(id.GetString()),
+            $"Schema does not declare a stable $id: {path}");
+        Require(
+            root.TryGetProperty("$defs", out JsonElement definitions)
+                && definitions.ValueKind == JsonValueKind.Object
+                && definitions.EnumerateObject().Any(),
+            $"Schema does not expose reusable definitions: {path}");
     }
 
     private static IReadOnlyList<FrozenBusinessInventory> AssertFrozenBusiness(
@@ -432,27 +474,6 @@ internal static class ConformanceProgram
         return inventories;
     }
 
-    private static void AssertFramingRejectsLengthMismatch()
-    {
-        byte[] malformed = { 0, 0, 0, 2, (byte)'{', (byte)'}', (byte)' ' };
-        ExpectFailure(() => FrameCodec.Decode(malformed, FrameLimits.BootstrapMaxEncodedBytes), "frame length mismatch");
-    }
-
-    private static void AssertFramingHonorsExactLimit()
-    {
-        byte[] exact = Encoding.UTF8.GetBytes(
-            "\"" + new string('x', FrameLimits.BootstrapMaxEncodedBytes - 2) + "\"");
-        byte[] frame = FrameCodec.Encode(exact, FrameLimits.BootstrapMaxEncodedBytes);
-        Require(
-            FrameCodec.Decode(frame, FrameLimits.BootstrapMaxEncodedBytes).AsSpan().SequenceEqual(exact),
-            "Bootstrap frame exact encoded limit did not round trip.");
-        ExpectFailure(
-            () => FrameCodec.Encode(
-                Encoding.UTF8.GetBytes("\"" + new string('x', FrameLimits.BootstrapMaxEncodedBytes - 1) + "\""),
-                FrameLimits.BootstrapMaxEncodedBytes),
-            "bootstrap frame one byte over limit");
-    }
-
     private static void AssertFixedIdsRejectNonCanonicalHex()
     {
         string uppercase = "project-v1:" + new string('A', 64);
@@ -473,7 +494,7 @@ internal static class ConformanceProgram
         const string contractCanonical =
             "{\"unicode\":\"A\u3000B\uE000\U00010000\",\"controls\":\"\\u0000\\b\\t\\n\\f\\r\\u001f\",\"signed_zero\":0}";
         using JsonDocument writerDocument = JsonDocument.Parse(writerInput);
-        byte[] writerEncoded = BootstrapCodec.Write(writer => writerDocument.RootElement.WriteTo(writer));
+        byte[] writerEncoded = CanonicalJson.Write(writer => writerDocument.RootElement.WriteTo(writer));
         Require(
             writerEncoded.AsSpan().SequenceEqual(Encoding.UTF8.GetBytes(contractCanonical)),
             "C# contract JSON writer does not match Rust contract string and integer bytes.");
@@ -540,52 +561,6 @@ internal static class ConformanceProgram
                 requireRelative: true,
                 rejectControlCharacters: true),
             "second-character colon prefix");
-    }
-
-    private static void AssertBootstrapRejectsBindingMismatches(string fixtureRoot)
-    {
-        BootstrapHelloV2 hello = BootstrapCodec.DecodeHello(
-            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "hello-v2.json"))));
-        BootstrapReplyV2 wrongProject = BootstrapNegotiator.Negotiate(
-            hello,
-            ProjectId.Parse("project-v1:" + new string('a', 64)),
-            hello.DaemonInstanceId,
-            QueryPolicyId.Parse("query-policy-v1:" + new string('4', 64)),
-            new ushort[] { ProtocolConstants.BusinessProtocolRevision });
-        BootstrapReplyV2 wrongInstance = BootstrapNegotiator.Negotiate(
-            hello,
-            hello.ProjectId,
-            DaemonInstanceId.Parse("daemon-v1:" + new string('b', 32)),
-            QueryPolicyId.Parse("query-policy-v1:" + new string('4', 64)),
-            new ushort[] { ProtocolConstants.BusinessProtocolRevision });
-        Require(
-            wrongProject is BootstrapRejectedV2 projectRejected && projectRejected.Code == "project_mismatch",
-            "Bootstrap negotiation did not reject a project mismatch.");
-        Require(
-            wrongInstance is BootstrapRejectedV2 instanceRejected && instanceRejected.Code == "instance_mismatch",
-            "Bootstrap negotiation did not reject a daemon instance mismatch.");
-    }
-
-    private static void AssertBootstrapRejectsNoCommonRevision(string fixtureRoot)
-    {
-        BootstrapHelloV2 hello = BootstrapCodec.DecodeHello(
-            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "hello-v2.json"))));
-        BootstrapReplyV2 reply = BootstrapNegotiator.Negotiate(
-            hello,
-            hello.ProjectId,
-            hello.DaemonInstanceId,
-            QueryPolicyId.Parse("query-policy-v1:" + new string('4', 64)),
-            new ushort[] { 1 });
-        Require(
-            reply is BootstrapRejectedV2 rejected && rejected.Code == "no_common_revision",
-            "Bootstrap negotiation did not reject a peer without the current business revision.");
-
-        BootstrapReplyV2 fixtureReply = BootstrapCodec.DecodeReply(
-            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "rejected-v2.json"))));
-        Require(
-            fixtureReply is BootstrapRejectedV2 fixtureRejected
-                && fixtureRejected.Code == "no_common_revision",
-            "Bootstrap rejected fixture does not preserve no_common_revision.");
     }
 
     private static string Sha256(byte[] payload)
@@ -688,7 +663,7 @@ internal static class ConformanceProgram
         AssertStatusPathBudget(fixtureRoot);
         AssertBackgroundReindexOperationContract(fixtureRoot);
         AssertOperationControlForbiddenCode(fixtureRoot);
-        AssertErrorFrameBudget(fixtureRoot, binding);
+        AssertErrorJsonBudget(fixtureRoot, binding);
         AssertReindexPublishWarningBudget(fixtureRoot);
     }
 
@@ -927,7 +902,7 @@ internal static class ConformanceProgram
             "C# structured errors did not project operation_control_forbidden.");
     }
 
-    private static void AssertErrorFrameBudget(string fixtureRoot, ProtocolBinding binding)
+    private static void AssertErrorJsonBudget(string fixtureRoot, ProtocolBinding binding)
     {
         RequestEnvelopeV1 shutdown = BusinessCodec.DecodeRequest(
             Encoding.UTF8.GetBytes(ReadFixtureText(fixtureRoot, "requests/shutdown-v5.json")),
@@ -937,7 +912,8 @@ internal static class ConformanceProgram
         errorNode["request_id"] = shutdown.RequestId.ToString();
         errorNode["value"]!["message"] = new string('x', 16 * 1024);
         ResponseEnvelopeV1 error = BusinessCodec.DecodeResponse(SerializeNode(errorNode));
-        FrameCodec.EncodeResponse(error, shutdown);
+        error.ValidateFor(shutdown);
+        BusinessCodec.EncodeResponse(error);
 
         var details = new JsonObject();
         for (int index = 0; index < 64; index++)
@@ -1213,384 +1189,6 @@ internal static class ConformanceProgram
             "UTF-16-only path ordering");
     }
 
-    private static async Task AssertFramedStreamPoisoningAsync()
-    {
-        using (var stream = new MemoryStream(new byte[] { 0, 0, 0, 2 }))
-        using (var framed = new FramedProtocolStream(stream))
-        {
-            Exception declarationError = await ExpectFailureAsync(
-                () => framed.ReadPayloadAsync(1, CancellationToken.None),
-                "oversized frame declaration").ConfigureAwait(false);
-            Require(
-                declarationError is ProtocolValidationException,
-                "Oversized frame declaration did not fail protocol validation.");
-            Exception reuseError = await ExpectFailureAsync(
-                () => framed.ReadPayloadAsync(1, CancellationToken.None),
-                "oversized frame stream reuse").ConfigureAwait(false);
-            RequirePoisonedStream(reuseError, "oversized frame stream reuse");
-        }
-
-        using var cancellation = new CancellationTokenSource();
-        using var partial = new CancelAfterPartialReadStream(cancellation);
-        using var cancelled = new FramedProtocolStream(partial);
-        Exception cancellationError = await ExpectFailureAsync(
-            () => cancelled.ReadPayloadAsync(8, cancellation.Token),
-            "cancelled partial frame").ConfigureAwait(false);
-        Require(
-            cancellationError is OperationCanceledException,
-            "Cancelled partial frame did not preserve cancellation evidence.");
-        Exception cancelledReuseError = await ExpectFailureAsync(
-            () => cancelled.ReadPayloadAsync(8, CancellationToken.None),
-            "cancelled frame stream reuse").ConfigureAwait(false);
-        RequirePoisonedStream(cancelledReuseError, "cancelled frame stream reuse");
-    }
-
-    private static async Task AssertPublicProtocolSessionAsync(string fixtureRoot)
-    {
-        var accepted = BootstrapCodec.DecodeReply(
-            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "accepted-v2.json"))))
-            as BootstrapAcceptedV2
-            ?? throw new InvalidOperationException("Accepted bootstrap fixture did not decode as accepted.");
-        var hello = new BootstrapHelloV2(
-            ProtocolConstants.BootstrapVersion,
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            new[] { ProtocolConstants.BusinessProtocolRevision });
-        byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
-        var exchangeFixtures = OperationNames.Select(operation =>
-        {
-            string fixtureName = operation.Replace('_', '-');
-            return (
-                Operation: operation,
-                RequestPayload: TrimTerminalNewline(
-                    ReadNonEmpty(Path.Combine(fixtureRoot, "requests", $"{fixtureName}-v5.json"))),
-                ResponsePayload: TrimTerminalNewline(
-                    ReadNonEmpty(Path.Combine(fixtureRoot, "responses", $"{fixtureName}-v5.json"))));
-        }).ToArray();
-        var incomingBytes = new List<byte>(acceptedFrame);
-        foreach (var fixture in exchangeFixtures)
-        {
-            incomingBytes.AddRange(FrameCodec.Encode(
-                fixture.ResponsePayload,
-                FrameLimits.ForResponse(fixture.Operation)));
-        }
-        var exchangeStream = new ScriptedDuplexStream(incomingBytes.ToArray());
-        var adapter = new SingleStreamTransportAdapter(exchangeStream);
-
-        using (ProtocolSession session = await ProtocolSession.ConnectAsync(
-            adapter,
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            CancellationToken.None).ConfigureAwait(false))
-        {
-            Require(
-                session.Binding.ProtocolRevision == ProtocolConstants.BusinessProtocolRevision,
-                "Public session retained the wrong business revision.");
-            Require(session.Binding.ProjectId.Equals(accepted.ProjectId), "Public session lost project binding.");
-            Require(
-                session.Binding.DaemonInstanceId.Equals(accepted.DaemonInstanceId),
-                "Public session lost daemon instance binding.");
-            Require(
-                session.Binding.QueryPolicyId.Equals(accepted.QueryPolicyId),
-                "Public session lost query policy binding.");
-
-            var expectedWrites = new List<byte>(FrameCodec.EncodeBootstrapHello(hello));
-            var sentOperations = new List<string>();
-            var receivedOperations = new List<string>();
-            foreach (var fixture in exchangeFixtures)
-            {
-                RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(
-                    fixture.RequestPayload,
-                    session.Binding);
-                Require(
-                    string.Equals(request.OperationKind, fixture.Operation, StringComparison.Ordinal),
-                    $"Public session request fixture decoded as {request.OperationKind}, expected {fixture.Operation}.");
-
-                ResponseEnvelopeV1 response = await session.ExchangeAsync(
-                    request,
-                    CancellationToken.None).ConfigureAwait(false);
-                Require(!response.IsError, $"Public session decoded {fixture.Operation} as an error response.");
-                Require(
-                    string.Equals(response.OperationKind, fixture.Operation, StringComparison.Ordinal),
-                    $"Public session decoded the wrong response operation for {fixture.Operation}.");
-                Require(
-                    string.Equals(
-                        response.Value.GetProperty("kind").GetString(),
-                        fixture.Operation,
-                        StringComparison.Ordinal),
-                    $"Public session did not expose the {fixture.Operation} response value.");
-
-                sentOperations.Add(request.OperationKind);
-                receivedOperations.Add(response.OperationKind!);
-                expectedWrites.AddRange(FrameCodec.Encode(
-                    fixture.RequestPayload,
-                    FrameLimits.ForRequest(fixture.Operation)));
-            }
-
-            Require(
-                sentOperations.SequenceEqual(OperationNames, StringComparer.Ordinal),
-                "Public session did not send every operation in canonical fixture order.");
-            Require(
-                receivedOperations.SequenceEqual(OperationNames, StringComparer.Ordinal),
-                "Public session did not receive every operation in canonical fixture order.");
-            Require(
-                exchangeStream.WrittenBytes.AsSpan().SequenceEqual(expectedWrites.ToArray()),
-                "Public session did not emit the canonical Bootstrap and complete request frame sequence.");
-        }
-        Require(exchangeStream.WasDisposed, "Public session did not own and dispose its transport stream.");
-
-        byte[] errorRequestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "reindex-cancel-v5.json")));
-        byte[] errorResponsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "structured-error-v5.json")));
-        var errorStream = new ScriptedDuplexStream(
-            acceptedFrame.Concat(FrameCodec.Encode(errorResponsePayload, FrameLimits.ForResponse("reindex_cancel"))).ToArray());
-        using (ProtocolSession errorSession = await ProtocolSession.ConnectAsync(
-            new SingleStreamTransportAdapter(errorStream),
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            CancellationToken.None).ConfigureAwait(false))
-        {
-            RequestEnvelopeV1 errorRequest = BusinessCodec.DecodeRequest(errorRequestPayload, errorSession.Binding);
-            ResponseEnvelopeV1 errorResponse = await errorSession.ExchangeAsync(
-                errorRequest,
-                CancellationToken.None).ConfigureAwait(false);
-            Require(errorResponse.IsError, "Public session did not preserve the structured error outcome.");
-            Require(
-                errorResponse.ReadApiErrorCode() == ApiErrorCode.OperationControlForbidden,
-                "Public session did not expose the structured error value.");
-        }
-        Require(errorStream.WasDisposed, "Public session did not dispose its error-response stream.");
-
-        byte[] rejectedPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "rejected-v2.json")));
-        var rejectedStream = new ScriptedDuplexStream(
-            FrameCodec.Encode(rejectedPayload, FrameLimits.BootstrapMaxEncodedBytes));
-        Exception rejectedError = await ExpectFailureAsync(
-            async () =>
-            {
-                using ProtocolSession ignored = await ProtocolSession.ConnectAsync(
-                    new SingleStreamTransportAdapter(rejectedStream),
-                    accepted.ProjectId,
-                    accepted.DaemonInstanceId,
-                    CancellationToken.None).ConfigureAwait(false);
-            },
-            "public session bootstrap rejection").ConfigureAwait(false);
-        Require(
-            rejectedError is ProtocolBootstrapRejectedException rejection
-                && rejection.Code == "no_common_revision",
-            "Public session did not preserve the structured bootstrap rejection code.");
-        Require(rejectedStream.WasDisposed, "Rejected Bootstrap did not dispose its transport stream.");
-
-        byte[] mismatchPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "invalid", "bootstrap-project-mismatch-v2.json")));
-        var mismatchStream = new ScriptedDuplexStream(
-            FrameCodec.Encode(mismatchPayload, FrameLimits.BootstrapMaxEncodedBytes));
-        Exception mismatchError = await ExpectFailureAsync(
-            async () =>
-            {
-                using ProtocolSession ignored = await ProtocolSession.ConnectAsync(
-                    new SingleStreamTransportAdapter(mismatchStream),
-                    accepted.ProjectId,
-                    accepted.DaemonInstanceId,
-                    CancellationToken.None).ConfigureAwait(false);
-            },
-            "public session project mismatch").ConfigureAwait(false);
-        Require(
-            mismatchError is ProtocolValidationException
-                && mismatchError.Message.Contains("project", StringComparison.OrdinalIgnoreCase),
-            "Public session did not reject a mismatched project binding.");
-        Require(mismatchStream.WasDisposed, "Mismatched Bootstrap did not dispose its transport stream.");
-    }
-
-    private static async Task AssertPublicProtocolSessionPoisoningAsync(string fixtureRoot)
-    {
-        BootstrapAcceptedV2 accepted = ReadAcceptedBootstrap(fixtureRoot);
-        byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
-        byte[] requestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v5.json")));
-        byte[] responsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v5.json")));
-        byte[] responseFrame = FrameCodec.Encode(responsePayload, FrameLimits.ForResponse("status"));
-
-        using var cancellation = new CancellationTokenSource();
-        var partialStream = new ScriptedDuplexStream(
-            acceptedFrame.Concat(responseFrame[..^1]).ToArray(),
-            cancellation);
-        using (ProtocolSession partialSession = await ProtocolSession.ConnectAsync(
-            new SingleStreamTransportAdapter(partialStream),
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            CancellationToken.None).ConfigureAwait(false))
-        {
-            RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(requestPayload, partialSession.Binding);
-            Exception cancellationError = await ExpectFailureAsync(
-                () => partialSession.ExchangeAsync(request, cancellation.Token),
-                "public session partial response cancellation").ConfigureAwait(false);
-            Require(
-                cancellationError is OperationCanceledException,
-                "Public session did not propagate partial-response cancellation.");
-            Require(partialStream.WasDisposed, "Cancelled public session did not close its owned stream.");
-            int writesBeforeRetry = partialStream.WrittenBytes.Length;
-            await ExpectFailureAsync(
-                () => partialSession.ExchangeAsync(request, CancellationToken.None),
-                "public session reuse after cancellation").ConfigureAwait(false);
-            Require(
-                partialStream.WrittenBytes.Length == writesBeforeRetry,
-                "Poisoned public session wrote another request after cancellation.");
-        }
-
-        string invalidResponse = ReplaceExactly(
-            Encoding.UTF8.GetString(responsePayload),
-            "request-v1:11111111111111111111111111111111",
-            "request-v1:99999999999999999999999999999999",
-            "invalid public-session response request ID");
-        var invalidStream = new ScriptedDuplexStream(
-            acceptedFrame.Concat(FrameCodec.Encode(
-                Encoding.UTF8.GetBytes(invalidResponse),
-                FrameLimits.ForResponse("status"))).ToArray());
-        using (ProtocolSession invalidSession = await ProtocolSession.ConnectAsync(
-            new SingleStreamTransportAdapter(invalidStream),
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            CancellationToken.None).ConfigureAwait(false))
-        {
-            RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(requestPayload, invalidSession.Binding);
-            Exception validationError = await ExpectFailureAsync(
-                () => invalidSession.ExchangeAsync(request, CancellationToken.None),
-                "public session invalid response").ConfigureAwait(false);
-            Require(
-                validationError is ProtocolValidationException,
-                "Public session accepted a response for another request.");
-            Require(invalidStream.WasDisposed, "Invalid public-session response did not close its owned stream.");
-            int writesBeforeRetry = invalidStream.WrittenBytes.Length;
-            await ExpectFailureAsync(
-                () => invalidSession.ExchangeAsync(request, CancellationToken.None),
-                "public session reuse after invalid response").ConfigureAwait(false);
-            Require(
-                invalidStream.WrittenBytes.Length == writesBeforeRetry,
-                "Poisoned public session wrote another request after invalid response.");
-        }
-    }
-
-    private static async Task AssertPublicProtocolSessionSerializesExchangesAsync(string fixtureRoot)
-    {
-        BootstrapAcceptedV2 accepted = ReadAcceptedBootstrap(fixtureRoot);
-        var hello = new BootstrapHelloV2(
-            ProtocolConstants.BootstrapVersion,
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            new[] { ProtocolConstants.BusinessProtocolRevision });
-        byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
-        byte[] firstRequestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v5.json")));
-        string secondRequestJson = ReplaceExactly(
-            Encoding.UTF8.GetString(firstRequestPayload),
-            "request-v1:11111111111111111111111111111111",
-            "request-v1:55555555555555555555555555555555",
-            "second public-session request ID");
-        byte[] secondRequestPayload = Encoding.UTF8.GetBytes(secondRequestJson);
-        byte[] firstResponsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v5.json")));
-        string secondResponseJson = ReplaceExactly(
-            Encoding.UTF8.GetString(firstResponsePayload),
-            "request-v1:11111111111111111111111111111111",
-            "request-v1:55555555555555555555555555555555",
-            "second public-session response request ID");
-        byte[] secondResponsePayload = Encoding.UTF8.GetBytes(secondResponseJson);
-        byte[] firstResponseFrame = FrameCodec.Encode(firstResponsePayload, FrameLimits.ForResponse("status"));
-        byte[] secondResponseFrame = FrameCodec.Encode(secondResponsePayload, FrameLimits.ForResponse("status"));
-        var stream = new ScriptedDuplexStream(
-            acceptedFrame.Concat(firstResponseFrame).Concat(secondResponseFrame).ToArray(),
-            blockAfterIncomingBytes: acceptedFrame.Length);
-
-        using (ProtocolSession session = await ProtocolSession.ConnectAsync(
-            new SingleStreamTransportAdapter(stream),
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            CancellationToken.None).ConfigureAwait(false))
-        {
-            RequestEnvelopeV1 firstRequest = BusinessCodec.DecodeRequest(firstRequestPayload, session.Binding);
-            RequestEnvelopeV1 secondRequest = BusinessCodec.DecodeRequest(secondRequestPayload, session.Binding);
-            Task<ResponseEnvelopeV1> first = session.ExchangeAsync(firstRequest, CancellationToken.None);
-            await stream.WaitUntilReadBlockedAsync().ConfigureAwait(false);
-            Task<ResponseEnvelopeV1> second = session.ExchangeAsync(secondRequest, CancellationToken.None);
-
-            byte[] writesBeforeRelease = FrameCodec.EncodeBootstrapHello(hello)
-                .Concat(FrameCodec.Encode(firstRequestPayload, FrameLimits.ForRequest("status")))
-                .ToArray();
-            Require(!second.IsCompleted, "Concurrent public-session exchange bypassed the sequential gate.");
-            Require(
-                stream.WrittenBytes.AsSpan().SequenceEqual(writesBeforeRelease),
-                "Concurrent public-session exchange wrote before the first response completed.");
-
-            stream.ReleaseReads();
-            ResponseEnvelopeV1[] responses = await Task.WhenAll(first, second).ConfigureAwait(false);
-            Require(responses.All(response => !response.IsError), "Serialized public-session exchanges returned an error.");
-
-            byte[] expectedWrites = writesBeforeRelease
-                .Concat(FrameCodec.Encode(secondRequestPayload, FrameLimits.ForRequest("status")))
-                .ToArray();
-            Require(
-                stream.WrittenBytes.AsSpan().SequenceEqual(expectedWrites),
-                "Public session did not preserve exchange write order.");
-        }
-        Require(stream.WasDisposed, "Serialized public session did not dispose its owned stream.");
-    }
-
-    private static async Task AssertPublicProtocolSessionDisposeAsync(string fixtureRoot)
-    {
-        BootstrapAcceptedV2 accepted = ReadAcceptedBootstrap(fixtureRoot);
-        byte[] acceptedFrame = FrameCodec.EncodeBootstrapReply(accepted);
-        byte[] requestPayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "requests", "status-v5.json")));
-        byte[] responsePayload = TrimTerminalNewline(
-            ReadNonEmpty(Path.Combine(fixtureRoot, "responses", "status-v5.json")));
-        byte[] responseFrame = FrameCodec.Encode(responsePayload, FrameLimits.ForResponse("status"));
-        var stream = new ScriptedDuplexStream(
-            acceptedFrame.Concat(responseFrame).ToArray(),
-            blockAfterIncomingBytes: acceptedFrame.Length);
-        using var session = await ProtocolSession.ConnectAsync(
-            new SingleStreamTransportAdapter(stream),
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            CancellationToken.None).ConfigureAwait(false);
-        RequestEnvelopeV1 request = BusinessCodec.DecodeRequest(requestPayload, session.Binding);
-        Task<ResponseEnvelopeV1> active = session.ExchangeAsync(request, CancellationToken.None);
-        await stream.WaitUntilReadBlockedAsync().ConfigureAwait(false);
-        Task<ResponseEnvelopeV1> queued = session.ExchangeAsync(request, CancellationToken.None);
-
-        session.Dispose();
-        Exception activeError = await ExpectFailureAsync(
-            async () => await active.ConfigureAwait(false),
-            "public session disposal during active exchange").ConfigureAwait(false);
-        Exception queuedError = await ExpectFailureAsync(
-            async () => await queued.ConfigureAwait(false),
-            "public session disposal during queued exchange").ConfigureAwait(false);
-        Require(activeError is ObjectDisposedException, "Disposing a public session did not interrupt the active exchange.");
-        Require(queuedError is ObjectDisposedException, "Disposing a public session did not reject the queued exchange.");
-        Require(stream.WasDisposed, "Disposing a public session did not close its owned stream.");
-
-        byte[] expectedWrites = FrameCodec.EncodeBootstrapHello(new BootstrapHelloV2(
-            ProtocolConstants.BootstrapVersion,
-            accepted.ProjectId,
-            accepted.DaemonInstanceId,
-            new[] { ProtocolConstants.BusinessProtocolRevision }))
-            .Concat(FrameCodec.Encode(requestPayload, FrameLimits.ForRequest("status")))
-            .ToArray();
-        Require(
-            stream.WrittenBytes.AsSpan().SequenceEqual(expectedWrites),
-            "Disposed public session wrote a queued request after closing the stream.");
-    }
-
-    private static BootstrapAcceptedV2 ReadAcceptedBootstrap(string fixtureRoot)
-    {
-        return BootstrapCodec.DecodeReply(
-            TrimTerminalNewline(ReadNonEmpty(Path.Combine(fixtureRoot, "bootstrap", "accepted-v2.json"))))
-            as BootstrapAcceptedV2
-            ?? throw new InvalidOperationException("Accepted bootstrap fixture did not decode as accepted.");
-    }
-
     private static JsonSerializerOptions ManifestOptions() => new()
     {
         PropertyNameCaseInsensitive = false,
@@ -1642,7 +1240,7 @@ internal static class ConformanceProgram
 
     private static byte[] SerializeNode(JsonNode node)
     {
-        return BootstrapCodec.Write(writer => node.WriteTo(writer));
+        return CanonicalJson.Write(writer => node.WriteTo(writer));
     }
 
     private static string ReplaceExactly(string source, string oldValue, string newValue, string subject)
@@ -1678,25 +1276,17 @@ internal static class ConformanceProgram
         throw new InvalidOperationException($"Expected rejection did not occur: {subject}");
     }
 
-    private static async Task<Exception> ExpectFailureAsync(Func<Task> action, string subject)
+    private static void ExpectEndpointChanged(Action action, string subject)
     {
         try
         {
-            await action().ConfigureAwait(false);
+            action();
         }
-        catch (Exception error)
+        catch (ProtocolEndpointChangedException)
         {
-            return error;
+            return;
         }
-        throw new InvalidOperationException($"Expected rejection did not occur: {subject}");
-    }
-
-    private static void RequirePoisonedStream(Exception error, string subject)
-    {
-        Require(
-            error.GetType() == typeof(IOException)
-                && error.Message == "Protocol stream is poisoned after an incomplete or invalid exchange.",
-            $"{subject} did not fail from the poisoned-stream guard.");
+        throw new InvalidOperationException($"Expected endpoint replacement was not detected: {subject}");
     }
 
     private static void Require(bool condition, string message)
@@ -1708,246 +1298,21 @@ internal static class ConformanceProgram
     }
 }
 
-internal sealed class CancelAfterPartialReadStream : Stream
+internal static class ConformanceOperations
 {
-    private readonly byte[] bytes = { 0, 0, 0, 2, (byte)'x' };
-    private readonly CancellationTokenSource cancellation;
-    private int offset;
-
-    internal CancelAfterPartialReadStream(CancellationTokenSource cancellation)
+    internal static IReadOnlySet<string> All { get; } = new[]
     {
-        this.cancellation = cancellation;
-    }
-
-    public override bool CanRead => true;
-
-    public override bool CanSeek => false;
-
-    public override bool CanWrite => true;
-
-    public override long Length => throw new NotSupportedException();
-
-    public override long Position
-    {
-        get => throw new NotSupportedException();
-        set => throw new NotSupportedException();
-    }
-
-    public override void Flush()
-    {
-    }
-
-    public override int Read(byte[] buffer, int bufferOffset, int count)
-    {
-        throw new NotSupportedException();
-    }
-
-    public override Task<int> ReadAsync(
-        byte[] buffer,
-        int bufferOffset,
-        int count,
-        CancellationToken cancellationToken)
-    {
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return Task.FromCanceled<int>(cancellationToken);
-        }
-        int remaining = bytes.Length - offset;
-        if (remaining == 0)
-        {
-            return Task.FromResult(0);
-        }
-        int copied = Math.Min(count, remaining);
-        Buffer.BlockCopy(bytes, offset, buffer, bufferOffset, copied);
-        offset += copied;
-        if (offset == bytes.Length)
-        {
-            cancellation.Cancel();
-        }
-        return Task.FromResult(copied);
-    }
-
-    public override long Seek(long offset, SeekOrigin origin)
-    {
-        throw new NotSupportedException();
-    }
-
-    public override void SetLength(long value)
-    {
-        throw new NotSupportedException();
-    }
-
-    public override void Write(byte[] buffer, int bufferOffset, int count)
-    {
-    }
-}
-
-internal sealed class SingleStreamTransportAdapter : IProtocolTransportAdapter
-{
-    private Stream? stream;
-
-    internal SingleStreamTransportAdapter(Stream stream)
-    {
-        this.stream = stream;
-    }
-
-    public Task<Stream> ConnectAsync(CancellationToken cancellationToken)
-    {
-        if (cancellationToken.IsCancellationRequested)
-        {
-            return Task.FromCanceled<Stream>(cancellationToken);
-        }
-        Stream result = Interlocked.Exchange(ref stream, null)
-            ?? throw new InvalidOperationException("The fixture transport can only connect once.");
-        return Task.FromResult(result);
-    }
-}
-
-internal sealed class ScriptedDuplexStream : Stream
-{
-    private readonly MemoryStream incoming;
-    private readonly MemoryStream outgoing = new MemoryStream();
-    private readonly CancellationTokenSource? cancellationAfterIncoming;
-    private readonly int? blockAfterIncomingBytes;
-    private readonly TaskCompletionSource<bool>? readBlocked;
-    private readonly TaskCompletionSource<bool>? releaseReads;
-
-    internal ScriptedDuplexStream(
-        byte[] incoming,
-        CancellationTokenSource? cancellationAfterIncoming = null,
-        int? blockAfterIncomingBytes = null)
-    {
-        if (blockAfterIncomingBytes is < 0 || blockAfterIncomingBytes > incoming.Length)
-        {
-            throw new ArgumentOutOfRangeException(nameof(blockAfterIncomingBytes));
-        }
-        this.incoming = new MemoryStream(incoming, writable: false);
-        this.cancellationAfterIncoming = cancellationAfterIncoming;
-        this.blockAfterIncomingBytes = blockAfterIncomingBytes;
-        if (blockAfterIncomingBytes.HasValue)
-        {
-            readBlocked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-            releaseReads = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        }
-    }
-
-    internal byte[] WrittenBytes => outgoing.ToArray();
-
-    internal bool WasDisposed { get; private set; }
-
-    internal Task WaitUntilReadBlockedAsync()
-    {
-        return readBlocked?.Task
-            ?? throw new InvalidOperationException("This fixture stream has no read gate.");
-    }
-
-    internal void ReleaseReads()
-    {
-        if (releaseReads == null)
-        {
-            throw new InvalidOperationException("This fixture stream has no read gate.");
-        }
-        releaseReads.TrySetResult(true);
-    }
-
-    public override bool CanRead => !WasDisposed;
-
-    public override bool CanSeek => false;
-
-    public override bool CanWrite => !WasDisposed;
-
-    public override long Length => throw new NotSupportedException();
-
-    public override long Position
-    {
-        get => throw new NotSupportedException();
-        set => throw new NotSupportedException();
-    }
-
-    public override void Flush()
-    {
-        ThrowIfDisposed();
-    }
-
-    public override int Read(byte[] buffer, int offset, int count)
-    {
-        ThrowIfDisposed();
-        return incoming.Read(buffer, offset, count);
-    }
-
-    public override async Task<int> ReadAsync(
-        byte[] buffer,
-        int offset,
-        int count,
-        CancellationToken cancellationToken)
-    {
-        ThrowIfDisposed();
-        if (cancellationToken.IsCancellationRequested)
-        {
-            throw new OperationCanceledException(cancellationToken);
-        }
-        if (blockAfterIncomingBytes.HasValue
-            && incoming.Position >= blockAfterIncomingBytes.Value
-            && releaseReads is not null
-            && !releaseReads.Task.IsCompleted)
-        {
-            readBlocked!.TrySetResult(true);
-            await releaseReads.Task.ConfigureAwait(false);
-            ThrowIfDisposed();
-        }
-        int read = incoming.Read(buffer, offset, count);
-        if (read > 0 && incoming.Position == incoming.Length)
-        {
-            cancellationAfterIncoming?.Cancel();
-        }
-        return read;
-    }
-
-    public override long Seek(long offset, SeekOrigin origin)
-    {
-        throw new NotSupportedException();
-    }
-
-    public override void SetLength(long value)
-    {
-        throw new NotSupportedException();
-    }
-
-    public override void Write(byte[] buffer, int offset, int count)
-    {
-        ThrowIfDisposed();
-        outgoing.Write(buffer, offset, count);
-    }
-
-    public override Task WriteAsync(
-        byte[] buffer,
-        int offset,
-        int count,
-        CancellationToken cancellationToken)
-    {
-        ThrowIfDisposed();
-        return outgoing.WriteAsync(buffer, offset, count, cancellationToken);
-    }
-
-    protected override void Dispose(bool disposing)
-    {
-        if (disposing && !WasDisposed)
-        {
-            WasDisposed = true;
-            releaseReads?.TrySetResult(true);
-            incoming.Dispose();
-            outgoing.Dispose();
-        }
-        base.Dispose(disposing);
-    }
-
-    private void ThrowIfDisposed()
-    {
-        if (WasDisposed)
-        {
-            throw new ObjectDisposedException(nameof(ScriptedDuplexStream));
-        }
-    }
+        "capabilities",
+        "status",
+        "search",
+        "suggest",
+        "references",
+        "reindex_admit",
+        "reindex_status",
+        "reindex_wait",
+        "reindex_cancel",
+        "shutdown",
+    }.ToFrozenSet(StringComparer.Ordinal);
 }
 
 internal sealed class FixtureManifest

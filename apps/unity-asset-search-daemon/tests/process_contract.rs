@@ -1,21 +1,20 @@
 mod support;
 
 use std::fs;
-use std::time::Instant;
 
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST};
 use support::{SearchDaemonFixture, TEST_TIMEOUT};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1, VerifiedFramedTransportV1,
+    DiscoveredLoopbackEndpoint, EndpointNamespaceV1, EndpointStoreError,
 };
 use unity_asset_search_protocol::{
-    ApiErrorCode, BUSINESS_PROTOCOL_REVISION, BackgroundReindexOrigin, BootstrapHelloV2,
-    BootstrapReplyV2, CapabilitiesRequest, DaemonLifecycleState, FilesystemReindexIntent,
-    FrameLimits, OperationId, QueryPolicyId, ReferenceRequest, ReindexAdmitRequest,
+    ApiErrorCode, BackgroundReindexOrigin, CapabilitiesRequest, DaemonLifecycleState,
+    FilesystemReindexIntent, OperationId, ReferenceRequest, ReindexAdmitRequest,
     ReindexCancelRequest, ReindexOperationState, ReindexStatusRequest, ReindexWaitRequest,
     RequestEnvelope, RequestId, RequestOperation, ResponseOperation, ResponseOutcome,
     SearchCapabilities, SearchRequest, ShutdownRequest, StatusRequest, SuggestRequest,
-    decode_response_frame, decode_validated_frame, encode_frame, encode_request_frame,
+    decode_response_json, encode_request_json, max_response_json_bytes,
 };
 
 const OWNER_ONE_GUID: &str = "11111111111111111111111111111111";
@@ -62,21 +61,10 @@ GameObject:
 async fn startup_reindex_is_discoverable_observable_and_not_client_cancelable() {
     let fixture = SearchDaemonFixture::new();
     fixture.write_asset("Startup.prefab", TARGET, TARGET_GUID);
-    let project = fixture.project();
     let namespace = fixture.namespace();
     let mut daemon = fixture.spawn_daemon(true);
     let discovered = fixture.wait_for_endpoint(&mut daemon).await;
-    let descriptor = discovered.descriptor();
-    let stream = discovered
-        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
-        .await
-        .expect("connect to startup-reindex daemon");
-    let mut client = ProcessClient::bootstrap(
-        stream,
-        project.project_id(),
-        descriptor.daemon_instance_id(),
-    )
-    .await;
+    let mut client = ProcessClient::new(namespace.clone(), discovered);
 
     let status = client
         .exchange(RequestOperation::Status(StatusRequest::default()))
@@ -142,22 +130,12 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
     fixture.write_asset("Target.prefab", TARGET, TARGET_GUID);
     fixture.write_asset("TargetTwo.prefab", TARGET_TWO, TARGET_TWO_GUID);
 
-    let project = fixture.project();
     let namespace = fixture.namespace();
     let mut daemon = fixture.spawn_daemon(false);
     let discovered = fixture.wait_for_endpoint(&mut daemon).await;
-    let stale_discovered = discovered;
-    let descriptor = discovered.descriptor();
-    let stream = discovered
-        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
-        .await
-        .expect("connect to real daemon");
-    let mut client = ProcessClient::bootstrap(
-        stream,
-        project.project_id(),
-        descriptor.daemon_instance_id(),
-    )
-    .await;
+    let stale_discovered = discovered.clone();
+    let original_daemon_instance_id = discovered.descriptor().daemon_instance_id();
+    let mut client = ProcessClient::new(namespace.clone(), discovered);
 
     let capabilities = client
         .exchange(RequestOperation::Capabilities(
@@ -315,18 +293,9 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
     drop(client);
 
     let rediscovered = namespace
-        .discover_endpoint()
+        .discover_loopback_endpoint()
         .expect("rediscover the still-running daemon");
-    let reconnected_stream = rediscovered
-        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
-        .await
-        .expect("reconnect after dropping the admitting connection");
-    let mut client = ProcessClient::bootstrap(
-        reconnected_stream,
-        project.project_id(),
-        descriptor.daemon_instance_id(),
-    )
-    .await;
+    let mut client = ProcessClient::new(namespace.clone(), rediscovered);
     let retried_operation = admit_reindex(&mut client, "process-contract-disconnect").await;
     assert_eq!(retried_operation, disconnected_operation);
     let status = client
@@ -361,7 +330,7 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
         daemon.stderr()
     );
     assert!(matches!(
-        namespace.discover_endpoint(),
+        namespace.discover_loopback_endpoint(),
         Err(EndpointStoreError::DescriptorMissing)
     ));
 
@@ -369,27 +338,13 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
     let replacement_discovered = fixture.wait_for_endpoint(&mut replacement).await;
     assert_ne!(
         replacement_discovered.descriptor().daemon_instance_id(),
-        descriptor.daemon_instance_id()
+        original_daemon_instance_id
     );
     assert!(matches!(
-        stale_discovered
-            .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
-            .await,
-        Err(EndpointTransportError::Store(
-            EndpointStoreError::EndpointChanged
-        ))
+        stale_discovered.ensure_unchanged(namespace),
+        Err(EndpointStoreError::EndpointChanged)
     ));
-    let replacement_descriptor = replacement_discovered.descriptor();
-    let replacement_stream = replacement_discovered
-        .connect_verified(namespace, Instant::now() + TEST_TIMEOUT)
-        .await
-        .expect("connect to replacement daemon");
-    let mut replacement_client = ProcessClient::bootstrap(
-        replacement_stream,
-        project.project_id(),
-        replacement_descriptor.daemon_instance_id(),
-    )
-    .await;
+    let mut replacement_client = ProcessClient::new(namespace.clone(), replacement_discovered);
     let lost = replacement_client
         .exchange(RequestOperation::ReindexStatus(ReindexStatusRequest {
             operation_id: disconnected_operation,
@@ -408,7 +363,7 @@ async fn real_daemon_process_exercises_every_operation_and_rejects_stale_state()
     drop(replacement_client);
     assert!(replacement.wait_for_exit().await.success());
     assert!(matches!(
-        namespace.discover_endpoint(),
+        namespace.discover_loopback_endpoint(),
         Err(EndpointStoreError::DescriptorMissing)
     ));
 }
@@ -484,44 +439,27 @@ async fn shutdown(client: &mut ProcessClient) {
 }
 
 struct ProcessClient {
-    stream: VerifiedFramedTransportV1,
-    project_id: unity_asset_search_protocol::ProjectId,
-    daemon_instance_id: unity_asset_search_protocol::DaemonInstanceId,
-    query_policy_id: QueryPolicyId,
+    http: reqwest::Client,
+    namespace: EndpointNamespaceV1,
+    discovered: DiscoveredLoopbackEndpoint,
     next_request_id: u8,
 }
 
 impl ProcessClient {
-    async fn bootstrap(
-        mut stream: VerifiedFramedTransportV1,
-        project_id: unity_asset_search_protocol::ProjectId,
-        daemon_instance_id: unity_asset_search_protocol::DaemonInstanceId,
-    ) -> Self {
-        let hello = BootstrapHelloV2::new(
-            project_id,
-            daemon_instance_id,
-            vec![BUSINESS_PROTOCOL_REVISION],
-        )
-        .expect("valid bootstrap hello");
-        let hello_frame = encode_frame(&hello, FrameLimits::bootstrap()).expect("encode hello");
-        write_frame(&mut stream, &hello_frame, FrameLimits::bootstrap()).await;
-        let reply_frame = read_frame(&mut stream, FrameLimits::bootstrap()).await;
-        let mut budget = AssetLoadBudget::default();
-        let reply: BootstrapReplyV2 =
-            decode_validated_frame(&reply_frame, &mut budget, FrameLimits::bootstrap())
-                .expect("decode bootstrap reply");
-        reply
-            .validate_for(&hello)
-            .expect("validate bootstrap reply");
-        let query_policy_id = reply
-            .query_policy_id()
-            .expect("daemon accepted bootstrap with query policy");
-        assert_eq!(reply.selected_revision(), Some(BUSINESS_PROTOCOL_REVISION));
+    fn new(namespace: EndpointNamespaceV1, discovered: DiscoveredLoopbackEndpoint) -> Self {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(TEST_TIMEOUT)
+            .timeout(TEST_TIMEOUT)
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("build process-contract HTTP client");
         Self {
-            stream,
-            project_id,
-            daemon_instance_id,
-            query_policy_id,
+            http,
+            namespace,
+            discovered,
             next_request_id: 1,
         }
     }
@@ -534,50 +472,58 @@ impl ProcessClient {
     }
 
     async fn exchange_outcome(&mut self, operation: RequestOperation) -> ResponseOutcome {
+        let operation_kind = operation.kind();
         let request_id = RequestId::from_bytes([self.next_request_id; 16]);
         self.next_request_id = self
             .next_request_id
             .checked_add(1)
             .expect("request ID space");
+        let descriptor = self.discovered.descriptor();
         let request = RequestEnvelope::new(
-            BUSINESS_PROTOCOL_REVISION,
+            descriptor.business_protocol_revision(),
             request_id,
-            self.project_id,
-            self.daemon_instance_id,
-            self.query_policy_id,
+            descriptor.project_id(),
+            descriptor.daemon_instance_id(),
+            descriptor.query_policy_id(),
             operation,
         )
         .expect("valid process-contract request");
-        let request_frame = encode_request_frame(&request).expect("encode business request");
-        write_frame(
-            &mut self.stream,
-            &request_frame,
-            FrameLimits::request_envelope(),
-        )
-        .await;
-        let response_frame = read_frame(
-            &mut self.stream,
-            FrameLimits::response(request.operation().kind()),
-        )
-        .await;
+        let encoded = encode_request_json(&request).expect("encode business request");
+        let capability = descriptor.capability().encode_hex();
+        let capability = std::str::from_utf8(&capability).expect("hex capability is UTF-8");
+        let response = self
+            .http
+            .post(format!("http://{}/v1/request", descriptor.socket_addr()))
+            .header(HOST, descriptor.socket_addr().to_string())
+            .header(AUTHORIZATION, format!("Bearer {capability}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(encoded)
+            .send()
+            .await
+            .expect("exchange request with real daemon");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let maximum = max_response_json_bytes(operation_kind);
+        if let Some(length) = response.content_length() {
+            assert!(length <= maximum as u64, "response exceeds protocol limit");
+        }
+        let mut response = response;
+        let mut response_json = Vec::new();
+        while let Some(chunk) = response.chunk().await.expect("read HTTP response body") {
+            let requested = response_json
+                .len()
+                .checked_add(chunk.len())
+                .expect("response length fits usize");
+            assert!(requested <= maximum, "response exceeds protocol limit");
+            response_json.extend_from_slice(&chunk);
+        }
         let mut budget = AssetLoadBudget::default();
-        let response = decode_response_frame(&response_frame, &mut budget, &request)
+        let response = decode_response_json(&response_json, &mut budget, &request)
             .expect("decode business response");
+        if operation_kind != unity_asset_search_protocol::OperationKind::Shutdown {
+            self.discovered
+                .ensure_unchanged(&self.namespace)
+                .expect("endpoint remains unchanged after HTTP exchange");
+        }
         response.into_outcome()
     }
-}
-
-async fn read_frame(stream: &mut VerifiedFramedTransportV1, limits: FrameLimits) -> Vec<u8> {
-    stream
-        .read_frame(limits, FrameReadTimeoutsV1::uniform(TEST_TIMEOUT))
-        .await
-        .expect("read real daemon frame")
-        .expect("real daemon closed before returning a frame")
-}
-
-async fn write_frame(stream: &mut VerifiedFramedTransportV1, frame: &[u8], limits: FrameLimits) {
-    stream
-        .write_frame(frame, limits, TEST_TIMEOUT)
-        .await
-        .expect("write real daemon frame");
 }

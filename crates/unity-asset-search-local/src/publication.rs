@@ -6,7 +6,7 @@ use crate::EndpointNamespaceV1;
 /// Private names for one crash-recoverable namespace artifact.
 ///
 /// The caller must hold the artifact's authority before it invokes recovery. A daemon lease owns
-/// endpoint and rendezvous recovery; the namespace binding lock owns binding recovery.
+/// endpoint recovery; the namespace binding lock owns binding recovery.
 #[derive(Clone, Copy)]
 pub(crate) struct PublicationSlots {
     current: &'static str,

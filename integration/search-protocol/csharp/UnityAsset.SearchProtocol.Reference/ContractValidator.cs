@@ -1069,7 +1069,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 StrictJson.Required(response, "diagnostic_coverage", path),
                 path + ".diagnostic_coverage",
                 diagnosticCount,
-                checked((ulong)BootstrapCodec.Write(writer => diagnostics.WriteTo(writer)).Length));
+                checked((ulong)CanonicalJson.Write(writer => diagnostics.WriteTo(writer)).Length));
 
             string responseGeneration = StrictJson.String(
                 StrictJson.Required(generation, "generation", path + ".generation"),
@@ -1966,7 +1966,7 @@ namespace UnityAsset.SearchProtocol.Reference
                 "outgoing");
             JsonElement selector = StrictJson.Required(request, "selector", path);
             byte[] domain = Encoding.UTF8.GetBytes("unity-asset:reference-query:cursor-binding:v2\0");
-            byte[] selectorJson = BootstrapCodec.Write(writer => selector.WriteTo(writer));
+            byte[] selectorJson = CanonicalJson.Write(writer => selector.WriteTo(writer));
             var input = new byte[checked(domain.Length + 1 + selectorJson.Length)];
             Buffer.BlockCopy(domain, 0, input, 0, domain.Length);
             input[domain.Length] = direction == "incoming" ? (byte)0 : (byte)1;

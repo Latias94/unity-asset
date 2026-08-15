@@ -6,9 +6,8 @@ use std::str::FromStr;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use unity_asset_search_protocol::{
-    BUSINESS_PROTOCOL_REVISION, BootstrapErrorCode, BootstrapHelloV2, BootstrapReplyV2,
-    DaemonInstanceId, ProjectId, QueryPolicyId, RequestEnvelope, ResponseEnvelope,
-    ValidateContract,
+    BUSINESS_PROTOCOL_REVISION, DaemonInstanceId, ProjectId, QueryPolicyId, RequestEnvelope,
+    ResponseEnvelope,
 };
 
 const FROZEN_BUSINESS_V1_INVENTORY_SHA256: &str =
@@ -112,25 +111,6 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
     for fixture in &manifest.valid {
         let bytes = read_canonical(&root.join(&fixture.path));
         match fixture.kind.as_str() {
-            "bootstrap_hello" => {
-                let value: BootstrapHelloV2 = serde_json::from_slice(&bytes).unwrap();
-                value.validate().unwrap();
-                assert_canonical(fixture, &bytes, &value);
-            }
-            "bootstrap_reply" => {
-                let value: BootstrapReplyV2 = serde_json::from_slice(&bytes).unwrap();
-                value.validate().unwrap();
-                if fixture.name == "bootstrap rejected" {
-                    assert!(matches!(
-                        &value,
-                        BootstrapReplyV2::Rejected {
-                            code: BootstrapErrorCode::NoCommonRevision,
-                            ..
-                        }
-                    ));
-                }
-                assert_canonical(fixture, &bytes, &value);
-            }
             "request" => {
                 let value: RequestEnvelope = serde_json::from_slice(&bytes).unwrap();
                 value
@@ -158,20 +138,6 @@ fn rust_and_csharp_share_canonical_nonempty_protocol_fixtures() {
         let expected = fixture.expected_error.as_deref().unwrap();
         let bytes = read_canonical(&root.join(&fixture.path));
         let error = match fixture.kind.as_str() {
-            "bootstrap_hello" => serde_json::from_slice::<BootstrapHelloV2>(&bytes)
-                .and_then(|value| {
-                    value.validate().map_err(serde::de::Error::custom)?;
-                    Ok(value)
-                })
-                .unwrap_err()
-                .to_string(),
-            "bootstrap_reply" => match serde_json::from_slice::<BootstrapReplyV2>(&bytes) {
-                Ok(reply) => reply
-                    .validate_for(&fixture_hello(&root))
-                    .unwrap_err()
-                    .to_string(),
-                Err(error) => error.to_string(),
-            },
             "request" => match serde_json::from_slice::<RequestEnvelope>(&bytes) {
                 Ok(request) => request
                     .validate_binding(project, instance, query_policy)
@@ -269,10 +235,6 @@ fn archived_business_paths(root: &Path, business_revision: u16) -> BTreeSet<Stri
             is_archived_business.then(|| format!("{directory}/{name}"))
         })
         .collect()
-}
-
-fn fixture_hello(root: &Path) -> BootstrapHelloV2 {
-    serde_json::from_slice(&read_canonical(&root.join("bootstrap/hello-v2.json"))).unwrap()
 }
 
 fn assert_canonical<T: serde::Serialize>(fixture: &FixtureEntry, bytes: &[u8], value: &T) {

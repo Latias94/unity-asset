@@ -7,7 +7,9 @@ mod output;
 use clap::Parser as _;
 use clap::error::ErrorKind;
 
-use crate::client::{ConnectionOptions, connect};
+use unity_asset_search_protocol::{CapabilitiesRequest, RequestOperation};
+
+use crate::client::{ConnectionOptions, execute};
 use crate::command::{Action, Args};
 use crate::output::{CliFailure, CliSuccess, write_failure, write_success};
 
@@ -45,25 +47,9 @@ async fn run(args: Args) -> Result<(), CliFailure> {
 
     match action {
         Action::DaemonStart(settings) => {
-            let (session, started) = connect(&options, Some(&settings)).await?;
-            write_success(
-                session.binding(),
-                CliSuccess::Bootstrap {
-                    selected_revision: session.binding().protocol_revision,
-                    daemon_started: started,
-                },
-            )
-        }
-        Action::Bootstrap => {
-            let start = args.start_if_needed().then_some(Default::default());
-            let (session, started) = connect(&options, start.as_ref()).await?;
-            write_success(
-                session.binding(),
-                CliSuccess::Bootstrap {
-                    selected_revision: session.binding().protocol_revision,
-                    daemon_started: started,
-                },
-            )
+            let operation = RequestOperation::Capabilities(CapabilitiesRequest::default());
+            let (binding, response) = execute(&options, Some(&settings), operation).await?;
+            write_success(binding, CliSuccess::Operation(response))
         }
         Action::Operation(operation) => {
             if args.start_if_needed()
@@ -77,10 +63,8 @@ async fn run(args: Args) -> Result<(), CliFailure> {
                 ));
             }
             let start = args.start_if_needed().then_some(Default::default());
-            let (mut session, _) = connect(&options, start.as_ref()).await?;
-            let binding = session.binding();
-            let response = session.execute(operation).await?;
-            write_success(binding, CliSuccess::Operation(Box::new(response)))
+            let (binding, response) = execute(&options, start.as_ref(), operation).await?;
+            write_success(binding, CliSuccess::Operation(response))
         }
     }
 }

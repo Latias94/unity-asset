@@ -8,9 +8,12 @@ use unity_asset_core::{
     read_contract_json_slice,
 };
 
-use crate::operation::{request_envelope_encoded_limit, response_encoded_limit};
+use crate::operation::{
+    ResponseExpectation, request_envelope_encoded_limit, response_encoded_limit,
+};
 use crate::{
-    ContractValidationError, OperationKind, RequestEnvelope, ResponseEnvelope, ValidateContract,
+    ApiError, ContractValidationError, DaemonInstanceId, OperationKind, ProjectId, QueryPolicyId,
+    RequestEnvelope, RequestOperation, ResponseEnvelope, ResponseOperation, ValidateContract,
 };
 
 const BUSINESS_MAX_JSON_ENTRIES: u64 = 1_000_000;
@@ -18,6 +21,61 @@ const BUSINESS_MAX_JSON_MEMBERS: u64 = 1_000_000;
 
 /// Maximum encoded bytes accepted for one complete business request document.
 pub const MAX_REQUEST_JSON_BYTES: usize = request_envelope_encoded_limit();
+
+/// Returns the maximum encoded bytes accepted for a response JSON document.
+#[must_use]
+pub const fn max_response_json_bytes(operation: OperationKind) -> usize {
+    response_encoded_limit(operation)
+}
+
+/// A request whose canonical JSON, resource limits, and complete semantic contract were validated.
+#[derive(Debug)]
+#[must_use = "validated requests must be bound before dispatch"]
+pub struct ValidatedRequest {
+    request: RequestEnvelope,
+}
+
+/// One-shot authority for validating and encoding the response to a bound request.
+#[derive(Debug)]
+#[must_use = "bound response encoders must encode the dispatch result"]
+pub struct ResponseEncoder {
+    expectation: ResponseExpectation,
+}
+
+impl ValidatedRequest {
+    const fn from_validated(request: RequestEnvelope) -> Self {
+        Self { request }
+    }
+
+    /// Verifies daemon-owned scalar bindings and releases a one-shot response encoder.
+    pub fn bind(
+        self,
+        expected_project: ProjectId,
+        expected_instance: DaemonInstanceId,
+        expected_query_policy: QueryPolicyId,
+    ) -> Result<(RequestOperation, ResponseEncoder), ContractValidationError> {
+        self.request
+            .ensure_binding(expected_project, expected_instance, expected_query_policy)?;
+        let expectation = ResponseExpectation::from_validated_request(&self.request);
+        let operation = self.request.into_operation();
+        Ok((operation, ResponseEncoder { expectation }))
+    }
+}
+
+impl ResponseEncoder {
+    /// Validates the dispatch result against the bound request and encodes canonical JSON.
+    pub fn encode(
+        self,
+        result: Result<ResponseOperation, ApiError>,
+    ) -> Result<Vec<u8>, ProtocolJsonError> {
+        let operation = self.expectation.operation_kind();
+        let response = self.expectation.response_envelope(result);
+        self.expectation
+            .validate_response(&response)
+            .map_err(ProtocolJsonError::Validation)?;
+        encode_json(&response, JsonLimits::response(operation))
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 struct JsonLimits {
@@ -45,7 +103,7 @@ impl JsonLimits {
     }
 
     const fn response(operation: OperationKind) -> Self {
-        Self::business(response_encoded_limit(operation))
+        Self::business(max_response_json_bytes(operation))
     }
 }
 
@@ -60,7 +118,7 @@ pub fn encode_request_json(request: &RequestEnvelope) -> Result<Vec<u8>, Protoco
 pub fn decode_request_json(
     encoded: &[u8],
     budget: &mut AssetLoadBudget,
-) -> Result<RequestEnvelope, ProtocolJsonError> {
+) -> Result<ValidatedRequest, ProtocolJsonError> {
     let request: RequestEnvelope = decode_validated_json(encoded, budget, JsonLimits::request())?;
     let maximum = request.operation().max_encoded_bytes();
     if encoded.len() > maximum {
@@ -70,7 +128,7 @@ pub fn decode_request_json(
             maximum,
         });
     }
-    Ok(request)
+    Ok(ValidatedRequest::from_validated(request))
 }
 
 pub fn encode_response_json(

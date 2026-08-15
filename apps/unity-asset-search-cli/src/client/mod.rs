@@ -1,19 +1,21 @@
-use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use rand::TryRngCore as _;
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_TYPE, HOST, HeaderMap, HeaderValue,
+};
+use reqwest::{Client, StatusCode};
 use unity_asset_core::AssetLoadBudget;
 use unity_asset_search_local::{
-    EndpointDescriptorError, EndpointStoreError, EndpointTransportError, FrameReadTimeoutsV1,
-    PrivateRootsV1, ProjectLocatorV1, VerifiedFramedTransportV1,
+    DiscoveredLoopbackEndpoint, EndpointNamespaceV1, EndpointStoreError, HTTP_CAPABILITY_HEX_BYTES,
+    LOOPBACK_HTTP_REQUEST_PATH, LoopbackEndpointDescriptorError, PrivateRootsV1, ProjectLocatorV1,
 };
 use unity_asset_search_protocol::{
-    BUSINESS_PROTOCOL_REVISION, BootstrapErrorCode, BootstrapHelloV2, BootstrapReplyV2,
-    DaemonInstanceId, FrameLimits, ProjectId, QueryPolicyId, RequestEnvelope, RequestId,
-    RequestOperation, ResponseOperation, ResponseOutcome, decode_response_frame,
-    decode_validated_frame, encode_frame, encode_request_frame,
+    CapabilitiesRequest, DaemonInstanceId, ProjectId, QueryPolicyId, RequestEnvelope, RequestId,
+    RequestOperation, ResponseOperation, ResponseOutcome, decode_response_json,
+    encode_request_json, max_response_json_bytes,
 };
 
 use crate::command::{Args, DaemonStartSettings};
@@ -22,6 +24,8 @@ use crate::output::CliFailure;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const MAX_START_RETRY_DELAY: Duration = Duration::from_secs(1);
 const SERVER_WAIT_RESPONSE_MARGIN: Duration = Duration::from_secs(2);
+const JSON_CONTENT_TYPE: &str = "application/json";
+const BEARER_PREFIX: &[u8] = b"Bearer ";
 
 #[derive(Debug, Clone)]
 pub struct ConnectionOptions {
@@ -30,101 +34,118 @@ pub struct ConnectionOptions {
     daemon_binary: Option<PathBuf>,
     connect_timeout: Duration,
     request_timeout: Duration,
+    http: Client,
 }
 
 impl ConnectionOptions {
     pub fn from_args(args: &Args) -> Result<Self, CliFailure> {
+        let connect_timeout = args.connect_timeout();
+        let http = Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(connect_timeout)
+            .http1_only()
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|error| {
+                CliFailure::internal(format!("configure loopback HTTP client: {error}"))
+            })?;
         Ok(Self {
             project_root: args.project_root()?,
             index_dir: args.index_dir(),
             daemon_binary: args.daemon_binary(),
-            connect_timeout: args.connect_timeout(),
+            connect_timeout,
             request_timeout: args.request_timeout(),
+            http,
         })
     }
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SessionBinding {
+pub struct EndpointBinding {
     pub project_id: ProjectId,
     pub daemon_instance_id: DaemonInstanceId,
     pub query_policy_id: QueryPolicyId,
-    pub protocol_revision: u16,
 }
 
-pub struct ClientSession {
-    stream: VerifiedFramedTransportV1,
-    binding: SessionBinding,
+struct CompletedRequest {
+    binding: EndpointBinding,
+    outcome: ResponseOutcome,
     server_pid: u32,
-    request_timeout: Duration,
 }
 
-impl ClientSession {
-    #[must_use]
-    pub const fn binding(&self) -> SessionBinding {
-        self.binding
+struct ConnectionContext {
+    project: ProjectLocatorV1,
+    roots: PrivateRootsV1,
+    namespace: EndpointNamespaceV1,
+}
+
+impl ConnectionContext {
+    fn open(options: &ConnectionOptions) -> Result<Self, ConnectError> {
+        let project =
+            ProjectLocatorV1::open(&options.project_root).map_err(ConnectError::Project)?;
+        let roots = PrivateRootsV1::discover_for_current_context().map_err(ConnectError::Roots)?;
+        let namespace = roots
+            .runtime()
+            .endpoint_namespace(project.project_id())
+            .map_err(ConnectError::Roots)?;
+        Ok(Self {
+            project,
+            roots,
+            namespace,
+        })
     }
 
-    pub async fn execute(
-        &mut self,
-        operation: RequestOperation,
-    ) -> Result<ResponseOperation, CliFailure> {
-        let response_timeout = operation_response_timeout(&operation, self.request_timeout);
-        let request = RequestEnvelope::new(
-            self.binding.protocol_revision,
-            random_request_id()?,
-            self.binding.project_id,
-            self.binding.daemon_instance_id,
-            self.binding.query_policy_id,
-            operation,
-        )
-        .map_err(|error| CliFailure::input(format!("invalid request: {error}")))?;
-        let frame = encode_request_frame(&request)
-            .map_err(|error| CliFailure::protocol(format!("encode request frame: {error}")))?;
-        write_frame(
-            &mut self.stream,
-            &frame,
-            FrameLimits::request_envelope(),
-            self.request_timeout,
-        )
-        .await?;
-        let limits = FrameLimits::response(request.operation().kind());
-        let response_frame = read_required_frame(
-            &mut self.stream,
-            limits,
-            response_timeout,
-            "business response",
-        )
-        .await?;
-        let mut budget = AssetLoadBudget::default();
-        let response = decode_response_frame(&response_frame, &mut budget, &request)
-            .map_err(|error| CliFailure::protocol(format!("decode response frame: {error}")))?;
-        match response.into_outcome() {
-            ResponseOutcome::Success(operation) => Ok(*operation),
-            ResponseOutcome::Error(error) => Err(CliFailure::daemon(*error)),
-        }
+    fn discover_endpoint(&self) -> Result<DiscoveredLoopbackEndpoint, ConnectError> {
+        self.project.revalidate().map_err(ConnectError::Project)?;
+        self.roots.revalidate().map_err(ConnectError::Roots)?;
+        self.namespace.revalidate().map_err(ConnectError::Roots)?;
+        self.namespace
+            .discover_loopback_endpoint()
+            .map_err(ConnectError::Store)
     }
 }
 
-fn operation_response_timeout(operation: &RequestOperation, configured: Duration) -> Duration {
-    let RequestOperation::ReindexWait(request) = operation else {
-        return configured;
-    };
-    Duration::from_millis(u64::from(request.timeout_ms))
-        .saturating_add(SERVER_WAIT_RESPONSE_MARGIN)
-        .max(configured)
-}
-
-pub async fn connect(
+pub async fn execute(
     options: &ConnectionOptions,
     start: Option<&DaemonStartSettings>,
-) -> Result<(ClientSession, bool), CliFailure> {
+    operation: RequestOperation,
+) -> Result<(EndpointBinding, Box<ResponseOperation>), CliFailure> {
+    let completed = request_with_start(options, start, operation).await?;
+    match completed.outcome {
+        ResponseOutcome::Success(response) => Ok((completed.binding, response)),
+        ResponseOutcome::Error(error) => Err(CliFailure::daemon(*error)),
+    }
+}
+
+async fn request_with_start(
+    options: &ConnectionOptions,
+    start: Option<&DaemonStartSettings>,
+    operation: RequestOperation,
+) -> Result<CompletedRequest, CliFailure> {
     let deadline = Instant::now()
         .checked_add(options.connect_timeout)
         .ok_or_else(|| CliFailure::internal("connect deadline overflow"))?;
+    let context = ConnectionContext::open(options).map_err(ConnectError::into_failure)?;
+    let acquisition_operation = start
+        .as_ref()
+        .map(|_| RequestOperation::Capabilities(CapabilitiesRequest::default()));
     loop {
-        match connect_once(options, deadline).await {
-            Ok(session) => return Ok((session, false)),
+        let request = acquisition_operation
+            .clone()
+            .unwrap_or_else(|| operation.clone());
+        let acquisition_deadline = acquisition_operation.as_ref().map(|_| deadline);
+        match request_once(options, &context, request, acquisition_deadline).await {
+            Ok(probe) => {
+                if acquisition_operation.is_none()
+                    || matches!(operation, RequestOperation::Capabilities(_))
+                {
+                    return Ok(probe);
+                }
+                return request_once(options, &context, operation, None)
+                    .await
+                    .map_err(ConnectError::into_failure);
+            }
             Err(error) if error.is_verified_generation_change() => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
@@ -138,9 +159,9 @@ pub async fn connect(
     }
 
     let settings = start.expect("start settings checked");
-    let mut child: Option<SpawnedDaemon> = None;
+    let mut child = Some(SpawnedDaemon::new(spawn_daemon(options, settings)?));
     let mut last_exit = None;
-    let mut next_spawn = Instant::now();
+    let mut next_spawn = deadline;
     let mut spawn_retry_delay = CONNECT_RETRY_DELAY;
     loop {
         let now = Instant::now();
@@ -150,7 +171,7 @@ pub async fn connect(
                 .unwrap_or_default();
             return Err(CliFailure::unavailable(
                 format!(
-                    "daemon did not publish a verified endpoint before the connect deadline{exit}"
+                    "daemon did not publish a verified loopback endpoint before the connect deadline{exit}"
                 ),
                 true,
             ));
@@ -171,130 +192,339 @@ pub async fn connect(
                 .min(MAX_START_RETRY_DELAY);
         }
 
-        match connect_once(options, deadline).await {
-            Ok(session) => {
-                let started = if let Some(mut spawned) = child.take() {
+        match request_once(
+            options,
+            &context,
+            RequestOperation::Capabilities(CapabilitiesRequest::default()),
+            Some(deadline),
+        )
+        .await
+        {
+            Ok(probe) => {
+                if let Some(mut spawned) = child.take() {
                     let _ = spawned.observe()?;
-                    if spawned.process_id() == Some(session.server_pid) {
-                        spawned.detach_running()
-                    } else {
-                        false
+                    if spawned.process_id() == Some(probe.server_pid) {
+                        spawned.detach_running();
                     }
-                } else {
-                    false
-                };
-                return Ok((session, started));
-            }
-            Err(error) if error.is_verified_generation_change() || error.is_startup_pending() => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if !remaining.is_zero() {
-                    tokio::time::sleep(CONNECT_RETRY_DELAY.min(remaining)).await;
                 }
+                if matches!(operation, RequestOperation::Capabilities(_)) {
+                    return Ok(probe);
+                }
+                let completed = request_once(options, &context, operation, None)
+                    .await
+                    .map_err(ConnectError::into_failure)?;
+                return Ok(completed);
             }
+            Err(error) if error.is_verified_generation_change() || error.is_startup_pending() => {}
             Err(error) => return Err(error.into_failure()),
         }
 
         let now = Instant::now();
-        if child.is_none() {
-            if now < next_spawn {
-                tokio::time::sleep(next_spawn.min(deadline).saturating_duration_since(now)).await;
-                continue;
-            }
+        if child.is_none() && now >= next_spawn {
             child = Some(SpawnedDaemon::new(spawn_daemon(options, settings)?));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if !remaining.is_zero() {
-            tokio::time::sleep(CONNECT_RETRY_DELAY.min(remaining)).await;
+            let until_spawn = if child.is_none() {
+                next_spawn.saturating_duration_since(Instant::now())
+            } else {
+                CONNECT_RETRY_DELAY
+            };
+            tokio::time::sleep(CONNECT_RETRY_DELAY.min(until_spawn).min(remaining)).await;
         }
     }
 }
 
-async fn connect_once(
+async fn request_once(
     options: &ConnectionOptions,
-    deadline: Instant,
-) -> Result<ClientSession, ConnectError> {
-    let project = ProjectLocatorV1::open(&options.project_root).map_err(ConnectError::Project)?;
-    let roots = PrivateRootsV1::discover_for_current_context().map_err(ConnectError::Roots)?;
-    let namespace = roots
-        .runtime()
-        .endpoint_namespace(project.project_id())
-        .map_err(ConnectError::Roots)?;
-    let discovered = namespace.discover_endpoint().map_err(ConnectError::Store)?;
+    context: &ConnectionContext,
+    operation: RequestOperation,
+    acquisition_deadline: Option<Instant>,
+) -> Result<CompletedRequest, ConnectError> {
+    let discovered = context.discover_endpoint()?;
     let descriptor = discovered.descriptor();
-    let daemon_instance_id = descriptor.daemon_instance_id();
-    let mut stream = discovered
-        .connect_verified(&namespace, deadline)
-        .await
-        .map_err(ConnectError::Transport)?;
-
-    let hello = BootstrapHelloV2::new(
-        project.project_id(),
-        daemon_instance_id,
-        vec![BUSINESS_PROTOCOL_REVISION],
+    let binding = EndpointBinding {
+        project_id: descriptor.project_id(),
+        daemon_instance_id: descriptor.daemon_instance_id(),
+        query_policy_id: descriptor.query_policy_id(),
+    };
+    let request = RequestEnvelope::new(
+        descriptor.business_protocol_revision(),
+        random_request_id().map_err(ConnectError::Failure)?,
+        binding.project_id,
+        binding.daemon_instance_id,
+        binding.query_policy_id,
+        operation,
     )
     .map_err(ConnectError::Contract)?;
-    let frame = encode_frame(&hello, FrameLimits::bootstrap()).map_err(ConnectError::Framing)?;
-    write_frame(
-        &mut stream,
-        &frame,
-        FrameLimits::bootstrap(),
-        remaining_timeout(deadline, options.request_timeout)?,
-    )
-    .await
-    .map_err(ConnectError::Failure)?;
-    let reply_frame = read_required_frame(
-        &mut stream,
-        FrameLimits::bootstrap(),
-        remaining_timeout(deadline, options.request_timeout)?,
-        "bootstrap reply",
-    )
-    .await
-    .map_err(ConnectError::Failure)?;
-    let mut budget = AssetLoadBudget::default();
-    let reply: BootstrapReplyV2 =
-        decode_validated_frame(&reply_frame, &mut budget, FrameLimits::bootstrap())
-            .map_err(ConnectError::Framing)?;
-    reply.validate_for(&hello).map_err(ConnectError::Contract)?;
-    let selected_revision = reply
-        .selected_revision()
-        .ok_or_else(|| ConnectError::Rejected(rejection_code(&reply)))?;
-    let query_policy_id = reply
-        .query_policy_id()
-        .ok_or(ConnectError::MissingQueryPolicy)?;
-    discovered
-        .ensure_unchanged(&namespace)
-        .map_err(ConnectError::Store)?;
-    project.revalidate().map_err(ConnectError::Project)?;
+    let encoded = encode_request_json(&request).map_err(ConnectError::Protocol)?;
+    let host = descriptor.socket_addr().to_string();
+    let url = format!("http://{host}{LOOPBACK_HTTP_REQUEST_PATH}");
+    let host_header =
+        HeaderValue::try_from(host.as_str()).map_err(|error| ConnectError::InvalidHeader {
+            field: "Host",
+            error,
+        })?;
+    let authorization = authorization_header(descriptor.capability())?;
+    let response_timeout = request_timeout(
+        request.operation(),
+        options.request_timeout,
+        acquisition_deadline,
+    )?;
+    let response = options
+        .http
+        .post(url)
+        .header(HOST, host_header)
+        .header(AUTHORIZATION, authorization)
+        .header(CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(ACCEPT, JSON_CONTENT_TYPE)
+        .header(CONNECTION, "close")
+        .timeout(response_timeout)
+        .body(encoded)
+        .send()
+        .await;
+    let mut response = match response {
+        Ok(response) => response,
+        Err(source) => {
+            context
+                .project
+                .revalidate()
+                .map_err(ConnectError::Project)?;
+            match discovered.ensure_unchanged(&context.namespace) {
+                Err(EndpointStoreError::EndpointChanged) if source.is_connect() => {
+                    return Err(ConnectError::GenerationChanged);
+                }
+                Err(error) => return Err(ConnectError::StoreAfterRequest(error)),
+                Ok(()) if source.is_connect() => {
+                    return Err(ConnectError::EndpointUnavailable(source));
+                }
+                Ok(()) => return Err(ConnectError::RequestFailed(source)),
+            }
+        }
+    };
 
-    Ok(ClientSession {
-        stream,
-        binding: SessionBinding {
-            project_id: project.project_id(),
-            daemon_instance_id,
-            query_policy_id,
-            protocol_revision: selected_revision,
-        },
+    let status = response.status();
+    let content_type_is_json = response_content_type_is_json(response.headers());
+    let maximum_response_bytes = max_response_json_bytes(request.operation().kind());
+    let body = if status == StatusCode::OK {
+        read_bounded_response(&mut response, maximum_response_bytes).await
+    } else {
+        read_bounded_error_response(&mut response, maximum_response_bytes).await
+    };
+    context
+        .project
+        .revalidate()
+        .map_err(ConnectError::Project)?;
+    let encoded = match body {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            discovered
+                .ensure_unchanged(&context.namespace)
+                .map_err(ConnectError::StoreAfterResponse)?;
+            return Err(ConnectError::ResponseBody(error));
+        }
+    };
+    if status != StatusCode::OK {
+        discovered
+            .ensure_unchanged(&context.namespace)
+            .map_err(ConnectError::StoreAfterResponse)?;
+        return Err(ConnectError::HttpStatus {
+            status,
+            detail: http_error_detail(&encoded),
+        });
+    }
+    if !content_type_is_json {
+        discovered
+            .ensure_unchanged(&context.namespace)
+            .map_err(ConnectError::StoreAfterResponse)?;
+        return Err(ConnectError::InvalidContentType);
+    }
+    let mut budget = AssetLoadBudget::default();
+    let response = match decode_response_json(&encoded, &mut budget, &request) {
+        Ok(response) => response,
+        Err(error) => {
+            discovered
+                .ensure_unchanged(&context.namespace)
+                .map_err(ConnectError::StoreAfterResponse)?;
+            return Err(ConnectError::Protocol(error));
+        }
+    };
+    let outcome = response.into_outcome();
+    let allow_missing_endpoint = successful_shutdown(&outcome);
+    if allow_missing_endpoint {
+        revalidate_after_shutdown(&discovered, &context.namespace)
+            .map_err(ConnectError::StoreAfterResponse)?;
+    } else {
+        discovered
+            .ensure_unchanged(&context.namespace)
+            .map_err(ConnectError::StoreAfterResponse)?;
+    }
+    Ok(CompletedRequest {
+        binding,
+        outcome,
         server_pid: descriptor.server_pid(),
-        request_timeout: options.request_timeout,
     })
 }
 
-fn remaining_timeout(deadline: Instant, configured: Duration) -> Result<Duration, ConnectError> {
+fn authorization_header(
+    capability: &unity_asset_search_local::HttpCapability,
+) -> Result<HeaderValue, ConnectError> {
+    let encoded = capability.encode_hex();
+    let mut value = [0_u8; BEARER_PREFIX.len() + HTTP_CAPABILITY_HEX_BYTES];
+    value[..BEARER_PREFIX.len()].copy_from_slice(BEARER_PREFIX);
+    value[BEARER_PREFIX.len()..].copy_from_slice(&encoded);
+    let mut header =
+        HeaderValue::from_bytes(&value).map_err(|error| ConnectError::InvalidHeader {
+            field: "Authorization",
+            error,
+        })?;
+    value.fill(0);
+    header.set_sensitive(true);
+    Ok(header)
+}
+
+fn response_content_type_is_json(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all(CONTENT_TYPE).iter();
+    let Some(value) = values.next() else {
+        return false;
+    };
+    values.next().is_none() && value.as_bytes() == JSON_CONTENT_TYPE.as_bytes()
+}
+
+fn successful_shutdown(outcome: &ResponseOutcome) -> bool {
+    matches!(
+        outcome,
+        ResponseOutcome::Success(response) if matches!(
+            response.as_ref(),
+            ResponseOperation::Shutdown(response) if response.accepted
+        )
+    )
+}
+
+fn revalidate_after_shutdown(
+    expected: &DiscoveredLoopbackEndpoint,
+    namespace: &EndpointNamespaceV1,
+) -> Result<(), EndpointStoreError> {
+    match namespace.discover_loopback_endpoint() {
+        Ok(current) if &current == expected => Ok(()),
+        Ok(_) => Err(EndpointStoreError::EndpointChanged),
+        Err(EndpointStoreError::DescriptorMissing) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_bounded_response(
+    response: &mut reqwest::Response,
+    maximum: usize,
+) -> Result<Vec<u8>, ResponseBodyError> {
+    if let Some(content_length) = response.content_length()
+        && content_length > maximum as u64
+    {
+        return Err(ResponseBodyError::TooLarge {
+            requested: content_length,
+            maximum,
+        });
+    }
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(maximum);
+    let mut encoded = Vec::new();
+    encoded
+        .try_reserve(initial_capacity)
+        .map_err(|_| ResponseBodyError::AllocationFailed {
+            requested: initial_capacity,
+        })?;
+    while let Some(chunk) = response.chunk().await.map_err(ResponseBodyError::Read)? {
+        let requested = encoded
+            .len()
+            .checked_add(chunk.len())
+            .ok_or(ResponseBodyError::LengthOverflow)?;
+        if requested > maximum {
+            return Err(ResponseBodyError::TooLarge {
+                requested: requested as u64,
+                maximum,
+            });
+        }
+        encoded
+            .try_reserve(chunk.len())
+            .map_err(|_| ResponseBodyError::AllocationFailed { requested })?;
+        encoded.extend_from_slice(&chunk);
+    }
+    Ok(encoded)
+}
+
+async fn read_bounded_error_response(
+    response: &mut reqwest::Response,
+    maximum: usize,
+) -> Result<Vec<u8>, ResponseBodyError> {
+    const MAXIMUM_RETAINED: usize = 512;
+    if let Some(content_length) = response.content_length()
+        && content_length > maximum as u64
+    {
+        return Err(ResponseBodyError::TooLarge {
+            requested: content_length,
+            maximum,
+        });
+    }
+    let mut total = 0_usize;
+    let mut prefix = Vec::new();
+    prefix
+        .try_reserve(MAXIMUM_RETAINED)
+        .map_err(|_| ResponseBodyError::AllocationFailed {
+            requested: MAXIMUM_RETAINED,
+        })?;
+    while let Some(chunk) = response.chunk().await.map_err(ResponseBodyError::Read)? {
+        total = total
+            .checked_add(chunk.len())
+            .ok_or(ResponseBodyError::LengthOverflow)?;
+        if total > maximum {
+            return Err(ResponseBodyError::TooLarge {
+                requested: total as u64,
+                maximum,
+            });
+        }
+        let remaining = MAXIMUM_RETAINED.saturating_sub(prefix.len());
+        prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    Ok(prefix)
+}
+
+fn http_error_detail(encoded: &[u8]) -> String {
+    if encoded.is_empty() {
+        "empty response body".to_owned()
+    } else {
+        String::from_utf8_lossy(encoded).into_owned()
+    }
+}
+
+fn operation_response_timeout(operation: &RequestOperation, configured: Duration) -> Duration {
+    let RequestOperation::ReindexWait(request) = operation else {
+        return configured;
+    };
+    Duration::from_millis(u64::from(request.timeout_ms))
+        .saturating_add(SERVER_WAIT_RESPONSE_MARGIN)
+        .max(configured)
+}
+
+fn request_timeout(
+    operation: &RequestOperation,
+    configured: Duration,
+    acquisition_deadline: Option<Instant>,
+) -> Result<Duration, ConnectError> {
+    let operation_timeout = operation_response_timeout(operation, configured);
+    let Some(deadline) = acquisition_deadline else {
+        return Ok(operation_timeout);
+    };
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        return Err(ConnectError::Failure(CliFailure::transport(
-            "local IPC connect/bootstrap deadline elapsed",
+        return Err(ConnectError::Failure(CliFailure::unavailable(
+            "daemon acquisition deadline elapsed before the capabilities probe",
             true,
         )));
     }
-    Ok(configured.min(remaining))
-}
-
-fn rejection_code(reply: &BootstrapReplyV2) -> BootstrapErrorCode {
-    match reply {
-        BootstrapReplyV2::Rejected { code, .. } => *code,
-        BootstrapReplyV2::Accepted { .. } => BootstrapErrorCode::NoCommonRevision,
-    }
+    Ok(operation_timeout.min(remaining))
 }
 
 fn spawn_daemon(
@@ -356,8 +586,8 @@ impl SpawnedDaemon {
         self.child.as_ref().map(Child::id)
     }
 
-    fn detach_running(mut self) -> bool {
-        self.child.take().is_some()
+    fn detach_running(mut self) {
+        self.child = None;
     }
 }
 
@@ -387,17 +617,7 @@ fn resolve_daemon_binary(options: &ConnectionOptions) -> Result<PathBuf, CliFail
     } else {
         "unity-asset-search-daemon"
     });
-    if sibling.is_file() {
-        Ok(sibling)
-    } else {
-        Err(CliFailure::unavailable(
-            format!(
-                "daemon binary is not installed beside the CLI at {}; pass --daemon-binary or set UNITY_ASSET_SEARCH_DAEMON",
-                sibling.display()
-            ),
-            false,
-        ))
-    }
+    Ok(sibling)
 }
 
 fn random_request_id() -> Result<RequestId, CliFailure> {
@@ -416,67 +636,29 @@ fn random_request_id() -> Result<RequestId, CliFailure> {
     ))
 }
 
-async fn write_frame(
-    stream: &mut VerifiedFramedTransportV1,
-    frame: &[u8],
-    limits: FrameLimits,
-    timeout: Duration,
-) -> Result<(), CliFailure> {
-    stream
-        .write_frame(frame, limits, timeout)
-        .await
-        .map_err(map_transport)
-}
-
-async fn read_required_frame(
-    stream: &mut VerifiedFramedTransportV1,
-    limits: FrameLimits,
-    timeout: Duration,
-    label: &'static str,
-) -> Result<Vec<u8>, CliFailure> {
-    tokio::time::timeout(
-        timeout,
-        stream.read_frame(limits, FrameReadTimeoutsV1::uniform(timeout)),
-    )
-    .await
-    .map_err(|_| CliFailure::transport(format!("{label} deadline elapsed"), true))?
-    .map_err(map_transport)?
-    .ok_or_else(|| CliFailure::transport(format!("peer closed before {label}"), true))
-}
-
-fn map_transport(error: EndpointTransportError) -> CliFailure {
-    let message = format!("local IPC transport: {error}");
-    match error {
-        EndpointTransportError::FrameTooLarge { .. }
-        | EndpointTransportError::FrameLengthOverflow
-        | EndpointTransportError::InvalidEncodedFrame { .. } => CliFailure::protocol(message),
-        EndpointTransportError::FrameAllocationFailed { .. }
-        | EndpointTransportError::FrameDeadlineOverflow => CliFailure::internal(message),
-        EndpointTransportError::DeadlineElapsed
-        | EndpointTransportError::FrameReadDeadlineElapsed
-        | EndpointTransportError::FrameWriteDeadlineElapsed
-        | EndpointTransportError::EndpointUnavailable
-        | EndpointTransportError::Io { .. }
-        | EndpointTransportError::Store(
-            EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged,
-        ) => CliFailure::transport(message, true),
-        EndpointTransportError::PeerContextMismatch
-        | EndpointTransportError::PeerIdentityMismatch => CliFailure::transport(message, false),
-        _ => CliFailure::transport(message, false),
-    }
-}
-
 fn map_store_failure(error: EndpointStoreError) -> CliFailure {
     let message = format!("endpoint discovery failed: {error}");
     match error {
-        EndpointStoreError::Descriptor(EndpointDescriptorError::BindingMismatch { .. }) => {
-            CliFailure::transport(message, false)
-        }
+        EndpointStoreError::LoopbackDescriptor(
+            LoopbackEndpointDescriptorError::BindingMismatch { .. },
+        ) => CliFailure::transport(message, false),
         EndpointStoreError::DescriptorMissing | EndpointStoreError::EndpointChanged => {
             CliFailure::unavailable(message, true)
         }
         _ => CliFailure::unavailable(message, false),
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ResponseBodyError {
+    #[error("response body is {requested} bytes; maximum is {maximum}")]
+    TooLarge { requested: u64, maximum: usize },
+    #[error("response body length overflowed usize")]
+    LengthOverflow,
+    #[error("could not reserve {requested} bytes for the response body")]
+    AllocationFailed { requested: usize },
+    #[error("could not read the response body: {0}")]
+    Read(#[source] reqwest::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -487,40 +669,49 @@ enum ConnectError {
     Roots(#[source] unity_asset_search_local::PrivateRootsError),
     #[error("endpoint discovery failed: {0}")]
     Store(#[source] EndpointStoreError),
-    #[error("local IPC connection failed: {0}")]
-    Transport(#[source] EndpointTransportError),
-    #[error("protocol framing failed: {0}")]
-    Framing(#[source] unity_asset_search_protocol::FramingError),
+    #[error("endpoint generation changed before a request connection was established")]
+    GenerationChanged,
+    #[error("endpoint validation failed after a request attempt: {0}")]
+    StoreAfterRequest(#[source] EndpointStoreError),
+    #[error("endpoint validation failed after receiving a response: {0}")]
+    StoreAfterResponse(#[source] EndpointStoreError),
+    #[error("loopback HTTP endpoint is unavailable: {0}")]
+    EndpointUnavailable(#[source] reqwest::Error),
+    #[error("loopback HTTP request failed after connection: {0}")]
+    RequestFailed(#[source] reqwest::Error),
+    #[error("loopback HTTP response body failed: {0}")]
+    ResponseBody(#[source] ResponseBodyError),
+    #[error("loopback HTTP response status {status}: {detail}")]
+    HttpStatus { status: StatusCode, detail: String },
+    #[error("loopback HTTP response must have exactly one application/json Content-Type")]
+    InvalidContentType,
+    #[error("invalid {field} HTTP header: {error}")]
+    InvalidHeader {
+        field: &'static str,
+        #[source]
+        error: reqwest::header::InvalidHeaderValue,
+    },
+    #[error("protocol JSON failed: {0}")]
+    Protocol(#[source] unity_asset_search_protocol::ProtocolJsonError),
     #[error("protocol validation failed: {0}")]
     Contract(#[source] unity_asset_search_protocol::ContractValidationError),
-    #[error("bootstrap was rejected: {0:?}")]
-    Rejected(BootstrapErrorCode),
-    #[error("accepted bootstrap reply omitted the query policy identity")]
-    MissingQueryPolicy,
     #[error("{0:?}")]
     Failure(CliFailure),
 }
 
 impl ConnectError {
     fn is_verified_generation_change(&self) -> bool {
-        matches!(
-            self,
-            Self::Store(EndpointStoreError::EndpointChanged)
-                | Self::Transport(EndpointTransportError::Store(
-                    EndpointStoreError::EndpointChanged,
-                ))
-        )
+        matches!(self, Self::GenerationChanged)
     }
 
     fn is_startup_pending(&self) -> bool {
-        matches!(
-            self,
-            Self::Store(EndpointStoreError::DescriptorMissing)
-                | Self::Transport(EndpointTransportError::EndpointUnavailable)
-                | Self::Transport(EndpointTransportError::Store(
-                    EndpointStoreError::DescriptorMissing,
-                ))
-        )
+        match self {
+            Self::Store(EndpointStoreError::DescriptorMissing) | Self::EndpointUnavailable(_) => {
+                true
+            }
+            Self::RequestFailed(error) => error.is_timeout(),
+            _ => false,
+        }
     }
 
     fn into_failure(self) -> CliFailure {
@@ -533,316 +724,128 @@ impl ConnectError {
                 false,
             ),
             Self::Store(error) => map_store_failure(error),
-            Self::Transport(error) => map_transport(error),
-            Self::Framing(error) => {
-                CliFailure::protocol(format!("protocol framing failed: {error}"))
+            Self::GenerationChanged => CliFailure::unavailable(
+                "endpoint generation changed before the request connected",
+                true,
+            ),
+            Self::StoreAfterRequest(error) => CliFailure::transport(
+                format!(
+                    "endpoint changed after a request attempt; the operation may have completed: {error}"
+                ),
+                false,
+            ),
+            Self::StoreAfterResponse(error) => CliFailure::transport(
+                format!("endpoint changed after the response was received: {error}"),
+                false,
+            ),
+            Self::EndpointUnavailable(error) => CliFailure::transport(
+                format!("loopback HTTP endpoint is unavailable: {error}"),
+                true,
+            ),
+            Self::RequestFailed(error) => CliFailure::transport(
+                format!("loopback HTTP request failed; the operation may have completed: {error}"),
+                false,
+            ),
+            Self::ResponseBody(error) => CliFailure::transport(
+                format!("loopback HTTP response body failed: {error}"),
+                false,
+            ),
+            Self::HttpStatus { status, detail } if status.is_server_error() => {
+                CliFailure::unavailable(
+                    format!("loopback HTTP server returned {status}: {detail}"),
+                    false,
+                )
             }
+            Self::HttpStatus { status, detail } => CliFailure::protocol(format!(
+                "loopback HTTP server rejected the request with {status}: {detail}"
+            )),
+            Self::InvalidContentType => CliFailure::protocol(
+                "loopback HTTP response must have exactly one application/json Content-Type",
+            ),
+            Self::InvalidHeader { field, error } => {
+                CliFailure::internal(format!("construct {field} HTTP header: {error}"))
+            }
+            Self::Protocol(error) => CliFailure::protocol(format!("protocol JSON failed: {error}")),
             Self::Contract(error) => {
                 CliFailure::protocol(format!("protocol validation failed: {error}"))
-            }
-            Self::Rejected(code) => {
-                CliFailure::protocol(format!("bootstrap was rejected: {code:?}"))
-            }
-            Self::MissingQueryPolicy => {
-                CliFailure::protocol("accepted bootstrap reply omitted the query policy identity")
             }
             Self::Failure(failure) => failure,
         }
     }
 }
 
-impl From<io::Error> for ConnectError {
-    fn from(error: io::Error) -> Self {
-        Self::Failure(CliFailure::transport(error.to_string(), true))
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::time::{Duration, Instant};
 
-    use unity_asset_core::AssetLoadBudget;
-    use unity_asset_search_local::{
-        EndpointCleanupV1, EndpointDescriptorError, EndpointStoreError, EndpointTransportError,
-        FrameReadTimeoutsV1, PrivateRootsV1, ProjectLocatorError, ProjectLocatorV1,
-        generate_daemon_instance_id,
-    };
+    use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
     use unity_asset_search_protocol::{
-        BUSINESS_PROTOCOL_REVISION, BootstrapHelloV2, BootstrapReplyV2, FrameLimits, QueryPolicyId,
-        decode_validated_frame, encode_frame,
+        CapabilitiesRequest, OperationId, ReindexWaitRequest, RequestOperation, ResponseOperation,
+        ResponseOutcome, ShutdownResponse,
     };
 
-    use super::{ConnectError, ConnectionOptions, connect_once};
+    use super::{
+        SERVER_WAIT_RESPONSE_MARGIN, operation_response_timeout, request_timeout,
+        response_content_type_is_json, successful_shutdown,
+    };
 
-    #[tokio::test]
-    async fn bootstrap_cannot_commit_a_session_after_endpoint_withdrawal() {
-        let project_root = tempfile::tempdir().expect("temporary Unity project");
-        fs::create_dir(project_root.path().join("Assets")).expect("Assets marker");
-        fs::create_dir(project_root.path().join("ProjectSettings"))
-            .expect("ProjectSettings marker");
-        let project = ProjectLocatorV1::open(project_root.path()).expect("locate project");
-        let roots = PrivateRootsV1::discover_for_current_context().expect("private roots");
-        let namespace = roots
-            .runtime()
-            .endpoint_namespace(project.project_id())
-            .expect("endpoint namespace");
-        let cleanup_path = namespace.path().to_path_buf();
-        let mut claim = namespace
-            .claim_daemon_endpoint()
-            .expect("claim daemon endpoint");
-        let instance = generate_daemon_instance_id().expect("daemon instance");
-        let mut endpoint = claim.publish(instance).expect("publish endpoint");
-        let options = ConnectionOptions {
-            project_root: project_root.path().to_path_buf(),
-            index_dir: None,
-            daemon_binary: None,
-            connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10),
-        };
-
-        let client = tokio::spawn(async move {
-            connect_once(&options, Instant::now() + options.connect_timeout).await
+    #[test]
+    fn reindex_wait_timeout_includes_server_margin() {
+        let request = RequestOperation::ReindexWait(ReindexWaitRequest {
+            operation_id: OperationId::from_bytes([0x33; 16]),
+            timeout_ms: 4_000,
         });
-        let mut server = endpoint.accept_verified().await.expect("accept client");
-        let hello_frame = server
-            .read_frame(
-                FrameLimits::bootstrap(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(10)),
-            )
-            .await
-            .expect("read bootstrap hello")
-            .expect("client sent bootstrap hello");
-        let mut budget = AssetLoadBudget::default();
-        let hello: BootstrapHelloV2 =
-            decode_validated_frame(&hello_frame, &mut budget, FrameLimits::bootstrap())
-                .expect("decode bootstrap hello");
-        let reply = BootstrapReplyV2::negotiate(
-            &hello,
-            project.project_id(),
-            instance,
-            QueryPolicyId::from_bytes([0x44; 32]),
-            &[BUSINESS_PROTOCOL_REVISION],
-        );
-        let reply_frame =
-            encode_frame(&reply, FrameLimits::bootstrap()).expect("encode bootstrap reply");
         assert_eq!(
-            endpoint.withdraw().expect("withdraw endpoint publication"),
-            EndpointCleanupV1::Removed
-        );
-        server
-            .write_frame(
-                &reply_frame,
-                FrameLimits::bootstrap(),
-                Duration::from_secs(10),
-            )
-            .await
-            .expect("write bootstrap reply");
-
-        assert!(matches!(
-            client.await.expect("join client"),
-            Err(ConnectError::Store(EndpointStoreError::EndpointChanged))
-        ));
-        let post_bootstrap = server
-            .read_frame(
-                FrameLimits::request_envelope(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(1)),
-            )
-            .await
-            .expect("observe client disconnect");
-        assert!(post_bootstrap.is_none());
-
-        drop(server);
-        drop(endpoint);
-        drop(claim);
-        drop(namespace);
-        drop(roots);
-        for name in ["binding.v1", ".binding-v1.lock", ".daemon-v1.lock"] {
-            let result = fs::remove_file(cleanup_path.join(name));
-            assert!(
-                result.is_ok()
-                    || result.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            );
-        }
-        fs::remove_dir(cleanup_path).expect("remove endpoint namespace");
-    }
-
-    #[tokio::test]
-    async fn bootstrap_cannot_commit_a_session_after_project_replacement() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let project_root = temporary.path().join("project");
-        let displaced_root = temporary.path().join("displaced-project");
-        fs::create_dir_all(project_root.join("Assets")).expect("Assets marker");
-        fs::create_dir_all(project_root.join("ProjectSettings")).expect("ProjectSettings marker");
-        let project = ProjectLocatorV1::open(&project_root).expect("locate project");
-        let roots = PrivateRootsV1::discover_for_current_context().expect("private roots");
-        let namespace = roots
-            .runtime()
-            .endpoint_namespace(project.project_id())
-            .expect("endpoint namespace");
-        let cleanup_path = namespace.path().to_path_buf();
-        let mut claim = namespace
-            .claim_daemon_endpoint()
-            .expect("claim daemon endpoint");
-        let instance = generate_daemon_instance_id().expect("daemon instance");
-        let mut endpoint = claim.publish(instance).expect("publish endpoint");
-        let options = ConnectionOptions {
-            project_root: project_root.clone(),
-            index_dir: None,
-            daemon_binary: None,
-            connect_timeout: Duration::from_secs(10),
-            request_timeout: Duration::from_secs(10),
-        };
-
-        let client = tokio::spawn(async move {
-            connect_once(&options, Instant::now() + options.connect_timeout).await
-        });
-        let mut server = endpoint.accept_verified().await.expect("accept client");
-        let hello_frame = server
-            .read_frame(
-                FrameLimits::bootstrap(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(10)),
-            )
-            .await
-            .expect("read bootstrap hello")
-            .expect("client sent bootstrap hello");
-        let mut budget = AssetLoadBudget::default();
-        let hello: BootstrapHelloV2 =
-            decode_validated_frame(&hello_frame, &mut budget, FrameLimits::bootstrap())
-                .expect("decode bootstrap hello");
-        let reply = BootstrapReplyV2::negotiate(
-            &hello,
-            project.project_id(),
-            instance,
-            QueryPolicyId::from_bytes([0x45; 32]),
-            &[BUSINESS_PROTOCOL_REVISION],
-        );
-        let reply_frame =
-            encode_frame(&reply, FrameLimits::bootstrap()).expect("encode bootstrap reply");
-        fs::rename(&project_root, &displaced_root).expect("displace project root");
-        fs::create_dir_all(project_root.join("Assets")).expect("replacement Assets marker");
-        fs::create_dir_all(project_root.join("ProjectSettings"))
-            .expect("replacement ProjectSettings marker");
-        server
-            .write_frame(
-                &reply_frame,
-                FrameLimits::bootstrap(),
-                Duration::from_secs(10),
-            )
-            .await
-            .expect("write bootstrap reply");
-
-        assert!(matches!(
-            client.await.expect("join client"),
-            Err(ConnectError::Project(
-                ProjectLocatorError::IdentityChanged { .. }
-            ))
-        ));
-        let post_bootstrap = server
-            .read_frame(
-                FrameLimits::request_envelope(),
-                FrameReadTimeoutsV1::uniform(Duration::from_secs(1)),
-            )
-            .await
-            .expect("observe client disconnect");
-        assert!(post_bootstrap.is_none());
-
-        drop(server);
-        drop(endpoint);
-        drop(claim);
-        drop(namespace);
-        drop(roots);
-        for name in ["binding.v1", ".binding-v1.lock", ".daemon-v1.lock"] {
-            let result = fs::remove_file(cleanup_path.join(name));
-            assert!(
-                result.is_ok()
-                    || result.is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-            );
-        }
-        fs::remove_dir(cleanup_path).expect("remove endpoint namespace");
-    }
-
-    #[test]
-    fn only_startup_pending_endpoints_authorize_daemon_start() {
-        assert!(ConnectError::Store(EndpointStoreError::DescriptorMissing).is_startup_pending());
-        assert!(
-            ConnectError::Transport(EndpointTransportError::EndpointUnavailable)
-                .is_startup_pending()
-        );
-        assert!(
-            !ConnectError::Transport(EndpointTransportError::PeerContextMismatch)
-                .is_startup_pending()
-        );
-        assert!(!ConnectError::Store(EndpointStoreError::EndpointChanged).is_startup_pending());
-    }
-
-    #[test]
-    fn only_verified_generation_changes_are_retryable_after_spawn() {
-        assert!(
-            ConnectError::Store(EndpointStoreError::EndpointChanged)
-                .is_verified_generation_change()
-        );
-        assert!(
-            ConnectError::Transport(EndpointTransportError::Store(
-                EndpointStoreError::EndpointChanged
-            ))
-            .is_verified_generation_change()
-        );
-        assert!(
-            !ConnectError::Transport(EndpointTransportError::Store(
-                EndpointStoreError::DescriptorMissing,
-            ))
-            .is_verified_generation_change()
-        );
-        assert!(
-            !ConnectError::Transport(EndpointTransportError::EndpointUnavailable)
-                .is_verified_generation_change()
-        );
-        for field in [
-            "server_pid",
-            "process_start_identity",
-            "security_context_id",
-        ] {
-            assert!(
-                !ConnectError::Transport(EndpointTransportError::Descriptor(
-                    EndpointDescriptorError::BindingMismatch { field }
-                ))
-                .is_verified_generation_change()
-            );
-        }
-        assert!(
-            !ConnectError::Transport(EndpointTransportError::PeerContextMismatch)
-                .is_verified_generation_change()
-        );
-        assert!(
-            !ConnectError::Transport(EndpointTransportError::PeerIdentityMismatch)
-                .is_verified_generation_change()
+            operation_response_timeout(&request, Duration::from_secs(1)),
+            Duration::from_millis(4_000) + SERVER_WAIT_RESPONSE_MARGIN
         );
     }
 
     #[test]
-    fn startup_pending_states_are_not_generation_changes() {
-        for error in [
-            ConnectError::Store(EndpointStoreError::DescriptorMissing),
-            ConnectError::Transport(EndpointTransportError::EndpointUnavailable),
-            ConnectError::Transport(EndpointTransportError::Store(
-                EndpointStoreError::DescriptorMissing,
-            )),
-        ] {
-            assert!(error.is_startup_pending());
-            assert!(!error.is_verified_generation_change());
-        }
-        assert!(!ConnectError::Store(EndpointStoreError::EndpointChanged).is_startup_pending());
+    fn acquisition_probe_uses_only_the_remaining_connect_deadline() {
+        let request = RequestOperation::Capabilities(CapabilitiesRequest::default());
+        let maximum = Duration::from_millis(100);
+        let timeout = request_timeout(
+            &request,
+            Duration::from_secs(60),
+            Some(Instant::now() + maximum),
+        )
+        .unwrap();
+
+        assert!(!timeout.is_zero());
+        assert!(timeout <= maximum);
     }
 
     #[test]
-    fn descriptor_binding_mismatch_is_not_retryable_in_cli_output() {
-        let failure = ConnectError::Store(EndpointStoreError::Descriptor(
-            EndpointDescriptorError::BindingMismatch {
-                field: "project_id",
-            },
-        ))
-        .into_failure();
-        assert!(!failure.is_retryable());
+    fn response_content_type_requires_one_exact_json_value() {
+        let mut headers = HeaderMap::new();
+        assert!(!response_content_type_is_json(&headers));
+
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(response_content_type_is_json(&headers));
+
+        headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        assert!(!response_content_type_is_json(&headers));
+
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        assert!(!response_content_type_is_json(&headers));
+    }
+
+    #[test]
+    fn only_an_accepted_shutdown_response_allows_endpoint_withdrawal() {
+        let accepted =
+            ResponseOutcome::Success(Box::new(ResponseOperation::Shutdown(ShutdownResponse {
+                accepted: true,
+            })));
+        assert!(successful_shutdown(&accepted));
+
+        let rejected =
+            ResponseOutcome::Success(Box::new(ResponseOperation::Shutdown(ShutdownResponse {
+                accepted: false,
+            })));
+        assert!(!successful_shutdown(&rejected));
     }
 }

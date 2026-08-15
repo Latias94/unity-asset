@@ -121,6 +121,23 @@ class RecordingBackend:
 
 
 class WorkspacePackagePublisherTests(unittest.TestCase):
+    def cargo_backend(
+        self,
+        root: Path,
+        *,
+        token: str = "token",
+        prepared: Path | None = None,
+        environment: dict[str, str] | None = None,
+    ) -> PUBLISHER.CargoBackend:
+        return PUBLISHER.CargoBackend(
+            repository_root=root,
+            cargo="cargo-custom",
+            token=token,
+            cargo_cwd=Path("clean-cargo-cwd"),
+            cargo_environment=environment or {"CARGO_TARGET_DIR": str(root / "target")},
+            prepared_crates_directory=prepared or root / "prepared",
+        )
+
     def test_crates_io_download_uses_the_hard_deadline_adapter(self) -> None:
         payload = b"crate bytes"
 
@@ -255,7 +272,11 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
         )
 
     def test_uncredentialed_cargo_subprocess_removes_ambient_registry_token(self) -> None:
-        backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "passed-token")
+        backend = self.cargo_backend(
+            Path("repository"),
+            token="passed-token",
+            environment={"UNCHANGED": "kept", "CARGO_TARGET_DIR": "target"},
+        )
         completed = subprocess.CompletedProcess([], 0, stdout="")
         with (
             mock.patch.dict(
@@ -274,10 +295,14 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
             backend.run(["cargo-custom", "metadata"])
 
         environment = run.call_args.kwargs["env"]
-        self.assertEqual(environment, {"UNCHANGED": "kept"})
+        self.assertEqual(
+            environment,
+            {"UNCHANGED": "kept", "CARGO_TARGET_DIR": "target"},
+        )
+        self.assertEqual(run.call_args.kwargs["cwd"], Path("clean-cargo-cwd"))
 
     def test_release_observation_only_treats_http_404_as_missing(self) -> None:
-        backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "token")
+        backend = self.cargo_backend(Path("repository"))
 
         def available(_url, destination, **_kwargs):
             destination.write_text(
@@ -321,7 +346,7 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
     def test_release_observation_reports_yanked_and_rejects_mismatched_metadata(
         self,
     ) -> None:
-        backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "token")
+        backend = self.cargo_backend(Path("repository"))
 
         def yanked(_url, destination, **_kwargs):
             destination.write_text(
@@ -353,7 +378,11 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
                 backend.release_state("example", "1.2.3")
 
     def test_publish_subprocess_targets_crates_io_and_only_injects_passed_token(self) -> None:
-        backend = PUBLISHER.CargoBackend(Path("repository"), "cargo-custom", "passed-token")
+        backend = self.cargo_backend(
+            Path("repository"),
+            token="passed-token",
+            environment={"UNCHANGED": "kept", "CARGO_TARGET_DIR": "target"},
+        )
         completed = subprocess.CompletedProcess([], 0, stdout="")
         with (
             mock.patch.dict(
@@ -382,6 +411,8 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
                 "--no-verify",
                 "--registry",
                 "crates-io",
+                "--manifest-path",
+                str(Path("repository") / "Cargo.toml"),
                 "-p",
                 "example",
             ],
@@ -389,8 +420,38 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
         environment = run.call_args.kwargs["env"]
         self.assertEqual(
             environment,
-            {"UNCHANGED": "kept", "CARGO_REGISTRY_TOKEN": "passed-token"},
+            {
+                "UNCHANGED": "kept",
+                "CARGO_TARGET_DIR": "target",
+                "CARGO_REGISTRY_TOKEN": "passed-token",
+            },
         )
+
+    def test_package_rejects_bytes_not_produced_by_the_unprivileged_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            prepared = root / "prepared"
+            prepared.mkdir()
+            expected = prepared / "example-1.2.3.crate"
+            expected.write_bytes(b"verified")
+            backend = self.cargo_backend(root, prepared=prepared)
+            archive = backend.archive_path("example", "1.2.3")
+
+            def package(_command, **_kwargs):
+                archive.parent.mkdir(parents=True, exist_ok=True)
+                archive.write_bytes(b"different")
+                return subprocess.CompletedProcess([], 0, stdout="")
+
+            with mock.patch.object(
+                PUBLISHER,
+                "run_bounded_command",
+                side_effect=package,
+            ):
+                with self.assertRaisesRegex(
+                    PUBLISHER.PublishError,
+                    "does not match the unprivileged candidate archive",
+                ):
+                    backend.package("example", "1.2.3")
 
     def test_preflight_retries_remote_observation_without_publishing(self) -> None:
         backend = RecordingBackend(
@@ -418,12 +479,18 @@ class WorkspacePackagePublisherTests(unittest.TestCase):
         self.assertEqual(pauses, [3])
 
     def test_package_removes_the_exact_stale_archive_before_running_cargo(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary, mock.patch.dict(
-            os.environ,
-            {"CARGO_TARGET_DIR": temporary},
-            clear=False,
-        ):
-            backend = PUBLISHER.CargoBackend(Path("repository"), "cargo", "token")
+        with tempfile.TemporaryDirectory() as temporary:
+            prepared = Path(temporary) / "prepared"
+            prepared.mkdir()
+            (prepared / "example-1.2.3.crate").write_bytes(b"fresh")
+            backend = PUBLISHER.CargoBackend(
+                repository_root=Path("repository"),
+                cargo="cargo",
+                token="token",
+                cargo_cwd=Path("clean-cargo-cwd"),
+                cargo_environment={"CARGO_TARGET_DIR": temporary},
+                prepared_crates_directory=prepared,
+            )
             archive = backend.archive_path("example", "1.2.3")
             archive.parent.mkdir(parents=True)
             archive.write_bytes(b"stale")

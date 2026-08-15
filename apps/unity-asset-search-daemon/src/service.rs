@@ -191,8 +191,11 @@ impl SearchService {
         self.shutdown_handle().begin_shutdown_at(deadline);
     }
 
-    pub(crate) async fn begin_draining(&self) {
-        self.inner.admission.begin_draining().await;
+    pub(crate) async fn wait_for_admission_linearization(&self) {
+        self.inner
+            .admission
+            .wait_for_admission_linearization()
+            .await;
     }
 
     pub(crate) async fn execute(&self, operation: RequestOperation) -> SearchServiceResult {

@@ -47,11 +47,18 @@ def parse_args() -> argparse.Namespace:
             "installs and probes published binaries (default: packages)."
         ),
     )
+    parser.add_argument(
+        "--archive-output",
+        type=Path,
+        help="Export the verified .crate files for a later trusted publication job.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.archive_output is not None and args.mode != "full":
+        raise VerificationError("--archive-output requires --mode full")
     workspace_root = Path(__file__).resolve().parent.parent
     root_manifest = workspace_root / "Cargo.toml"
     root_document = load_toml(root_manifest)
@@ -93,6 +100,9 @@ def main() -> int:
         workspace_root=workspace_root,
         closure=closure,
         verify_binaries=args.mode == "full",
+        archive_output=(
+            args.archive_output.resolve() if args.archive_output is not None else None
+        ),
     )
     print(
         f"workspace package verification ({args.mode}) passed: every publishable "

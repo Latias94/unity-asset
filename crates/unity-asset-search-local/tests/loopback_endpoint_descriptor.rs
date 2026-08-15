@@ -1,7 +1,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use unity_asset_search_local::{
-    EndpointDescriptorV1, HttpCapability, HttpCapabilityError, LoopbackEndpointDescriptor,
+    HttpCapability, HttpCapabilityError, LoopbackEndpointDescriptor,
     LoopbackEndpointDescriptorError, MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES,
 };
 use unity_asset_search_protocol::{
@@ -165,10 +165,7 @@ fn loopback_descriptor_rejects_v1_unknown_trailing_and_noncanonical_json() {
         Err(LoopbackEndpointDescriptorError::UnsupportedDescriptorVersion { actual: 1 })
     ));
 
-    let v2 = descriptor().encode_json().unwrap();
-    assert!(EndpointDescriptorV1::decode_json(&v2).is_err());
-
-    let encoded = v2;
+    let encoded = descriptor().encode_json().unwrap();
     let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     value["unexpected"] = serde_json::json!(true);
     assert!(matches!(

@@ -11,7 +11,7 @@ use unity_asset_search_local::{PrivateRootsV1, ProjectLocatorV1, generate_daemon
 
 mod build_identity;
 mod coordinator;
-mod ipc;
+mod http_transport;
 mod lifecycle;
 mod operations;
 mod service;
@@ -132,9 +132,9 @@ async fn main() -> anyhow::Result<()> {
 
     let roots = PrivateRootsV1::discover_for_current_context()?;
     let namespace = roots.runtime().endpoint_namespace(paths.project_id())?;
-    let endpoint_claim = namespace.claim_daemon_endpoint()?;
+    let endpoint_claim = namespace.claim_loopback_endpoint()?;
     let stale_cleanup = endpoint_claim.stale_cleanup();
-    if stale_cleanup == unity_asset_search_local::EndpointCleanupV1::Removed {
+    if stale_cleanup == unity_asset_search_local::LoopbackEndpointCleanup::Removed {
         eprintln!("retired stale endpoint descriptor before daemon initialization");
     }
     let daemon_instance_id = generate_daemon_instance_id()?;
