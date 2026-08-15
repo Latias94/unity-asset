@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-07-30
 - Supersedes: the localhost HTTP and bearer-token decisions previously recorded in this ADR
+- Superseded in part by: ADR 0005's HTTP capability and transport decisions
 
 ## Context
 

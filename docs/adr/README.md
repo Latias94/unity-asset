@@ -8,6 +8,7 @@ This project uses ADRs to record significant architectural decisions.
 - [ADR 0002: Fuzzy search and ranking strategy](0002-fuzzy-search-ranking.md)
 - [ADR 0003: Unity Editor plugin integration and repository strategy](0003-unity-editor-plugin.md)
 - [ADR 0004: Asset Workspace transactions](0004-asset-workspace-transactions.md)
+- [ADR 0005: Local search HTTP capability boundary](0005-local-search-http-capability.md)
 
 ## Template
 
