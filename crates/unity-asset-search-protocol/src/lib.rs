@@ -3,6 +3,7 @@
 mod bootstrap;
 mod framing;
 mod ids;
+mod json;
 mod model;
 mod operation;
 mod validation;
@@ -17,6 +18,10 @@ pub use framing::{
 };
 pub use ids::{
     DaemonInstanceId, FixedIdParseError, OperationId, ProjectId, QueryPolicyId, RequestId,
+};
+pub use json::{
+    MAX_REQUEST_JSON_BYTES, ProtocolJsonError, decode_request_json, decode_response_json,
+    encode_request_json, encode_response_json,
 };
 pub use model::{
     ApiError, ApiErrorCode, CandidateFieldV1, DaemonLifecycleState, DaemonLifecycleStatus,
