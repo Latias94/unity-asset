@@ -1,3 +1,5 @@
+//! Transport-neutral search daemon operation service.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,11 +38,11 @@ const REFERENCE_QUERY_BUDGET_MEMBERS: u64 = 2 * 1024 * 1024;
 const REFERENCE_QUERY_BUDGET_DEPTH: u32 = 32;
 
 #[derive(Clone)]
-pub struct Dispatcher {
-    inner: Arc<DispatcherInner>,
+pub(crate) struct SearchService {
+    inner: Arc<SearchServiceInner>,
 }
 
-struct DispatcherInner {
+struct SearchServiceInner {
     index: SearchIndex,
     query_policy_id: QueryPolicyId,
     operations: OperationService,
@@ -51,18 +53,18 @@ struct DispatcherInner {
 }
 
 #[derive(Clone)]
-pub(crate) struct DispatcherShutdown {
+pub(crate) struct SearchServiceShutdown {
     shutdown: watch::Sender<Option<Instant>>,
     admission: AdmissionGate,
 }
 
-pub struct DispatchResult {
-    pub response: Result<ResponseOperation, ApiError>,
-    pub shutdown_after_response: Option<Instant>,
+pub(crate) struct SearchServiceResult {
+    pub(crate) response: Result<ResponseOperation, ApiError>,
+    pub(crate) shutdown_after_response: Option<Instant>,
 }
 
-impl Dispatcher {
-    pub fn new(
+impl SearchService {
+    pub(crate) fn new(
         index: SearchIndex,
         blocking_tasks: BlockingTaskHandle,
         operations: OperationService,
@@ -72,7 +74,7 @@ impl Dispatcher {
     ) -> Self {
         let (shutdown, _) = watch::channel(None);
         Self {
-            inner: Arc::new(DispatcherInner {
+            inner: Arc::new(SearchServiceInner {
                 index,
                 query_policy_id,
                 operations,
@@ -85,16 +87,16 @@ impl Dispatcher {
     }
 
     #[must_use]
-    pub fn query_policy_id(&self) -> QueryPolicyId {
+    pub(crate) fn query_policy_id(&self) -> QueryPolicyId {
         self.inner.query_policy_id
     }
 
-    pub fn subscribe_shutdown(&self) -> watch::Receiver<Option<Instant>> {
+    pub(crate) fn subscribe_shutdown(&self) -> watch::Receiver<Option<Instant>> {
         self.inner.shutdown.subscribe()
     }
 
-    pub(crate) fn shutdown_handle(&self) -> DispatcherShutdown {
-        DispatcherShutdown {
+    pub(crate) fn shutdown_handle(&self) -> SearchServiceShutdown {
+        SearchServiceShutdown {
             shutdown: self.inner.shutdown.clone(),
             admission: self.inner.admission.clone(),
         }
@@ -104,22 +106,22 @@ impl Dispatcher {
         *self.inner.shutdown.borrow()
     }
 
-    pub fn begin_shutdown_at(&self, deadline: Instant) {
+    pub(crate) fn begin_shutdown_at(&self, deadline: Instant) {
         self.shutdown_handle().begin_shutdown_at(deadline);
     }
 
-    pub async fn begin_draining(&self) {
+    pub(crate) async fn begin_draining(&self) {
         self.inner.admission.begin_draining().await;
     }
 
-    pub async fn dispatch(&self, operation: RequestOperation) -> DispatchResult {
+    pub(crate) async fn execute(&self, operation: RequestOperation) -> SearchServiceResult {
         let shutdown_after_response = requested_shutdown_deadline(&operation);
         if matches!(operation, RequestOperation::Shutdown(_)) {
             self.inner.admission.close();
         } else if requires_lifecycle_admission(operation.kind())
             && self.inner.admission.admit().await.is_none()
         {
-            return DispatchResult {
+            return SearchServiceResult {
                 response: Err(lifecycle_admission_error(
                     self.inner.admission.lifecycle(),
                     self.inner.query_policy_id,
@@ -179,7 +181,7 @@ impl Dispatcher {
                     Ok(intent) => self
                         .inner
                         .operations
-                        .admit(OperationOrigin::Ipc, intent, request.idempotency_key)
+                        .admit(OperationOrigin::Client, intent, request.idempotency_key)
                         .await
                         .map(|status| {
                             ResponseOperation::ReindexAdmit(operation_status(
@@ -231,7 +233,7 @@ impl Dispatcher {
                 accepted: true,
             })),
         };
-        DispatchResult {
+        SearchServiceResult {
             response,
             shutdown_after_response,
         }
@@ -259,7 +261,7 @@ impl Dispatcher {
     }
 }
 
-impl DispatcherShutdown {
+impl SearchServiceShutdown {
     pub(crate) fn begin_shutdown_at(&self, deadline: Instant) {
         self.admission.close();
         self.shutdown
@@ -693,7 +695,7 @@ mod tests {
     };
 
     use super::{
-        DispatcherShutdown, daemon_lifecycle_status, operation_status,
+        SearchServiceShutdown, daemon_lifecycle_status, operation_status,
         requires_lifecycle_admission, tighten_shutdown,
     };
     use crate::coordinator::{
@@ -923,7 +925,7 @@ mod tests {
     async fn shutdown_signal_closes_admission_before_publishing_deadline() {
         let admission = AdmissionGate::default();
         let (shutdown, receiver) = watch::channel(None);
-        let handle = DispatcherShutdown {
+        let handle = SearchServiceShutdown {
             shutdown,
             admission: admission.clone(),
         };

@@ -1,5 +1,3 @@
-mod dispatch;
-
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
@@ -20,8 +18,7 @@ use unity_asset_search_protocol::{
     decode_validated_frame, encode_frame, encode_response_frame,
 };
 
-pub use dispatch::Dispatcher;
-pub(crate) use dispatch::DispatcherShutdown;
+use crate::service::{SearchService, SearchServiceResult, SearchServiceShutdown};
 
 const MAX_WORK_IN_FLIGHT: usize = 16;
 const MAX_WAIT_IN_FLIGHT: usize = 16;
@@ -272,7 +269,7 @@ impl DispatchClass {
 /// still owns its `JoinSet` and can explicitly abort and join each session before releasing the
 /// endpoint or index-writer leases.
 pub(crate) struct IpcService {
-    dispatcher: Dispatcher,
+    service: SearchService,
     connections: ConnectionCapacity,
     dispatch_capacity: DispatchCapacity,
     shutdown: watch::Receiver<Option<Instant>>,
@@ -292,10 +289,10 @@ pub(crate) struct SessionPanicTestGate {
 }
 
 impl IpcService {
-    pub(crate) fn new(dispatcher: Dispatcher) -> Self {
+    pub(crate) fn new(service: SearchService) -> Self {
         Self {
-            shutdown: dispatcher.subscribe_shutdown(),
-            dispatcher,
+            shutdown: service.subscribe_shutdown(),
+            service,
             connections: ConnectionCapacity::production(),
             dispatch_capacity: DispatchCapacity::production(),
             sessions: JoinSet::new(),
@@ -313,16 +310,16 @@ impl IpcService {
         self
     }
 
-    pub(crate) fn shutdown_handle(&self) -> DispatcherShutdown {
-        self.dispatcher.shutdown_handle()
+    pub(crate) fn shutdown_handle(&self) -> SearchServiceShutdown {
+        self.service.shutdown_handle()
     }
 
     pub(crate) fn requested_shutdown_deadline(&self) -> Option<Instant> {
-        self.dispatcher.requested_shutdown_deadline()
+        self.service.requested_shutdown_deadline()
     }
 
     pub(crate) fn begin_shutdown_at(&self, deadline: Instant) {
-        self.dispatcher.begin_shutdown_at(deadline);
+        self.service.begin_shutdown_at(deadline);
     }
 
     pub(crate) async fn serve(
@@ -335,7 +332,7 @@ impl IpcService {
 
         let requested_before_serve = *self.shutdown.borrow_and_update();
         let drain_deadline = if let Some(deadline) = requested_before_serve {
-            self.dispatcher.begin_draining().await;
+            self.service.begin_draining().await;
             deadline
         } else {
             loop {
@@ -347,12 +344,12 @@ impl IpcService {
                 .await
                 {
                     ServeEvent::Shutdown(Ok(Some(deadline))) => {
-                        self.dispatcher.begin_draining().await;
+                        self.service.begin_draining().await;
                         break deadline;
                     }
                     ServeEvent::Shutdown(Ok(None)) => {}
                     ServeEvent::Shutdown(Err(_)) => {
-                        self.dispatcher.begin_draining().await;
+                        self.service.begin_draining().await;
                         fatal = Some(anyhow::anyhow!(
                             "IPC shutdown controller closed unexpectedly"
                         ));
@@ -364,25 +361,25 @@ impl IpcService {
                             Err(error) => {
                                 let requested_deadline = *self.shutdown.borrow();
                                 if let Some(deadline) = requested_deadline {
-                                    self.dispatcher.begin_draining().await;
+                                    self.service.begin_draining().await;
                                     break deadline;
                                 }
                                 if error.is_peer_rejection() {
                                     self.rejection_log.record(&error);
                                     continue;
                                 }
-                                self.dispatcher.begin_draining().await;
+                                self.service.begin_draining().await;
                                 fatal = Some(anyhow::Error::new(error));
                                 break fatal_drain_deadline();
                             }
                         };
-                        let dispatcher = self.dispatcher.clone();
+                        let service = self.service.clone();
                         let connections = self.connections.clone();
                         let dispatch_capacity = self.dispatch_capacity.clone();
                         self.sessions.spawn(async move {
                             if let Err(error) = session(
                                 stream,
-                                dispatcher,
+                                service,
                                 connections,
                                 dispatch_capacity,
                                 connection,
@@ -410,7 +407,7 @@ impl IpcService {
                     ServeEvent::SessionJoined(joined) => {
                         if let Err(error) = joined {
                             let message = crate::truncate_utf8(error.to_string(), 4 * 1024);
-                            self.dispatcher.begin_draining().await;
+                            self.service.begin_draining().await;
                             fatal =
                                 Some(anyhow::anyhow!("local IPC session task failed: {message}"));
                             break fatal_drain_deadline();
@@ -445,7 +442,7 @@ impl IpcService {
 
     /// Drain every owned session after the supervisor has closed discovery and admission.
     pub(crate) async fn shutdown(&mut self) -> anyhow::Result<()> {
-        self.dispatcher.begin_draining().await;
+        self.service.begin_draining().await;
         let deadline = (*self.shutdown.borrow_and_update()).unwrap_or_else(fatal_drain_deadline);
         match self.drain_to(deadline).await {
             Some(message) => Err(anyhow::anyhow!(
@@ -504,9 +501,9 @@ where
 #[cfg(test)]
 pub async fn serve(
     endpoint: &mut ClaimedEndpointV1,
-    dispatcher: Dispatcher,
+    service: SearchService,
 ) -> anyhow::Result<EndpointCleanupV1> {
-    IpcService::new(dispatcher).serve(endpoint).await
+    IpcService::new(service).serve(endpoint).await
 }
 
 fn fatal_drain_deadline() -> Instant {
@@ -601,7 +598,7 @@ async fn accept_when_capacity(
 
 async fn session(
     mut stream: VerifiedFramedTransportV1,
-    dispatcher: Dispatcher,
+    service: SearchService,
     connections: ConnectionCapacity,
     dispatch_capacity: DispatchCapacity,
     connection: ConnectionLease,
@@ -629,7 +626,7 @@ async fn session(
         &hello,
         project_id,
         daemon_instance_id,
-        dispatcher.query_policy_id(),
+        service.query_policy_id(),
         &[BUSINESS_PROTOCOL_REVISION],
     );
     let reply_frame = encode_frame(&reply, FrameLimits::bootstrap())?;
@@ -670,7 +667,7 @@ async fn session(
     };
     let mut budget = AssetLoadBudget::default();
     let first_request = decode_request_frame(&first_frame, &mut budget)?;
-    first_request.validate_binding(project_id, daemon_instance_id, dispatcher.query_policy_id())?;
+    first_request.validate_binding(project_id, daemon_instance_id, service.query_policy_id())?;
     if preclassification_deadline.expired() {
         return Ok(());
     }
@@ -685,7 +682,7 @@ async fn session(
                 DispatchClass::Control => ORDINARY_CONNECTIONS + CONTROL_RESERVED_CONNECTIONS,
                 DispatchClass::Work | DispatchClass::Wait => ORDINARY_CONNECTIONS,
             };
-            let saturated = dispatch::DispatchResult {
+            let saturated = SearchServiceResult {
                 response: Err(ApiError::new(
                     ApiErrorCode::Busy,
                     "daemon persistent IPC session capacity reached",
@@ -693,13 +690,13 @@ async fn session(
                 )
                 .with_detail("class", first_class.name())
                 .with_detail("maximum", maximum.to_string())
-                .with_query_policy(dispatcher.query_policy_id())),
+                .with_query_policy(service.query_policy_id())),
                 shutdown_after_response: None,
             };
             let _connection = connection;
             let _ = write_dispatch_response(
                 &mut stream,
-                &dispatcher,
+                &service,
                 &first_request,
                 saturated,
                 FramedPeerStateV1::Open,
@@ -717,7 +714,7 @@ async fn session(
         (first_class == DispatchClass::Control).then_some(preclassification_deadline);
     if handle_request(
         &mut stream,
-        &dispatcher,
+        &service,
         &dispatch_capacity,
         first_request,
         first_deadline,
@@ -745,13 +742,13 @@ async fn session(
         let frame_processing_deadline = SessionDeadline::new()?;
         let mut budget = AssetLoadBudget::default();
         let request = decode_request_frame(&frame, &mut budget)?;
-        request.validate_binding(project_id, daemon_instance_id, dispatcher.query_policy_id())?;
+        request.validate_binding(project_id, daemon_instance_id, service.query_policy_id())?;
         if frame_processing_deadline.expired() {
             return Ok(());
         }
         let class = DispatchClass::for_operation(request.operation().kind());
         if !capacity_lane.permits(class) {
-            let rejected = dispatch::DispatchResult {
+            let rejected = SearchServiceResult {
                 response: Err(ApiError::new(
                     ApiErrorCode::Busy,
                     "control-reserved connection only accepts control operations",
@@ -759,12 +756,12 @@ async fn session(
                 )
                 .with_detail("lane", "control_reserved")
                 .with_detail("accepted_class", DispatchClass::Control.name())
-                .with_query_policy(dispatcher.query_policy_id())),
+                .with_query_policy(service.query_policy_id())),
                 shutdown_after_response: None,
             };
             let _ = write_dispatch_response(
                 &mut stream,
-                &dispatcher,
+                &service,
                 &request,
                 rejected,
                 FramedPeerStateV1::Open,
@@ -780,14 +777,7 @@ async fn session(
         } else {
             None
         };
-        if handle_request(
-            &mut stream,
-            &dispatcher,
-            &dispatch_capacity,
-            request,
-            deadline,
-        )
-        .await?
+        if handle_request(&mut stream, &service, &dispatch_capacity, request, deadline).await?
             == RequestDisposition::Close
         {
             return Ok(());
@@ -803,20 +793,20 @@ enum RequestDisposition {
 
 async fn handle_request(
     stream: &mut VerifiedFramedTransportV1,
-    dispatcher: &Dispatcher,
+    service: &SearchService,
     dispatch_capacity: &DispatchCapacity,
     request: RequestEnvelope,
     deadline: Option<SessionDeadline>,
 ) -> Result<RequestDisposition, SessionError> {
     let operation = request.operation().clone();
     let dispatch_class = DispatchClass::for_operation(operation.kind());
-    let request_dispatcher = dispatcher.clone();
+    let request_service = service.clone();
     let request_capacity = dispatch_capacity.clone();
     let dispatch = async move {
         let permit = request_capacity.try_acquire(dispatch_class);
         match permit {
-            Ok(_permit) => request_dispatcher.dispatch(operation).await,
-            Err(_) => dispatch::DispatchResult {
+            Ok(_permit) => request_service.execute(operation).await,
+            Err(_) => SearchServiceResult {
                 response: Err(ApiError::new(
                     ApiErrorCode::Busy,
                     "daemon in-flight request class limit reached",
@@ -824,7 +814,7 @@ async fn handle_request(
                 )
                 .with_detail("class", dispatch_class.name())
                 .with_detail("maximum", dispatch_class.maximum().to_string())
-                .with_query_policy(request_dispatcher.query_policy_id())),
+                .with_query_policy(request_service.query_policy_id())),
                 shutdown_after_response: None,
             },
         }
@@ -836,21 +826,18 @@ async fn handle_request(
     };
     if peer_state == FramedPeerStateV1::Closed {
         if let Some(shutdown_deadline) = dispatched.shutdown_after_response {
-            dispatcher.begin_shutdown_at(shutdown_deadline);
+            service.begin_shutdown_at(shutdown_deadline);
         }
         return Ok(RequestDisposition::Close);
     }
-    write_dispatch_response(
-        stream, dispatcher, &request, dispatched, peer_state, deadline,
-    )
-    .await
+    write_dispatch_response(stream, service, &request, dispatched, peer_state, deadline).await
 }
 
 async fn write_dispatch_response(
     stream: &mut VerifiedFramedTransportV1,
-    dispatcher: &Dispatcher,
+    service: &SearchService,
     request: &RequestEnvelope,
-    dispatched: dispatch::DispatchResult,
+    dispatched: SearchServiceResult,
     peer_state: FramedPeerStateV1,
     deadline: Option<SessionDeadline>,
 ) -> Result<RequestDisposition, SessionError> {
@@ -864,7 +851,7 @@ async fn write_dispatch_response(
         run_synchronous_before(deadline, || encode_response_frame(&response, request))?
     else {
         if let Some(shutdown_deadline) = shutdown_after_response {
-            dispatcher.begin_shutdown_at(shutdown_deadline);
+            service.begin_shutdown_at(shutdown_deadline);
         }
         return Ok(RequestDisposition::Close);
     };
@@ -881,7 +868,7 @@ async fn write_dispatch_response(
     };
     let write_result = run_before(deadline, write).await;
     if let Some(shutdown_deadline) = shutdown_after_response {
-        dispatcher.begin_shutdown_at(shutdown_deadline);
+        service.begin_shutdown_at(shutdown_deadline);
     }
     let Some(write_result) = write_result else {
         return Ok(RequestDisposition::Close);
@@ -958,8 +945,8 @@ mod tests {
 
     use super::{
         CONTROL_ADMISSION_RESPONSE_RESERVE, CONTROL_RESERVED_CONNECTIONS, ConnectionCapacity,
-        DispatchCapacity, DispatchClass, Dispatcher, MAX_CONTROL_IN_FLIGHT,
-        MAX_LOCAL_IPC_CONNECTIONS_V1, MAX_WAIT_IN_FLIGHT, MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS,
+        DispatchCapacity, DispatchClass, MAX_CONTROL_IN_FLIGHT, MAX_LOCAL_IPC_CONNECTIONS_V1,
+        MAX_WAIT_IN_FLIGHT, MAX_WORK_IN_FLIGHT, ORDINARY_CONNECTIONS,
         PRECLASSIFICATION_AND_CONTROL_TIMEOUT, ServeEvent, SessionCapacityLane, SessionDeadline,
         SessionError, UNCLASSIFIED_CONNECTION_HEADROOM, drain_sessions, next_serve_event,
         run_synchronous_before, session,
@@ -967,6 +954,7 @@ mod tests {
     use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime};
     use crate::lifecycle::{AdmissionGate, BlockingTaskOwner};
     use crate::operations::OperationServiceOwner;
+    use crate::service::SearchService;
     use crate::watcher::MaintenanceRuntime;
 
     #[tokio::test]
@@ -1535,7 +1523,7 @@ mod tests {
             lifecycle_admission.clone(),
         );
         let maintenance = MaintenanceRuntime::start(operation_service.service(), None, None);
-        let dispatcher = Dispatcher::new(
+        let service = SearchService::new(
             index,
             _blocking_tasks.handle(),
             operation_service.service(),
@@ -1577,7 +1565,7 @@ mod tests {
             RequestId::from_bytes([7; 16]),
             project_id,
             instance_id,
-            dispatcher.query_policy_id(),
+            service.query_policy_id(),
             first_operation,
         )
         .unwrap();
@@ -1603,7 +1591,7 @@ mod tests {
         }
         let server_session = tokio::spawn(session(
             accepted,
-            dispatcher.clone(),
+            service.clone(),
             connections,
             DispatchCapacity::new(1, 1, 1),
             connection,
@@ -1639,7 +1627,7 @@ mod tests {
                 RequestId::from_bytes([8; 16]),
                 project_id,
                 instance_id,
-                dispatcher.query_policy_id(),
+                service.query_policy_id(),
                 second_operation,
             )
             .unwrap();
@@ -1768,7 +1756,7 @@ mod tests {
 
         drop(connected);
         let session_result = server_session.await.unwrap();
-        let admissions = coordinator.snapshot().await.admissions.ipc;
+        let admissions = coordinator.snapshot().await.admissions.client;
         if matches!(
             case,
             SessionCase::SequentialBusiness
@@ -1898,7 +1886,7 @@ mod tests {
             lifecycle_admission.clone(),
         );
         let mut maintenance = MaintenanceRuntime::start(operation_service.service(), None, None);
-        let dispatcher = Dispatcher::new(
+        let service = SearchService::new(
             index,
             blocking_tasks.handle(),
             operation_service.service(),
@@ -1908,7 +1896,7 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             let mut endpoint = endpoint;
-            let result = super::serve(&mut endpoint, dispatcher).await;
+            let result = super::serve(&mut endpoint, service).await;
             (result, endpoint)
         });
 
@@ -1948,7 +1936,7 @@ mod tests {
         };
         assert!(!operation.state.is_terminal());
         let active_operation = operation.operation_id;
-        let admissions_before = coordinator.snapshot().await.admissions.ipc;
+        let admissions_before = coordinator.snapshot().await.admissions.client;
 
         let shutdown = RequestEnvelope::new(
             BUSINESS_PROTOCOL_REVISION,
@@ -2091,7 +2079,7 @@ mod tests {
         };
         assert_eq!(error.code, ApiErrorCode::NotReady);
         assert_eq!(
-            coordinator.snapshot().await.admissions.ipc,
+            coordinator.snapshot().await.admissions.client,
             admissions_before
         );
 

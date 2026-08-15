@@ -16,8 +16,9 @@ use unity_asset_search_local::{ClaimedEndpointV1, EndpointClaimV1, EndpointClean
 use unity_asset_search_protocol::{DaemonInstanceId, ProjectId};
 
 use crate::coordinator::{ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution};
-use crate::ipc::{Dispatcher, DispatcherShutdown, IpcService};
+use crate::ipc::IpcService;
 use crate::operations::{OperationOrigin, OperationServiceOwner, SemanticUpgradeRuntime};
+use crate::service::{SearchService, SearchServiceShutdown};
 use crate::watcher::{MaintenanceRuntime, WatcherConfig};
 
 const DAEMON_RUNTIME_WORKER_THREADS: usize = 2;
@@ -149,7 +150,7 @@ impl AdmissionGate {
 /// The sole owner of resources whose destruction releases daemon or index-writer authority.
 #[must_use = "the daemon runtime must be run through its complete shutdown sequence"]
 pub struct DaemonRuntime {
-    shutdown: DispatcherShutdown,
+    shutdown: SearchServiceShutdown,
     completion: Option<oneshot::Receiver<Result<DaemonShutdownReport, DaemonRuntimeError>>>,
 }
 
@@ -206,7 +207,7 @@ struct DaemonRuntimeParts {
     endpoint_claim: EndpointClaimV1,
     daemon_instance_id: DaemonInstanceId,
     startup_reindex: Option<FilesystemReindexIntent>,
-    dispatcher: Dispatcher,
+    service: SearchService,
     maintenance: MaintenanceRuntime,
     semantic_upgrade: SemanticUpgradeRuntime,
     coordinator: ReindexCoordinatorRuntime,
@@ -381,7 +382,7 @@ fn assemble_runtime(
     let semantic_upgrade =
         SemanticUpgradeRuntime::start(semantic_upgrade_required, operations.service());
     let maintenance = MaintenanceRuntime::start(operations.service(), watcher, reconcile_interval);
-    let dispatcher = Dispatcher::new(
+    let service = SearchService::new(
         index.clone(),
         blocking_tasks.handle(),
         operations.service(),
@@ -393,7 +394,7 @@ fn assemble_runtime(
         endpoint_claim,
         daemon_instance_id,
         startup_reindex,
-        dispatcher,
+        service,
         maintenance,
         semantic_upgrade,
         coordinator,
@@ -453,7 +454,7 @@ impl Drop for DaemonRuntime {
 }
 
 enum SupervisorStartup {
-    Ready(DispatcherShutdown),
+    Ready(SearchServiceShutdown),
     Failed(DaemonRuntimeError),
 }
 
@@ -597,7 +598,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             endpoint_claim,
             daemon_instance_id,
             startup_reindex,
-            dispatcher,
+            service,
             maintenance,
             semantic_upgrade,
             coordinator,
@@ -609,7 +610,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
             #[cfg(test)]
             session_panic_gate,
         } = parts;
-        let ipc = IpcService::new(dispatcher);
+        let ipc = IpcService::new(service);
         #[cfg(test)]
         let ipc = ipc.with_session_panic_gate(session_panic_gate);
         Self {
@@ -634,7 +635,7 @@ impl From<DaemonRuntimeParts> for SupervisorState {
 }
 
 impl SupervisorState {
-    fn shutdown_handle(&self) -> DispatcherShutdown {
+    fn shutdown_handle(&self) -> SearchServiceShutdown {
         self.ipc.shutdown_handle()
     }
 
@@ -994,8 +995,9 @@ mod tests {
     use crate::coordinator::{
         ReindexCoordinatorConfig, ReindexCoordinatorRuntime, ReindexExecution,
     };
-    use crate::ipc::{Dispatcher, SessionPanicTestGate};
+    use crate::ipc::SessionPanicTestGate;
     use crate::operations::{OperationServiceOwner, SemanticUpgradeRuntime};
+    use crate::service::SearchService;
     use crate::watcher::{MaintenanceRuntime, WatcherConfig};
 
     #[derive(Debug, Clone, Copy)]
@@ -1808,7 +1810,7 @@ mod tests {
             );
             let semantic_upgrade = SemanticUpgradeRuntime::start(false, operations.service());
             let maintenance = MaintenanceRuntime::start(operations.service(), None, None);
-            let dispatcher = Dispatcher::new(
+            let service = SearchService::new(
                 index.clone(),
                 blocking_tasks.handle(),
                 operations.service(),
@@ -1820,7 +1822,7 @@ mod tests {
                 endpoint_claim,
                 daemon_instance_id,
                 startup_reindex: None,
-                dispatcher,
+                service,
                 maintenance,
                 semantic_upgrade,
                 coordinator,

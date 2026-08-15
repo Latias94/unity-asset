@@ -1,6 +1,6 @@
 //! Serial admission and execution for every daemon reindex trigger.
 //!
-//! Admission is intentionally centralized here. Filesystem events, timers, IPC requests, and
+//! Admission is intentionally centralized here. Filesystem events, timers, client requests, and
 //! startup reconciliation must not grow independent scheduling rules around the index builder.
 
 use std::collections::VecDeque;
@@ -96,7 +96,7 @@ pub enum ReindexSource {
     Watcher,
     Timer,
     SemanticUpgrade,
-    Ipc,
+    Client,
 }
 
 impl ReindexSource {
@@ -106,7 +106,7 @@ impl ReindexSource {
             Self::Watcher => 1,
             Self::Timer => 2,
             Self::SemanticUpgrade => 3,
-            Self::Ipc => 4,
+            Self::Client => 4,
         }
     }
 }
@@ -234,7 +234,7 @@ pub struct ReindexAdmissionCounts {
     pub watcher: u64,
     pub timer: u64,
     pub semantic_upgrade: u64,
-    pub ipc: u64,
+    pub client: u64,
 }
 
 impl ReindexAdmissionCounts {
@@ -244,7 +244,7 @@ impl ReindexAdmissionCounts {
             watcher: counts[1],
             timer: counts[2],
             semantic_upgrade: counts[3],
-            ipc: counts[4],
+            client: counts[4],
         }
     }
 }

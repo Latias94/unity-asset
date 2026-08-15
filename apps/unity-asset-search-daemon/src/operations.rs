@@ -38,7 +38,7 @@ pub enum OperationOrigin {
     WatcherOverflow,
     Timer,
     SemanticUpgrade,
-    Ipc,
+    Client,
 }
 
 impl OperationOrigin {
@@ -48,13 +48,13 @@ impl OperationOrigin {
             Self::Watcher | Self::WatcherOverflow => ReindexSource::Watcher,
             Self::Timer => ReindexSource::Timer,
             Self::SemanticUpgrade => ReindexSource::SemanticUpgrade,
-            Self::Ipc => ReindexSource::Ipc,
+            Self::Client => ReindexSource::Client,
         }
     }
 
     const fn active_limit(self, retention: OperationRetentionPolicy) -> usize {
         match self {
-            Self::Ipc => retention.maximum_client_active,
+            Self::Client => retention.maximum_client_active,
             Self::Startup
             | Self::Watcher
             | Self::WatcherOverflow
@@ -70,7 +70,7 @@ impl OperationOrigin {
             Self::WatcherOverflow => Some(BackgroundReindexOrigin::WatcherOverflow),
             Self::Timer => Some(BackgroundReindexOrigin::Timer),
             Self::SemanticUpgrade => Some(BackgroundReindexOrigin::SemanticUpgrade),
-            Self::Ipc => None,
+            Self::Client => None,
         }
     }
 
@@ -81,7 +81,7 @@ impl OperationOrigin {
             Self::WatcherOverflow => "watcher_overflow",
             Self::Timer => "timer",
             Self::SemanticUpgrade => "semantic_upgrade",
-            Self::Ipc => "ipc",
+            Self::Client => "client",
         }
     }
 }
@@ -607,7 +607,7 @@ impl OperationService {
         self.ensure_completion_tasks_healthy().await?;
         let entry = match self.lookup(operation_id).await {
             Some(OperationLookup::Entry(entry)) => {
-                if entry.origin != OperationOrigin::Ipc {
+                if entry.origin != OperationOrigin::Client {
                     return Err(OperationError::ControlForbidden {
                         origin: entry.origin,
                     });
@@ -616,7 +616,7 @@ impl OperationService {
             }
             Some(OperationLookup::Snapshot(status)) => {
                 if let Some(origin) = status.origin
-                    && origin != OperationOrigin::Ipc
+                    && origin != OperationOrigin::Client
                 {
                     return Err(OperationError::ControlForbidden { origin });
                 }
@@ -1273,7 +1273,7 @@ mod tests {
         let service = owner.service();
         let admitted = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1409,7 +1409,7 @@ mod tests {
             .unwrap();
         service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1446,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_summary_replaces_an_origin_without_exposing_ipc_operations() {
+    async fn background_summary_replaces_an_origin_without_exposing_client_operations() {
         let fixture = CoordinatorFixture::pending();
         let service = fixture.service(10);
         let first = service
@@ -1467,7 +1467,7 @@ mod tests {
             .unwrap();
         service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1622,7 +1622,7 @@ mod tests {
         for _ in 0..2 {
             service
                 .admit(
-                    OperationOrigin::Ipc,
+                    OperationOrigin::Client,
                     FilesystemReindexIntent::reconcile(),
                     None,
                 )
@@ -1632,7 +1632,7 @@ mod tests {
         assert!(matches!(
             service
                 .admit(
-                    OperationOrigin::Ipc,
+                    OperationOrigin::Client,
                     FilesystemReindexIntent::reconcile(),
                     None,
                 )
@@ -1659,7 +1659,7 @@ mod tests {
         let service = fixture.service(3);
         let first = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::full(),
                 Some("same-key".to_owned()),
             )
@@ -1667,7 +1667,7 @@ mod tests {
             .unwrap();
         let repeated = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::full(),
                 Some("same-key".to_owned()),
             )
@@ -1678,7 +1678,7 @@ mod tests {
         assert!(matches!(
             service
                 .admit(
-                    OperationOrigin::Ipc,
+                    OperationOrigin::Client,
                     FilesystemReindexIntent::reconcile(),
                     Some("same-key".to_owned()),
                 )
@@ -1694,7 +1694,7 @@ mod tests {
         let service = fixture.service(7);
         let first = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1702,7 +1702,7 @@ mod tests {
             .unwrap();
         let second = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1723,7 +1723,7 @@ mod tests {
         let service = fixture.service(8);
         let operation = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1758,7 +1758,7 @@ mod tests {
         );
         let operation = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )
@@ -1775,7 +1775,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         let expired = service.status(operation.operation_id).await.unwrap();
         assert_eq!(expired.state, ReindexOperationState::Expired);
-        assert_eq!(expired.origin, Some(OperationOrigin::Ipc));
+        assert_eq!(expired.origin, Some(OperationOrigin::Client));
 
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(matches!(
@@ -1806,7 +1806,7 @@ mod tests {
         for origin in [
             OperationOrigin::Watcher,
             OperationOrigin::Timer,
-            OperationOrigin::Ipc,
+            OperationOrigin::Client,
         ] {
             assert!(matches!(
                 service
@@ -1838,7 +1838,7 @@ mod tests {
         assert!(matches!(
             service
                 .admit(
-                    OperationOrigin::Ipc,
+                    OperationOrigin::Client,
                     FilesystemReindexIntent::reconcile(),
                     None,
                 )
@@ -1855,7 +1855,7 @@ mod tests {
                 .snapshot()
                 .await
                 .admissions
-                .ipc,
+                .client,
             0
         );
     }
@@ -1926,7 +1926,7 @@ mod tests {
         );
         let blocker = service
             .admit(
-                OperationOrigin::Ipc,
+                OperationOrigin::Client,
                 FilesystemReindexIntent::reconcile(),
                 None,
             )

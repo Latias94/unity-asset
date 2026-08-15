@@ -196,7 +196,7 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
             ReindexSource::SemanticUpgrade,
             "Assets/semantic-upgrade.prefab",
         ),
-        (ReindexSource::Ipc, "Assets/ipc.prefab"),
+        (ReindexSource::Client, "Assets/client.prefab"),
     ] {
         coordinator
             .admit(source, changed(&project_paths, path))
@@ -212,7 +212,7 @@ async fn all_boundaries_share_one_serial_coalescing_window() {
     assert_eq!(snapshot.admissions.watcher, 1);
     assert_eq!(snapshot.admissions.timer, 1);
     assert_eq!(snapshot.admissions.semantic_upgrade, 1);
-    assert_eq!(snapshot.admissions.ipc, 1);
+    assert_eq!(snapshot.admissions.client, 1);
     assert!(!seen.lock().await.is_empty());
 }
 
@@ -235,7 +235,7 @@ async fn changed_paths_are_normalized_and_cross_project_paths_fail_closed() {
     let coordinator = _runtime.coordinator();
     coordinator
         .admit(
-            ReindexSource::Ipc,
+            ReindexSource::Client,
             changed(owned_project_paths, "Assets/../Assets/hero.prefab"),
         )
         .await
@@ -260,7 +260,7 @@ async fn changed_paths_are_normalized_and_cross_project_paths_fail_closed() {
     let foreign_project_id = foreign_paths.project_id();
     assert_ne!(owned_project_id, foreign_project_id);
     let foreign = changed(foreign_paths, "Assets/foreign.prefab");
-    match coordinator.admit(ReindexSource::Ipc, foreign).await {
+    match coordinator.admit(ReindexSource::Client, foreign).await {
         Err(CoordinatorError::ChangedPathProjectMismatch { expected, actual }) => {
             assert_eq!(expected, owned_project_id);
             assert_eq!(actual, foreign_project_id);
@@ -304,7 +304,7 @@ async fn observed_admission_survives_the_requesting_connection() {
             .unwrap();
     let coordinator = _runtime.coordinator();
     let observation = coordinator
-        .admit_observed(ReindexSource::Ipc, FilesystemReindexIntent::reconcile())
+        .admit_observed(ReindexSource::Client, FilesystemReindexIntent::reconcile())
         .await
         .unwrap();
     assert!(matches!(
@@ -337,7 +337,7 @@ async fn dropping_a_waiter_never_cancels_admitted_work() {
     .unwrap();
     let coordinator = _runtime.coordinator();
     let observation = coordinator
-        .admit_observed(ReindexSource::Ipc, FilesystemReindexIntent::full())
+        .admit_observed(ReindexSource::Client, FilesystemReindexIntent::full())
         .await
         .unwrap();
     drop(observation);
@@ -364,13 +364,13 @@ async fn failures_are_bounded_and_the_runner_recovers() {
     .unwrap();
     let coordinator = _runtime.coordinator();
     coordinator
-        .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
+        .admit(ReindexSource::Client, FilesystemReindexIntent::full())
         .await
         .unwrap();
     wait_for_idle(&coordinator).await;
     assert!(coordinator.snapshot().await.last_completion_failed);
     coordinator
-        .admit(ReindexSource::Ipc, FilesystemReindexIntent::reconcile())
+        .admit(ReindexSource::Client, FilesystemReindexIntent::reconcile())
         .await
         .unwrap();
     wait_for_idle(&coordinator).await;
@@ -398,12 +398,12 @@ async fn completion_waiters_are_explicitly_bounded() {
     .unwrap();
     let coordinator = _runtime.coordinator();
     let first = coordinator
-        .admit_observed(ReindexSource::Ipc, FilesystemReindexIntent::full())
+        .admit_observed(ReindexSource::Client, FilesystemReindexIntent::full())
         .await
         .unwrap();
     assert!(matches!(
         coordinator
-            .admit_observed(ReindexSource::Ipc, FilesystemReindexIntent::reconcile())
+            .admit_observed(ReindexSource::Client, FilesystemReindexIntent::reconcile())
             .await,
         Err(CoordinatorError::CompletionWaiterLimit { maximum: 1 })
     ));
@@ -427,7 +427,7 @@ async fn shutdown_closes_admission_and_joins_every_accepted_build() {
     .unwrap();
     let coordinator = runtime.coordinator();
     coordinator
-        .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
+        .admit(ReindexSource::Client, FilesystemReindexIntent::full())
         .await
         .unwrap();
 
@@ -463,7 +463,7 @@ async fn cancelled_shutdown_join_can_resume_without_detaching_runner() {
     .unwrap();
     let coordinator = runtime.coordinator();
     coordinator
-        .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
+        .admit(ReindexSource::Client, FilesystemReindexIntent::full())
         .await
         .unwrap();
     tokio::time::advance(Duration::from_secs(1)).await;
@@ -504,7 +504,7 @@ async fn coordinator_client_does_not_retain_executor_resources_after_join() {
     assert!(weak_resource.upgrade().is_none());
     assert!(matches!(
         coordinator
-            .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
+            .admit(ReindexSource::Client, FilesystemReindexIntent::full())
             .await,
         Err(CoordinatorError::ShuttingDown)
     ));
@@ -523,7 +523,7 @@ async fn runner_panic_closes_lifecycle_and_fails_every_pending_observer() {
     .unwrap();
     let coordinator = runtime.coordinator();
     let observation = coordinator
-        .admit_observed(ReindexSource::Ipc, FilesystemReindexIntent::reconcile())
+        .admit_observed(ReindexSource::Client, FilesystemReindexIntent::reconcile())
         .await
         .unwrap();
 
@@ -554,7 +554,7 @@ async fn runner_panic_closes_lifecycle_and_fails_every_pending_observer() {
     ));
     assert!(matches!(
         coordinator
-            .admit(ReindexSource::Ipc, FilesystemReindexIntent::full())
+            .admit(ReindexSource::Client, FilesystemReindexIntent::full())
             .await,
         Err(CoordinatorError::RunnerTerminated { message })
             if message.contains("test-injected coordinator runner panic")

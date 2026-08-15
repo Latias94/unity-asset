@@ -14,6 +14,7 @@ mod coordinator;
 mod ipc;
 mod lifecycle;
 mod operations;
+mod service;
 mod watcher;
 
 use crate::coordinator::ReindexCoordinatorConfig;
