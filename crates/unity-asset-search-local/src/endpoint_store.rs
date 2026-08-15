@@ -6,26 +6,54 @@ use std::io::{self, Read as _};
 use rand::TryRngCore as _;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use unity_asset_search_protocol::{DaemonInstanceId, ProjectId};
+use unity_asset_search_protocol::{DaemonInstanceId, ProjectId, QueryPolicyId};
 
 use crate::publication::{self, PublicationSlots, QuarantinedPublication};
 use crate::transport::EndpointServerV1;
 use crate::{
     EndpointDescriptorError, EndpointDescriptorV1, EndpointNamespaceV1, EndpointTransportError,
-    MAX_ENDPOINT_DESCRIPTOR_BYTES, SecurityContextIdV1,
+    HttpCapability, HttpCapabilityError, LoopbackEndpointDescriptor,
+    LoopbackEndpointDescriptorError, MAX_ENDPOINT_DESCRIPTOR_BYTES,
+    MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES, SecurityContextIdV1,
 };
 
 const DAEMON_LEASE_FILE: &str = ".daemon-v1.lock";
+// V1 discovery remains only for the still-migrating IPC callers. V2 discovery never reads it.
 const ENDPOINT_DESCRIPTOR_FILE: &str = "endpoint.v1.json";
+const LOOPBACK_ENDPOINT_DESCRIPTOR_FILE: &str = "endpoint.v2.json";
 const TEMPORARY_ATTEMPTS: usize = 16;
 const PUBLICATION_STAMP_DOMAIN: &[u8] = b"unity-asset:endpoint-publication-stamp:v1\0";
+const LOOPBACK_PUBLICATION_STAMP_DOMAIN: &[u8] =
+    b"unity-asset:loopback-endpoint-publication-stamp:v2\0";
 const ENDPOINT_DESCRIPTOR_PUBLICATION: PublicationSlots = PublicationSlots::new(
     ENDPOINT_DESCRIPTOR_FILE,
     ".endpoint-v1.staging",
     Some(".endpoint-v1.quarantine"),
 );
+const LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION: PublicationSlots = PublicationSlots::new(
+    LOOPBACK_ENDPOINT_DESCRIPTOR_FILE,
+    ".endpoint-v2.staging",
+    Some(".endpoint-v2.quarantine"),
+);
 
 impl EndpointNamespaceV1 {
+    /// Acquires the single-daemon lease and creates this process instance's HTTP capability.
+    ///
+    /// The claim does not bind or own a listener. A daemon can bind `127.0.0.1:0`, configure its
+    /// HTTP service with [`LoopbackEndpointClaim::capability`], and publish the selected port only
+    /// after the service is ready.
+    pub fn claim_loopback_endpoint(&self) -> Result<LoopbackEndpointClaim, EndpointStoreError> {
+        let lease = self.acquire_daemon_lease()?;
+        let stale_cleanup = self.retire_stale_loopback_endpoint(&lease)?;
+        let capability = HttpCapability::generate()?;
+        Ok(LoopbackEndpointClaim {
+            namespace: self.clone(),
+            lease,
+            capability,
+            stale_cleanup,
+        })
+    }
+
     pub fn claim_daemon_endpoint(&self) -> Result<EndpointClaimV1, EndpointStoreError> {
         let lease = self.acquire_daemon_lease()?;
         let stale_cleanup = self.retire_stale_endpoint(&lease)?;
@@ -92,6 +120,43 @@ impl EndpointNamespaceV1 {
         })
     }
 
+    pub(crate) fn publish_loopback_endpoint(
+        &self,
+        lease: &DaemonLeaseV1,
+        descriptor: &LoopbackEndpointDescriptor,
+    ) -> Result<PublishedLoopbackEndpointGuard, EndpointStoreError> {
+        lease.validate_namespace(self)?;
+        descriptor.validate_project(self.project_id())?;
+        let encoded = descriptor.encode_json()?;
+        let prepared =
+            publication::prepare(self, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION, &encoded)
+                .map_err(|source| EndpointStoreError::PublicationPreCommit {
+                    operation: "create loopback endpoint descriptor staging file",
+                    source,
+                })?;
+        let commit =
+            prepared
+                .commit(self)
+                .map_err(|source| EndpointStoreError::PublicationPreCommit {
+                    operation: "atomically replace loopback endpoint descriptor",
+                    source,
+                })?;
+        let stamp = LoopbackEndpointPublicationStamp::for_encoded(&encoded);
+        let verification_unconfirmed = match self.discover_loopback_endpoint() {
+            Ok(discovered) => discovered.stamp != stamp,
+            Err(_) => true,
+        };
+        Ok(PublishedLoopbackEndpointGuard {
+            namespace: self.clone(),
+            stamp,
+            warning: LoopbackEndpointPublicationWarning {
+                durability_unconfirmed: commit.durability_unconfirmed(),
+                verification_unconfirmed,
+            },
+            active: true,
+        })
+    }
+
     pub fn discover_endpoint(&self) -> Result<DiscoveredEndpointV1, EndpointStoreError> {
         let encoded = read_descriptor(self)?;
         let descriptor = EndpointDescriptorV1::decode_json(&encoded)?;
@@ -99,6 +164,19 @@ impl EndpointNamespaceV1 {
         Ok(DiscoveredEndpointV1 {
             descriptor,
             stamp: PublicationStampV1::for_encoded(&encoded),
+        })
+    }
+
+    /// Discovers only the capability-bound V2 descriptor; legacy V1 is never a fallback.
+    pub fn discover_loopback_endpoint(
+        &self,
+    ) -> Result<DiscoveredLoopbackEndpoint, EndpointStoreError> {
+        let encoded = read_loopback_descriptor(self)?;
+        let descriptor = LoopbackEndpointDescriptor::decode_json(&encoded)?;
+        descriptor.validate_project(self.project_id())?;
+        Ok(DiscoveredLoopbackEndpoint {
+            descriptor,
+            stamp: LoopbackEndpointPublicationStamp::for_encoded(&encoded),
         })
     }
 
@@ -135,6 +213,165 @@ impl EndpointNamespaceV1 {
         } else {
             Ok(EndpointCleanupV1::AlreadyAbsent)
         }
+    }
+
+    fn retire_stale_loopback_endpoint(
+        &self,
+        lease: &DaemonLeaseV1,
+    ) -> Result<LoopbackEndpointCleanup, EndpointStoreError> {
+        lease.validate_namespace(self)?;
+        let recovery =
+            publication::recover_abandoned(self, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION)
+                .map_err(|source| EndpointStoreError::DescriptorIo {
+                    operation: "recover abandoned loopback endpoint descriptor publication",
+                    source,
+                })?;
+        let descriptor = if let Some(quarantine) = claim_loopback_descriptor(self)? {
+            remove_quarantine(self, quarantine)?;
+            LoopbackEndpointCleanup::Removed
+        } else {
+            LoopbackEndpointCleanup::AlreadyAbsent
+        };
+        if recovery.removed_any() || descriptor == LoopbackEndpointCleanup::Removed {
+            Ok(LoopbackEndpointCleanup::Removed)
+        } else {
+            Ok(LoopbackEndpointCleanup::AlreadyAbsent)
+        }
+    }
+}
+
+/// Lease-backed authority to publish one already-bound loopback HTTP endpoint.
+#[must_use = "the loopback endpoint claim must be published or retained to keep the daemon lease"]
+pub struct LoopbackEndpointClaim {
+    namespace: EndpointNamespaceV1,
+    lease: DaemonLeaseV1,
+    capability: HttpCapability,
+    stale_cleanup: LoopbackEndpointCleanup,
+}
+
+impl LoopbackEndpointClaim {
+    #[must_use]
+    pub const fn project_id(&self) -> ProjectId {
+        self.namespace.project_id()
+    }
+
+    /// Returns the process-instance credential so the HTTP service can authenticate every route.
+    #[must_use]
+    pub const fn capability(&self) -> &HttpCapability {
+        &self.capability
+    }
+
+    #[must_use]
+    pub const fn stale_cleanup(&self) -> LoopbackEndpointCleanup {
+        self.stale_cleanup
+    }
+
+    /// Publishes the operating-system-selected port after the separately owned listener is ready.
+    pub fn publish(
+        self,
+        daemon_instance_id: DaemonInstanceId,
+        port: u16,
+        query_policy_id: QueryPolicyId,
+    ) -> Result<PublishedLoopbackEndpoint, LoopbackEndpointPublishError> {
+        let Self {
+            namespace,
+            lease,
+            capability,
+            stale_cleanup,
+        } = self;
+        let descriptor = LoopbackEndpointDescriptor::for_current_process(
+            namespace.project_id(),
+            daemon_instance_id,
+            port,
+            capability,
+            query_policy_id,
+        )?;
+        let publication = namespace.publish_loopback_endpoint(&lease, &descriptor)?;
+        if publication.warning().verification_unconfirmed() {
+            return match publication.remove() {
+                Ok(_) => Err(LoopbackEndpointPublishError::PublicationVerificationUnconfirmed),
+                Err(source) => {
+                    Err(LoopbackEndpointPublishError::PublicationVerificationCleanup { source })
+                }
+            };
+        }
+        Ok(PublishedLoopbackEndpoint {
+            descriptor,
+            publication: Some(publication),
+            lease,
+            stale_cleanup,
+        })
+    }
+}
+
+impl fmt::Debug for LoopbackEndpointClaim {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoopbackEndpointClaim")
+            .field("project_id", &self.project_id())
+            .field("capability", &self.capability)
+            .field("stale_cleanup", &self.stale_cleanup)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Published discovery ownership independent of the HTTP listener and serving task.
+#[must_use = "the published endpoint must remain alive until discovery is withdrawn"]
+pub struct PublishedLoopbackEndpoint {
+    descriptor: LoopbackEndpointDescriptor,
+    publication: Option<PublishedLoopbackEndpointGuard>,
+    lease: DaemonLeaseV1,
+    stale_cleanup: LoopbackEndpointCleanup,
+}
+
+impl PublishedLoopbackEndpoint {
+    #[must_use]
+    pub const fn project_id(&self) -> ProjectId {
+        self.lease.project_id
+    }
+
+    #[must_use]
+    pub const fn descriptor(&self) -> &LoopbackEndpointDescriptor {
+        &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn stale_cleanup(&self) -> LoopbackEndpointCleanup {
+        self.stale_cleanup
+    }
+
+    #[must_use]
+    pub fn publication_warning(&self) -> LoopbackEndpointPublicationWarning {
+        self.publication.as_ref().map_or(
+            LoopbackEndpointPublicationWarning::default(),
+            PublishedLoopbackEndpointGuard::warning,
+        )
+    }
+
+    /// Withdraws discovery before the independently owned HTTP service begins shutdown draining.
+    pub fn withdraw(&mut self) -> Result<LoopbackEndpointCleanup, EndpointStoreError> {
+        match self.publication.take() {
+            Some(publication) => publication.remove(),
+            None => Ok(LoopbackEndpointCleanup::AlreadyAbsent),
+        }
+    }
+}
+
+impl fmt::Debug for PublishedLoopbackEndpoint {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedLoopbackEndpoint")
+            .field("project_id", &self.project_id())
+            .field("descriptor", &self.descriptor)
+            .field("stale_cleanup", &self.stale_cleanup)
+            .field("publication", &self.publication)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PublishedLoopbackEndpoint {
+    fn drop(&mut self) {
+        let _ = self.withdraw();
     }
 }
 
@@ -318,20 +555,149 @@ pub struct PublicationStampV1([u8; 32]);
 
 impl PublicationStampV1 {
     fn for_encoded(encoded: &[u8]) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(PUBLICATION_STAMP_DOMAIN);
-        hasher.update(
-            u64::try_from(encoded.len())
-                .expect("bounded endpoint descriptor length fits u64")
-                .to_le_bytes(),
-        );
-        hasher.update(encoded);
-        Self(hasher.finalize().into())
+        Self(publication_stamp(PUBLICATION_STAMP_DOMAIN, encoded))
     }
 
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackEndpointPublicationStamp([u8; 32]);
+
+impl LoopbackEndpointPublicationStamp {
+    fn for_encoded(encoded: &[u8]) -> Self {
+        Self(publication_stamp(
+            LOOPBACK_PUBLICATION_STAMP_DOMAIN,
+            encoded,
+        ))
+    }
+
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredLoopbackEndpoint {
+    descriptor: LoopbackEndpointDescriptor,
+    stamp: LoopbackEndpointPublicationStamp,
+}
+
+impl DiscoveredLoopbackEndpoint {
+    #[must_use]
+    pub const fn descriptor(&self) -> &LoopbackEndpointDescriptor {
+        &self.descriptor
+    }
+
+    #[must_use]
+    pub const fn publication_stamp(&self) -> LoopbackEndpointPublicationStamp {
+        self.stamp
+    }
+
+    pub fn ensure_unchanged(
+        &self,
+        namespace: &EndpointNamespaceV1,
+    ) -> Result<(), EndpointStoreError> {
+        match namespace.discover_loopback_endpoint() {
+            Ok(current) if current == *self => Ok(()),
+            Ok(_) | Err(EndpointStoreError::DescriptorMissing) => {
+                Err(EndpointStoreError::EndpointChanged)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LoopbackEndpointPublicationWarning {
+    durability_unconfirmed: bool,
+    verification_unconfirmed: bool,
+}
+
+impl LoopbackEndpointPublicationWarning {
+    #[must_use]
+    pub const fn durability_unconfirmed(&self) -> bool {
+        self.durability_unconfirmed
+    }
+
+    #[must_use]
+    pub const fn verification_unconfirmed(&self) -> bool {
+        self.verification_unconfirmed
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        !self.durability_unconfirmed && !self.verification_unconfirmed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopbackEndpointCleanup {
+    Removed,
+    AlreadyAbsent,
+    ReplacedPreserved,
+}
+
+#[must_use = "the publication guard owns cleanup for the matching loopback descriptor"]
+pub(crate) struct PublishedLoopbackEndpointGuard {
+    namespace: EndpointNamespaceV1,
+    stamp: LoopbackEndpointPublicationStamp,
+    warning: LoopbackEndpointPublicationWarning,
+    active: bool,
+}
+
+impl PublishedLoopbackEndpointGuard {
+    #[must_use]
+    pub const fn warning(&self) -> LoopbackEndpointPublicationWarning {
+        self.warning
+    }
+
+    pub fn remove(mut self) -> Result<LoopbackEndpointCleanup, EndpointStoreError> {
+        let outcome = self.remove_if_current()?;
+        self.active = false;
+        Ok(outcome)
+    }
+
+    fn remove_if_current(&self) -> Result<LoopbackEndpointCleanup, EndpointStoreError> {
+        let Some(quarantine) = claim_loopback_descriptor(&self.namespace)? else {
+            return Ok(LoopbackEndpointCleanup::AlreadyAbsent);
+        };
+        let discovered = match discover_loopback_named(&self.namespace, quarantine.name()) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                restore_quarantine(&self.namespace, quarantine)?;
+                return Err(error);
+            }
+        };
+        if discovered.stamp != self.stamp {
+            restore_quarantine(&self.namespace, quarantine)?;
+            return Ok(LoopbackEndpointCleanup::ReplacedPreserved);
+        }
+        remove_quarantine(&self.namespace, quarantine)?;
+        Ok(LoopbackEndpointCleanup::Removed)
+    }
+}
+
+impl fmt::Debug for PublishedLoopbackEndpointGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedLoopbackEndpointGuard")
+            .field("stamp", &self.stamp)
+            .field("warning", &self.warning)
+            .field("active", &self.active)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PublishedLoopbackEndpointGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.remove_if_current();
+        }
     }
 }
 
@@ -458,6 +824,23 @@ impl Drop for PublishedEndpointGuardV1 {
 }
 
 #[derive(Debug, Error)]
+pub enum LoopbackEndpointPublishError {
+    #[error("loopback endpoint descriptor publication committed but read-back verification failed")]
+    PublicationVerificationUnconfirmed,
+    #[error(
+        "loopback endpoint descriptor publication could not be verified and cleanup also failed: {source}"
+    )]
+    PublicationVerificationCleanup {
+        #[source]
+        source: EndpointStoreError,
+    },
+    #[error(transparent)]
+    Descriptor(#[from] LoopbackEndpointDescriptorError),
+    #[error(transparent)]
+    Store(#[from] EndpointStoreError),
+}
+
+#[derive(Debug, Error)]
 pub enum EndpointClaimError {
     #[error("endpoint claim has already been published")]
     AlreadyPublished,
@@ -509,7 +892,11 @@ pub enum EndpointStoreError {
     #[error("operating-system entropy repeatedly returned the reserved zero identifier")]
     EntropyReturnedOnlyZeroValues,
     #[error(transparent)]
+    Capability(#[from] HttpCapabilityError),
+    #[error(transparent)]
     Descriptor(#[from] EndpointDescriptorError),
+    #[error(transparent)]
+    LoopbackDescriptor(#[from] LoopbackEndpointDescriptorError),
 }
 
 impl EndpointStoreError {
@@ -520,6 +907,23 @@ impl EndpointStoreError {
 
 fn read_descriptor(namespace: &EndpointNamespaceV1) -> Result<Vec<u8>, EndpointStoreError> {
     read_descriptor_named(namespace, OsStr::new(ENDPOINT_DESCRIPTOR_FILE))
+}
+
+fn read_loopback_descriptor(
+    namespace: &EndpointNamespaceV1,
+) -> Result<Vec<u8>, EndpointStoreError> {
+    read_bounded_descriptor_named(
+        namespace,
+        OsStr::new(LOOPBACK_ENDPOINT_DESCRIPTOR_FILE),
+        MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES,
+        |actual| {
+            LoopbackEndpointDescriptorError::EncodedSizeLimit {
+                actual,
+                maximum: MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES,
+            }
+            .into()
+        },
+    )
 }
 
 fn discover_named(
@@ -535,6 +939,30 @@ fn discover_named(
     })
 }
 
+fn discover_loopback_named(
+    namespace: &EndpointNamespaceV1,
+    name: &OsStr,
+) -> Result<DiscoveredLoopbackEndpoint, EndpointStoreError> {
+    let encoded = read_bounded_descriptor_named(
+        namespace,
+        name,
+        MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES,
+        |actual| {
+            LoopbackEndpointDescriptorError::EncodedSizeLimit {
+                actual,
+                maximum: MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES,
+            }
+            .into()
+        },
+    )?;
+    let descriptor = LoopbackEndpointDescriptor::decode_json(&encoded)?;
+    descriptor.validate_project(namespace.project_id())?;
+    Ok(DiscoveredLoopbackEndpoint {
+        descriptor,
+        stamp: LoopbackEndpointPublicationStamp::for_encoded(&encoded),
+    })
+}
+
 fn claim_descriptor(
     namespace: &EndpointNamespaceV1,
 ) -> Result<Option<QuarantinedPublication>, EndpointStoreError> {
@@ -544,6 +972,17 @@ fn claim_descriptor(
             source,
         }
     })
+}
+
+fn claim_loopback_descriptor(
+    namespace: &EndpointNamespaceV1,
+) -> Result<Option<QuarantinedPublication>, EndpointStoreError> {
+    publication::claim_current(namespace, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION).map_err(
+        |source| EndpointStoreError::DescriptorIo {
+            operation: "claim loopback endpoint descriptor for cleanup",
+            source,
+        },
+    )
 }
 
 fn restore_quarantine(
@@ -577,6 +1016,21 @@ fn read_descriptor_named(
     namespace: &EndpointNamespaceV1,
     name: &OsStr,
 ) -> Result<Vec<u8>, EndpointStoreError> {
+    read_bounded_descriptor_named(namespace, name, MAX_ENDPOINT_DESCRIPTOR_BYTES, |actual| {
+        EndpointDescriptorError::EncodedSizeLimit {
+            actual,
+            maximum: MAX_ENDPOINT_DESCRIPTOR_BYTES,
+        }
+        .into()
+    })
+}
+
+fn read_bounded_descriptor_named(
+    namespace: &EndpointNamespaceV1,
+    name: &OsStr,
+    maximum: usize,
+    size_error: impl FnOnce(usize) -> EndpointStoreError,
+) -> Result<Vec<u8>, EndpointStoreError> {
     let mut file = namespace.open_file(name, false).map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             EndpointStoreError::DescriptorMissing
@@ -589,20 +1043,28 @@ fn read_descriptor_named(
     })?;
     let mut encoded = Vec::new();
     std::io::Read::by_ref(&mut file)
-        .take(u64::try_from(MAX_ENDPOINT_DESCRIPTOR_BYTES).expect("descriptor limit fits u64") + 1)
+        .take(u64::try_from(maximum).expect("descriptor limit fits u64") + 1)
         .read_to_end(&mut encoded)
         .map_err(|source| EndpointStoreError::DescriptorIo {
             operation: "read endpoint descriptor",
             source,
         })?;
-    if encoded.len() > MAX_ENDPOINT_DESCRIPTOR_BYTES {
-        return Err(EndpointDescriptorError::EncodedSizeLimit {
-            actual: encoded.len(),
-            maximum: MAX_ENDPOINT_DESCRIPTOR_BYTES,
-        }
-        .into());
+    if encoded.len() > maximum {
+        return Err(size_error(encoded.len()));
     }
     Ok(encoded)
+}
+
+fn publication_stamp(domain: &[u8], encoded: &[u8]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(
+        u64::try_from(encoded.len())
+            .expect("bounded endpoint descriptor length fits u64")
+            .to_le_bytes(),
+    );
+    hasher.update(encoded);
+    hasher.finalize().into()
 }
 
 fn is_lock_contention(error: &io::Error) -> bool {
@@ -628,6 +1090,92 @@ mod tests {
             PublicationStampV1::for_encoded(b"one"),
             PublicationStampV1::for_encoded(b"two")
         );
+    }
+
+    #[test]
+    fn loopback_publication_stamps_bind_exact_bytes() {
+        assert_eq!(
+            LoopbackEndpointPublicationStamp::for_encoded(b"one"),
+            LoopbackEndpointPublicationStamp::for_encoded(b"one")
+        );
+        assert_ne!(
+            LoopbackEndpointPublicationStamp::for_encoded(b"one"),
+            LoopbackEndpointPublicationStamp::for_encoded(b"two")
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn stale_capability_is_detected_and_old_cleanup_preserves_the_replacement() {
+        let (roots, namespace, cleanup_path) = test_namespace();
+        let lease = namespace.acquire_daemon_lease().unwrap();
+        let daemon_instance_id = generate_daemon_instance_id().unwrap();
+        let query_policy_id = unity_asset_search_protocol::QueryPolicyId::from_bytes([0x44; 32]);
+        let first = LoopbackEndpointDescriptor::for_current_process(
+            namespace.project_id(),
+            daemon_instance_id,
+            42_424,
+            HttpCapability::from_bytes([0x11; 32]).unwrap(),
+            query_policy_id,
+        )
+        .unwrap();
+        let second = LoopbackEndpointDescriptor::for_current_process(
+            namespace.project_id(),
+            daemon_instance_id,
+            42_424,
+            HttpCapability::from_bytes([0x22; 32]).unwrap(),
+            query_policy_id,
+        )
+        .unwrap();
+        let first_publication = namespace.publish_loopback_endpoint(&lease, &first).unwrap();
+        let first_discovery = namespace.discover_loopback_endpoint().unwrap();
+        let second_publication = namespace
+            .publish_loopback_endpoint(&lease, &second)
+            .unwrap();
+
+        assert!(matches!(
+            first_discovery.ensure_unchanged(&namespace),
+            Err(EndpointStoreError::EndpointChanged)
+        ));
+        assert_eq!(
+            first_publication.remove().unwrap(),
+            LoopbackEndpointCleanup::ReplacedPreserved
+        );
+        assert_eq!(
+            namespace.discover_loopback_endpoint().unwrap().descriptor(),
+            &second
+        );
+        assert_eq!(
+            second_publication.remove().unwrap(),
+            LoopbackEndpointCleanup::Removed
+        );
+
+        drop(lease);
+        drop(namespace);
+        drop(roots);
+        cleanup_test_namespace(&cleanup_path);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[test]
+    fn loopback_claim_recovers_abandoned_v2_publication_files_under_the_lease() {
+        let (roots, namespace, cleanup_path) = test_namespace();
+        for name in [".endpoint-v2.staging", ".endpoint-v2.quarantine"] {
+            let mut file = namespace.create_file(OsStr::new(name)).unwrap();
+            file.write_all(b"abandoned loopback endpoint publication")
+                .unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let claim = namespace.claim_loopback_endpoint().unwrap();
+        assert_eq!(claim.stale_cleanup(), LoopbackEndpointCleanup::Removed);
+        assert!(!cleanup_path.join(".endpoint-v2.staging").exists());
+        assert!(!cleanup_path.join(".endpoint-v2.quarantine").exists());
+        drop(claim);
+
+        drop(namespace);
+        drop(roots);
+        cleanup_test_namespace(&cleanup_path);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]

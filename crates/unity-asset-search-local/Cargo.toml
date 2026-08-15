@@ -19,6 +19,7 @@ rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+subtle = "2.6.0"
 thiserror.workspace = true
 tokio.workspace = true
 unity-asset-search-protocol = { workspace = true }

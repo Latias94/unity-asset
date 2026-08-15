@@ -18,12 +18,17 @@ mod windows_volume;
 
 pub use endpoint::{
     ENDPOINT_DESCRIPTOR_VERSION, EndpointDescriptorError, EndpointDescriptorV1,
-    MAX_ENDPOINT_DESCRIPTOR_BYTES, ProcessStartIdentityV1,
+    HTTP_CAPABILITY_BYTES, HTTP_CAPABILITY_HEX_BYTES, HttpCapability, HttpCapabilityError,
+    LOOPBACK_ENDPOINT_DESCRIPTOR_VERSION, LoopbackEndpointDescriptor,
+    LoopbackEndpointDescriptorError, MAX_ENDPOINT_DESCRIPTOR_BYTES,
+    MAX_LOOPBACK_ENDPOINT_DESCRIPTOR_BYTES, ProcessStartIdentityV1,
 };
 pub use endpoint_store::{
-    ClaimedEndpointV1, DiscoveredEndpointV1, EndpointClaimError, EndpointClaimV1,
-    EndpointCleanupV1, EndpointStoreError, PublicationStampV1, PublicationWarningV1,
-    generate_daemon_instance_id,
+    ClaimedEndpointV1, DiscoveredEndpointV1, DiscoveredLoopbackEndpoint, EndpointClaimError,
+    EndpointClaimV1, EndpointCleanupV1, EndpointStoreError, LoopbackEndpointClaim,
+    LoopbackEndpointCleanup, LoopbackEndpointPublicationStamp, LoopbackEndpointPublicationWarning,
+    LoopbackEndpointPublishError, PublicationStampV1, PublicationWarningV1,
+    PublishedLoopbackEndpoint, generate_daemon_instance_id,
 };
 pub use ids::LocalIdentityParseError;
 pub use process::{ProcessIdentityError, ProcessIdentityV1};
