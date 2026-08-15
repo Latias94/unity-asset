@@ -1743,7 +1743,7 @@ mod tests {
             stable_id: stable_id.to_owned(),
             source_path: format!("Assets/Source{source_path_id}.asset"),
             source_kind: "SerializedAsset".to_owned(),
-            source_guid: Some(format!("source-guid-{source_path_id}")),
+            source_guid: Some(format!("{:032x}", source_path_id.unsigned_abs())),
             fact: ReferenceProjectionFact {
                 source_object: source_object.clone(),
                 source_class_id: Some(-3),
@@ -2292,11 +2292,11 @@ mod tests {
             ObjectAddress::yaml_document(SourceLocator::path(source_path).unwrap(), 1).unwrap();
         let mut document = projected_reference("reference-unanchored", -7);
         document.source_path = source_path.to_owned();
-        document.source_guid = Some("scene-guid".to_owned());
+        document.source_guid = Some(GUID.to_owned());
         document.fact.source_object = source.clone();
         document.fact.source_class_id = Some(0);
         document.outgoing_keys = vec![
-            reference_guid_key("scene-guid", None),
+            reference_guid_key(GUID, None),
             reference_object_key(&source),
         ];
         document.outgoing_keys.sort_unstable();
