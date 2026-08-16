@@ -1,0 +1,1032 @@
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, Diagnostic, FieldPath, FieldPathSegment, ObjectAddress,
+    ObjectKind, SourceId, UnityClass, UnityValue, ValuePathError, WorkspaceRevision, YamlFileId,
+    class_ids, class_names, field_schema_digest, observe_semantic_value, semantic_value_digest,
+    yaml_field_schema_digest,
+};
+
+use super::contract::{
+    CAPABILITIES, RecipeApplicability, RecipeError, RecipeId, RecipeLowering, RecipeRejectionCode,
+    RecipeValueKind, SchemaOrigin, SchemaProvenance, SchemaVariantId,
+};
+use super::output::RecipeOutputBuilder;
+use crate::reference::yaml_value::{ClassifiedYamlReferenceValue, YamlReferenceValue};
+use crate::schema::resource::classify_audio_clip_resource;
+use crate::workspace::{
+    FieldGuard, GenericMutation, MutationPlanError, MutationPlanFragment, MutationValue,
+    PlanPayload, SourceExpectation, SourceObjectDescriptor, WorkspaceLookup, WorkspaceObject,
+    WorkspaceSource, WorkspaceView,
+};
+
+/// Trusted immutable observation used by every built-in recipe.
+#[derive(Debug)]
+pub struct RecipeObject {
+    address: ObjectAddress,
+    source_id: SourceId,
+    source: SourceExpectation,
+    object: WorkspaceObject,
+}
+
+impl RecipeObject {
+    #[must_use]
+    pub const fn address(&self) -> &ObjectAddress {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn source_expectation(&self) -> &SourceExpectation {
+        &self.source
+    }
+
+    pub(crate) const fn source_id(&self) -> SourceId {
+        self.source_id
+    }
+
+    #[must_use]
+    pub fn class(&self) -> &UnityClass {
+        self.object.class()
+    }
+
+    #[must_use]
+    pub fn provenance(&self) -> &SchemaProvenance {
+        self.object.schema_provenance()
+    }
+
+    pub(crate) fn field<'value>(&'value self, path: &FieldPath) -> Option<&'value UnityValue> {
+        self.class().value_at_path(path).ok()
+    }
+
+    pub(crate) fn require_field<'value>(
+        &'value self,
+        path: &FieldPath,
+        output: &mut RecipeOutputBuilder<'_>,
+    ) -> Result<&'value UnityValue, RecipeError> {
+        self.resolve_field(path, output)
+    }
+
+    pub(crate) fn field_guard(
+        &self,
+        path: &FieldPath,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<FieldGuard, RecipeError> {
+        let object_schema = self
+            .provenance()
+            .schema_digest()
+            .ok_or(RecipeError::MissingSchemaProvenance)?;
+        let mut output = RecipeOutputBuilder::new(budget);
+        let value = self.resolve_field(path, &mut output)?;
+        let schema = match self.address.kind() {
+            ObjectKind::Binary => field_schema_digest(object_schema, path)?,
+            ObjectKind::Yaml => yaml_field_schema_digest(self.class(), path, value, budget)?,
+        };
+        Ok(FieldGuard::new(
+            schema,
+            semantic_value_digest(value, budget)?,
+        ))
+    }
+
+    fn resolve_field<'value>(
+        &'value self,
+        path: &FieldPath,
+        output: &mut RecipeOutputBuilder<'_>,
+    ) -> Result<&'value UnityValue, RecipeError> {
+        match self.class().value_at_path(path) {
+            Ok(value) => Ok(value),
+            Err(source) => {
+                let path = output.path(path)?;
+                Err(match source {
+                    ValuePathError::MissingField { .. } => RecipeError::MissingField { path },
+                    source => RecipeError::InvalidFieldPath { path, source },
+                })
+            }
+        }
+    }
+
+    pub(crate) fn fragment(
+        &self,
+        planner: &SchemaRecipePlanner<'_>,
+        payloads: Vec<PlanPayload>,
+        actions: Vec<GenericMutation>,
+        output: &mut RecipeOutputBuilder<'_>,
+    ) -> Result<MutationPlanFragment, RecipeError> {
+        planner.validate_object(self)?;
+        let mut sources = output.vec::<SourceExpectation>(1, "recipe fragment sources")?;
+        sources.push(output.source(&self.source)?);
+        output.fragment(
+            self.object.handle().workspace(),
+            self.object.handle().revision(),
+            sources,
+            payloads,
+            actions,
+        )
+    }
+}
+
+pub struct SchemaRecipePlanner<'view> {
+    view: &'view dyn WorkspaceView,
+}
+
+impl<'view> SchemaRecipePlanner<'view> {
+    #[must_use]
+    pub const fn new(view: &'view dyn WorkspaceView) -> Self {
+        Self { view }
+    }
+
+    #[must_use]
+    pub fn revision(&self) -> WorkspaceRevision {
+        self.view.revision()
+    }
+
+    /// Returns the immutable workspace identity observed by this planner.
+    #[must_use]
+    pub fn workspace_id(&self) -> unity_asset_core::WorkspaceId {
+        self.view.workspace_id()
+    }
+
+    pub fn inspect(
+        &self,
+        address: &ObjectAddress,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
+        let handle = match self.view.resolve_object(address, budget)? {
+            WorkspaceLookup::Resolved(handle) => handle,
+            WorkspaceLookup::Unloaded => return Err(RecipeError::TargetUnloaded),
+            WorkspaceLookup::Missing => return Err(RecipeError::TargetMissing),
+            WorkspaceLookup::Ambiguous { candidates } => {
+                return Err(RecipeError::TargetAmbiguous {
+                    candidates: candidates.len(),
+                });
+            }
+            WorkspaceLookup::Invalid { diagnostic } => {
+                return Err(RecipeError::TargetInvalid {
+                    code: invalid_target_code(diagnostic, budget)?,
+                });
+            }
+        };
+        self.inspect_handle(address, &handle, budget)
+    }
+
+    fn inspect_handle(
+        &self,
+        address: &ObjectAddress,
+        handle: &unity_asset_core::RevisionedObjectHandle,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
+        handle
+            .validate_context(self.view.workspace_id(), self.view.revision())
+            .map_err(|_| RecipeError::InspectionContractMismatch)?;
+        let object = self.view.read_object(handle, budget)?;
+        self.finish_inspection(address, handle, object, budget)
+    }
+
+    fn finish_inspection(
+        &self,
+        address: &ObjectAddress,
+        handle: &unity_asset_core::RevisionedObjectHandle,
+        object: WorkspaceObject,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
+        let source = match self.view.source(handle.object().source(), budget)? {
+            WorkspaceLookup::Resolved(source) => source,
+            WorkspaceLookup::Unloaded => return Err(RecipeError::TargetUnloaded),
+            WorkspaceLookup::Missing => return Err(RecipeError::TargetMissing),
+            WorkspaceLookup::Ambiguous { candidates } => {
+                return Err(RecipeError::TargetAmbiguous {
+                    candidates: candidates.len(),
+                });
+            }
+            WorkspaceLookup::Invalid { diagnostic } => {
+                return Err(RecipeError::TargetInvalid {
+                    code: invalid_target_code(diagnostic, budget)?,
+                });
+            }
+        };
+        validate_inspection(address, handle, &source, &object)?;
+        let mut output = RecipeOutputBuilder::new(budget);
+        Ok(RecipeObject {
+            address: output.address(address)?,
+            source_id: source.id(),
+            source: SourceExpectation::new(output.locator(source.locator())?, source.fingerprint()),
+            object,
+        })
+    }
+
+    pub(crate) fn object_count_in_source(
+        &self,
+        source: SourceId,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<usize, RecipeError> {
+        crate::workspace::object_count_in_source(self.view, source, budget)
+            .map_err(RecipeError::from)
+    }
+
+    pub(crate) fn source_object_descriptor(
+        &self,
+        source_id: SourceId,
+        index: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SourceObjectDescriptor, RecipeError> {
+        crate::workspace::object_descriptor_at_in_source(self.view, source_id, index, budget)
+            .map_err(RecipeError::from)
+    }
+
+    pub(crate) fn source_object_address(
+        &self,
+        descriptor: &SourceObjectDescriptor,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<ObjectAddress, RecipeError> {
+        self.view
+            .object_address(descriptor.handle(), budget)
+            .map_err(RecipeError::from)
+    }
+
+    pub(crate) fn inspect_source_object(
+        &self,
+        descriptor: &SourceObjectDescriptor,
+        address: &ObjectAddress,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeObject, RecipeError> {
+        descriptor
+            .handle()
+            .validate_context(self.view.workspace_id(), self.view.revision())
+            .map_err(|_| RecipeError::InspectionContractMismatch)?;
+        let object = crate::workspace::read_object_at_in_source(self.view, descriptor, budget)?;
+        self.finish_inspection(address, descriptor.handle(), object, budget)
+    }
+
+    /// Reports target-specific recipe applicability without lowering or mutating state.
+    pub fn capabilities_for(
+        &self,
+        object: &RecipeObject,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<[RecipeApplicability; 6], RecipeError> {
+        if let Err(error) = self
+            .validate_object(object)
+            .and_then(|()| validate_recipe_provenance(object))
+        {
+            let rejection = error
+                .code()
+                .unwrap_or(RecipeRejectionCode::MissingSchemaProvenance);
+            return Ok(std::array::from_fn(|index| {
+                RecipeApplicability::rejected(CAPABILITIES[index].id(), rejection)
+            }));
+        }
+        budget.consume_entries(u64::try_from(CAPABILITIES.len()).map_err(|_| {
+            BudgetError::ArithmeticOverflow {
+                resource: "recipe_capabilities",
+            }
+        })?)?;
+        let hierarchy = hierarchy_applicability(self, object, budget)?;
+        Ok([
+            RecipeApplicability::applicable(
+                RecipeId::ReferenceRetargetV1,
+                SchemaVariantId::GenericReference,
+            ),
+            transform_applicability(object),
+            material_applicability(object, budget)?,
+            event_applicability(object, budget)?,
+            hierarchy,
+            resource_applicability(object)?,
+        ])
+    }
+
+    pub fn lower_reference(
+        &self,
+        object: &RecipeObject,
+        path: FieldPath,
+        expected: crate::workspace::ReferenceTarget,
+        replacement: crate::workspace::ReferenceTarget,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<RecipeLowering, RecipeError> {
+        self.validate_object(object)?;
+        validate_recipe_provenance(object)?;
+        let mut output = RecipeOutputBuilder::new(budget);
+        validate_reference_shape(object, &path, &mut output)?;
+        if expected == replacement {
+            return Ok(RecipeLowering::unchanged(
+                RecipeId::ReferenceRetargetV1,
+                SchemaVariantId::GenericReference,
+            ));
+        }
+        let guard = object.field_guard(&path, output.budget())?;
+        let action = GenericMutation::ReferenceReplace {
+            target: output.address(&object.address)?,
+            path,
+            schema_digest: guard.schema_digest(),
+            expected,
+            replacement,
+        };
+        let mut actions = output.vec::<GenericMutation>(1, "reference recipe actions")?;
+        actions.push(action);
+        RecipeLowering::changed(
+            RecipeId::ReferenceRetargetV1,
+            SchemaVariantId::GenericReference,
+            object.fragment(self, Vec::new(), actions, &mut output)?,
+        )
+    }
+
+    /// Lowers one observed field replacement into a revision-bound guarded plan fragment.
+    ///
+    /// The guard is derived from this planner's immutable view, so callers do not need to assemble
+    /// schema and semantic digests manually. Use [`Self::lower_reference`] for a top-level Unity
+    /// pointer field so logical target resolution and external-table allocation stay in preflight.
+    pub fn lower_field_replace(
+        &self,
+        object: &RecipeObject,
+        path: FieldPath,
+        replacement: MutationValue,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<MutationPlanFragment, RecipeError> {
+        self.validate_object(object)?;
+        validate_recipe_provenance(object)?;
+        if path.segments().is_empty() {
+            return Err(MutationPlanError::RootFieldPath {
+                operation: "field_replace",
+            }
+            .into());
+        }
+        let mut output = RecipeOutputBuilder::new(budget);
+        let guard = object.field_guard(&path, output.budget())?;
+        if let Some(owner) = protected_plain_field_owner(
+            object.class().class_id(),
+            object.address.kind(),
+            object.class().properties(),
+            &path,
+        ) {
+            return Err(RecipeError::ProtectedSemanticField {
+                path: output.path(&path)?,
+                owner,
+            });
+        }
+        let action = GenericMutation::FieldReplace {
+            target: output.address(&object.address)?,
+            path,
+            guard,
+            replacement,
+        };
+        let mut actions = output.vec::<GenericMutation>(1, "field replacement actions")?;
+        actions.push(action);
+        object.fragment(self, Vec::new(), actions, &mut output)
+    }
+
+    pub(crate) fn validate_object(&self, object: &RecipeObject) -> Result<(), RecipeError> {
+        object
+            .object
+            .handle()
+            .validate_context(self.view.workspace_id(), self.view.revision())
+            .map_err(|_| RecipeError::InspectionContractMismatch)
+    }
+}
+
+fn validate_inspection(
+    address: &ObjectAddress,
+    handle: &unity_asset_core::RevisionedObjectHandle,
+    source: &WorkspaceSource,
+    object: &WorkspaceObject,
+) -> Result<(), RecipeError> {
+    let identity = handle.object();
+    let key_matches = match address.kind() {
+        ObjectKind::Binary => identity.binary_path_id() == address.binary_path_id(),
+        ObjectKind::Yaml => {
+            identity.yaml_file_id() == address.yaml_file_id()
+                && identity.yaml_document_ordinal() == address.yaml_document_ordinal()
+        }
+    };
+    if source.locator() != address.source_locator()
+        || source.id() != identity.source()
+        || object.handle() != handle
+        || !key_matches
+        || object.schema_provenance().object_kind() != address.kind()
+        || object.schema_provenance().class_id() != object.class().class_id()
+    {
+        return Err(RecipeError::InspectionContractMismatch);
+    }
+    Ok(())
+}
+
+fn invalid_target_code(
+    diagnostic: Diagnostic,
+    budget: &mut AssetLoadBudget,
+) -> Result<String, RecipeError> {
+    let mut output = RecipeOutputBuilder::new(budget);
+    output.string(diagnostic.code(), "recipe target diagnostic")
+}
+
+pub(crate) fn value_kind(value: &UnityValue) -> RecipeValueKind {
+    match value {
+        UnityValue::Null => RecipeValueKind::Null,
+        UnityValue::Bool(_) => RecipeValueKind::Bool,
+        UnityValue::Integer(_) => RecipeValueKind::Signed,
+        UnityValue::Unsigned(_) => RecipeValueKind::Unsigned,
+        UnityValue::Float(_) => RecipeValueKind::Float,
+        UnityValue::String(_) => RecipeValueKind::String,
+        UnityValue::Bytes(_) => RecipeValueKind::Bytes,
+        UnityValue::Array(_) => RecipeValueKind::Array,
+        UnityValue::Object(_) => RecipeValueKind::Object,
+    }
+}
+
+/// Returns the semantic subsystem that owns a field which must not be mutated as plain data.
+pub(crate) fn protected_plain_field_owner(
+    class_id: i32,
+    kind: ObjectKind,
+    root: &indexmap::IndexMap<String, UnityValue>,
+    path: &FieldPath,
+) -> Option<&'static str> {
+    let first = match path.segments().first()? {
+        FieldPathSegment::Field(name) => name.as_str(),
+        FieldPathSegment::Index(_) => return None,
+    };
+    if class_id == class_ids::AUDIO_CLIP && matches!(first, "m_Resource" | "m_StreamData") {
+        return Some("streamed-resource");
+    }
+    if matches!(class_id, class_ids::TRANSFORM | class_ids::RECT_TRANSFORM)
+        && first == "m_Children"
+        && path.segments().len() == 1
+    {
+        return Some("transform-hierarchy");
+    }
+
+    let mut current = root.get(first)?;
+    if is_reference_value(current, kind) {
+        return Some("unity-reference");
+    }
+    for segment in &path.segments()[1..] {
+        current = match (segment, current) {
+            (FieldPathSegment::Field(name), UnityValue::Object(fields)) => fields.get(name)?,
+            (FieldPathSegment::Index(index), UnityValue::Array(values)) => {
+                values.get(usize::try_from(*index).ok()?)?
+            }
+            _ => return None,
+        };
+        if is_reference_value(current, kind) {
+            return Some("unity-reference");
+        }
+    }
+    None
+}
+
+fn is_reference_value(value: &UnityValue, kind: ObjectKind) -> bool {
+    let Some(fields) = value.as_object() else {
+        return false;
+    };
+    match kind {
+        ObjectKind::Yaml => !matches!(
+            YamlReferenceValue::classify(value),
+            ClassifiedYamlReferenceValue::NotReference
+        ),
+        ObjectKind::Binary => {
+            aliased_reference_integer(fields, "m_FileID", "fileID").is_some()
+                && aliased_reference_integer(fields, "m_PathID", "pathID").is_some()
+        }
+    }
+}
+
+pub(crate) fn validate_recipe_provenance(object: &RecipeObject) -> Result<(), RecipeError> {
+    let provenance = object.provenance();
+    if provenance.schema_digest().is_none() {
+        return Err(RecipeError::MissingSchemaProvenance);
+    }
+    match provenance.object_kind() {
+        ObjectKind::Yaml => {
+            if provenance.origin() != SchemaOrigin::YamlShape
+                || provenance.binary_version().is_some()
+            {
+                return Err(RecipeError::InspectionContractMismatch);
+            }
+        }
+        ObjectKind::Binary => {
+            if !matches!(
+                provenance.origin(),
+                SchemaOrigin::EmbeddedTypeTree | SchemaOrigin::FrozenRegistry
+            ) {
+                return Err(RecipeError::MissingSchemaProvenance);
+            }
+            let version = provenance
+                .binary_version()
+                .ok_or(RecipeError::InspectionContractMismatch)?;
+            if version.unity().is_none() {
+                return Err(RecipeError::UnsupportedVersion);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reference_shape<'value>(
+    object: &'value RecipeObject,
+    path: &FieldPath,
+    output: &mut RecipeOutputBuilder<'_>,
+) -> Result<&'value indexmap::IndexMap<String, UnityValue>, RecipeError> {
+    let value = object.resolve_field(path, output)?;
+    let Some(fields) = value.as_object() else {
+        return Err(RecipeError::WrongFieldShape {
+            path: output.path(path)?,
+            expected: "a Unity pointer object",
+            actual: value_kind(value),
+        });
+    };
+    let valid = match object.address.kind() {
+        ObjectKind::Yaml => matches!(
+            YamlReferenceValue::classify(value),
+            ClassifiedYamlReferenceValue::Valid(_)
+        ),
+        ObjectKind::Binary => {
+            let file = aliased_reference_integer(fields, "m_FileID", "fileID");
+            let path_id = aliased_reference_integer(fields, "m_PathID", "pathID");
+            file.is_some() && path_id.is_some()
+        }
+    };
+    if !valid {
+        return Err(RecipeError::InvalidReference {
+            path: output.path(path)?,
+        });
+    }
+    Ok(fields)
+}
+
+pub(crate) fn decode_local_reference(
+    object: &RecipeObject,
+    path: &FieldPath,
+    output: &mut RecipeOutputBuilder<'_>,
+) -> Result<Option<ObjectAddress>, RecipeError> {
+    let fields = validate_reference_shape(object, path, output)?;
+    match object.address().kind() {
+        ObjectKind::Yaml => {
+            let value = object.resolve_field(path, output)?;
+            let raw = match YamlReferenceValue::read(value) {
+                Ok(raw) => raw,
+                Err(_) => {
+                    return Err(RecipeError::InvalidReference {
+                        path: output.path(path)?,
+                    });
+                }
+            };
+            let file_id = raw.file_id();
+            if file_id == 0 {
+                return Ok(None);
+            }
+            if raw.guid().is_some() {
+                return Err(RecipeError::UnresolvedReference {
+                    path: output.path(path)?,
+                });
+            }
+            let file_id = match YamlFileId::new(file_id) {
+                Ok(file_id) => file_id,
+                Err(_) => {
+                    return Err(RecipeError::InvalidReference {
+                        path: output.path(path)?,
+                    });
+                }
+            };
+            let locator = output.locator(object.address().source_locator())?;
+            match ObjectAddress::yaml(locator, file_id) {
+                Ok(address) => Ok(Some(address)),
+                Err(_) => Err(RecipeError::InvalidReference {
+                    path: output.path(path)?,
+                }),
+            }
+        }
+        ObjectKind::Binary => {
+            let Some(file_id) = aliased_reference_integer(fields, "m_FileID", "fileID") else {
+                return Err(RecipeError::InvalidReference {
+                    path: output.path(path)?,
+                });
+            };
+            let Some(path_id) = aliased_reference_integer(fields, "m_PathID", "pathID") else {
+                return Err(RecipeError::InvalidReference {
+                    path: output.path(path)?,
+                });
+            };
+            if path_id == 0 {
+                return Ok(None);
+            }
+            if file_id != 0 {
+                return Err(RecipeError::UnresolvedReference {
+                    path: output.path(path)?,
+                });
+            }
+            let locator = output.locator(object.address().source_locator())?;
+            match ObjectAddress::binary_at(locator, path_id) {
+                Ok(address) => Ok(Some(address)),
+                Err(_) => Err(RecipeError::InvalidReference {
+                    path: output.path(path)?,
+                }),
+            }
+        }
+    }
+}
+
+fn aliased_reference_integer(
+    fields: &indexmap::IndexMap<String, UnityValue>,
+    primary: &str,
+    compatibility: &str,
+) -> Option<i64> {
+    match (fields.get(primary), fields.get(compatibility)) {
+        (Some(primary), Some(compatibility)) => {
+            let primary = primary.as_i64()?;
+            (compatibility.as_i64()? == primary).then_some(primary)
+        }
+        (Some(value), None) | (None, Some(value)) => value.as_i64(),
+        (None, None) => None,
+    }
+}
+
+fn transform_applicability(object: &RecipeObject) -> RecipeApplicability {
+    let class = object.class();
+    if class.class_id() == unity_asset_core::class_ids::TRANSFORM
+        && class.class_name() == class_names::TRANSFORM
+    {
+        return RecipeApplicability::applicable(RecipeId::TransformV1, SchemaVariantId::Transform);
+    }
+    if class.class_id() == unity_asset_core::class_ids::RECT_TRANSFORM
+        && class.class_name() == class_names::RECT_TRANSFORM
+    {
+        let modern = class.has_property("m_AnchoredPosition");
+        let legacy = class.has_property("m_Position");
+        return match (modern, legacy) {
+            (true, false) => RecipeApplicability::applicable(
+                RecipeId::TransformV1,
+                SchemaVariantId::RectTransformAnchoredPosition,
+            ),
+            (false, true) => RecipeApplicability::applicable(
+                RecipeId::TransformV1,
+                SchemaVariantId::RectTransformLegacyPosition,
+            ),
+            _ => RecipeApplicability::rejected(
+                RecipeId::TransformV1,
+                RecipeRejectionCode::AmbiguousFieldVariant,
+            ),
+        };
+    }
+    RecipeApplicability::rejected(RecipeId::TransformV1, RecipeRejectionCode::WrongClass)
+}
+
+fn material_applicability(
+    object: &RecipeObject,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecipeApplicability, RecipeError> {
+    let class = object.class();
+    if class.class_id() != unity_asset_core::class_ids::MATERIAL
+        || class.class_name() != class_names::MATERIAL
+    {
+        return Ok(RecipeApplicability::rejected(
+            RecipeId::MaterialTextureEnvironmentV1,
+            RecipeRejectionCode::WrongClass,
+        ));
+    }
+    let variant = class
+        .get("m_SavedProperties")
+        .and_then(UnityValue::as_object)
+        .and_then(|saved| saved.get("m_TexEnvs"))
+        .map(|value| material_container_variant(value, budget, 1))
+        .transpose()?
+        .flatten();
+    Ok(variant.map_or_else(
+        || {
+            RecipeApplicability::rejected(
+                RecipeId::MaterialTextureEnvironmentV1,
+                RecipeRejectionCode::UnsupportedSchema,
+            )
+        },
+        |variant| RecipeApplicability::applicable(RecipeId::MaterialTextureEnvironmentV1, variant),
+    ))
+}
+
+fn material_container_variant(
+    value: &UnityValue,
+    budget: &mut AssetLoadBudget,
+    depth: u32,
+) -> Result<Option<SchemaVariantId>, RecipeError> {
+    observe_semantic_value(depth, budget)?;
+    match value {
+        UnityValue::Array(entries) => Ok(entries.first().and_then(material_entry_variant)),
+        UnityValue::Object(fields) if fields.len() == 1 && fields.contains_key("data") => {
+            fields.get("data").map_or(Ok(None), |value| {
+                material_container_variant(value, budget, depth + 1)
+            })
+        }
+        UnityValue::Object(fields) => Ok(material_entry_variant(value).or_else(|| {
+            fields
+                .first()
+                .filter(|(_, value)| matches!(value, UnityValue::Object(_)))
+                .map(|_| SchemaVariantId::MaterialYamlPropertyName)
+        })),
+        _ => Ok(None),
+    }
+}
+
+fn material_entry_variant(entry: &UnityValue) -> Option<SchemaVariantId> {
+    let key = match entry {
+        UnityValue::Array(values) if values.len() == 2 => &values[0],
+        UnityValue::Object(fields)
+            if fields.len() == 2
+                && fields.contains_key("first")
+                && fields.contains_key("second") =>
+        {
+            fields.get("first")?
+        }
+        UnityValue::Object(fields) if fields.len() == 1 => {
+            return fields
+                .first()
+                .filter(|(_, value)| matches!(value, UnityValue::Object(_)))
+                .map(|_| SchemaVariantId::MaterialYamlPropertyName);
+        }
+        _ => return None,
+    };
+    match key {
+        UnityValue::String(_) => Some(SchemaVariantId::MaterialStringPropertyName),
+        UnityValue::Object(fields) if matches!(fields.get("name"), Some(UnityValue::String(_))) => {
+            Some(SchemaVariantId::MaterialFastPropertyName)
+        }
+        _ => None,
+    }
+}
+
+fn event_applicability(
+    object: &RecipeObject,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecipeApplicability, RecipeError> {
+    let mut found = false;
+    for value in object.class().properties().values() {
+        observe_semantic_value(1, budget)?;
+        found = value.as_object().is_some_and(|event| {
+            event
+                .get("m_PersistentCalls")
+                .and_then(UnityValue::as_object)
+                .and_then(|calls| calls.get("m_Calls"))
+                .is_some_and(|calls| matches!(calls, UnityValue::Array(_)))
+                || event
+                    .get("m_PersistentListeners")
+                    .and_then(UnityValue::as_object)
+                    .and_then(|listeners| listeners.get("m_Listeners"))
+                    .is_some_and(|listeners| matches!(listeners, UnityValue::Array(_)))
+        });
+        if found {
+            break;
+        }
+    }
+    if found {
+        Ok(RecipeApplicability::applicable(
+            RecipeId::UnityEventPersistentCallsV1,
+            SchemaVariantId::UnityEventPersistentCalls,
+        ))
+    } else {
+        Ok(RecipeApplicability::rejected(
+            RecipeId::UnityEventPersistentCallsV1,
+            RecipeRejectionCode::UnsupportedSchema,
+        ))
+    }
+}
+
+fn hierarchy_applicability(
+    planner: &SchemaRecipePlanner<'_>,
+    object: &RecipeObject,
+    budget: &mut AssetLoadBudget,
+) -> Result<RecipeApplicability, RecipeError> {
+    match crate::schema::hierarchy::validate_hierarchy_target(planner, object, budget) {
+        Ok(()) => Ok(RecipeApplicability::applicable(
+            RecipeId::HierarchyReparentV1,
+            SchemaVariantId::HierarchyLocalReferences,
+        )),
+        Err(error) => match error.code() {
+            Some(rejection) => Ok(RecipeApplicability::rejected(
+                RecipeId::HierarchyReparentV1,
+                rejection,
+            )),
+            None => Err(error),
+        },
+    }
+}
+
+fn resource_applicability(object: &RecipeObject) -> Result<RecipeApplicability, RecipeError> {
+    let class = object.class();
+    if class.class_id() != unity_asset_core::class_ids::AUDIO_CLIP
+        || class.class_name() != class_names::AUDIO_CLIP
+    {
+        return Ok(RecipeApplicability::rejected(
+            RecipeId::AudioClipStreamedResourceV1,
+            RecipeRejectionCode::WrongClass,
+        ));
+    }
+    match classify_audio_clip_resource(object) {
+        Ok(selection) => Ok(RecipeApplicability::applicable(
+            RecipeId::AudioClipStreamedResourceV1,
+            selection.schema_variant(),
+        )),
+        Err(error) => match error.code() {
+            Some(rejection) => Ok(RecipeApplicability::rejected(
+                RecipeId::AudioClipStreamedResourceV1,
+                rejection,
+            )),
+            None => Err(error),
+        },
+    }
+}
+
+pub(crate) fn ensure_finite(values: &[f64]) -> Result<(), RecipeError> {
+    if values.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(RecipeError::NonFiniteValue)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use indexmap::IndexMap;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use unity_asset_binary::object::UnityObject;
+    use unity_asset_core::{AssetLoadBudget, FieldPath, SourceLocator, UnityClass, UnityValue};
+
+    use crate::workspace::{
+        AssetWorkspace, ReferenceTarget, WorkspaceObject, WorkspaceObjectValue,
+    };
+
+    use super::*;
+
+    #[test]
+    fn malformed_yaml_reference_fields_remain_semantically_protected() {
+        let malformed = UnityValue::Object(IndexMap::from([
+            (
+                "fileID".to_owned(),
+                UnityValue::String("not-an-integer".to_owned()),
+            ),
+            ("unexpected".to_owned(), UnityValue::Integer(1)),
+        ]));
+        let root = IndexMap::from([("m_Target".to_owned(), malformed)]);
+        let target = FieldPath::root().push_field("m_Target").unwrap();
+        let nested = target.clone().push_field("fileID").unwrap();
+
+        assert_eq!(
+            protected_plain_field_owner(1, ObjectKind::Yaml, &root, &target),
+            Some("unity-reference")
+        );
+        assert_eq!(
+            protected_plain_field_owner(1, ObjectKind::Yaml, &root, &nested),
+            Some("unity-reference")
+        );
+    }
+
+    #[test]
+    fn plain_yaml_objects_are_not_claimed_by_the_reference_subsystem() {
+        let root = IndexMap::from([(
+            "m_Data".to_owned(),
+            UnityValue::Object(IndexMap::from([(
+                "value".to_owned(),
+                UnityValue::Integer(1),
+            )])),
+        )]);
+        let path = FieldPath::root()
+            .push_field("m_Data")
+            .unwrap()
+            .push_field("value")
+            .unwrap();
+
+        assert_eq!(
+            protected_plain_field_owner(1, ObjectKind::Yaml, &root, &path),
+            None
+        );
+    }
+
+    #[test]
+    fn reference_lowering_rejects_each_conflicting_binary_alias_before_building_a_fragment() {
+        let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
+        );
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&sample, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let locator = SourceLocator::path("transform_hierarchy_v22.assets.bin").unwrap();
+        let address = ObjectAddress::binary_direct(locator.clone(), 1).unwrap();
+        for (case, compatibility_file_id, compatibility_path_id) in
+            [("file ID", 1, 0), ("path ID", 0, 99)]
+        {
+            let inspected = planner
+                .inspect(&address, &mut AssetLoadBudget::default())
+                .unwrap();
+            let RecipeObject {
+                address,
+                source_id,
+                source,
+                object,
+            } = inspected;
+            let handle = object.handle().clone();
+            let provenance = object.schema_provenance().clone();
+            let WorkspaceObjectValue::Binary(binary) = object.into_value() else {
+                panic!("expected the binary fixture to yield a binary object");
+            };
+            let binary = (*binary).clone();
+            let (header, mut properties) = binary.as_unity_class().clone().into_parts();
+            let Some(UnityValue::Object(fields)) = properties.get_mut("m_Father") else {
+                panic!("expected the Transform fixture to contain m_Father");
+            };
+            assert_eq!(fields.get("m_FileID").and_then(UnityValue::as_i64), Some(0));
+            assert_eq!(fields.get("m_PathID").and_then(UnityValue::as_i64), Some(0));
+            fields.insert(
+                "fileID".to_owned(),
+                UnityValue::Integer(compatibility_file_id),
+            );
+            fields.insert(
+                "pathID".to_owned(),
+                UnityValue::Integer(compatibility_path_id),
+            );
+            let class = UnityClass::from_parts(header, properties);
+            let object = RecipeObject {
+                address,
+                source_id,
+                source,
+                object: WorkspaceObject::new(
+                    handle,
+                    WorkspaceObjectValue::Binary(Arc::new(UnityObject::from_info_and_class(
+                        binary.info,
+                        class,
+                    ))),
+                    provenance,
+                ),
+            };
+
+            let result = planner.lower_reference(
+                &object,
+                FieldPath::root().push_field("m_Father").unwrap(),
+                ReferenceTarget::null(),
+                ReferenceTarget::object(ObjectAddress::binary_direct(locator.clone(), 2).unwrap()),
+                &mut AssetLoadBudget::default(),
+            );
+            assert!(
+                result
+                    .as_ref()
+                    .ok()
+                    .and_then(|lowering| lowering.fragment())
+                    .is_none(),
+                "{case} alias conflict must not produce a fragment"
+            );
+            assert!(
+                matches!(result, Err(RecipeError::InvalidReference { .. })),
+                "{case} alias conflict must be rejected as an invalid reference"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_zero_path_id_is_null_before_external_source_classification() {
+        let sample = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "../unity-asset-write/tests/fixtures/serialized_file_wire/transform_hierarchy_v22.assets.bin",
+        );
+        let mut workspace = AssetWorkspace::new().unwrap();
+        workspace
+            .load_path(&sample, &mut AssetLoadBudget::default())
+            .unwrap();
+        let snapshot = workspace.snapshot();
+        let planner = SchemaRecipePlanner::new(&snapshot);
+        let locator = SourceLocator::path("transform_hierarchy_v22.assets.bin").unwrap();
+        let address = ObjectAddress::binary_direct(locator, 1).unwrap();
+        let inspected = planner
+            .inspect(&address, &mut AssetLoadBudget::default())
+            .unwrap();
+        let RecipeObject {
+            address,
+            source_id,
+            source,
+            object,
+        } = inspected;
+        let handle = object.handle().clone();
+        let provenance = object.schema_provenance().clone();
+        let WorkspaceObjectValue::Binary(binary) = object.into_value() else {
+            panic!("expected the binary fixture to yield a binary object");
+        };
+        let binary = (*binary).clone();
+        let (header, mut properties) = binary.as_unity_class().clone().into_parts();
+        let Some(UnityValue::Object(fields)) = properties.get_mut("m_Father") else {
+            panic!("expected the Transform fixture to contain m_Father");
+        };
+        fields.insert("m_FileID".to_owned(), UnityValue::Integer(1));
+        fields.insert("m_PathID".to_owned(), UnityValue::Integer(0));
+        let object = RecipeObject {
+            address,
+            source_id,
+            source,
+            object: WorkspaceObject::new(
+                handle,
+                WorkspaceObjectValue::Binary(Arc::new(UnityObject::from_info_and_class(
+                    binary.info,
+                    UnityClass::from_parts(header, properties),
+                ))),
+                provenance,
+            ),
+        };
+        let path = FieldPath::root().push_field("m_Father").unwrap();
+        let mut budget = AssetLoadBudget::default();
+        let mut output = RecipeOutputBuilder::new(&mut budget);
+
+        assert!(matches!(
+            decode_local_reference(&object, &path, &mut output),
+            Ok(None)
+        ));
+    }
+}

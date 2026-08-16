@@ -1,57 +1,47 @@
 [package]
 name = "unity-asset-decode"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
-description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite/Mesh) built on unity-asset-binary"
+description = "Decode/export helpers for Unity assets (Texture/Audio/Sprite) built on unity-asset-binary"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://docs.rs/unity-asset-decode"
 keywords = ["unity", "assets", "decode", "export", "parser"]
 categories = ["parsing", "game-development"]
+include = ["src/**", "assets/**", "tests/**", "Cargo.toml"]
 
 [dependencies]
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset-binary = { workspace = true }
+unity-asset-core = { workspace = true }
 serde = { workspace = true }
 image = { workspace = true, optional = true }
-symphonia = { version = "0.5", features = ["all"], optional = true }
-hound = { version = "3.5", optional = true }
+crc32fast = { version = "1.5", optional = true }
 texture2ddecoder = { version = "0.1", optional = true }
-obj = { version = "0.10", optional = true }
 indexmap = { workspace = true }
+base64 = { version = "0.22", optional = true }
+ogg = { version = "0.9", optional = true }
+serde_json = { workspace = true, optional = true }
+thiserror = { workspace = true }
 
 [features]
 default = []
 
-texture = ["dep:image"]
+texture = ["dep:crc32fast", "dep:image"]
 texture-advanced = ["texture", "dep:texture2ddecoder"]
-audio = ["dep:symphonia", "dep:hound"]
-mesh = []
-mesh-export = ["mesh", "dep:obj"]
+audio = [
+    "dep:base64",
+    "dep:ogg",
+    "dep:serde_json",
+]
 sprite = ["texture"]
 
-full = ["texture", "texture-advanced", "audio", "mesh", "mesh-export", "sprite"]
+full = ["texture", "texture-advanced", "audio", "sprite"]
 
 [dev-dependencies]
-tempfile = { workspace = true }
-hex = "0.4"
-
-[[example]]
-name = "debug_texture_formats"
-path = "examples/debug_texture_formats.rs"
-required-features = ["texture"]
-
-[[example]]
-name = "texture_decoding_demo"
-path = "examples/texture_decoding_demo.rs"
-required-features = ["texture"]
-
-[[example]]
-name = "export_textures"
-path = "examples/export_textures.rs"
-required-features = ["texture"]
+serde_json = { workspace = true }
 
 [package.metadata.docs.rs]
 no-default-features = true

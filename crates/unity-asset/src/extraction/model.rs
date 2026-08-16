@@ -1,0 +1,2025 @@
+//! Versioned, deterministic extraction requests and inert plans.
+
+use std::collections::TryReserveError;
+use std::io::{Read, Write};
+use std::num::NonZeroU64;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, BudgetedJsonError, DigestV1, ObjectAddress, ObjectKind,
+    SourceFingerprint, SourceKind, SourceLocator, WorkspaceId, WorkspaceRevision,
+    vec_allocation_bytes,
+};
+use unity_asset_decode::descriptor::MediaFamily;
+use unity_asset_write::artifact::ArtifactNameError;
+
+pub use super::contract::{
+    ExtractionArtifactKind, ExtractionDiagnostic, ExtractionPath, ExtractionRepresentationPolicy,
+    ExtractionSourceExpectation,
+};
+use super::json_contract::{large_contract_limits, read_json_bounded, small_contract_limits};
+use super::manifest::{
+    ExtractionCanonicalError, canonical_digest, canonical_json, write_canonical_json,
+};
+use super::representation::{
+    PlannedContent, PlannedFallback, RepresentationContract, RepresentationContractError,
+    RepresentationContractParts, RepresentationSemantics,
+};
+use crate::reference::{ReferenceDirection, ReferenceTraversalLimits};
+
+pub const EXTRACTION_REQUEST_VERSION: u8 = 4;
+pub const EXTRACTION_PLAN_VERSION: u8 = 8;
+pub const EXTRACTION_MANIFEST_VERSION: u8 = super::manifest::EXTRACTION_MANIFEST_VERSION;
+pub const EXTRACTION_REPORT_VERSION: u8 = super::manifest::EXTRACTION_REPORT_VERSION;
+pub const EXTRACTION_REQUEST_CONTRACT: &str = "unity_asset.extraction_request";
+pub const EXTRACTION_PLAN_CONTRACT: &str = "unity_asset.extraction_plan";
+
+const EXTRACTION_REQUEST_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
+    small_contract_limits(EXTRACTION_REQUEST_CONTRACT);
+const EXTRACTION_PLAN_JSON_LIMITS: unity_asset_core::ContractJsonLimits =
+    large_contract_limits(EXTRACTION_PLAN_CONTRACT);
+
+const MAX_SELECTION_PATTERN_BYTES: usize = 4_096;
+const MAX_FILTER_TEXT_BYTES: usize = 4_096;
+const MAX_METADATA_TEXT_BYTES: usize = 64 * 1_024;
+
+/// Direction persisted by an extraction-owned reference traversal intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionReferenceDirection {
+    Outgoing,
+    Incoming,
+}
+
+impl ExtractionReferenceDirection {
+    pub(crate) const fn as_reference(self) -> ReferenceDirection {
+        match self {
+            Self::Outgoing => ReferenceDirection::Outgoing,
+            Self::Incoming => ReferenceDirection::Incoming,
+        }
+    }
+}
+
+/// Extraction-owned soft limits for a reference selection closure.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractionReferenceTraversalLimits {
+    max_depth: Option<u32>,
+    max_nodes: Option<u64>,
+    max_edges: Option<u64>,
+}
+
+impl ExtractionReferenceTraversalLimits {
+    #[must_use]
+    pub const fn unbounded() -> Self {
+        Self {
+            max_depth: None,
+            max_nodes: None,
+            max_edges: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_max_depth(mut self, maximum: u32) -> Self {
+        self.max_depth = Some(maximum);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_nodes(mut self, maximum: u64) -> Self {
+        self.max_nodes = Some(maximum);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_max_edges(mut self, maximum: u64) -> Self {
+        self.max_edges = Some(maximum);
+        self
+    }
+
+    #[must_use]
+    pub const fn max_depth(self) -> Option<u32> {
+        self.max_depth
+    }
+
+    #[must_use]
+    pub const fn max_nodes(self) -> Option<u64> {
+        self.max_nodes
+    }
+
+    #[must_use]
+    pub const fn max_edges(self) -> Option<u64> {
+        self.max_edges
+    }
+
+    pub(crate) const fn as_reference(self) -> ReferenceTraversalLimits {
+        let mut limits = ReferenceTraversalLimits::unbounded();
+        if let Some(maximum) = self.max_depth {
+            limits = limits.with_max_depth(maximum);
+        }
+        if let Some(maximum) = self.max_nodes {
+            limits = limits.with_max_nodes(maximum);
+        }
+        if let Some(maximum) = self.max_edges {
+            limits = limits.with_max_edges(maximum);
+        }
+        limits
+    }
+}
+
+/// A portable, normalized object selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtractionSelection {
+    All,
+    Sources {
+        sources: Box<[SourceLocator]>,
+    },
+    Addresses {
+        addresses: Box<[ObjectAddress]>,
+    },
+    BundleContainer {
+        pattern: String,
+    },
+    ReferenceTraversal {
+        roots: Box<[ObjectAddress]>,
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
+    },
+}
+
+impl ExtractionSelection {
+    fn normalize(self) -> Result<Self, ExtractionModelError> {
+        match self {
+            Self::All => Ok(Self::All),
+            Self::Sources { sources } => Ok(Self::Sources {
+                sources: normalize_values(sources.into_vec()).into_boxed_slice(),
+            }),
+            Self::Addresses { addresses } => Ok(Self::Addresses {
+                addresses: normalize_values(addresses.into_vec()).into_boxed_slice(),
+            }),
+            Self::BundleContainer { pattern } => Ok(Self::BundleContainer {
+                pattern: normalize_selection_pattern(pattern)?,
+            }),
+            Self::ReferenceTraversal {
+                roots,
+                direction,
+                limits,
+            } => Ok(Self::ReferenceTraversal {
+                roots: normalize_values(roots.into_vec()).into_boxed_slice(),
+                direction,
+                limits,
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExtractionSelectionRef<'value> {
+    All,
+    Sources {
+        sources: &'value [SourceLocator],
+    },
+    Addresses {
+        addresses: &'value [ObjectAddress],
+    },
+    BundleContainer {
+        pattern: &'value str,
+    },
+    ReferenceTraversal {
+        roots: &'value [ObjectAddress],
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum ExtractionSelectionWire {
+    All,
+    Sources {
+        sources: Vec<SourceLocator>,
+    },
+    Addresses {
+        addresses: Vec<ObjectAddress>,
+    },
+    BundleContainer {
+        pattern: String,
+    },
+    ReferenceTraversal {
+        roots: Vec<ObjectAddress>,
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
+    },
+}
+
+impl Serialize for ExtractionSelection {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let selection = match self {
+            Self::All => ExtractionSelectionRef::All,
+            Self::Sources { sources } => ExtractionSelectionRef::Sources { sources },
+            Self::Addresses { addresses } => ExtractionSelectionRef::Addresses { addresses },
+            Self::BundleContainer { pattern } => {
+                ExtractionSelectionRef::BundleContainer { pattern }
+            }
+            Self::ReferenceTraversal {
+                roots,
+                direction,
+                limits,
+            } => ExtractionSelectionRef::ReferenceTraversal {
+                roots,
+                direction: *direction,
+                limits: *limits,
+            },
+        };
+        selection.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtractionSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let selection = match ExtractionSelectionWire::deserialize(deserializer)? {
+            ExtractionSelectionWire::All => Self::All,
+            ExtractionSelectionWire::Sources { sources } => Self::Sources {
+                sources: sources.into_boxed_slice(),
+            },
+            ExtractionSelectionWire::Addresses { addresses } => Self::Addresses {
+                addresses: addresses.into_boxed_slice(),
+            },
+            ExtractionSelectionWire::BundleContainer { pattern } => {
+                Self::BundleContainer { pattern }
+            }
+            ExtractionSelectionWire::ReferenceTraversal {
+                roots,
+                direction,
+                limits,
+            } => Self::ReferenceTraversal {
+                roots: roots.into_boxed_slice(),
+                direction,
+                limits,
+            },
+        };
+        selection.normalize().map_err(serde::de::Error::custom)
+    }
+}
+
+/// Optional filters applied after a selection adapter resolves candidate objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionFilter {
+    object_kinds: Box<[ObjectKind]>,
+    class_ids: Box<[i32]>,
+    class_name_contains: Option<String>,
+    object_name_contains: Option<String>,
+    limit: Option<NonZeroU64>,
+}
+
+impl ExtractionFilter {
+    pub fn new(
+        class_ids: impl IntoIterator<Item = i32>,
+        class_name_contains: Option<String>,
+        object_name_contains: Option<String>,
+        limit: Option<u64>,
+    ) -> Result<Self, ExtractionModelError> {
+        let limit = limit
+            .map(|value| NonZeroU64::new(value).ok_or(ExtractionModelError::ZeroExtractionLimit))
+            .transpose()?;
+        Ok(Self {
+            object_kinds: Box::new([]),
+            class_ids: normalize_values(class_ids.into_iter().collect()).into_boxed_slice(),
+            class_name_contains: normalize_filter_text("class_name_contains", class_name_contains)?,
+            object_name_contains: normalize_filter_text(
+                "object_name_contains",
+                object_name_contains,
+            )?,
+            limit,
+        })
+    }
+
+    /// Restricts the request to format-local object identity families.
+    #[must_use]
+    pub fn with_object_kinds(mut self, object_kinds: impl IntoIterator<Item = ObjectKind>) -> Self {
+        self.object_kinds = normalize_values(object_kinds.into_iter().collect()).into_boxed_slice();
+        self
+    }
+
+    #[must_use]
+    pub fn object_kinds(&self) -> &[ObjectKind] {
+        &self.object_kinds
+    }
+
+    #[must_use]
+    pub fn class_ids(&self) -> &[i32] {
+        &self.class_ids
+    }
+
+    #[must_use]
+    pub fn class_name_contains(&self) -> Option<&str> {
+        self.class_name_contains.as_deref()
+    }
+
+    #[must_use]
+    pub fn object_name_contains(&self) -> Option<&str> {
+        self.object_name_contains.as_deref()
+    }
+
+    #[must_use]
+    pub fn limit(&self) -> Option<u64> {
+        self.limit.map(NonZeroU64::get)
+    }
+
+    #[must_use]
+    pub fn matches_object_kind(&self, object_kind: ObjectKind) -> bool {
+        self.object_kinds.is_empty() || self.object_kinds.contains(&object_kind)
+    }
+
+    #[must_use]
+    pub fn matches_class(&self, class_id: i32, class_name: &str) -> bool {
+        (self.class_ids.is_empty() || self.class_ids.binary_search(&class_id).is_ok())
+            && self
+                .class_name_contains
+                .as_deref()
+                .is_none_or(|needle| lowercase_contains(class_name, needle))
+    }
+
+    #[must_use]
+    pub fn matches_object_name(&self, object_name: Option<&str>) -> bool {
+        self.object_name_contains
+            .as_deref()
+            .is_none_or(|needle| object_name.is_some_and(|name| lowercase_contains(name, needle)))
+    }
+}
+
+impl Default for ExtractionFilter {
+    fn default() -> Self {
+        Self {
+            object_kinds: Box::new([]),
+            class_ids: Box::new([]),
+            class_name_contains: None,
+            object_name_contains: None,
+            limit: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct ExtractionFilterRef<'value> {
+    object_kinds: &'value [ObjectKind],
+    class_ids: &'value [i32],
+    class_name_contains: Option<&'value str>,
+    object_name_contains: Option<&'value str>,
+    limit: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionFilterWire {
+    object_kinds: Option<Vec<ObjectKind>>,
+    class_ids: Vec<i32>,
+    class_name_contains: Option<String>,
+    object_name_contains: Option<String>,
+    limit: Option<u64>,
+}
+
+impl ExtractionFilterWire {
+    fn into_filter(self) -> Result<ExtractionFilter, ExtractionModelError> {
+        let object_kinds = self
+            .object_kinds
+            .ok_or(ExtractionModelError::MissingObjectKindFilter)?;
+        ExtractionFilter::new(
+            self.class_ids,
+            self.class_name_contains,
+            self.object_name_contains,
+            self.limit,
+        )
+        .map(|filter| filter.with_object_kinds(object_kinds))
+    }
+}
+
+impl Serialize for ExtractionFilter {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ExtractionFilterRef {
+            object_kinds: &self.object_kinds,
+            class_ids: &self.class_ids,
+            class_name_contains: self.class_name_contains(),
+            object_name_contains: self.object_name_contains(),
+            limit: self.limit(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtractionFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExtractionFilterWire::deserialize(deserializer)?;
+        wire.into_filter().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A versioned extraction request containing only portable identities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionRequest {
+    selection: ExtractionSelection,
+    representation: ExtractionRepresentationPolicy,
+    filter: ExtractionFilter,
+    prefix: Option<ExtractionPath>,
+}
+
+impl ExtractionRequest {
+    #[must_use]
+    pub fn all(representation: ExtractionRepresentationPolicy) -> Self {
+        Self {
+            selection: ExtractionSelection::All,
+            representation,
+            filter: ExtractionFilter::default(),
+            prefix: None,
+        }
+    }
+
+    #[must_use]
+    pub fn sources(
+        sources: impl IntoIterator<Item = SourceLocator>,
+        representation: ExtractionRepresentationPolicy,
+    ) -> Self {
+        Self {
+            selection: ExtractionSelection::Sources {
+                sources: normalize_values(sources.into_iter().collect()).into_boxed_slice(),
+            },
+            representation,
+            filter: ExtractionFilter::default(),
+            prefix: None,
+        }
+    }
+
+    pub fn addresses(
+        addresses: impl IntoIterator<Item = ObjectAddress>,
+        representation: ExtractionRepresentationPolicy,
+    ) -> Result<Self, ExtractionModelError> {
+        Self::with_selection(
+            ExtractionSelection::Addresses {
+                addresses: addresses.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            },
+            representation,
+            ExtractionFilter::default(),
+            None,
+        )
+    }
+
+    pub fn bundle_container(
+        pattern: impl Into<String>,
+        representation: ExtractionRepresentationPolicy,
+    ) -> Result<Self, ExtractionModelError> {
+        Self::with_selection(
+            ExtractionSelection::BundleContainer {
+                pattern: pattern.into(),
+            },
+            representation,
+            ExtractionFilter::default(),
+            None,
+        )
+    }
+
+    pub fn reference_traversal(
+        roots: impl IntoIterator<Item = ObjectAddress>,
+        direction: ExtractionReferenceDirection,
+        limits: ExtractionReferenceTraversalLimits,
+        representation: ExtractionRepresentationPolicy,
+    ) -> Result<Self, ExtractionModelError> {
+        Self::with_selection(
+            ExtractionSelection::ReferenceTraversal {
+                roots: roots.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+                direction,
+                limits,
+            },
+            representation,
+            ExtractionFilter::default(),
+            None,
+        )
+    }
+
+    /// Selects every YAML document for deterministic raw YAML extraction.
+    #[must_use]
+    pub fn yaml_documents() -> Self {
+        Self::all(ExtractionRepresentationPolicy::RawOnly)
+            .with_filter(ExtractionFilter::default().with_object_kinds([ObjectKind::Yaml]))
+    }
+
+    #[must_use]
+    pub fn with_filter(mut self, filter: ExtractionFilter) -> Self {
+        self.filter = filter;
+        self
+    }
+
+    #[must_use]
+    pub fn with_prefix(mut self, prefix: ExtractionPath) -> Self {
+        self.prefix = Some(prefix);
+        self
+    }
+
+    pub(crate) fn with_selection(
+        selection: ExtractionSelection,
+        representation: ExtractionRepresentationPolicy,
+        filter: ExtractionFilter,
+        prefix: Option<ExtractionPath>,
+    ) -> Result<Self, ExtractionModelError> {
+        Ok(Self {
+            selection: selection.normalize()?,
+            representation,
+            filter,
+            prefix,
+        })
+    }
+
+    #[must_use]
+    pub const fn selection(&self) -> &ExtractionSelection {
+        &self.selection
+    }
+
+    #[must_use]
+    pub const fn representation(&self) -> ExtractionRepresentationPolicy {
+        self.representation
+    }
+
+    #[must_use]
+    pub const fn filter(&self) -> &ExtractionFilter {
+        &self.filter
+    }
+
+    #[must_use]
+    pub fn prefix(&self) -> Option<&ExtractionPath> {
+        self.prefix.as_ref()
+    }
+
+    pub fn read_json(
+        reader: impl Read,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, BudgetedJsonError> {
+        read_json_bounded(reader, budget, EXTRACTION_REQUEST_JSON_LIMITS)
+    }
+
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
+        canonical_json(self)
+    }
+
+    pub fn write_canonical_json(&self, writer: impl Write) -> Result<(), ExtractionCanonicalError> {
+        write_canonical_json(writer, self)
+    }
+
+    pub fn digest(&self) -> Result<DigestV1, ExtractionCanonicalError> {
+        canonical_digest(self)
+    }
+}
+
+#[derive(Serialize)]
+struct ExtractionRequestRef<'value> {
+    contract: &'static str,
+    version: u8,
+    selection: &'value ExtractionSelection,
+    representation: ExtractionRepresentationPolicy,
+    filter: &'value ExtractionFilter,
+    prefix: Option<&'value ExtractionPath>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionRequestWire {
+    contract: String,
+    version: u8,
+    selection: ExtractionSelection,
+    representation: ExtractionRepresentationPolicy,
+    filter: ExtractionFilterWire,
+    prefix: Option<ExtractionPath>,
+}
+
+impl Serialize for ExtractionRequest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ExtractionRequestRef {
+            contract: EXTRACTION_REQUEST_CONTRACT,
+            version: EXTRACTION_REQUEST_VERSION,
+            selection: &self.selection,
+            representation: self.representation,
+            filter: &self.filter,
+            prefix: self.prefix.as_ref(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtractionRequest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExtractionRequestWire::deserialize(deserializer)?;
+        if wire.contract != EXTRACTION_REQUEST_CONTRACT {
+            return Err(serde::de::Error::custom(
+                ExtractionModelError::UnexpectedContract {
+                    expected: EXTRACTION_REQUEST_CONTRACT,
+                    actual: wire.contract,
+                },
+            ));
+        }
+        if wire.version != EXTRACTION_REQUEST_VERSION {
+            return Err(serde::de::Error::custom(
+                ExtractionModelError::UnsupportedRequestVersion(wire.version),
+            ));
+        }
+        let filter = wire
+            .filter
+            .into_filter()
+            .map_err(serde::de::Error::custom)?;
+        Self::with_selection(wire.selection, wire.representation, filter, wire.prefix)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+/// One ordered artifact in an immutable extraction plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedArtifact {
+    ordinal: u32,
+    address: ObjectAddress,
+    class_id: i32,
+    class_name: String,
+    object_name: Option<String>,
+    representation: RepresentationContract,
+}
+
+impl PlannedArtifact {
+    pub(super) fn new(
+        ordinal: u32,
+        address: ObjectAddress,
+        class_id: i32,
+        class_name: String,
+        object_name: Option<String>,
+        representation: RepresentationContract,
+    ) -> Result<Self, ExtractionModelError> {
+        validate_metadata("class_name", &class_name, false)?;
+        if let Some(object_name) = object_name.as_deref() {
+            validate_metadata("object_name", object_name, true)?;
+        }
+        Ok(Self {
+            ordinal,
+            address,
+            class_id,
+            class_name,
+            object_name,
+            representation,
+        })
+    }
+
+    #[must_use]
+    pub const fn ordinal(&self) -> u32 {
+        self.ordinal
+    }
+
+    #[must_use]
+    pub const fn address(&self) -> &ObjectAddress {
+        &self.address
+    }
+
+    #[must_use]
+    pub const fn class_id(&self) -> i32 {
+        self.class_id
+    }
+
+    #[must_use]
+    pub fn class_name(&self) -> &str {
+        &self.class_name
+    }
+
+    #[must_use]
+    pub fn object_name(&self) -> Option<&str> {
+        self.object_name.as_deref()
+    }
+
+    #[must_use]
+    pub const fn preferred_kind(&self) -> ExtractionArtifactKind {
+        self.representation.preferred_kind()
+    }
+
+    #[must_use]
+    pub const fn preferred_path(&self) -> &ExtractionPath {
+        self.representation.preferred_path()
+    }
+
+    pub(super) const fn preferred_content(&self) -> &PlannedContent {
+        self.representation.preferred_content()
+    }
+
+    pub(super) const fn preferred_requires_write_budget(&self) -> bool {
+        self.representation.preferred_requires_write_budget()
+    }
+
+    #[must_use]
+    pub fn fallback_kind(&self) -> Option<ExtractionArtifactKind> {
+        self.representation.fallback_kind()
+    }
+
+    #[must_use]
+    pub fn fallback_path(&self) -> Option<&ExtractionPath> {
+        self.representation.fallback_path()
+    }
+
+    /// Planner-declared conservative maximum transient bytes for this artifact.
+    ///
+    /// The executor derives an authoritative bound from the exact workspace revision before it
+    /// creates output and rejects declarations below that proof.
+    #[must_use]
+    pub const fn working_set_bytes(&self) -> u64 {
+        self.representation.working_set_bytes()
+    }
+
+    #[must_use]
+    pub const fn diagnostics(&self) -> &[ExtractionDiagnostic] {
+        self.representation.diagnostics()
+    }
+
+    pub(crate) fn matches_output(
+        &self,
+        kind: ExtractionArtifactKind,
+        path: &ExtractionPath,
+    ) -> bool {
+        self.representation.matches_output(kind, path)
+    }
+
+    pub(super) const fn representation(&self) -> &RepresentationContract {
+        &self.representation
+    }
+}
+
+#[derive(Serialize)]
+struct PlannedFallbackRef<'artifact> {
+    kind: ExtractionArtifactKind,
+    path: &'artifact ExtractionPath,
+    content: &'artifact PlannedContent,
+    representation_semantics: RepresentationSemantics,
+}
+
+impl<'artifact> From<&'artifact PlannedFallback> for PlannedFallbackRef<'artifact> {
+    fn from(fallback: &'artifact PlannedFallback) -> Self {
+        Self {
+            kind: fallback.kind(),
+            path: fallback.path(),
+            content: fallback.content(),
+            representation_semantics: fallback.representation_semantics(),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PlannedArtifactRef<'artifact> {
+    ordinal: u32,
+    address: &'artifact ObjectAddress,
+    class_id: i32,
+    class_name: &'artifact str,
+    object_name: Option<&'artifact str>,
+    preferred_kind: ExtractionArtifactKind,
+    preferred_path: &'artifact ExtractionPath,
+    preferred_content: &'artifact PlannedContent,
+    representation_semantics: RepresentationSemantics,
+    fallback: Option<PlannedFallbackRef<'artifact>>,
+    working_set_bytes: u64,
+    diagnostics: &'artifact [ExtractionDiagnostic],
+}
+
+impl Serialize for PlannedArtifact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        PlannedArtifactRef {
+            ordinal: self.ordinal,
+            address: &self.address,
+            class_id: self.class_id,
+            class_name: &self.class_name,
+            object_name: self.object_name.as_deref(),
+            preferred_kind: self.preferred_kind(),
+            preferred_path: self.preferred_path(),
+            preferred_content: self.preferred_content(),
+            representation_semantics: self.representation.representation_semantics(),
+            fallback: self.representation.fallback().map(PlannedFallbackRef::from),
+            working_set_bytes: self.working_set_bytes(),
+            diagnostics: self.diagnostics(),
+        }
+        .serialize(serializer)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedFallbackWire {
+    kind: ExtractionArtifactKind,
+    path: ExtractionPath,
+    content: PlannedContent,
+    representation_semantics: Option<RepresentationSemantics>,
+}
+
+impl PlannedFallbackWire {
+    fn into_fallback(self) -> Result<PlannedFallback, ExtractionModelError> {
+        PlannedFallback::from_declared_parts(
+            self.kind,
+            self.path,
+            self.content,
+            self.representation_semantics,
+        )
+        .map_err(Into::into)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlannedArtifactWire {
+    ordinal: u32,
+    address: ObjectAddress,
+    class_id: i32,
+    class_name: String,
+    object_name: Option<String>,
+    preferred_kind: ExtractionArtifactKind,
+    preferred_path: ExtractionPath,
+    preferred_content: PlannedContent,
+    representation_semantics: Option<RepresentationSemantics>,
+    fallback: Option<PlannedFallbackWire>,
+    working_set_bytes: u64,
+    diagnostics: Vec<ExtractionDiagnostic>,
+}
+
+impl PlannedArtifactWire {
+    fn into_artifact(self) -> Result<PlannedArtifact, ExtractionModelError> {
+        let Self {
+            ordinal,
+            address,
+            class_id,
+            class_name,
+            object_name,
+            preferred_kind,
+            preferred_path,
+            preferred_content,
+            representation_semantics,
+            fallback,
+            working_set_bytes,
+            diagnostics,
+        } = self;
+        preferred_content.validate_declared_kind(preferred_kind)?;
+        let fallback = fallback
+            .map(PlannedFallbackWire::into_fallback)
+            .transpose()?;
+        let representation_semantics = representation_semantics.ok_or(
+            RepresentationContractError::MissingRepresentationSemantics {
+                artifact_kind: preferred_content.artifact_kind(),
+            },
+        )?;
+        let representation = RepresentationContract::from_declared_parts(
+            ordinal,
+            &address,
+            representation_semantics,
+            RepresentationContractParts {
+                preferred_path,
+                preferred_content,
+                fallback,
+                working_set_bytes,
+                diagnostics,
+            },
+        )?;
+        PlannedArtifact::new(
+            ordinal,
+            address,
+            class_id,
+            class_name,
+            object_name,
+            representation,
+        )
+    }
+}
+
+/// Canonical proof of the normalized objects resolved by an extraction selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExtractionSelectionWitness {
+    candidate_count: u64,
+    candidate_digest: DigestV1,
+}
+
+impl ExtractionSelectionWitness {
+    pub(crate) const fn new(candidate_count: u64, candidate_digest: DigestV1) -> Self {
+        Self {
+            candidate_count,
+            candidate_digest,
+        }
+    }
+
+    #[must_use]
+    pub const fn candidate_count(self) -> u64 {
+        self.candidate_count
+    }
+
+    #[must_use]
+    pub const fn candidate_digest(self) -> DigestV1 {
+        self.candidate_digest
+    }
+}
+
+/// An immutable, revision-bound extraction plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionPlan {
+    workspace_id: WorkspaceId,
+    revision: WorkspaceRevision,
+    request: ExtractionRequest,
+    request_digest: DigestV1,
+    selection_witness: ExtractionSelectionWitness,
+    sources: Box<[ExtractionSourceExpectation]>,
+    artifacts: Box<[PlannedArtifact]>,
+}
+
+impl ExtractionPlan {
+    pub(crate) fn new(
+        workspace_id: WorkspaceId,
+        revision: WorkspaceRevision,
+        request: ExtractionRequest,
+        selection_witness: ExtractionSelectionWitness,
+        sources: Vec<ExtractionSourceExpectation>,
+        artifacts: Vec<PlannedArtifact>,
+    ) -> Result<Self, ExtractionModelError> {
+        let request_digest = request.digest()?;
+        let sources = normalize_source_expectations(sources)?;
+        validate_planned_artifacts(&request, selection_witness, &sources, &artifacts)?;
+        Ok(Self {
+            workspace_id,
+            revision,
+            request,
+            request_digest,
+            selection_witness,
+            sources: sources.into_boxed_slice(),
+            artifacts: artifacts.into_boxed_slice(),
+        })
+    }
+
+    pub(crate) fn new_budgeted(
+        workspace_id: WorkspaceId,
+        revision: WorkspaceRevision,
+        request: ExtractionRequest,
+        selection_witness: ExtractionSelectionWitness,
+        sources: Vec<ExtractionSourceExpectation>,
+        artifacts: Vec<PlannedArtifact>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, ExtractionModelError> {
+        let request_digest = request.digest()?;
+        let sources = normalize_source_expectations(sources)?;
+        validate_planned_artifacts_budgeted(
+            &request,
+            selection_witness,
+            &sources,
+            &artifacts,
+            budget,
+        )?;
+        Ok(Self {
+            workspace_id,
+            revision,
+            request,
+            request_digest,
+            selection_witness,
+            sources: sources.into_boxed_slice(),
+            artifacts: artifacts.into_boxed_slice(),
+        })
+    }
+
+    #[must_use]
+    pub const fn workspace_id(&self) -> WorkspaceId {
+        self.workspace_id
+    }
+
+    #[must_use]
+    pub const fn revision(&self) -> WorkspaceRevision {
+        self.revision
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &ExtractionRequest {
+        &self.request
+    }
+
+    #[must_use]
+    pub const fn request_digest(&self) -> DigestV1 {
+        self.request_digest
+    }
+
+    #[must_use]
+    pub const fn selection_witness(&self) -> ExtractionSelectionWitness {
+        self.selection_witness
+    }
+
+    #[must_use]
+    pub const fn sources(&self) -> &[ExtractionSourceExpectation] {
+        &self.sources
+    }
+
+    #[must_use]
+    pub const fn artifacts(&self) -> &[PlannedArtifact] {
+        &self.artifacts
+    }
+
+    pub(crate) fn validate_current_representation_semantics(
+        &self,
+    ) -> Result<(), ExtractionModelError> {
+        for artifact in &self.artifacts {
+            artifact.representation.validate_current_semantics()?;
+        }
+        Ok(())
+    }
+
+    pub fn canonical_json(&self) -> Result<Vec<u8>, ExtractionCanonicalError> {
+        canonical_json(self)
+    }
+
+    pub fn write_canonical_json(&self, writer: impl Write) -> Result<(), ExtractionCanonicalError> {
+        write_canonical_json(writer, self)
+    }
+
+    pub fn digest(&self) -> Result<DigestV1, ExtractionCanonicalError> {
+        canonical_digest(self)
+    }
+
+    pub fn read_json(
+        reader: impl Read,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Self, BudgetedJsonError> {
+        read_json_bounded(reader, budget, EXTRACTION_PLAN_JSON_LIMITS)
+    }
+}
+
+#[derive(Serialize)]
+struct ExtractionPlanRef<'value> {
+    contract: &'static str,
+    version: u8,
+    workspace_id: WorkspaceId,
+    revision: WorkspaceRevision,
+    request: &'value ExtractionRequest,
+    request_digest: DigestV1,
+    selection_witness: ExtractionSelectionWitness,
+    sources: &'value [ExtractionSourceExpectation],
+    artifacts: &'value [PlannedArtifact],
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExtractionPlanWire {
+    contract: String,
+    version: u8,
+    workspace_id: WorkspaceId,
+    revision: WorkspaceRevision,
+    request: ExtractionRequest,
+    request_digest: DigestV1,
+    selection_witness: ExtractionSelectionWitness,
+    sources: Vec<ExtractionSourceExpectation>,
+    artifacts: Vec<PlannedArtifactWire>,
+}
+
+impl Serialize for ExtractionPlan {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        ExtractionPlanRef {
+            contract: EXTRACTION_PLAN_CONTRACT,
+            version: EXTRACTION_PLAN_VERSION,
+            workspace_id: self.workspace_id,
+            revision: self.revision,
+            request: &self.request,
+            request_digest: self.request_digest,
+            selection_witness: self.selection_witness,
+            sources: &self.sources,
+            artifacts: &self.artifacts,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtractionPlan {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ExtractionPlanWire::deserialize(deserializer)?;
+        if wire.contract != EXTRACTION_PLAN_CONTRACT {
+            return Err(serde::de::Error::custom(
+                ExtractionModelError::UnexpectedContract {
+                    expected: EXTRACTION_PLAN_CONTRACT,
+                    actual: wire.contract,
+                },
+            ));
+        }
+        if wire.version != EXTRACTION_PLAN_VERSION {
+            return Err(serde::de::Error::custom(
+                ExtractionModelError::UnsupportedPlanVersion(wire.version),
+            ));
+        }
+        let artifacts = wire
+            .artifacts
+            .into_iter()
+            .map(PlannedArtifactWire::into_artifact)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(serde::de::Error::custom)?;
+        let plan = Self::new(
+            wire.workspace_id,
+            wire.revision,
+            wire.request,
+            wire.selection_witness,
+            wire.sources,
+            artifacts,
+        )
+        .map_err(serde::de::Error::custom)?;
+        if plan.request_digest != wire.request_digest {
+            return Err(serde::de::Error::custom(
+                ExtractionModelError::RequestDigestMismatch {
+                    declared: wire.request_digest,
+                    actual: plan.request_digest,
+                },
+            ));
+        }
+        Ok(plan)
+    }
+}
+
+pub(crate) fn normalize_source_expectations(
+    mut sources: Vec<ExtractionSourceExpectation>,
+) -> Result<Vec<ExtractionSourceExpectation>, ExtractionModelError> {
+    sources.sort_unstable_by(|left, right| left.locator().cmp(right.locator()));
+    if let Some(pair) = sources.windows(2).find(|pair| {
+        pair[0].locator() == pair[1].locator() && pair[0].fingerprint() != pair[1].fingerprint()
+    }) {
+        return Err(ExtractionModelError::ConflictingSourceExpectation {
+            locator: pair[1].locator().clone(),
+            first: pair[0].fingerprint(),
+            second: pair[1].fingerprint(),
+        });
+    }
+    sources.dedup_by(|right, left| right.locator() == left.locator());
+    Ok(sources)
+}
+
+fn validate_planned_artifacts(
+    request: &ExtractionRequest,
+    selection_witness: ExtractionSelectionWitness,
+    sources: &[ExtractionSourceExpectation],
+    artifacts: &[PlannedArtifact],
+) -> Result<(), ExtractionModelError> {
+    validate_planned_artifacts_with_budget(request, selection_witness, sources, artifacts, None)
+}
+
+fn validate_planned_artifacts_budgeted(
+    request: &ExtractionRequest,
+    selection_witness: ExtractionSelectionWitness,
+    sources: &[ExtractionSourceExpectation],
+    artifacts: &[PlannedArtifact],
+    budget: &mut AssetLoadBudget,
+) -> Result<(), ExtractionModelError> {
+    validate_planned_artifacts_with_budget(
+        request,
+        selection_witness,
+        sources,
+        artifacts,
+        Some(budget),
+    )
+}
+
+fn validate_planned_artifacts_with_budget(
+    request: &ExtractionRequest,
+    selection_witness: ExtractionSelectionWitness,
+    sources: &[ExtractionSourceExpectation],
+    artifacts: &[PlannedArtifact],
+    mut budget: Option<&mut AssetLoadBudget>,
+) -> Result<(), ExtractionModelError> {
+    let artifact_count = u64::try_from(artifacts.len()).map_err(|_| {
+        ExtractionModelError::ArtifactCountOverflow {
+            count: artifacts.len(),
+        }
+    })?;
+    if artifact_count > selection_witness.candidate_count() {
+        return Err(ExtractionModelError::ArtifactCountExceedsSelectionWitness {
+            candidates: selection_witness.candidate_count(),
+            artifacts: artifact_count,
+        });
+    }
+    let path_capacity =
+        artifacts
+            .len()
+            .checked_mul(2)
+            .ok_or(ExtractionModelError::ArithmeticOverflow {
+                resource: "extraction plan validation paths",
+            })?;
+    let source_capacity =
+        artifacts
+            .len()
+            .checked_mul(3)
+            .ok_or(ExtractionModelError::ArithmeticOverflow {
+                resource: "extraction plan validation source locators",
+            })?;
+    let mut addresses = validation_vec(
+        artifacts.len(),
+        "extraction plan validation addresses",
+        reborrow_budget(&mut budget),
+    )?;
+    let mut paths = validation_vec(
+        path_capacity,
+        "extraction plan validation paths",
+        reborrow_budget(&mut budget),
+    )?;
+    let mut expected_sources = validation_vec(
+        source_capacity,
+        "extraction plan validation source locators",
+        reborrow_budget(&mut budget),
+    )?;
+    for (index, artifact) in artifacts.iter().enumerate() {
+        let expected = u32::try_from(index)
+            .map_err(|_| ExtractionModelError::ArtifactCountOverflow { count: index + 1 })?;
+        if artifact.ordinal != expected {
+            return Err(ExtractionModelError::NonCanonicalArtifactOrdinal {
+                index,
+                expected,
+                actual: artifact.ordinal,
+            });
+        }
+        if !request
+            .filter()
+            .matches_object_kind(artifact.address.kind())
+        {
+            return Err(ExtractionModelError::ArtifactOutsideObjectKindFilter {
+                ordinal: artifact.ordinal,
+                object_kind: artifact.address.kind(),
+            });
+        }
+        validate_source_for_address(sources, &artifact.address)?;
+        artifact.representation.validate_sources(sources)?;
+        artifact.representation.validate_request(
+            artifact.address.kind(),
+            artifact.class_id,
+            request.representation(),
+        )?;
+        if !path_is_within_prefix(request.prefix(), artifact.preferred_path())
+            || artifact
+                .fallback_path()
+                .is_some_and(|path| !path_is_within_prefix(request.prefix(), path))
+        {
+            return Err(ExtractionModelError::ArtifactOutsideRequestPrefix {
+                ordinal: artifact.ordinal,
+            });
+        }
+        expected_sources.push(artifact.address.source_locator());
+        if let Some(locator) = artifact.representation.dependency_locator() {
+            expected_sources.push(locator);
+        }
+        if let Some(source) = artifact.representation.stream_source_expectation() {
+            expected_sources.push(source.locator());
+        }
+        paths.push(artifact.preferred_path());
+        if let Some(path) = artifact.fallback_path() {
+            paths.push(path);
+        }
+        addresses.push(&artifact.address);
+    }
+    addresses.sort_unstable();
+    if let Some(pair) = addresses.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(ExtractionModelError::DuplicateArtifactAddress(
+            (*pair[0]).clone(),
+        ));
+    }
+    expected_sources.sort_unstable();
+    expected_sources.dedup();
+    if expected_sources.len() != sources.len()
+        || expected_sources
+            .iter()
+            .zip(sources)
+            .any(|(expected, actual)| *expected != actual.locator())
+    {
+        return Err(ExtractionModelError::SourceExpectationSetMismatch {
+            expected: expected_sources.len(),
+            actual: sources.len(),
+        });
+    }
+    validate_unique_paths(paths)
+}
+
+fn path_is_within_prefix(prefix: Option<&ExtractionPath>, path: &ExtractionPath) -> bool {
+    let Some(prefix) = prefix else {
+        return true;
+    };
+    path.as_str()
+        .strip_prefix(prefix.as_str())
+        .is_some_and(|suffix| suffix.len() > 1 && suffix.starts_with('/'))
+}
+
+fn reborrow_budget<'borrow>(
+    budget: &'borrow mut Option<&mut AssetLoadBudget>,
+) -> Option<&'borrow mut AssetLoadBudget> {
+    match budget {
+        Some(budget) => Some(&mut **budget),
+        None => None,
+    }
+}
+
+fn validation_vec<T>(
+    capacity: usize,
+    resource: &'static str,
+    budget: Option<&mut AssetLoadBudget>,
+) -> Result<Vec<T>, ExtractionModelError> {
+    let entries =
+        u64::try_from(capacity).map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    let minimum_bytes = vec_allocation_bytes::<T>(capacity)
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+    if let Some(budget) = budget.as_deref() {
+        budget.check_entries(entries)?;
+        budget.check_bytes(minimum_bytes)?;
+    }
+
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|source| ExtractionModelError::Allocation {
+            resource,
+            requested: capacity,
+            source,
+        })?;
+    if let Some(budget) = budget {
+        let retained_bytes = vec_allocation_bytes::<T>(values.capacity())
+            .map_err(|_| BudgetError::ArithmeticOverflow { resource })?;
+        budget.check_bytes(retained_bytes)?;
+        budget.consume_entries(entries)?;
+        budget.consume_bytes(retained_bytes)?;
+    }
+    Ok(values)
+}
+
+fn validate_source_for_address(
+    sources: &[ExtractionSourceExpectation],
+    address: &ObjectAddress,
+) -> Result<(), ExtractionModelError> {
+    let source = expectation_for(sources, address.source_locator())?;
+    let expected = match address.kind() {
+        ObjectKind::Binary => SourceKind::SerializedFile,
+        ObjectKind::Yaml => SourceKind::Yaml,
+    };
+    let actual = source.fingerprint().kind();
+    if actual != expected {
+        return Err(ExtractionModelError::SourceKindMismatch {
+            locator: source.locator().clone(),
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn expectation_for<'source>(
+    sources: &'source [ExtractionSourceExpectation],
+    locator: &SourceLocator,
+) -> Result<&'source ExtractionSourceExpectation, ExtractionModelError> {
+    sources
+        .binary_search_by(|source| source.locator().cmp(locator))
+        .map(|index| &sources[index])
+        .map_err(|_| ExtractionModelError::MissingSourceExpectation(locator.clone()))
+}
+
+pub(super) fn paths_conflict(left: &str, right: &str) -> bool {
+    left == right
+        || left
+            .strip_prefix(right)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+pub(super) fn first_path_conflict<'path>(
+    paths: &mut [&'path ExtractionPath],
+) -> Option<(&'path ExtractionPath, &'path ExtractionPath)> {
+    paths.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+    if let Some(pair) = paths
+        .windows(2)
+        .find(|pair| paths_conflict(pair[0].as_str(), pair[1].as_str()))
+    {
+        return Some((pair[0], pair[1]));
+    }
+    paths.sort_unstable_by(|left, right| {
+        left.portability_key()
+            .cmp(right.portability_key())
+            .then_with(|| left.as_str().cmp(right.as_str()))
+    });
+    paths
+        .windows(2)
+        .find(|pair| paths_conflict(pair[0].portability_key(), pair[1].portability_key()))
+        .map(|pair| (pair[0], pair[1]))
+}
+
+fn validate_unique_paths(mut paths: Vec<&ExtractionPath>) -> Result<(), ExtractionModelError> {
+    if let Some((first, second)) = first_path_conflict(&mut paths) {
+        return Err(ExtractionModelError::DuplicateArtifactPath {
+            first: first.as_str().to_owned(),
+            second: second.as_str().to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_metadata(
+    field: &'static str,
+    value: &str,
+    empty_allowed: bool,
+) -> Result<(), ExtractionModelError> {
+    if (!empty_allowed && value.is_empty())
+        || value.len() > MAX_METADATA_TEXT_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(ExtractionModelError::InvalidMetadata {
+            field,
+            value: value.to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn normalize_selection_pattern(value: String) -> Result<String, ExtractionModelError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_SELECTION_PATTERN_BYTES
+        || trimmed.chars().any(char::is_control)
+    {
+        return Err(ExtractionModelError::InvalidSelectionPattern(value));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn normalize_filter_text(
+    field: &'static str,
+    value: Option<String>,
+) -> Result<Option<String>, ExtractionModelError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let normalized: String = trimmed.chars().flat_map(char::to_lowercase).collect();
+    if normalized.len() > MAX_FILTER_TEXT_BYTES || normalized.chars().any(char::is_control) {
+        return Err(ExtractionModelError::InvalidFilterText { field, value });
+    }
+    Ok(Some(normalized))
+}
+
+pub(super) fn normalize_values<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn lowercase_contains(value: &str, needle: &str) -> bool {
+    value.char_indices().any(|(start, _)| {
+        let mut actual = value[start..].chars().flat_map(char::to_lowercase);
+        needle
+            .chars()
+            .all(|expected| actual.next() == Some(expected))
+    })
+}
+
+/// Validation failure for a persisted extraction request or plan.
+#[non_exhaustive]
+#[derive(Debug, Error)]
+pub enum ExtractionModelError {
+    #[error("extraction contract {actual:?} is unsupported; expected {expected:?}")]
+    UnexpectedContract {
+        expected: &'static str,
+        actual: String,
+    },
+    #[error("extraction request version {0} is unsupported")]
+    UnsupportedRequestVersion(u8),
+    #[error("extraction plan version {0} is unsupported")]
+    UnsupportedPlanVersion(u8),
+    #[error("invalid extraction path: {0}")]
+    InvalidPath(#[from] ArtifactNameError),
+    #[error("bundle container selection pattern is invalid: {0:?}")]
+    InvalidSelectionPattern(String),
+    #[error("extraction filter {field} is invalid: {value:?}")]
+    InvalidFilterText { field: &'static str, value: String },
+    #[error("extraction filter limit must be nonzero")]
+    ZeroExtractionLimit,
+    #[error("extraction filter is missing the required object_kinds field")]
+    MissingObjectKindFilter,
+    #[error(
+        "planned artifact {ordinal} has object kind {object_kind:?}, which the request filter excludes"
+    )]
+    ArtifactOutsideObjectKindFilter {
+        ordinal: u32,
+        object_kind: ObjectKind,
+    },
+    #[error("media descriptor family is {actual:?}; representation requires {expected:?}")]
+    MediaDescriptorFamilyMismatch {
+        expected: MediaFamily,
+        actual: MediaFamily,
+    },
+    #[error("artifact path {path:?} must end in the canonical .{expected} suffix")]
+    ArtifactExtensionMismatch {
+        path: String,
+        expected: &'static str,
+    },
+    #[error("artifact metadata {field} is invalid: {value:?}")]
+    InvalidMetadata { field: &'static str, value: String },
+    #[error("artifact declares kind {declared:?}, but content requires {actual:?}")]
+    ArtifactKindMismatch {
+        declared: ExtractionArtifactKind,
+        actual: ExtractionArtifactKind,
+    },
+    #[error("{artifact_kind:?} representation is missing its implementation semantics")]
+    MissingRepresentationSemantics {
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("representation semantics do not match the current implementation")]
+    RepresentationSemanticsMismatch,
+    #[error("preferred and fallback outputs collide at {0:?}")]
+    FallbackPathCollision(String),
+    #[error("decoded extraction fallbacks must be raw binary outputs")]
+    InvalidFallbackContent,
+    #[error("planned artifact {ordinal} declares a zero-byte working set")]
+    ZeroWorkingSet { ordinal: u32 },
+    #[error("extraction request digest is {actual}, not declared digest {declared}")]
+    RequestDigestMismatch {
+        declared: DigestV1,
+        actual: DigestV1,
+    },
+    #[error("source {locator:?} has conflicting fingerprints {first} and {second}")]
+    ConflictingSourceExpectation {
+        locator: SourceLocator,
+        first: SourceFingerprint,
+        second: SourceFingerprint,
+    },
+    #[error("source {0:?} has no expected fingerprint")]
+    MissingSourceExpectation(SourceLocator),
+    #[error("source {locator:?} has kind {actual:?}; object requires {expected:?}")]
+    SourceKindMismatch {
+        locator: SourceLocator,
+        expected: SourceKind,
+        actual: SourceKind,
+    },
+    #[error("source {locator:?} has fingerprint {actual}; representation requires {expected}")]
+    SourceFingerprintMismatch {
+        locator: SourceLocator,
+        expected: SourceFingerprint,
+        actual: SourceFingerprint,
+    },
+    #[error(
+        "extraction plan source expectations are not exact: expected {expected}, found {actual}"
+    )]
+    SourceExpectationSetMismatch { expected: usize, actual: usize },
+    #[error("{object_kind:?} object cannot use {artifact_kind:?} extraction content")]
+    ObjectKindContentMismatch {
+        object_kind: ObjectKind,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("class {class_id} cannot use {artifact_kind:?} extraction content")]
+    ClassContentMismatch {
+        class_id: i32,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("{policy:?} extraction cannot use {artifact_kind:?} content")]
+    RepresentationPolicyMismatch {
+        policy: ExtractionRepresentationPolicy,
+        artifact_kind: ExtractionArtifactKind,
+    },
+    #[error("prefer-decoded raw fallback requires a deterministic planning diagnostic")]
+    MissingFallbackDiagnostic,
+    #[error("extraction plan contains too many artifacts: {count}")]
+    ArtifactCountOverflow { count: usize },
+    #[error(
+        "extraction plan contains {artifacts} artifacts, but its selection witness contains only {candidates} candidates"
+    )]
+    ArtifactCountExceedsSelectionWitness { candidates: u64, artifacts: u64 },
+    #[error(
+        "planned artifact at index {index} has ordinal {actual}; expected consecutive ordinal {expected}"
+    )]
+    NonCanonicalArtifactOrdinal {
+        index: usize,
+        expected: u32,
+        actual: u32,
+    },
+    #[error("planned artifact {ordinal} is outside the extraction request prefix")]
+    ArtifactOutsideRequestPrefix { ordinal: u32 },
+    #[error("extraction plan contains duplicate object address {0:?}")]
+    DuplicateArtifactAddress(ObjectAddress),
+    #[error("planned artifact {ordinal} contains a diagnostic for another object")]
+    InvalidDiagnosticAddress { ordinal: u32 },
+    #[error("extraction paths {first:?} and {second:?} cannot coexist on portable filesystems")]
+    DuplicateArtifactPath { first: String, second: String },
+    #[error("arithmetic overflow while validating {resource}")]
+    ArithmeticOverflow { resource: &'static str },
+    #[error("failed to reserve {requested} capacity units for {resource}: {source}")]
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
+    #[error(transparent)]
+    Budget(#[from] BudgetError),
+    #[error(transparent)]
+    Canonical(#[from] ExtractionCanonicalError),
+}
+
+impl From<RepresentationContractError> for ExtractionModelError {
+    fn from(error: RepresentationContractError) -> Self {
+        match error {
+            RepresentationContractError::MissingRepresentationSemantics { artifact_kind } => {
+                Self::MissingRepresentationSemantics { artifact_kind }
+            }
+            RepresentationContractError::RepresentationSemanticsMismatch { .. } => {
+                Self::RepresentationSemanticsMismatch
+            }
+            RepresentationContractError::MediaDescriptorFamilyMismatch { expected, actual } => {
+                Self::MediaDescriptorFamilyMismatch { expected, actual }
+            }
+            RepresentationContractError::ArtifactExtensionMismatch { path, expected } => {
+                Self::ArtifactExtensionMismatch { path, expected }
+            }
+            RepresentationContractError::ArtifactKindMismatch { declared, actual } => {
+                Self::ArtifactKindMismatch { declared, actual }
+            }
+            RepresentationContractError::FallbackPathCollision(path) => {
+                Self::FallbackPathCollision(path)
+            }
+            RepresentationContractError::InvalidFallbackContent => Self::InvalidFallbackContent,
+            RepresentationContractError::ZeroWorkingSet { ordinal } => {
+                Self::ZeroWorkingSet { ordinal }
+            }
+            RepresentationContractError::InvalidDiagnosticAddress { ordinal } => {
+                Self::InvalidDiagnosticAddress { ordinal }
+            }
+            RepresentationContractError::MissingSourceExpectation(locator) => {
+                Self::MissingSourceExpectation(locator)
+            }
+            RepresentationContractError::SourceKindMismatch {
+                locator,
+                expected,
+                actual,
+            } => Self::SourceKindMismatch {
+                locator,
+                expected,
+                actual,
+            },
+            RepresentationContractError::SourceFingerprintMismatch {
+                locator,
+                expected,
+                actual,
+            } => Self::SourceFingerprintMismatch {
+                locator,
+                expected,
+                actual,
+            },
+            RepresentationContractError::ObjectKindContentMismatch {
+                object_kind,
+                artifact_kind,
+            } => Self::ObjectKindContentMismatch {
+                object_kind,
+                artifact_kind,
+            },
+            RepresentationContractError::ClassContentMismatch {
+                class_id,
+                artifact_kind,
+            } => Self::ClassContentMismatch {
+                class_id,
+                artifact_kind,
+            },
+            RepresentationContractError::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind,
+            } => Self::RepresentationPolicyMismatch {
+                policy,
+                artifact_kind,
+            },
+            RepresentationContractError::MissingFallbackDiagnostic => {
+                Self::MissingFallbackDiagnostic
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn planned_text_artifact() -> PlannedArtifact {
+        let address =
+            ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
+                .unwrap();
+        let fallback = PlannedFallback::new(
+            ExtractionPath::new("object.raw.bin").unwrap(),
+            PlannedContent::RawBinary,
+        )
+        .unwrap();
+        let representation = RepresentationContract::from_parts(
+            0,
+            &address,
+            RepresentationContractParts {
+                preferred_path: ExtractionPath::new("object.txt").unwrap(),
+                preferred_content: PlannedContent::TextAsset,
+                fallback: Some(fallback),
+                working_set_bytes: 1,
+                diagnostics: Vec::new(),
+            },
+        )
+        .unwrap();
+        PlannedArtifact::new(
+            0,
+            address,
+            49,
+            "TextAsset".to_owned(),
+            Some("object".to_owned()),
+            representation,
+        )
+        .unwrap()
+    }
+
+    fn planned_text_plan() -> ExtractionPlan {
+        let artifact = planned_text_artifact();
+        let source = ExtractionSourceExpectation::new(
+            artifact.address().source_locator().clone(),
+            SourceFingerprint::from_bytes(SourceKind::SerializedFile, b"content"),
+        );
+        ExtractionPlan::new(
+            WorkspaceId::from_u128(1).unwrap(),
+            WorkspaceRevision::new(DigestV1::hash_bytes(b"revision")),
+            ExtractionRequest::all(ExtractionRepresentationPolicy::PreferDecoded),
+            ExtractionSelectionWitness::new(1, DigestV1::hash_bytes(b"selection")),
+            vec![source],
+            vec![artifact],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn request_v4_persists_reference_intent_without_query_only_limits() {
+        let root = ObjectAddress::binary_direct(SourceLocator::path("content.assets").unwrap(), 41)
+            .unwrap();
+        let limits = ExtractionReferenceTraversalLimits::unbounded()
+            .with_max_depth(4)
+            .with_max_nodes(100)
+            .with_max_edges(250);
+        let request = ExtractionRequest::reference_traversal(
+            [root.clone()],
+            ExtractionReferenceDirection::Outgoing,
+            limits,
+            ExtractionRepresentationPolicy::RawOnly,
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            encoded["version"],
+            serde_json::json!(EXTRACTION_REQUEST_VERSION)
+        );
+        assert_eq!(
+            encoded["selection"]["direction"],
+            serde_json::json!("outgoing")
+        );
+        assert_eq!(encoded["selection"]["roots"], serde_json::json!([root]));
+        assert_eq!(encoded["selection"]["limits"]["max_depth"], 4);
+        assert_eq!(encoded["selection"]["limits"]["max_nodes"], 100);
+        assert_eq!(encoded["selection"]["limits"]["max_edges"], 250);
+        assert!(
+            encoded["selection"]["limits"]
+                .get("max_components")
+                .is_none()
+        );
+
+        let decoded: ExtractionRequest = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(decoded, request);
+
+        let mut legacy = encoded;
+        legacy["version"] = serde_json::json!(1);
+        let error = serde_json::from_value::<ExtractionRequest>(legacy).unwrap_err();
+        assert!(error.to_string().contains("version 1 is unsupported"));
+    }
+
+    #[test]
+    fn yaml_documents_request_persists_the_object_kind_filter() {
+        let request = ExtractionRequest::yaml_documents();
+        let encoded = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            request.representation(),
+            ExtractionRepresentationPolicy::RawOnly
+        );
+        assert_eq!(request.filter().object_kinds(), &[ObjectKind::Yaml]);
+        assert_eq!(
+            encoded["filter"]["object_kinds"],
+            serde_json::json!(["yaml"])
+        );
+        assert_eq!(
+            serde_json::from_value::<ExtractionRequest>(encoded).unwrap(),
+            request
+        );
+    }
+
+    #[test]
+    fn plan_v8_artifact_serializes_derived_kinds_and_semantics() {
+        let artifact = planned_text_artifact();
+        let encoded = serde_json::to_value(&artifact).unwrap();
+
+        assert_eq!(encoded["preferred_kind"], serde_json::json!("text"));
+        assert_eq!(
+            encoded["preferred_content"]["kind"],
+            serde_json::json!("text_asset")
+        );
+        assert_eq!(
+            encoded["representation_semantics"],
+            serde_json::json!({
+                "kind": "text_asset",
+                "bytes": "type_tree_script_bytes_v1",
+            })
+        );
+        assert_eq!(encoded["fallback"]["kind"], serde_json::json!("binary_raw"));
+        assert_eq!(
+            encoded["fallback"]["content"]["kind"],
+            serde_json::json!("raw_binary")
+        );
+        assert_eq!(
+            encoded["fallback"]["representation_semantics"],
+            serde_json::json!({
+                "kind": "raw_binary",
+                "bytes": "workspace_object_raw_bytes_v1",
+            })
+        );
+
+        let wire: PlannedArtifactWire = serde_json::from_value(encoded).unwrap();
+        assert_eq!(wire.into_artifact().unwrap(), artifact);
+    }
+
+    #[test]
+    fn plan_v8_digest_covers_representation_semantics() {
+        let plan = planned_text_plan();
+        let canonical = plan.canonical_json().unwrap();
+        assert_eq!(plan.digest().unwrap(), DigestV1::hash_bytes(&canonical));
+        assert!(
+            canonical
+                .windows(b"representation_semantics".len())
+                .any(|window| { window == b"representation_semantics" })
+        );
+        assert!(
+            canonical
+                .windows(b"type_tree_script_bytes_v1".len())
+                .any(|window| { window == b"type_tree_script_bytes_v1" })
+        );
+    }
+
+    #[test]
+    fn legacy_v7_plan_is_rejected() {
+        let mut legacy = serde_json::to_value(planned_text_plan()).unwrap();
+        legacy["version"] = serde_json::json!(7);
+
+        let error = serde_json::from_value::<ExtractionPlan>(legacy).unwrap_err();
+        assert!(error.to_string().contains("plan version 7 is unsupported"));
+    }
+
+    #[test]
+    fn v8_plan_rejects_missing_or_mismatched_semantics() {
+        let encoded = serde_json::to_value(planned_text_plan()).unwrap();
+
+        let mut missing = encoded.clone();
+        missing["artifacts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("representation_semantics");
+        let error = serde_json::from_value::<ExtractionPlan>(missing).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing its implementation semantics")
+        );
+
+        let mut mismatched = encoded;
+        mismatched["artifacts"][0]["representation_semantics"] = serde_json::json!({
+            "kind": "raw_binary",
+            "bytes": "workspace_object_raw_bytes_v1",
+        });
+        let error = serde_json::from_value::<ExtractionPlan>(mismatched).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("do not match the current implementation")
+        );
+    }
+
+    #[test]
+    fn require_decoded_rejects_a_raw_fallback() {
+        let artifact = planned_text_artifact();
+        let error = artifact
+            .representation
+            .validate_request(
+                ObjectKind::Binary,
+                49,
+                ExtractionRepresentationPolicy::RequireDecoded,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::RepresentationPolicyMismatch {
+                policy: ExtractionRepresentationPolicy::RequireDecoded,
+                artifact_kind: ExtractionArtifactKind::BinaryRaw,
+            }
+        ));
+    }
+
+    #[test]
+    fn prefer_decoded_requires_a_raw_fallback_for_decoded_content() {
+        let mut encoded = serde_json::to_value(planned_text_artifact()).unwrap();
+        encoded["fallback"] = serde_json::Value::Null;
+        let artifact = serde_json::from_value::<PlannedArtifactWire>(encoded)
+            .unwrap()
+            .into_artifact()
+            .unwrap();
+        let error = artifact
+            .representation
+            .validate_request(
+                ObjectKind::Binary,
+                49,
+                ExtractionRepresentationPolicy::PreferDecoded,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::RepresentationPolicyMismatch {
+                policy: ExtractionRepresentationPolicy::PreferDecoded,
+                artifact_kind: ExtractionArtifactKind::Text,
+            }
+        ));
+    }
+
+    #[test]
+    fn decoded_content_is_bound_to_its_unity_class() {
+        let artifact = planned_text_artifact();
+        let error = artifact
+            .representation
+            .validate_request(
+                ObjectKind::Binary,
+                unity_asset_binary::asset::class_ids::TEXTURE_2D,
+                ExtractionRepresentationPolicy::PreferDecoded,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            RepresentationContractError::ClassContentMismatch {
+                class_id: unity_asset_binary::asset::class_ids::TEXTURE_2D,
+                artifact_kind: ExtractionArtifactKind::Text,
+            }
+        ));
+    }
+
+    #[test]
+    fn plan_v8_artifact_rejects_tampered_preferred_and_fallback_kinds() {
+        let encoded = serde_json::to_value(planned_text_artifact()).unwrap();
+
+        let mut preferred = encoded.clone();
+        preferred["preferred_kind"] = serde_json::json!("yaml");
+        let error = serde_json::from_value::<PlannedArtifactWire>(preferred)
+            .unwrap()
+            .into_artifact()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionModelError::ArtifactKindMismatch {
+                declared: ExtractionArtifactKind::Yaml,
+                actual: ExtractionArtifactKind::Text,
+            }
+        ));
+
+        let mut fallback = encoded;
+        fallback["fallback"]["kind"] = serde_json::json!("text");
+        let error = serde_json::from_value::<PlannedArtifactWire>(fallback)
+            .unwrap()
+            .into_artifact()
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExtractionModelError::ArtifactKindMismatch {
+                declared: ExtractionArtifactKind::Text,
+                actual: ExtractionArtifactKind::BinaryRaw,
+            }
+        ));
+    }
+}

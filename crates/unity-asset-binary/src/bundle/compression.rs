@@ -4,9 +4,24 @@
 //! for Unity AssetBundle blocks, supporting LZ4, LZMA, and Brotli.
 
 use super::header::BundleHeader;
-use crate::compression::{CompressionBlock, CompressionType, decompress};
+use crate::compression::{
+    CompressionBlock, CompressionType, decompress_with_budget, decompressor_scratch_bytes,
+};
 use crate::error::{BinaryError, Result};
 use crate::reader::{BinaryReader, ByteOrder};
+use crate::shared_bytes::SharedBytes;
+use unity_asset_core::{AssetLoadBudget, arc_vec_allocation_bytes, vec_allocation_bytes};
+
+#[derive(Clone, Copy)]
+enum DataBlockOutputStorage {
+    Vec,
+    Shared,
+}
+
+struct DataBlockPreflight {
+    output_len: usize,
+    retained_bytes: u64,
+}
 
 /// Bundle compression handler
 ///
@@ -23,7 +38,16 @@ impl BundleCompression {
         header: &BundleHeader,
         compressed_data: &[u8],
     ) -> Result<Vec<u8>> {
-        Self::decompress_blocks_info_limited(header, compressed_data, None)
+        let mut budget = AssetLoadBudget::default();
+        Self::decompress_blocks_info_with_budget(header, compressed_data, &mut budget)
+    }
+
+    pub fn decompress_blocks_info_with_budget(
+        header: &BundleHeader,
+        compressed_data: &[u8],
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<u8>> {
+        Self::decompress_blocks_info_limited_with_budget(header, compressed_data, None, budget)
     }
 
     pub fn decompress_blocks_info_limited(
@@ -31,7 +55,23 @@ impl BundleCompression {
         compressed_data: &[u8],
         max_uncompressed_size: Option<usize>,
     ) -> Result<Vec<u8>> {
-        let expected_uncompressed = header.uncompressed_blocks_info_size as usize;
+        let mut budget = AssetLoadBudget::default();
+        Self::decompress_blocks_info_limited_with_budget(
+            header,
+            compressed_data,
+            max_uncompressed_size,
+            &mut budget,
+        )
+    }
+
+    pub fn decompress_blocks_info_limited_with_budget(
+        header: &BundleHeader,
+        compressed_data: &[u8],
+        max_uncompressed_size: Option<usize>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<u8>> {
+        let expected_uncompressed = usize::try_from(header.uncompressed_blocks_info_size)
+            .map_err(|_| BinaryError::invalid_data("Blocks info size does not fit in usize"))?;
         if let Some(limit) = max_uncompressed_size
             && expected_uncompressed > limit
         {
@@ -40,38 +80,22 @@ impl BundleCompression {
                 expected_uncompressed, limit
             )));
         }
-        let compression_type = header.flags & 0x3F; // CompressionTypeMask
-
-        match compression_type {
-            0 => {
-                // No compression
-                Ok(compressed_data.to_vec())
-            }
-            2 | 3 => {
-                // LZ4 or LZ4HC
-                decompress(compressed_data, CompressionType::Lz4, expected_uncompressed)
-            }
-            1 => {
-                // LZMA
-                decompress(
-                    compressed_data,
-                    CompressionType::Lzma,
-                    expected_uncompressed,
-                )
-            }
-            4 => {
-                // Brotli (newer Unity versions)
-                decompress(
-                    compressed_data,
-                    CompressionType::Brotli,
-                    expected_uncompressed,
-                )
-            }
-            _ => Err(BinaryError::unsupported(format!(
-                "Unknown compression type: {}",
-                compression_type
-            ))),
+        let compression = CompressionType::from_flags(header.flags)?;
+        if !compression.is_supported() {
+            return Err(BinaryError::unsupported_compression(format!(
+                "{} compression not yet supported",
+                compression.name()
+            )));
         }
+        budget.check_decompression(
+            u64::try_from(compressed_data.len()).map_err(|_| {
+                BinaryError::invalid_data("Blocks info compressed size does not fit in u64")
+            })?,
+            u64::try_from(expected_uncompressed).map_err(|_| {
+                BinaryError::invalid_data("Blocks info uncompressed size does not fit in u64")
+            })?,
+        )?;
+        decompress_with_budget(compressed_data, compression, expected_uncompressed, budget)
     }
 
     /// Parse compression blocks from decompressed blocks info
@@ -79,15 +103,23 @@ impl BundleCompression {
     /// This method parses the compression block metadata from the
     /// decompressed blocks info data.
     pub fn parse_compression_blocks(data: &[u8]) -> Result<Vec<CompressionBlock>> {
-        Self::parse_compression_blocks_limited(data, &super::types::BundleLoadOptions::fast())
+        Self::parse_compression_blocks_limited(data, &super::types::BundleLoadOptions::lazy())
     }
 
     pub fn parse_compression_blocks_limited(
         data: &[u8],
         options: &super::types::BundleLoadOptions,
     ) -> Result<Vec<CompressionBlock>> {
+        let mut budget = AssetLoadBudget::default();
+        Self::parse_compression_blocks_limited_with_budget(data, options, &mut budget)
+    }
+
+    pub fn parse_compression_blocks_limited_with_budget(
+        data: &[u8],
+        options: &super::types::BundleLoadOptions,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<CompressionBlock>> {
         let mut reader = BinaryReader::new(data, ByteOrder::Big);
-        let mut blocks = Vec::new();
 
         // Skip uncompressed data hash (16 bytes) - critical step
         reader.read_bytes(16)?;
@@ -100,7 +132,8 @@ impl BundleCompression {
                 block_count_i32
             )));
         }
-        let block_count = block_count_i32 as usize;
+        let block_count = usize::try_from(block_count_i32)
+            .map_err(|_| BinaryError::invalid_data("Negative compression block count"))?;
         if block_count > options.max_blocks {
             return Err(BinaryError::ResourceLimitExceeded(format!(
                 "Compression block count {} exceeds limit {}",
@@ -119,6 +152,15 @@ impl BundleCompression {
         if data.len() < required {
             return Err(BinaryError::not_enough_data(required, data.len()));
         }
+        budget.consume_entries(u64::try_from(block_count).map_err(|_| {
+            BinaryError::invalid_data("Compression block count does not fit in u64")
+        })?)?;
+        let mut blocks = Vec::new();
+        blocks.try_reserve_exact(block_count).map_err(|error| {
+            BinaryError::memory_error(format!(
+                "Failed to reserve {block_count} compression blocks: {error}"
+            ))
+        })?;
 
         for _ in 0..block_count {
             let uncompressed_size = reader.read_u32()?;
@@ -141,7 +183,17 @@ impl BundleCompression {
         blocks: &[CompressionBlock],
         reader: &mut BinaryReader,
     ) -> Result<Vec<u8>> {
-        Self::decompress_data_blocks_limited(header, blocks, reader, None)
+        let mut budget = AssetLoadBudget::default();
+        Self::decompress_data_blocks_with_budget(header, blocks, reader, &mut budget)
+    }
+
+    pub fn decompress_data_blocks_with_budget(
+        header: &BundleHeader,
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<u8>> {
+        Self::decompress_data_blocks_limited_with_budget(header, blocks, reader, None, budget)
     }
 
     pub fn decompress_data_blocks_limited(
@@ -150,49 +202,238 @@ impl BundleCompression {
         reader: &mut BinaryReader,
         max_memory: Option<usize>,
     ) -> Result<Vec<u8>> {
-        let mut total_uncompressed: u64 = 0;
-        for block in blocks {
-            total_uncompressed = total_uncompressed
-                .checked_add(block.uncompressed_size as u64)
-                .ok_or_else(|| BinaryError::invalid_data("Total uncompressed size overflow"))?;
-        }
-        if let Some(limit) = max_memory
-            && total_uncompressed > limit as u64
-        {
+        let mut budget = AssetLoadBudget::default();
+        Self::decompress_data_blocks_limited_with_budget(
+            header,
+            blocks,
+            reader,
+            max_memory,
+            &mut budget,
+        )
+    }
+
+    pub fn decompress_data_blocks_limited_with_budget(
+        _header: &BundleHeader,
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        max_memory: Option<usize>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<u8>> {
+        let preflight = Self::preflight_data_blocks_for_storage(
+            blocks,
+            reader,
+            max_memory,
+            budget,
+            DataBlockOutputStorage::Vec,
+        )?;
+        Self::decompress_preflighted_data_blocks(blocks, reader, preflight.output_len, budget)
+    }
+
+    pub(crate) fn decompress_data_blocks_shared_limited_with_budget(
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        max_memory: Option<usize>,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<SharedBytes> {
+        let preflight = Self::preflight_data_blocks_for_storage(
+            blocks,
+            reader,
+            max_memory,
+            budget,
+            DataBlockOutputStorage::Shared,
+        )?;
+        let data =
+            Self::decompress_preflighted_data_blocks(blocks, reader, preflight.output_len, budget)?;
+        let actual_retained_bytes =
+            arc_vec_allocation_bytes::<u8>(data.capacity()).map_err(|_| {
+                BinaryError::ResourceLimitExceeded(
+                    "Bundle shared output allocation size overflow".to_string(),
+                )
+            })?;
+        if actual_retained_bytes != preflight.retained_bytes {
             return Err(BinaryError::ResourceLimitExceeded(format!(
-                "Bundle decompressed size {} exceeds max_memory {}",
-                total_uncompressed, limit
+                "Bundle shared output retained allocation {actual_retained_bytes} differs from the preflight proof {}",
+                preflight.retained_bytes
             )));
         }
+        budget.consume_bytes(actual_retained_bytes)?;
+        Ok(SharedBytes::from_vec(data))
+    }
 
-        let total_uncompressed_usize = usize::try_from(total_uncompressed).map_err(|_| {
-            BinaryError::ResourceLimitExceeded(format!(
-                "Bundle decompressed size {} does not fit in usize",
-                total_uncompressed
-            ))
-        })?;
-
-        let mut decompressed_data = Vec::with_capacity(total_uncompressed_usize);
-
-        // The caller is responsible for positioning `reader` at the start of block data, taking
-        // header alignment and `BlocksInfoAtEnd` into account.
-        let _ = header;
+    fn decompress_preflighted_data_blocks(
+        blocks: &[CompressionBlock],
+        reader: &mut BinaryReader,
+        total_uncompressed: usize,
+        budget: &mut AssetLoadBudget,
+    ) -> Result<Vec<u8>> {
+        let mut decompressed_data = Vec::new();
+        decompressed_data
+            .try_reserve_exact(total_uncompressed)
+            .map_err(|error| {
+                BinaryError::memory_error(format!(
+                    "Failed to reserve {total_uncompressed} bundle output bytes: {error}"
+                ))
+            })?;
 
         for block in blocks.iter() {
-            if let Some(limit) = max_memory
-                && (block.uncompressed_size as u64) > (limit as u64)
-            {
-                return Err(BinaryError::ResourceLimitExceeded(format!(
-                    "Block uncompressed size {} exceeds max_memory {}",
-                    block.uncompressed_size, limit
-                )));
-            }
-            let compressed = reader.read_bytes(block.compressed_size as usize)?;
-            let block_data = block.decompress(&compressed)?;
+            let compressed_size = usize::try_from(block.compressed_size).map_err(|_| {
+                BinaryError::invalid_data("Block compressed size does not fit in usize")
+            })?;
+            let compressed = reader.read_bytes(compressed_size)?;
+            let block_data = block.decompress_with_budget(&compressed, budget)?;
             decompressed_data.extend_from_slice(&block_data);
         }
 
         Ok(decompressed_data)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preflight_data_blocks(
+        blocks: &[CompressionBlock],
+        reader: &BinaryReader<'_>,
+        max_memory: Option<usize>,
+        budget: &AssetLoadBudget,
+    ) -> Result<usize> {
+        Self::preflight_data_blocks_for_storage(
+            blocks,
+            reader,
+            max_memory,
+            budget,
+            DataBlockOutputStorage::Vec,
+        )
+        .map(|preflight| preflight.output_len)
+    }
+
+    fn preflight_data_blocks_for_storage(
+        blocks: &[CompressionBlock],
+        reader: &BinaryReader<'_>,
+        max_memory: Option<usize>,
+        budget: &AssetLoadBudget,
+        output_storage: DataBlockOutputStorage,
+    ) -> Result<DataBlockPreflight> {
+        let mut total_compressed = 0u64;
+        let mut total_uncompressed = 0u64;
+
+        for block in blocks {
+            let compressed = u64::from(block.compressed_size);
+            let uncompressed = u64::from(block.uncompressed_size);
+            total_compressed = total_compressed
+                .checked_add(compressed)
+                .ok_or_else(|| BinaryError::invalid_data("Total compressed size overflow"))?;
+            total_uncompressed = total_uncompressed
+                .checked_add(uncompressed)
+                .ok_or_else(|| BinaryError::invalid_data("Total uncompressed size overflow"))?;
+
+            budget.check_decompression(compressed, uncompressed)?;
+        }
+
+        budget.check_decompression(total_compressed, total_uncompressed)?;
+        let output_len = usize::try_from(total_uncompressed).map_err(|_| {
+            BinaryError::ResourceLimitExceeded(format!(
+                "Bundle decompressed size {total_uncompressed} does not fit in usize"
+            ))
+        })?;
+        let (retained_storage_bytes, retained_budget_bytes) = match output_storage {
+            DataBlockOutputStorage::Vec => (
+                vec_allocation_bytes::<u8>(output_len).map_err(|_| {
+                    BinaryError::ResourceLimitExceeded(
+                        "Bundle Vec output allocation size overflow".to_string(),
+                    )
+                })?,
+                0,
+            ),
+            DataBlockOutputStorage::Shared => {
+                let bytes = arc_vec_allocation_bytes::<u8>(output_len).map_err(|_| {
+                    BinaryError::ResourceLimitExceeded(
+                        "Bundle shared output allocation size overflow".to_string(),
+                    )
+                })?;
+                (bytes, bytes)
+            }
+        };
+
+        let compressed_len = usize::try_from(total_compressed).map_err(|_| {
+            BinaryError::ResourceLimitExceeded(format!(
+                "Bundle compressed size {total_compressed} does not fit in usize"
+            ))
+        })?;
+        if compressed_len > reader.remaining() {
+            return Err(BinaryError::not_enough_data(
+                compressed_len,
+                reader.remaining(),
+            ));
+        }
+
+        let source = reader.remaining_slice();
+        let mut source_offset = 0usize;
+        let mut max_block_working_set = 0u64;
+        let mut total_codec_scratch = 0u64;
+        for block in blocks {
+            let compressed_size = usize::try_from(block.compressed_size).map_err(|_| {
+                BinaryError::invalid_data("Block compressed size does not fit usize")
+            })?;
+            let source_end = source_offset
+                .checked_add(compressed_size)
+                .ok_or_else(|| BinaryError::invalid_data("Block source range overflow"))?;
+            let compressed = source
+                .get(source_offset..source_end)
+                .ok_or_else(|| BinaryError::not_enough_data(source_end, source.len()))?;
+            source_offset = source_end;
+
+            let uncompressed_size = usize::try_from(block.uncompressed_size).map_err(|_| {
+                BinaryError::invalid_data("Block uncompressed size does not fit usize")
+            })?;
+            let scratch = decompressor_scratch_bytes(
+                compressed,
+                block.compression_type()?,
+                uncompressed_size,
+            )?;
+            total_codec_scratch = total_codec_scratch.checked_add(scratch).ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(
+                    "Cumulative decompressor scratch size overflow".to_string(),
+                )
+            })?;
+            let block_working_set = u64::from(block.compressed_size)
+                .checked_add(u64::from(block.uncompressed_size))
+                .and_then(|amount| amount.checked_add(scratch))
+                .ok_or_else(|| {
+                    BinaryError::ResourceLimitExceeded(
+                        "Block decompression working-set size overflow".to_string(),
+                    )
+                })?;
+            max_block_working_set = max_block_working_set.max(block_working_set);
+        }
+        let budgeted_bytes = total_codec_scratch
+            .checked_add(retained_budget_bytes)
+            .ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(
+                    "Bundle retained and scratch byte total overflow".to_string(),
+                )
+            })?;
+        budget.check_bytes(budgeted_bytes)?;
+
+        let peak_memory = retained_storage_bytes
+            .checked_add(max_block_working_set)
+            .ok_or_else(|| {
+                BinaryError::ResourceLimitExceeded(
+                    "Bundle decompression peak-memory size overflow".to_string(),
+                )
+            })?;
+        if let Some(limit) = max_memory {
+            let limit = u64::try_from(limit).map_err(|_| {
+                BinaryError::ResourceLimitExceeded("max_memory does not fit u64".to_string())
+            })?;
+            if peak_memory > limit {
+                return Err(BinaryError::ResourceLimitExceeded(format!(
+                    "Bundle decompression peak memory {peak_memory} exceeds max_memory {limit}"
+                )));
+            }
+        }
+
+        Ok(DataBlockPreflight {
+            output_len,
+            retained_bytes: retained_budget_bytes,
+        })
     }
 
     /// Get compression statistics for blocks
@@ -245,7 +486,8 @@ impl BundleCompression {
 
             // Sanity check: compressed size shouldn't be much larger than uncompressed
             // (except for very small blocks or incompressible data)
-            if block.compressed_size > block.uncompressed_size * 2 && block.uncompressed_size > 1024
+            if u64::from(block.compressed_size) > u64::from(block.uncompressed_size) * 2
+                && block.uncompressed_size > 1024
             {
                 return Err(BinaryError::invalid_data(format!(
                     "Block {} has suspicious compression ratio: {}/{}",
@@ -259,27 +501,23 @@ impl BundleCompression {
 
     /// Estimate memory usage for decompression
     pub fn estimate_memory_usage(blocks: &[CompressionBlock]) -> usize {
-        // Estimate peak memory usage during decompression
-        let total_uncompressed: usize = blocks.iter().map(|b| b.uncompressed_size as usize).sum();
-        let max_block_size: usize = blocks
+        let total_uncompressed = blocks.iter().fold(0usize, |total, block| {
+            total.saturating_add(block.uncompressed_size as usize)
+        });
+        let max_block_working_set = blocks
             .iter()
-            .map(|b| b.uncompressed_size as usize)
+            .map(|block| {
+                (block.compressed_size as usize).saturating_add(block.uncompressed_size as usize)
+            })
             .max()
             .unwrap_or(0);
 
-        // Peak usage: total output + largest single block for temporary decompression
-        total_uncompressed + max_block_size
+        total_uncompressed.saturating_add(max_block_working_set)
     }
 
     /// Check if compression type is supported
     pub fn is_compression_supported(compression_type: u32) -> bool {
-        match compression_type {
-            0 => true,     // None
-            1 => true,     // LZMA
-            2 | 3 => true, // LZ4/LZ4HC
-            4 => true,     // Brotli
-            _ => false,
-        }
+        CompressionType::from_flags(compression_type).is_ok_and(CompressionType::is_supported)
     }
 }
 
@@ -355,6 +593,7 @@ impl CompressionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unity_asset_core::{AssetLoadBudget, AssetLoadLimits, BudgetError};
 
     #[test]
     fn test_compression_support() {
@@ -362,7 +601,30 @@ mod tests {
         assert!(BundleCompression::is_compression_supported(1)); // LZMA
         assert!(BundleCompression::is_compression_supported(2)); // LZ4
         assert!(BundleCompression::is_compression_supported(3)); // LZ4HC
+        assert!(!BundleCompression::is_compression_supported(4)); // LZHAM
+        assert!(BundleCompression::is_compression_supported(5)); // Brotli
         assert!(!BundleCompression::is_compression_supported(99)); // Unknown
+    }
+
+    #[test]
+    fn lzham_blocks_info_is_not_reinterpreted_as_brotli() {
+        let header = BundleHeader {
+            flags: CompressionType::Lzham as u32,
+            compressed_blocks_info_size: 1,
+            uncompressed_blocks_info_size: 1,
+            ..Default::default()
+        };
+        let mut budget = AssetLoadBudget::default();
+
+        let error =
+            BundleCompression::decompress_blocks_info_with_budget(&header, &[0], &mut budget)
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::UnsupportedCompression(message) if message.contains("LZHAM")
+        ));
+        assert_eq!(budget.usage(), Default::default());
     }
 
     #[test]
@@ -379,5 +641,70 @@ mod tests {
         assert_eq!(stats.compression_ratio, 0.5);
         assert_eq!(stats.space_saved, 1500);
         assert!(stats.is_effective());
+    }
+
+    #[test]
+    fn data_blocks_share_one_cumulative_decompression_budget() {
+        let header = BundleHeader::default();
+        let blocks = vec![
+            CompressionBlock::new(8, 8, 0),
+            CompressionBlock::new(8, 8, 0),
+        ];
+        let bytes = [0x11_u8; 16];
+        let mut reader = BinaryReader::new(&bytes, ByteOrder::Big);
+        let mut budget = AssetLoadBudget::new(AssetLoadLimits {
+            max_decompressed_bytes: 12,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+
+        let error = BundleCompression::decompress_data_blocks_with_budget(
+            &header,
+            &blocks,
+            &mut reader,
+            &mut budget,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BinaryError::Budget(BudgetError::Exceeded {
+                resource: "decompressed_bytes",
+                limit: 12,
+                requested: 16,
+            })
+        ));
+        assert_eq!(reader.position(), 0);
+        assert_eq!(budget.usage().compressed_bytes, 0);
+        assert_eq!(budget.usage().decompressed_bytes, 0);
+    }
+
+    #[test]
+    fn data_block_preflight_enforces_owned_peak_memory() {
+        let blocks = vec![CompressionBlock::new(8, 8, CompressionType::None as u16)];
+        let bytes = [0x11_u8; 8];
+        let reader = BinaryReader::new(&bytes, ByteOrder::Big);
+        let budget = AssetLoadBudget::default();
+
+        let error = BundleCompression::preflight_data_blocks(&blocks, &reader, Some(23), &budget)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            BinaryError::ResourceLimitExceeded(message)
+                if message.contains("peak memory 24") && message.contains("max_memory 23")
+        ));
+        assert_eq!(reader.position(), 0);
+        assert_eq!(budget.usage(), Default::default());
+
+        assert_eq!(
+            BundleCompression::preflight_data_blocks(&blocks, &reader, Some(24), &budget,).unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn block_validation_handles_u32_extremes_without_overflow() {
+        let blocks = [CompressionBlock::new(u32::MAX, u32::MAX, 0)];
+        BundleCompression::validate_blocks(&blocks).unwrap();
     }
 }

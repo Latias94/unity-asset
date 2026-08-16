@@ -1,14 +1,11 @@
-//! Unity asset edit/write support.
+//! Wire-faithful Unity asset encoding and prepared artifact construction.
 //!
-//! This crate is the home for UnityPy-parity write pipelines:
-//! - TypeTree-driven object encoding
-//! - SerializedFile rebuild/save
-//! - Bundle/WebFile repacking
-//! - `.resS` / streamed resource write support
-//!
-//! The initial milestones intentionally ship APIs and scaffolding first, before wiring up the full
-//! implementation.
+//! The crate owns schema-aware object mutation, SerializedFile rebuilds, Bundle/WebFile repacking,
+//! streamed-resource output, and segmented prepared artifacts that preserve unchanged source
+//! ranges. Canonical TypeTree wire execution lives in `unity-asset-binary`; workspace transaction
+//! authority remains in the high-level `unity-asset` crate.
 
+pub mod artifact;
 mod binary_writer;
 pub mod bundle;
 mod compression;
@@ -16,19 +13,10 @@ pub mod object;
 mod packer;
 pub mod resources;
 pub mod serialized_file;
-pub mod typetree;
 pub mod webfile;
 
-pub use binary_writer::{BinaryWriter, Endian};
-pub use compression::*;
-pub use packer::{PackerOptions, UnityPyPacker};
+pub use binary_writer::BinaryWriter;
+pub use compression::{compress_lz4, compress_lzma_unity, compress_lzma_unity_with_size};
+pub use packer::{PackingPolicy, PackingPolicyParseError};
+pub use unity_asset_binary::reader::ByteOrder;
 pub use unity_asset_core::{Result, UnityAssetError};
-
-/// A trait mirroring UnityPy's `mark_changed()` / `is_changed` behavior.
-///
-/// The write pipeline saves only changed assets by default.
-pub trait ChangeTracker {
-    fn mark_changed(&mut self);
-    fn is_changed(&self) -> bool;
-    fn clear_changed(&mut self);
-}

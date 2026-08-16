@@ -1,7 +1,8 @@
 [package]
 name = "unity-asset-search-index"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Local search index for Unity projects (Search Everything / Find References)"
 license.workspace = true
@@ -13,14 +14,36 @@ categories = ["command-line-utilities", "game-development"]
 
 [dependencies]
 anyhow.workspace = true
+async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
+regex-automata.workspace = true
+hex.workspace = true
 tantivy.workspace = true
-ignore.workspace = true
-once_cell.workspace = true
-unity-asset-search-core = { path = "../unity-asset-search-core", version = "0.3.0" }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
+fs2.workspace = true
+unity-asset-core = { workspace = true }
+unity-asset = { workspace = true }
+unity-asset-search-core = { workspace = true }
+unity-asset-search-local = { workspace = true }
+unity-asset-search-protocol = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Wdk_System_SystemServices",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

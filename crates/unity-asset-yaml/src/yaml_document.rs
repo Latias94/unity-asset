@@ -3,9 +3,7 @@
 //! This module provides the concrete implementation of UnityDocument
 //! for YAML format files.
 
-use crate::unity_yaml_serializer::UnityYamlSerializer;
-use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use unity_asset_core::{
     DocumentFormat, LineEnding, Result, UnityAssetError, UnityClass, UnityDocument,
     document::DocumentMetadata,
@@ -14,7 +12,7 @@ use unity_asset_core::{
 #[cfg(feature = "async")]
 use async_trait::async_trait;
 #[cfg(feature = "async")]
-use unity_asset_core::document::AsyncUnityDocument;
+use unity_asset_core::{AssetLoadBudget, document::AsyncUnityDocument};
 
 /// A Unity YAML document containing one or more Unity objects
 #[derive(Debug, Clone)]
@@ -28,138 +26,52 @@ pub struct YamlDocument {
 }
 
 impl YamlDocument {
-    /// Create a new empty YAML document
-    pub fn new() -> Self {
+    /// Creates an immutable YAML document from fully constructed entries.
+    pub fn from_entries(data: Vec<UnityClass>) -> Self {
         Self {
-            data: Vec::new(),
+            data,
             metadata: DocumentMetadata::new(DocumentFormat::Yaml),
             newline: LineEnding::default(),
         }
     }
 
-    /// Load a Unity YAML file
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the YAML file to load
-    /// * `preserve_types` - If true, try to preserve int/float types instead of converting all to strings
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use unity_asset_yaml::YamlDocument;
-    ///
-    /// let doc = YamlDocument::load_yaml("ProjectSettings.asset", false)?;
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
-    /// ```
-    pub fn load_yaml<P: AsRef<Path>>(path: P, _preserve_types: bool) -> Result<Self> {
-        Ok(Self::load_yaml_with_warnings(path, _preserve_types)?.0)
+    /// Returns the primary object when the document is not empty.
+    pub fn entry(&self) -> Option<&UnityClass> {
+        self.data.first()
     }
 
-    /// Load a Unity YAML file and return non-fatal conversion warnings.
-    pub fn load_yaml_with_warnings<P: AsRef<Path>>(
-        path: P,
-        _preserve_types: bool,
-    ) -> Result<(Self, Vec<crate::serde_unity_loader::SerdeUnityWarning>)> {
-        use crate::serde_unity_loader::SerdeUnityLoader;
-        use std::fs::File;
-        use std::io::BufReader;
-
-        let path = path.as_ref();
-
-        // Read the file
-        let file = File::open(path).map_err(|e| {
-            UnityAssetError::format(format!("Failed to open file {}: {}", path.display(), e))
-        })?;
-        let reader = BufReader::new(file);
-
-        // Use serde-based loader
-        let loader = SerdeUnityLoader::new();
-        let (unity_classes, warnings) = loader.load_from_reader_detailed(reader)?;
-
-        // Create YamlDocument with metadata
-        let mut yaml_doc = YamlDocument::new();
-        yaml_doc.metadata.file_path = Some(path.to_path_buf());
-
-        // Add all loaded classes
-        for unity_class in unity_classes {
-            yaml_doc.add_entry(unity_class);
-        }
-
-        Ok((yaml_doc, warnings))
+    /// Returns every object in document order.
+    pub fn entries(&self) -> &[UnityClass] {
+        &self.data
     }
 
-    /// Load a Unity YAML file asynchronously
-    ///
-    /// # Arguments
-    ///
-    /// * `path` - Path to the YAML file to load
-    /// * `preserve_types` - If true, try to preserve int/float types instead of converting all to strings
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// # #[cfg(feature = "async")]
-    /// # {
-    /// use unity_asset_yaml::YamlDocument;
-    ///
-    /// # tokio_test::block_on(async {
-    /// let doc = YamlDocument::load_yaml_async("ProjectSettings.asset", false).await?;
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
-    /// # }).unwrap();
-    /// # }
-    /// ```
-    #[cfg(feature = "async")]
-    pub async fn load_yaml_async<P: AsRef<Path> + Send>(
-        path: P,
-        _preserve_types: bool,
-    ) -> Result<Self> {
-        Ok(Self::load_yaml_async_with_warnings(path, _preserve_types)
-            .await?
-            .0)
+    /// Returns the path used to load this document, when available.
+    pub fn file_path(&self) -> Option<&Path> {
+        self.metadata.file_path.as_deref()
     }
 
-    #[cfg(feature = "async")]
-    pub async fn load_yaml_async_with_warnings<P: AsRef<Path> + Send>(
-        path: P,
-        _preserve_types: bool,
-    ) -> Result<(Self, Vec<crate::serde_unity_loader::SerdeUnityWarning>)> {
-        use crate::serde_unity_loader::SerdeUnityLoader;
-        use tokio::fs::File;
-        use tokio::io::BufReader;
+    /// Returns whether the document contains no objects.
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
 
-        let path = path.as_ref();
+    /// Returns the number of objects in the document.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
 
-        // Read the file asynchronously
-        let file = File::open(path).await.map_err(|e| {
-            UnityAssetError::format(format!("Failed to open file {}: {}", path.display(), e))
-        })?;
-        let reader = BufReader::new(file);
+    /// Returns the concrete document format.
+    pub const fn format(&self) -> DocumentFormat {
+        DocumentFormat::Yaml
+    }
 
-        // Use serde-based loader (we'll need to make this async too)
-        let loader = SerdeUnityLoader::new();
-        let (unity_classes, warnings) = loader.load_from_async_reader_detailed(reader).await?;
-
-        // Create YamlDocument with metadata
-        let mut yaml_doc = YamlDocument::new();
-        yaml_doc.metadata.file_path = Some(path.to_path_buf());
-
-        // Add all loaded classes
-        for unity_class in unity_classes {
-            yaml_doc.add_entry(unity_class);
-        }
-
-        Ok((yaml_doc, warnings))
+    pub(crate) fn set_file_path(&mut self, path: PathBuf) {
+        self.metadata.file_path = Some(path);
     }
 
     /// Get the line ending style
     pub fn line_ending(&self) -> LineEnding {
         self.newline
-    }
-
-    /// Set the line ending style
-    pub fn set_line_ending(&mut self, newline: LineEnding) {
-        self.newline = newline;
     }
 
     /// Get the YAML version
@@ -170,81 +82,6 @@ impl YamlDocument {
     /// Get the YAML metadata
     pub fn yaml_metadata(&self) -> &std::collections::HashMap<String, String> {
         &self.metadata.metadata
-    }
-
-    /// Save document to its original file
-    ///
-    /// This method saves the document back to the file it was loaded from.
-    /// If the document was not loaded from a file, this will return an error.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use unity_asset_yaml::YamlDocument;
-    ///
-    /// let mut doc = YamlDocument::load_yaml("ProjectSettings.asset", false)?;
-    /// // ... modify the document ...
-    /// doc.save()?;  // Save back to original file
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
-    /// ```
-    pub fn save(&self) -> Result<()> {
-        if let Some(path) = &self.metadata.file_path {
-            self.save_to(path)
-        } else {
-            Err(UnityAssetError::format(
-                "Cannot save document: no file path available. Use save_to() instead.".to_string(),
-            ))
-        }
-    }
-
-    /// Save document to a specific file
-    ///
-    /// This method serializes the document to Unity YAML format and saves it
-    /// to the specified file path.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use unity_asset_yaml::YamlDocument;
-    ///
-    /// let doc = YamlDocument::load_yaml("ProjectSettings.asset", false)?;
-    /// doc.save_to("ProjectSettings_backup.asset")?;
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
-    /// ```
-    pub fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-
-        // Create serializer with document settings
-        let mut serializer = UnityYamlSerializer::new().with_line_ending(self.newline);
-
-        // Serialize to string
-        let yaml_content = serializer.serialize_to_string(&self.data)?;
-
-        // Write to file
-        fs::write(path, yaml_content).map_err(UnityAssetError::from)?;
-
-        Ok(())
-    }
-
-    /// Get YAML content as string
-    ///
-    /// This method serializes the document to Unity YAML format and returns
-    /// it as a string without writing to a file.
-    ///
-    /// # Examples
-    ///
-    /// ```rust,no_run
-    /// use unity_asset_yaml::YamlDocument;
-    ///
-    /// let doc = YamlDocument::load_yaml("ProjectSettings.asset", false)?;
-    /// let yaml_string = doc.dump_yaml()?;
-    /// println!("{}", yaml_string);
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
-    /// ```
-    pub fn dump_yaml(&self) -> Result<String> {
-        let mut serializer = UnityYamlSerializer::new().with_line_ending(self.newline);
-
-        serializer.serialize_to_string(&self.data)
     }
 
     /// Filter entries by class names and/or attributes
@@ -260,9 +97,12 @@ impl YamlDocument {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use unity_asset_yaml::YamlDocument;
+    /// use unity_asset_core::AssetLoadBudget;
+    /// use unity_asset_yaml::load_budgeted_yaml_path;
     ///
-    /// let doc = YamlDocument::load_yaml("scene.unity", false)?;
+    /// let mut budget = AssetLoadBudget::default();
+    /// let source = load_budgeted_yaml_path("scene.unity", &mut budget)?;
+    /// let doc = source.document();
     ///
     /// // Find all GameObjects
     /// let gameobjects = doc.filter(Some(&["GameObject"]), None);
@@ -272,7 +112,7 @@ impl YamlDocument {
     ///
     /// // Find MonoBehaviours with m_Script property
     /// let scripts = doc.filter(Some(&["MonoBehaviour"]), Some(&["m_Script"]));
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn filter(
         &self,
@@ -285,7 +125,7 @@ impl YamlDocument {
                 // Check class name filter
                 if let Some(names) = class_names
                     && !names.is_empty()
-                    && !names.contains(&entry.class_name.as_str())
+                    && !names.contains(&entry.class_name())
                 {
                     return false;
                 }
@@ -319,16 +159,19 @@ impl YamlDocument {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use unity_asset_yaml::YamlDocument;
+    /// use unity_asset_core::AssetLoadBudget;
+    /// use unity_asset_yaml::load_budgeted_yaml_path;
     ///
-    /// let doc = YamlDocument::load_yaml("scene.unity", false)?;
+    /// let mut budget = AssetLoadBudget::default();
+    /// let source = load_budgeted_yaml_path("scene.unity", &mut budget)?;
+    /// let doc = source.document();
     ///
     /// // Get the first GameObject
     /// let gameobject = doc.get(Some("GameObject"), None)?;
     ///
     /// // Get an object with specific attributes
     /// let script = doc.get(Some("MonoBehaviour"), Some(&["m_Script", "m_Enabled"]))?;
-    /// # Ok::<(), unity_asset_core::UnityAssetError>(())
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn get(
         &self,
@@ -353,48 +196,12 @@ impl YamlDocument {
 }
 
 impl UnityDocument for YamlDocument {
-    fn entry(&self) -> Option<&UnityClass> {
-        self.data.first()
-    }
-
-    fn entry_mut(&mut self) -> Option<&mut UnityClass> {
-        self.data.first_mut()
-    }
-
     fn entries(&self) -> &[UnityClass] {
         &self.data
     }
 
-    fn entries_mut(&mut self) -> &mut Vec<UnityClass> {
-        &mut self.data
-    }
-
-    fn add_entry(&mut self, entry: UnityClass) {
-        self.data.push(entry);
-    }
-
     fn file_path(&self) -> Option<&Path> {
         self.metadata.file_path.as_deref()
-    }
-
-    fn save(&self) -> Result<()> {
-        match &self.metadata.file_path {
-            Some(path) => self.save_to(path),
-            None => Err(UnityAssetError::format("No file path specified for save")),
-        }
-    }
-
-    fn save_to<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = path.as_ref();
-
-        // Serialize the document to YAML format
-        let yaml_content = self.dump_yaml()?;
-
-        // Write to file
-        std::fs::write(path, yaml_content)
-            .map_err(|e| UnityAssetError::format(format!("Failed to write YAML file: {}", e)))?;
-
-        Ok(())
     }
 
     fn format(&self) -> DocumentFormat {
@@ -402,37 +209,23 @@ impl UnityDocument for YamlDocument {
     }
 }
 
-impl Default for YamlDocument {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Async implementation of UnityDocument trait for YamlDocument
 #[cfg(feature = "async")]
 #[async_trait]
 impl AsyncUnityDocument for YamlDocument {
-    async fn load_from_path_async<P: AsRef<Path> + Send>(path: P) -> Result<Self>
+    type LoadError = crate::BudgetedYamlError;
+
+    async fn load_from_path_async(
+        path: &Path,
+        budget: &mut AssetLoadBudget,
+    ) -> std::result::Result<Self, Self::LoadError>
     where
         Self: Sized,
     {
-        Self::load_yaml_async(path, false).await
-    }
-
-    async fn save_to_path_async<P: AsRef<Path> + Send>(&self, path: P) -> Result<()> {
-        // For now, use the sync version wrapped in spawn_blocking
-        let content = self.dump_yaml()?;
-        let path = path.as_ref().to_path_buf();
-
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(&path, content).map_err(|e| {
-                UnityAssetError::format(format!("Failed to write file {}: {}", path.display(), e))
-            })
-        })
-        .await
-        .map_err(|e| UnityAssetError::format(format!("Task join error: {}", e)))??;
-
-        Ok(())
+        let source = crate::load_budgeted_yaml_path_async(path, budget).await?;
+        let (_, document) = source.into_budgeted_parts(budget)?;
+        Ok(std::sync::Arc::try_unwrap(document)
+            .expect("a newly loaded YAML source uniquely owns its document"))
     }
 
     fn entries(&self) -> &[UnityClass] {
@@ -451,31 +244,25 @@ mod tests {
 
     #[test]
     fn test_yaml_document_creation() {
-        let doc = YamlDocument::new();
+        let doc = YamlDocument::from_entries(Vec::new());
         assert!(doc.is_empty());
         assert_eq!(doc.len(), 0);
         assert_eq!(doc.format(), DocumentFormat::Yaml);
     }
 
     #[test]
-    fn test_yaml_document_add_entry() {
-        let mut doc = YamlDocument::new();
+    fn test_yaml_document_from_entries() {
         let class = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
-
-        doc.add_entry(class);
+        let doc = YamlDocument::from_entries(vec![class]);
         assert_eq!(doc.len(), 1);
         assert!(!doc.is_empty());
     }
 
     #[test]
     fn test_yaml_document_filter() {
-        let mut doc = YamlDocument::new();
-
         let class1 = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
         let class2 = UnityClass::new(114, "MonoBehaviour".to_string(), "456".to_string());
-
-        doc.add_entry(class1);
-        doc.add_entry(class2);
+        let doc = YamlDocument::from_entries(vec![class1, class2]);
 
         let game_objects = doc.filter_by_class("GameObject");
         assert_eq!(game_objects.len(), 1);
@@ -486,7 +273,7 @@ mod tests {
 
     #[test]
     fn test_yaml_document_metadata() {
-        let doc = YamlDocument::new();
+        let doc = YamlDocument::from_entries(Vec::new());
         assert_eq!(doc.format(), DocumentFormat::Yaml);
         assert_eq!(doc.line_ending(), LineEnding::default());
         assert!(doc.version().is_none());
@@ -499,7 +286,7 @@ mod tests {
         use unity_asset_core::document::AsyncUnityDocument;
 
         // Test that the async trait methods compile and work
-        let doc = YamlDocument::new();
+        let doc = YamlDocument::from_entries(Vec::new());
         assert!(AsyncUnityDocument::entries(&doc).is_empty());
         assert!(AsyncUnityDocument::entry(&doc).is_none());
         assert!(AsyncUnityDocument::file_path(&doc).is_none());

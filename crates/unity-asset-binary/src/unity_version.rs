@@ -1,7 +1,6 @@
 //! Unity Version Management System
 //!
-//! This module provides comprehensive Unity version parsing, comparison, and compatibility
-//! handling based on UnityPy's implementation.
+//! This module provides Unity version parsing and comparison based on UnityPy's implementation.
 
 use crate::error::{BinaryError, Result};
 use serde::{Deserialize, Serialize};
@@ -9,7 +8,7 @@ use std::fmt;
 use std::str::FromStr;
 
 /// Unity version type (release channel)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum UnityVersionType {
     /// Alpha release
     A = 0,
@@ -18,7 +17,6 @@ pub enum UnityVersionType {
     /// China release
     C = 2,
     /// Final release
-    #[default]
     F = 3,
     /// Patch release
     P = 4,
@@ -69,19 +67,6 @@ pub struct UnityVersion {
     pub type_str: Option<String>, // For custom/unknown types
 }
 
-impl Default for UnityVersion {
-    fn default() -> Self {
-        Self {
-            major: 2020,
-            minor: 3,
-            build: 0,
-            version_type: UnityVersionType::F,
-            type_number: 1,
-            type_str: None,
-        }
-    }
-}
-
 impl UnityVersion {
     /// Create a new Unity version
     pub fn new(
@@ -110,7 +95,7 @@ impl UnityVersion {
         // - ignore any revision hash suffix in parentheses (ProjectVersion.txt style)
         let raw = version.trim();
         if raw.is_empty() {
-            return Ok(Self::default());
+            return Err(BinaryError::invalid_data("Unity version is empty"));
         }
         let raw = raw.split_whitespace().next().unwrap_or(raw);
 
@@ -145,7 +130,9 @@ impl UnityVersion {
         }
 
         let (type_str, type_number) = split_trailing_number(suffix);
-        let type_number_u8 = type_number.unwrap_or(0);
+        let type_number_u8 = type_number.ok_or_else(|| {
+            BinaryError::invalid_data(format!("Invalid version channel number: {raw}"))
+        })?;
 
         let parsed_type = UnityVersionType::from_str(type_str).unwrap_or(UnityVersionType::U);
         let mut out = Self::new(major, minor, build, parsed_type, type_number_u8);
@@ -159,7 +146,7 @@ impl UnityVersion {
     }
 
     /// Convert to tuple for comparison
-    pub fn as_tuple(&self) -> (u16, u16, u16, u8, u8) {
+    fn as_tuple(&self) -> (u16, u16, u16, u8, u8) {
         (
             self.major,
             self.minor,
@@ -167,67 +154,6 @@ impl UnityVersion {
             self.version_type as u8,
             self.type_number,
         )
-    }
-
-    /// Check if this version is greater than or equal to another
-    pub fn is_gte(&self, other: &UnityVersion) -> bool {
-        self.as_tuple() >= other.as_tuple()
-    }
-
-    /// Check if this version is less than another
-    pub fn is_lt(&self, other: &UnityVersion) -> bool {
-        self.as_tuple() < other.as_tuple()
-    }
-
-    /// Check if this version supports a specific feature
-    pub fn supports_feature(&self, feature: UnityFeature) -> bool {
-        match feature {
-            UnityFeature::BigIds => self.major >= 2019 || (self.major == 2018 && self.minor >= 2),
-            UnityFeature::TypeTreeEnabled => {
-                self.major >= 5 || (self.major == 4 && self.minor >= 5)
-            }
-            UnityFeature::ScriptTypeTree => self.major >= 2018,
-            UnityFeature::RefTypes => self.major >= 2019,
-            UnityFeature::UnityFS => self.major >= 5 && self.minor >= 3,
-            UnityFeature::LZ4Compression => self.major >= 5 && self.minor >= 3,
-            UnityFeature::LZMACompression => self.major >= 3,
-            UnityFeature::BrotliCompression => self.major >= 2020,
-            UnityFeature::ModernSerialization => self.major >= 2018,
-        }
-    }
-
-    /// Get the appropriate byte alignment for this version
-    pub fn get_alignment(&self) -> usize {
-        if self.major >= 2022 {
-            8 // Unity 2022+ uses 8-byte alignment
-        } else {
-            4 // Unity 2019+ and older versions use 4-byte alignment
-        }
-    }
-
-    /// Check if this version uses big endian by default
-    pub fn uses_big_endian(&self) -> bool {
-        // Most Unity versions use little endian, but some platforms/versions may differ
-        false
-    }
-
-    /// Get the serialized file format version for this Unity version
-    pub fn get_serialized_file_format_version(&self) -> u32 {
-        if self.major >= 2022 {
-            22
-        } else if self.major >= 2020 {
-            21
-        } else if self.major >= 2019 {
-            20
-        } else if self.major >= 2018 {
-            19
-        } else if self.major >= 2017 {
-            17
-        } else if self.major >= 5 {
-            15
-        } else {
-            10
-        }
     }
 }
 
@@ -286,80 +212,6 @@ impl Ord for UnityVersion {
     }
 }
 
-/// Unity features that depend on version
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnityFeature {
-    /// Support for 64-bit object IDs
-    BigIds,
-    /// TypeTree is enabled by default
-    TypeTreeEnabled,
-    /// Script type tree support
-    ScriptTypeTree,
-    /// Reference types support
-    RefTypes,
-    /// UnityFS format support
-    UnityFS,
-    /// LZ4 compression support
-    LZ4Compression,
-    /// LZMA compression support
-    LZMACompression,
-    /// Brotli compression support
-    BrotliCompression,
-    /// Modern serialization format
-    ModernSerialization,
-}
-
-/// Unity version compatibility checker
-pub struct VersionCompatibility;
-
-impl VersionCompatibility {
-    /// Check if a version is supported by this parser
-    pub fn is_supported(version: &UnityVersion) -> bool {
-        // We support Unity 3.4 to 2023.x
-        version.major >= 3 && version.major <= 2023
-    }
-
-    /// Get recommended settings for a Unity version
-    pub fn get_recommended_settings(version: &UnityVersion) -> VersionSettings {
-        VersionSettings {
-            use_type_tree: version.supports_feature(UnityFeature::TypeTreeEnabled),
-            alignment: version.get_alignment(),
-            big_endian: version.uses_big_endian(),
-            supports_big_ids: version.supports_feature(UnityFeature::BigIds),
-            supports_ref_types: version.supports_feature(UnityFeature::RefTypes),
-            serialized_file_format: version.get_serialized_file_format_version(),
-        }
-    }
-
-    /// Get a list of known Unity versions for testing
-    pub fn get_known_versions() -> Vec<UnityVersion> {
-        vec![
-            UnityVersion::parse_version("3.4.0f5").unwrap(),
-            UnityVersion::parse_version("4.7.2f1").unwrap(),
-            UnityVersion::parse_version("5.0.0f4").unwrap(),
-            UnityVersion::parse_version("5.6.7f1").unwrap(),
-            UnityVersion::parse_version("2017.4.40f1").unwrap(),
-            UnityVersion::parse_version("2018.4.36f1").unwrap(),
-            UnityVersion::parse_version("2019.4.40f1").unwrap(),
-            UnityVersion::parse_version("2020.3.48f1").unwrap(),
-            UnityVersion::parse_version("2021.3.21f1").unwrap(),
-            UnityVersion::parse_version("2022.3.21f1").unwrap(),
-            UnityVersion::parse_version("2023.2.20f1").unwrap(),
-        ]
-    }
-}
-
-/// Version-specific settings
-#[derive(Debug, Clone)]
-pub struct VersionSettings {
-    pub use_type_tree: bool,
-    pub alignment: usize,
-    pub big_endian: bool,
-    pub supports_big_ids: bool,
-    pub supports_ref_types: bool,
-    pub serialized_file_format: u32,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,28 +227,21 @@ mod tests {
     }
 
     #[test]
+    fn empty_version_is_not_guessed() {
+        for input in ["", "   "] {
+            assert!(matches!(
+                UnityVersion::parse_version(input),
+                Err(BinaryError::InvalidData(message)) if message == "Unity version is empty"
+            ));
+        }
+    }
+
+    #[test]
     fn test_version_comparison() {
         let v1 = UnityVersion::parse_version("2020.3.12f1").unwrap();
         let v2 = UnityVersion::parse_version("2021.1.0f1").unwrap();
 
         assert!(v1 < v2);
-        assert!(v2.is_gte(&v1));
-        assert!(v1.is_lt(&v2));
-    }
-
-    #[test]
-    fn test_feature_support() {
-        let old_version = UnityVersion::parse_version("5.0.0f1").unwrap();
-        let unity_fs_version = UnityVersion::parse_version("5.3.0f1").unwrap();
-        let new_version = UnityVersion::parse_version("2020.3.12f1").unwrap();
-
-        assert!(!old_version.supports_feature(UnityFeature::BigIds));
-        assert!(new_version.supports_feature(UnityFeature::BigIds));
-
-        // Unity 5.0 doesn't support UnityFS (introduced in 5.3)
-        assert!(!old_version.supports_feature(UnityFeature::UnityFS));
-        assert!(unity_fs_version.supports_feature(UnityFeature::UnityFS));
-        assert!(new_version.supports_feature(UnityFeature::UnityFS));
     }
 
     #[test]
@@ -436,11 +281,11 @@ mod tests {
     }
 
     #[test]
-    fn test_compatibility_check() {
-        let supported = UnityVersion::parse_version("2020.3.12f1").unwrap();
-        let unsupported = UnityVersion::parse_version("2.0.0f1").unwrap();
-
-        assert!(VersionCompatibility::is_supported(&supported));
-        assert!(!VersionCompatibility::is_supported(&unsupported));
+    fn version_channel_number_overflow_is_not_coerced_to_zero() {
+        assert!(matches!(
+            UnityVersion::parse_version("2020.3.0f999"),
+            Err(BinaryError::InvalidData(message))
+                if message == "Invalid version channel number: 2020.3.0f999"
+        ));
     }
 }

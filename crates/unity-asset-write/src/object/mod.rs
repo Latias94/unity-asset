@@ -1,13 +1,18 @@
-//! UnityPy-like object edit helpers.
+//! Atomic SerializedFile object encoding.
 //!
-//! UnityPy edits objects by mutating a parsed TypeTree dict and then calling `save_typetree`,
-//! which stores overridden raw bytes and marks the owning file as changed.
-//!
-//! This module provides the same workflow in Rust, built on:
-//! - `unity-asset-binary` for reading/parsing
-//! - `TypeTreeWriter` for encoding
-//! - `SerializedFileEdits` for capturing overridden bytes
+//! [`SerializedObjectEncoder`] is the authoritative schema-aware API. It binds one immutable
+//! SerializedFile object, applies caller-ordered and digest-guarded semantic mutations, then emits
+//! one immutable byte override through a single TypeTree rewrite. Raw replacement is a separate,
+//! explicitly acknowledged escape hatch.
 
-mod serialized_file_session;
+mod encoder;
 
-pub use serialized_file_session::SerializedFileEditSession;
+pub use encoder::{
+    EncodedSerializedObject, PreparedSerializedFieldReplace, PreparedUnsafeRawObject,
+    SerializedFieldGuard, SerializedManagedReferenceLayout, SerializedManagedReferenceType,
+    SerializedObjectCandidate, SerializedObjectEncodeError, SerializedObjectEncoder,
+    SerializedObjectEncodingMode, SerializedObjectEncodingStats, SerializedObjectGuard,
+    SerializedObjectMutation, SerializedPPtrLayout, SerializedSequenceEdit, SerializedValueKind,
+    SerializedValueSchema, SerializedValueSchemaError, UnsafeRawObjectAcknowledgement,
+    UnsafeRawObjectReplacement, ValidatedSerializedFieldGuard,
+};

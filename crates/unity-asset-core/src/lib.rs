@@ -4,29 +4,74 @@
 //! This crate provides the fundamental building blocks that are shared
 //! across different Unity asset formats (YAML, binary, etc.).
 
+pub mod allocation;
+mod bounded;
+pub mod budget;
+pub mod change;
 pub mod constants;
+pub mod contract_json;
+pub mod diagnostic;
+pub mod digest;
 pub mod document;
-pub mod dynamic_access;
 pub mod error;
+pub mod field_path;
+pub mod identity;
+pub mod media_schema;
+pub mod revision;
+pub mod semantic_digest;
+pub mod source_image;
 pub mod unity_class;
 pub mod unity_value;
 
 // Re-export main types
-pub use constants::*;
+pub use allocation::{
+    AllocationSizeError, arc_slice_allocation_bytes, arc_value_allocation_bytes,
+    arc_vec_allocation_bytes, index_map_allocation_bytes, string_allocation_bytes,
+    vec_allocation_bytes,
+};
+pub use budget::{
+    AssetLoadBudget, AssetLoadBudgetDomainToken, AssetLoadDepthScope, AssetLoadLimits,
+    AssetLoadUsage, BudgetError, BudgetedJsonError, DecompressionBudget, DecompressionUsage,
+};
+pub use change::{CHANGE_SET_VERSION, ChangeSet, ChangeSetError, IdentityRemap, TransactionId};
+pub use constants::{LineEnding, UNITY_TAG_URI, UNITY_YAML_VERSION, class_ids, class_names};
+pub use contract_json::{
+    ContractJsonLimits, ContractJsonResourceModel, read_contract_json, read_contract_json_slice,
+};
+pub use diagnostic::{DIAGNOSTIC_VERSION, Diagnostic, DiagnosticError, DiagnosticSeverity};
+pub use digest::{DigestBuildError, DigestParseError, DigestV1, DigestV1Builder};
 pub use document::{DocumentFormat, UnityDocument};
-pub use dynamic_access::{DynamicAccess, DynamicValue};
 pub use error::{Result, UnityAssetError};
-pub use unity_class::{UnityClass, UnityClassRegistry};
-pub use unity_value::UnityValue;
+pub use field_path::{FieldPath, FieldPathError, FieldPathSegment};
+pub use identity::{
+    BundleMemberId, ContainmentKind, ContainmentStep, ContractError, ObjectAddress, ObjectId,
+    ObjectKind, RevisionedObjectHandle, SourceAlias, SourceId, SourceLocator, SourceMemberId,
+    WorkspaceId, YamlDocumentSelector, YamlFileId,
+};
+pub use media_schema::{
+    AudioClipResourceField, AudioClipResourceSelection, AudioClipResourceShapeError,
+    StreamDataDeclaration, classify_audio_clip_resource,
+};
+pub use revision::{SourceFingerprint, SourceKind, WorkspaceRevision};
+pub use semantic_digest::{
+    SemanticDigestError, field_schema_digest, observe_semantic_value, semantic_value_digest,
+    yaml_field_schema_digest, yaml_schema_digest,
+};
+pub use source_image::{
+    BudgetedSourceBytes, BudgetedVerifiedSourceImage, VerifiedSourceImage,
+    VerifiedSourceImageError, VerifiedSourceRebinding,
+};
+pub use unity_class::{UnityClass, UnityClassHeader};
+pub use unity_value::{UnityValue, UnityValueCloneError, UnityValueKind, ValuePathError};
 
 /// Get Unity class name from class ID
 pub fn get_class_name(class_id: i32) -> Option<String> {
-    GLOBAL_CLASS_ID_MAP.get_class_name(class_id)
+    get_class_name_str(class_id).map(str::to_owned)
 }
 
 /// Get Unity class name from class ID without allocating.
 pub fn get_class_name_str(class_id: i32) -> Option<&'static str> {
-    GLOBAL_CLASS_ID_MAP.get_class_name_str(class_id)
+    constants::class_id_name(class_id)
 }
 
 #[cfg(test)]
@@ -37,7 +82,7 @@ mod tests {
     fn test_basic_functionality() {
         // Basic functionality test.
         let class = UnityClass::new(1, "GameObject".to_string(), "123".to_string());
-        assert_eq!(class.class_id, 1);
-        assert_eq!(class.class_name, "GameObject");
+        assert_eq!(class.class_id(), 1);
+        assert_eq!(class.class_name(), "GameObject");
     }
 }

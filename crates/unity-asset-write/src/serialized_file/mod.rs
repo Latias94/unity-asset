@@ -5,10 +5,19 @@
 //! - data stream (object payloads)
 //! - header + offsets + alignment
 
+mod artifact_writer;
 mod edit;
+mod external_table;
+mod plan;
+mod sink;
 mod types_write;
 mod typetree_dump;
 mod writer;
 
-pub use edit::SerializedFileEdits;
-pub use writer::{SerializedFileSaveOptions, SerializedFileWriter};
+pub use edit::{SerializedFileEditError, SerializedFileEdits};
+pub use external_table::{
+    BudgetedExternalPath, ExternalIdentifierField, ExternalMetadataField, ExternalTableAllocator,
+    ExternalTableError, PreparedExternalPath,
+};
+pub use plan::SerializedFileSource;
+pub use writer::SerializedFileWriter;

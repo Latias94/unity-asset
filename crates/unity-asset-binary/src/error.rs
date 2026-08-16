@@ -1,6 +1,55 @@
 //! Error types for Unity binary parsing
 
+use std::collections::TryReserveError;
+
 use thiserror::Error;
+use unity_asset_core::BudgetError;
+
+/// Invalid identity topology in a SerializedFile object table.
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryObjectIdentityError {
+    /// Unity reserves path ID zero as an invalid object identity.
+    #[error("object path ID cannot be zero")]
+    ZeroPathId,
+    /// Two object table entries use the same path ID.
+    #[error("duplicate object path ID {path_id}")]
+    DuplicatePathId { path_id: i64 },
+}
+
+/// Invalid use of replacement bytes with an existing SerializedFile object identity.
+#[derive(Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryObjectReplacementError {
+    /// Raw replacement bytes cannot be represented by the SerializedFile object-size field.
+    #[error("raw replacement payload length {length} exceeds the u32 wire-size limit")]
+    RawPayloadTooLarge { length: usize },
+    /// Replacement bytes cannot be interpreted without the object's canonical TypeTree.
+    #[error("object {path_id} (class {class_id}) has no TypeTree schema for replacement parsing")]
+    MissingSchema { path_id: i64, class_id: i32 },
+    /// Lenient traversal reached the end of the replacement extent without completing the schema.
+    #[error(
+        "replacement traversal for object {path_id} stopped before completing its TypeTree after consuming all {consumed} bytes"
+    )]
+    Incomplete { path_id: i64, consumed: usize },
+    /// One field-level read required more bytes than remained in the replacement extent.
+    #[error(
+        "replacement traversal for object {path_id} requires {required_at_failure} bytes at the failing read but only {available_at_failure} bytes remain"
+    )]
+    Truncated {
+        path_id: i64,
+        required_at_failure: usize,
+        available_at_failure: usize,
+    },
+    /// A complete schema traversal did not consume the caller-declared replacement extent.
+    #[error(
+        "replacement bytes for object {path_id} contain {remaining} trailing bytes after consuming {consumed} of {total} bytes"
+    )]
+    TrailingBytes {
+        path_id: i64,
+        consumed: usize,
+        total: usize,
+        remaining: usize,
+    },
+}
 
 /// Result type for Unity binary operations
 pub type Result<T> = std::result::Result<T, BinaryError>;
@@ -32,6 +81,14 @@ pub enum BinaryError {
     #[error("Invalid data: {0}")]
     InvalidData(String),
 
+    /// Invalid object identity topology.
+    #[error("Invalid object identity: {0}")]
+    ObjectIdentity(#[from] BinaryObjectIdentityError),
+
+    /// Invalid replacement payload for an existing object identity.
+    #[error("Invalid object replacement: {0}")]
+    ObjectReplacement(#[from] BinaryObjectReplacementError),
+
     /// Parsing error
     #[error("Parse error: {0}")]
     ParseError(String),
@@ -52,6 +109,15 @@ pub enum BinaryError {
     #[error("Memory allocation error: {0}")]
     MemoryError(String),
 
+    /// Fallible capacity reservation failed without allocating an error message.
+    #[error("failed to allocate {requested} bytes for {resource}: {source}")]
+    Allocation {
+        resource: &'static str,
+        requested: usize,
+        #[source]
+        source: TryReserveError,
+    },
+
     /// Timeout error
     #[error("Operation timed out: {0}")]
     Timeout(String),
@@ -60,13 +126,17 @@ pub enum BinaryError {
     #[error("Resource limit exceeded: {0}")]
     ResourceLimitExceeded(String),
 
+    /// Shared asset load budget exhausted or invalid
+    #[error("{0}")]
+    Budget(
+        #[from]
+        #[source]
+        BudgetError,
+    ),
+
     /// Corrupted data
     #[error("Corrupted data detected: {0}")]
     CorruptedData(String),
-
-    /// Version compatibility error
-    #[error("Version compatibility error: {0}")]
-    VersionCompatibility(String),
 
     /// Generic error with context
     #[error("Error: {0}")]
@@ -136,6 +206,17 @@ impl BinaryError {
     pub fn io_error<S: Into<String>>(msg: S) -> Self {
         Self::Generic(msg.into())
     }
+
+    /// Returns whether retrying requires a larger resource budget or available memory.
+    pub fn is_resource_error(&self) -> bool {
+        matches!(
+            self,
+            Self::Budget(_)
+                | Self::MemoryError(_)
+                | Self::Allocation { .. }
+                | Self::ResourceLimitExceeded(_)
+        )
+    }
 }
 
 // Conversion from other error types
@@ -182,6 +263,15 @@ impl BinaryError {
         BinaryError::MemoryError(msg.into())
     }
 
+    /// Preserve one failed capacity reservation without allocating diagnostics.
+    pub fn allocation(resource: &'static str, requested: usize, source: TryReserveError) -> Self {
+        Self::Allocation {
+            resource,
+            requested,
+            source,
+        }
+    }
+
     /// Create a timeout error
     pub fn timeout(msg: impl Into<String>) -> Self {
         BinaryError::Timeout(msg.into())
@@ -190,11 +280,6 @@ impl BinaryError {
     /// Create a corrupted data error
     pub fn corrupted_data(msg: impl Into<String>) -> Self {
         BinaryError::CorruptedData(msg.into())
-    }
-
-    /// Create a version compatibility error
-    pub fn version_compatibility(msg: impl Into<String>) -> Self {
-        BinaryError::VersionCompatibility(msg.into())
     }
 
     /// Check if this error is recoverable
@@ -206,15 +291,18 @@ impl BinaryError {
             BinaryError::UnsupportedCompression(_) => true, // Might try different compression
             BinaryError::DecompressionFailed(_) => true,    // Might retry or skip
             BinaryError::InvalidData(_) => true,            // Might skip corrupted object
+            BinaryError::ObjectIdentity(_) => true,         // Might skip a malformed file
+            BinaryError::ObjectReplacement(_) => true,      // Might reject one prepared mutation
             BinaryError::ParseError(_) => true,             // Might skip problematic object
             BinaryError::NotEnoughData { .. } => false,
             BinaryError::InvalidSignature { .. } => false,
             BinaryError::Unsupported(_) => true, // Might skip unsupported feature
             BinaryError::MemoryError(_) => false,
+            BinaryError::Allocation { .. } => false,
             BinaryError::Timeout(_) => true, // Might retry
             BinaryError::ResourceLimitExceeded(_) => true, // Might reduce limits
+            BinaryError::Budget(_) => true,  // Might retry with a larger load budget
             BinaryError::CorruptedData(_) => true, // Might skip corrupted section
-            BinaryError::VersionCompatibility(_) => true, // Might use compatibility mode
             BinaryError::Generic(_) => true, // Generic errors are usually recoverable
         }
     }
@@ -228,15 +316,18 @@ impl BinaryError {
             BinaryError::UnsupportedCompression(_) => ErrorSeverity::Medium,
             BinaryError::DecompressionFailed(_) => ErrorSeverity::Medium,
             BinaryError::InvalidData(_) => ErrorSeverity::Medium,
+            BinaryError::ObjectIdentity(_) => ErrorSeverity::Medium,
+            BinaryError::ObjectReplacement(_) => ErrorSeverity::Medium,
             BinaryError::ParseError(_) => ErrorSeverity::Medium,
             BinaryError::NotEnoughData { .. } => ErrorSeverity::High,
             BinaryError::InvalidSignature { .. } => ErrorSeverity::High,
             BinaryError::Unsupported(_) => ErrorSeverity::Low,
             BinaryError::MemoryError(_) => ErrorSeverity::Critical,
+            BinaryError::Allocation { .. } => ErrorSeverity::Critical,
             BinaryError::Timeout(_) => ErrorSeverity::Medium,
             BinaryError::ResourceLimitExceeded(_) => ErrorSeverity::Medium,
+            BinaryError::Budget(_) => ErrorSeverity::Medium,
             BinaryError::CorruptedData(_) => ErrorSeverity::Medium,
-            BinaryError::VersionCompatibility(_) => ErrorSeverity::Low,
             BinaryError::Generic(_) => ErrorSeverity::Medium,
         }
     }
@@ -251,8 +342,11 @@ impl BinaryError {
             BinaryError::Unsupported(_) => Some("Skip unsupported feature"),
             BinaryError::Timeout(_) => Some("Retry with longer timeout"),
             BinaryError::ResourceLimitExceeded(_) => Some("Reduce processing limits"),
+            BinaryError::Budget(_) => Some("Increase load limits or reduce the input scope"),
+            BinaryError::Allocation { .. } => Some("Reduce the input scope or free memory"),
             BinaryError::CorruptedData(_) => Some("Skip corrupted section"),
-            BinaryError::VersionCompatibility(_) => Some("Enable compatibility mode"),
+            BinaryError::ObjectIdentity(_) => Some("Skip malformed SerializedFile"),
+            BinaryError::ObjectReplacement(_) => Some("Reject the invalid object replacement"),
             _ => None,
         }
     }
@@ -274,6 +368,34 @@ mod tests {
         let err = BinaryError::not_enough_data(100, 50);
         assert!(matches!(err, BinaryError::NotEnoughData { .. }));
         assert_eq!(err.to_string(), "Not enough data: expected 100, got 50");
+    }
+
+    #[test]
+    fn budget_error_remains_available_in_the_source_chain() {
+        let error = BinaryError::from(BudgetError::Exceeded {
+            resource: "bytes",
+            limit: 1,
+            requested: 2,
+        });
+        let source = std::error::Error::source(&error).expect("budget error is the source");
+
+        assert!(matches!(
+            source.downcast_ref::<BudgetError>(),
+            Some(BudgetError::Exceeded {
+                resource: "bytes",
+                limit: 1,
+                requested: 2,
+            })
+        ));
+    }
+
+    #[test]
+    fn object_identity_error_remains_structurally_matchable() {
+        let error = BinaryError::from(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 });
+        assert!(matches!(
+            error,
+            BinaryError::ObjectIdentity(BinaryObjectIdentityError::DuplicatePathId { path_id: 42 })
+        ));
     }
 
     #[test]

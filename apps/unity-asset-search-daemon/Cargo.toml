@@ -1,28 +1,43 @@
 [package]
 name = "unity-asset-search-daemon"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
-description = "Local HTTP daemon for Unity project search (used by UnityHero)"
+description = "Capability-authenticated loopback HTTP daemon for Unity project search"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 documentation = "https://github.com/Latias94/unity-asset"
 keywords = ["unity", "search", "daemon", "references"]
 categories = ["command-line-utilities", "game-development"]
+exclude = ["tests/csharp_protocol_http.rs"]
 
 [dependencies]
 anyhow.workspace = true
-axum.workspace = true
-serde.workspace = true
-serde_json.workspace = true
 tokio.workspace = true
+thiserror.workspace = true
 clap.workspace = true
-tower-http.workspace = true
+futures.workspace = true
 rand.workspace = true
-hex.workspace = true
 notify.workspace = true
-unity-asset-search-index = { path = "../../crates/unity-asset-search-index", version = "0.3.0" }
+sha2.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+http-body-util.workspace = true
+hyper-util.workspace = true
+unity-asset-core = { workspace = true }
+unity-asset-search-index = { workspace = true }
+unity-asset-search-local = { workspace = true }
+unity-asset-search-protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+reqwest.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

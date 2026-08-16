@@ -1,4 +1,5 @@
 use unity_asset_binary::bundle::BundleParser;
+use unity_asset_core::{AssetLoadBudget, AssetLoadLimits};
 
 fn write_cstring(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
@@ -102,4 +103,13 @@ fn can_parse_minimal_unityraw_v3_bundle_and_extract_file() {
 
     let out = parsed.extract_node_data(node).unwrap();
     assert_eq!(out, file_bytes);
+
+    let mut no_copy_budget = AssetLoadBudget::new(AssetLoadLimits {
+        max_bytes: 1,
+        ..AssetLoadLimits::default()
+    })
+    .unwrap();
+    let shared = parsed.data_shared_with_budget(&mut no_copy_budget).unwrap();
+    assert_eq!(shared.as_bytes(), blob.as_slice());
+    assert_eq!(no_copy_budget.usage().bytes, 0);
 }

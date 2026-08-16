@@ -1,7 +1,8 @@
 [package]
 name = "unity-asset-cli"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "Command-line tools for Unity asset parsing and manipulation"
 license.workspace = true
@@ -23,41 +24,25 @@ exclude = [
 [[bin]]
 name = "unity-asset"
 path = "src/main.rs"
-
-[[bin]]
-name = "unity-asset-async"
-path = "src/main_async.rs"
-required-features = ["async"]
+# The binary's rustdoc output collides with the `unity-asset` library crate.
+doc = false
 
 [dependencies]
 # Core library
-unity-asset = { path = "../../crates/unity-asset", version = "0.3.0" }
-unity-asset-binary = { path = "../../crates/unity-asset-binary", version = "0.3.0" }
-unity-asset-decode = { path = "../../crates/unity-asset-decode", version = "0.3.0", features = ["audio", "sprite", "texture-advanced"], optional = true }
+unity-asset = { workspace = true }
+unity-asset-binary = { workspace = true }
 
 # CLI dependencies
 clap = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-memmap2 = { version = "0.9.9", optional = true }
-tracing = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-
-# Async CLI dependencies (optional)
-tokio = { version = "1.0", features = ["fs", "io-util", "rt-multi-thread", "macros"], optional = true }
-futures = { version = "0.3", optional = true }
-indicatif = { version = "0.18", optional = true }
 
 [features]
 default = ["mmap"]
-async = ["unity-asset/async", "tokio", "futures", "indicatif"]
-decode = ["dep:unity-asset-decode"]
-mmap = ["unity-asset/mmap", "unity-asset-binary/mmap", "dep:memmap2"]
+decode = ["unity-asset/decode"]
+mmap = ["unity-asset/mmap", "unity-asset-binary/mmap"]
 full = ["decode", "mmap"]
-
-[dev-dependencies]
-tempfile = { workspace = true }
 
 [package.metadata.docs.rs]
 no-default-features = true
@@ -67,3 +52,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [package.metadata.dist]
 dist = false
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[build-dependencies]
+serde_json = { workspace = true }

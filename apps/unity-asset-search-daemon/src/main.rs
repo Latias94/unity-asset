@@ -1,28 +1,73 @@
-use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-use axum::Json;
-use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
-use axum::routing::{get, post};
 use clap::Parser;
-use notify::Watcher as _;
-use rand::TryRngCore;
-use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
 
-use unity_asset_search_index::{IndexPaths, SearchIndex, SearchIndexOptions};
+use unity_asset_search_index::{
+    AssetLoadBudget, FilesystemReindexIntent, IndexPaths, ProjectPathSpace, SearchIndex,
+    SearchIndexOptions,
+};
+use unity_asset_search_local::{PrivateRootsV1, ProjectLocatorV1, generate_daemon_instance_id};
+
+mod build_identity;
+mod coordinator;
+mod http_transport;
+mod lifecycle;
+mod operations;
+mod service;
+mod watcher;
+
+use crate::coordinator::ReindexCoordinatorConfig;
+use crate::lifecycle::{DaemonRuntime, DaemonRuntimeConfig};
+use crate::watcher::WatcherConfig;
+
+const DEFAULT_RECONCILE_INTERVAL_MS: u64 = 5 * 60 * 1_000;
+
+fn truncate_utf8(mut value: String, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut boundary = maximum_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
+}
+
+#[cfg(test)]
+fn secure_test_tempdir() -> tempfile::TempDir {
+    #[cfg(windows)]
+    {
+        let local_app_data = std::env::var_os("LOCALAPPDATA")
+            .expect("Windows tests require a LocalAppData directory");
+        tempfile::Builder::new()
+            .prefix("unity-asset-search-daemon-test-")
+            .tempdir_in(local_app_data)
+            .expect("create a daemon test directory below the private LocalAppData namespace")
+    }
+    #[cfg(not(windows))]
+    {
+        let temporary_root = std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical system temporary directory");
+        tempfile::Builder::new()
+            .prefix("unity-asset-search-daemon-test-")
+            .tempdir_in(temporary_root)
+            .expect("create a daemon test directory below the physical temporary namespace")
+    }
+}
 
 #[derive(Debug, Parser)]
-#[command(name = "unity-asset-search-daemon")]
+#[command(
+    name = "unity-asset-search-daemon",
+    version = crate::build_identity::VERSION_REPORT
+)]
 struct Args {
     #[arg(long)]
     project_root: PathBuf,
 
-    #[arg(long)]
+    /// Absolute private base directory under which a project-bound index directory is derived.
+    #[arg(long, value_name = "PRIVATE_BASE")]
     index_dir: Option<PathBuf>,
 
     #[arg(long, value_name = "PATH")]
@@ -31,14 +76,9 @@ struct Args {
     #[arg(long)]
     scan_all: bool,
 
-    #[arg(long, default_value = "127.0.0.1:9781")]
-    listen: SocketAddr,
-
+    /// Skip the initial reconciliation performed before serving requests.
     #[arg(long)]
-    token: Option<String>,
-
-    #[arg(long)]
-    no_auto_reindex: bool,
+    no_startup_reindex: bool,
 
     #[arg(long)]
     watch: bool,
@@ -46,64 +86,31 @@ struct Args {
     #[arg(long, default_value_t = 1500)]
     watch_debounce_ms: u64,
 
-    /// When a watcher burst reports too many distinct paths, fall back to a full incremental scan.
+    /// Maximum dirty paths retained by the coordinator before escalating to a full reindex.
     ///
-    /// This is primarily to handle VCS operations like `git checkout` that can touch thousands of files.
+    /// Set to 0 to disable this threshold.
     #[arg(long, default_value_t = 5000)]
     watch_full_scan_threshold: usize,
 
-    /// Periodically run a full incremental scan to self-heal any missed watcher events.
+    /// Periodically reconcile the project independently of filesystem watching.
     ///
-    /// Set to 0 to disable.
-    #[arg(long, default_value_t = 0)]
-    watch_reconcile_interval_ms: u64,
+    /// This repairs missed watcher events and transient build failures. Set to 0 to disable.
+    #[arg(long, default_value_t = DEFAULT_RECONCILE_INTERVAL_MS)]
+    reconcile_interval_ms: u64,
 
-    /// Also index AssetBundle `m_Container` asset paths (UnityPy-like discovery).
-    ///
-    /// This makes built-time asset paths searchable even when the source files are not present on disk.
+    /// Also index AssetBundle `m_Container` asset paths.
     #[arg(long)]
     index_bundle_container_entries: bool,
 
-    /// Preset for an Everything-like experience.
-    ///
-    /// Equivalent to enabling `--index-bundle-container-entries` and disabling `.gitignore` rules
-    /// (bundles are commonly gitignored).
-    #[arg(long, alias = "everything")]
-    search_everything: bool,
-
-    #[arg(long, hide = true)]
-    unityflow: bool,
-
-    /// Cap indexed container entries per bundle (prevents pathological bundles from exploding the index).
+    /// Cap indexed container entries per bundle.
     #[arg(long, default_value_t = 50_000)]
     max_bundle_container_entries_per_bundle: usize,
-
-    /// Do not apply ignore files (`.gitignore`, `.ignore`, `.unity-asset-search-ignore`) when scanning.
-    ///
-    /// This is useful for indexing build artifacts (e.g. `Assets/StreamingAssets/AssetBundles/`) that are commonly gitignored.
-    #[arg(long)]
-    no_ignore_files: bool,
-
-    /// Ignore `.gitignore` rules while still honoring other ignore mechanisms.
-    #[arg(long)]
-    no_gitignore: bool,
-}
-
-#[derive(Clone)]
-struct AppState {
-    index: SearchIndex,
-    token: String,
-    paths: IndexPaths,
-    reindex_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    let preset_everything = args.search_everything || args.unityflow;
-    let index_bundle_container_entries = preset_everything || args.index_bundle_container_entries;
-    let no_gitignore = preset_everything || args.no_gitignore;
-
+    let project = ProjectLocatorV1::open(&args.project_root)?;
     let scan_roots = if args.scan_all {
         Some(vec![PathBuf::from(".")])
     } else if args.scan_root.is_empty() {
@@ -111,536 +118,107 @@ async fn main() -> anyhow::Result<()> {
     } else {
         Some(args.scan_root.clone())
     };
-    let paths = IndexPaths::for_project(args.project_root, args.index_dir, scan_roots)?;
+    let paths = IndexPaths::for_project(
+        args.project_root.clone(),
+        args.index_dir.clone(),
+        scan_roots,
+    )?;
+    anyhow::ensure!(
+        paths.project_id() == project.project_id(),
+        "project identity changed while preparing the search index"
+    );
+    project.revalidate()?;
+    paths.revalidate_project_root()?;
+
+    let roots = PrivateRootsV1::discover_for_current_context()?;
+    let namespace = roots.runtime().endpoint_namespace(paths.project_id())?;
+    let endpoint_claim = namespace.claim_loopback_endpoint()?;
+    let stale_cleanup = endpoint_claim.stale_cleanup();
+    if stale_cleanup == unity_asset_search_local::LoopbackEndpointCleanup::Removed {
+        eprintln!("retired stale endpoint descriptor before daemon initialization");
+    }
+    let daemon_instance_id = generate_daemon_instance_id()?;
     let options = SearchIndexOptions {
-        index_bundle_container_entries,
+        index_bundle_container_entries: args.index_bundle_container_entries,
         max_bundle_container_entries_per_bundle: args.max_bundle_container_entries_per_bundle,
-        respect_ignore_files: !args.no_ignore_files,
-        respect_project_gitignore: !no_gitignore,
+        ..SearchIndexOptions::default()
     };
-    let index = SearchIndex::open_or_create_with_options(&paths, options)?;
 
-    let token = args.token.unwrap_or_else(generate_token);
-    persist_token(&paths.index_root_dir, &token)?;
-    persist_pid(&paths.index_root_dir)?;
-
-    eprintln!(
-        "unity-asset-search-daemon listening on {} (index: {}, token: {})",
-        args.listen,
-        paths.index_root_dir.display(),
-        token
-    );
-    eprintln!(
-        "options: index_bundle_container_entries={} max_bundle_container_entries_per_bundle={} respect_ignore_files={} respect_project_gitignore={}",
-        index_bundle_container_entries,
-        args.max_bundle_container_entries_per_bundle,
-        !args.no_ignore_files,
-        !no_gitignore
-    );
-
-    let state = AppState {
-        index: index.clone(),
-        token,
+    let mut open_budget = AssetLoadBudget::default();
+    let index = SearchIndex::open_or_create_with_options(paths.clone(), options, &mut open_budget)?;
+    project.revalidate()?;
+    paths.revalidate_project_root()?;
+    let coordinator_config = coordinator_config(&args, paths.project_path_space());
+    let watcher = args.watch.then(|| WatcherConfig {
         paths: paths.clone(),
-        reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
-    };
-
-    if !args.no_auto_reindex {
-        let status = index.status()?;
-        let should_reindex =
-            (status.indexed_docs == 0 && !status.indexing) || index.options_changed();
-        if should_reindex {
-            let state = Arc::new(state.clone());
-            tokio::spawn(async move {
-                let _ = run_reindex(state, false).await;
-            });
-        }
-    }
-
-    if args.watch {
-        let state_arc = Arc::new(state.clone());
-        let debounce = Duration::from_millis(args.watch_debounce_ms.max(100));
-        let full_scan_threshold = args.watch_full_scan_threshold;
-        let watch_state = state_arc.clone();
-        tokio::spawn(async move {
-            if let Err(err) = watch_and_reindex(watch_state, debounce, full_scan_threshold).await {
-                eprintln!("watch error: {err}");
-            }
-        });
-
-        if args.watch_reconcile_interval_ms > 0 {
-            let state = state_arc.clone();
-            let interval = Duration::from_millis(args.watch_reconcile_interval_ms);
-            tokio::spawn(async move {
-                reconcile_loop(state, interval).await;
-            });
-        }
-    }
-
-    let app = axum::Router::new()
-        .route("/v1/health", get(health))
-        .route("/v1/search", get(search))
-        .route("/v1/status", get(status))
-        .route("/v1/suggest", get(suggest))
-        .route("/v1/references", get(references))
-        .route("/v1/reindex", post(reindex))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(Arc::new(state));
-
-    let listener = tokio::net::TcpListener::bind(args.listen).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-#[derive(Debug, serde::Serialize)]
-struct HealthResponse {
-    ok: bool,
-    api_version: u32,
-    version: &'static str,
-}
-
-async fn health() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(HealthResponse {
-            ok: true,
-            api_version: 1,
-            version: env!("CARGO_PKG_VERSION"),
-        }),
+    });
+    let reconcile_interval = reconciliation_interval(&args);
+    let startup_reindex = (!args.no_startup_reindex).then(FilesystemReindexIntent::reconcile);
+    let runtime_config = DaemonRuntimeConfig::new(
+        endpoint_claim,
+        daemon_instance_id,
+        index,
+        coordinator_config,
     )
-        .into_response()
+    .with_startup_reindex(startup_reindex)
+    .with_watcher(watcher)
+    .with_reconcile_interval(reconcile_interval);
+    let mut runtime = DaemonRuntime::start(runtime_config)?;
+    let report = runtime.run().await?;
+    eprintln!("endpoint cleanup: {:?}", report.endpoint_cleanup);
+    Ok(())
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct SearchQuery {
-    q: String,
-    limit: Option<usize>,
-}
-
-async fn search(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<SearchQuery>,
-) -> impl IntoResponse {
-    let limit = q.limit.unwrap_or(20).clamp(1, 200);
-    let index = state.index.clone();
-    let project_root = state.paths.project_root.clone();
-    let query = q.q.clone();
-    match tokio::task::spawn_blocking(move || index.search_enriched(&project_root, &query, limit))
-        .await
-    {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-async fn status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let index = state.index.clone();
-    match tokio::task::spawn_blocking(move || index.status()).await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SuggestQuery {
-    prefix: Option<String>,
-    limit: Option<usize>,
-}
-
-async fn suggest(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<SuggestQuery>,
-) -> impl IntoResponse {
-    let prefix = q.prefix.unwrap_or_default();
-    let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    let index = state.index.clone();
-    match tokio::task::spawn_blocking(move || index.suggest(&prefix, limit)).await {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ReferencesQuery {
-    guid: String,
-    file_id: Option<u64>,
-    limit: Option<usize>,
-}
-
-async fn references(
-    State(state): State<Arc<AppState>>,
-    Query(q): Query<ReferencesQuery>,
-) -> impl IntoResponse {
-    let guid = q.guid.clone();
-    let file_id = q.file_id;
-    let limit = q.limit.unwrap_or(50).clamp(1, 500);
-    let index = state.index.clone();
-    let project_root = state.paths.project_root.clone();
-
-    match tokio::task::spawn_blocking(move || {
-        index.references_enriched(&project_root, &guid, file_id, limit)
-    })
-    .await
-    {
-        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
-        Ok(Err(err)) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ReindexParams {
-    full: Option<bool>,
-    /// When false, start reindex in the background and return immediately.
-    ///
-    /// This is useful for UIs (e.g. Unity Editor) where a full reindex can take minutes.
-    wait: Option<bool>,
-    #[serde(default)]
-    path: Vec<String>,
-    #[serde(default)]
-    paths: Vec<String>,
-}
-
-async fn reindex(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-    Query(q): Query<ReindexParams>,
-) -> impl IntoResponse {
-    if !is_authorized(&headers, &state.token) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized" })),
-        )
-            .into_response();
-    }
-
-    let full = q.full.unwrap_or(false);
-    let wait = q.wait.unwrap_or(true);
-    let paths: Vec<String> = q.path.into_iter().chain(q.paths.into_iter()).collect();
-
-    if !wait {
-        let indexing = state
-            .index
-            .status()
-            .ok()
-            .map(|s| s.indexing)
-            .unwrap_or(false);
-        if indexing {
-            return (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({ "ok": true, "started": false, "indexing": true })),
-            )
-                .into_response();
-        }
-
-        let state_clone = state.clone();
-        tokio::spawn(async move {
-            let result = if full {
-                run_reindex(state_clone, true).await
-            } else if paths.is_empty() {
-                run_reindex(state_clone, false).await
-            } else {
-                run_reindex_paths(state_clone, &paths).await
-            };
-            if let Err(err) = result {
-                eprintln!("reindex error: {err}");
-            }
-        });
-
-        return (
-            StatusCode::ACCEPTED,
-            Json(serde_json::json!({ "ok": true, "started": true, "indexing": true })),
-        )
-            .into_response();
-    }
-
-    match if full {
-        run_reindex(state, true).await
-    } else if paths.is_empty() {
-        run_reindex(state, false).await
+fn coordinator_config(args: &Args, project_paths: &ProjectPathSpace) -> ReindexCoordinatorConfig {
+    let debounce = Duration::from_millis(args.watch_debounce_ms.max(100));
+    let max_debounce = Duration::from_millis(args.watch_debounce_ms.max(100).saturating_mul(4));
+    let maximum_dirty_paths = if args.watch_full_scan_threshold == 0 {
+        usize::MAX
     } else {
-        run_reindex_paths(state, &paths).await
-    } {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": err.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-fn is_authorized(headers: &HeaderMap, token: &str) -> bool {
-    let Some(value) = headers.get(axum::http::header::AUTHORIZATION) else {
-        return false;
+        args.watch_full_scan_threshold
     };
-    let Ok(value) = value.to_str() else {
-        return false;
-    };
-    value == format!("Bearer {token}")
+    ReindexCoordinatorConfig::new(project_paths.clone())
+        .with_debounce(debounce)
+        .with_max_debounce(max_debounce)
+        .with_max_dirty_paths(maximum_dirty_paths)
 }
 
-fn generate_token() -> String {
-    let mut bytes = [0u8; 16];
-    let mut rng = rand::rngs::OsRng;
-    rng.try_fill_bytes(&mut bytes)
-        .expect("OsRng should be available");
-    hex::encode(bytes)
+fn reconciliation_interval(args: &Args) -> Option<Duration> {
+    (args.reconcile_interval_ms > 0).then(|| Duration::from_millis(args.reconcile_interval_ms))
 }
 
-fn persist_token(index_dir: &std::path::Path, token: &str) -> anyhow::Result<()> {
-    let path = index_dir.join("token");
-    std::fs::write(path, token)?;
-    Ok(())
-}
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
 
-fn persist_pid(index_dir: &std::path::Path) -> anyhow::Result<()> {
-    let pid = std::process::id();
-    let path = index_dir.join("pid");
-    std::fs::write(path, pid.to_string())?;
-    Ok(())
-}
+    use clap::Parser as _;
 
-async fn watch_and_reindex(
-    state: Arc<AppState>,
-    debounce: Duration,
-    full_scan_threshold: usize,
-) -> anyhow::Result<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WatchMsg>();
+    use super::{Args, DEFAULT_RECONCILE_INTERVAL_MS, reconciliation_interval, truncate_utf8};
 
-    let scan_roots = state.paths.scan_roots.clone();
-    let index_root = state.paths.index_root_dir.clone();
+    #[test]
+    fn periodic_reconciliation_is_independent_of_watching_and_can_be_disabled() {
+        let defaults =
+            Args::try_parse_from(["unity-asset-search-daemon", "--project-root", "."]).unwrap();
+        assert!(!defaults.watch);
+        assert_eq!(
+            reconciliation_interval(&defaults),
+            Some(Duration::from_millis(DEFAULT_RECONCILE_INTERVAL_MS))
+        );
 
-    let mut watcher =
-        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            let Ok(event) = res else {
-                return;
-            };
-
-            let mut dir_paths = Vec::new();
-            let mut file_paths = Vec::new();
-            let mut force_full = false;
-
-            for path in event.paths {
-                if path.starts_with(&index_root) {
-                    continue;
-                }
-                if path.file_name().is_some_and(|n| {
-                    n == ".gitignore" || n == ".ignore" || n == ".unity-asset-search-ignore"
-                }) {
-                    force_full = true;
-                }
-                if path.exists() && path.is_dir() {
-                    dir_paths.push(path);
-                } else {
-                    file_paths.push(path);
-                }
-            }
-
-            let paths = if !file_paths.is_empty() {
-                file_paths
-            } else {
-                dir_paths
-            };
-
-            if paths.is_empty() {
-                return;
-            }
-            let _ = tx.send(WatchMsg { paths, force_full });
-        })?;
-
-    for root in scan_roots {
-        watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+        let disabled = Args::try_parse_from([
+            "unity-asset-search-daemon",
+            "--project-root",
+            ".",
+            "--reconcile-interval-ms",
+            "0",
+        ])
+        .unwrap();
+        assert_eq!(reconciliation_interval(&disabled), None);
     }
 
-    loop {
-        let Some(first) = rx.recv().await else {
-            return Ok(());
-        };
-
-        let mut pending = std::collections::BTreeSet::<PathBuf>::new();
-        let mut force_full = first.force_full;
-        for p in first.paths {
-            pending.insert(p);
-        }
-
-        let mut deadline = tokio::time::Instant::now() + debounce;
-        loop {
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            let sleep = tokio::time::sleep(deadline - now);
-            tokio::pin!(sleep);
-            tokio::select! {
-                _ = &mut sleep => break,
-                msg = rx.recv() => {
-                    let Some(msg) = msg else { return Ok(()); };
-                    force_full |= msg.force_full;
-                    for p in msg.paths {
-                        pending.insert(p);
-                    }
-                    deadline = tokio::time::Instant::now() + debounce;
-                }
-            }
-        }
-
-        if force_full {
-            if let Err(err) = run_reindex(state.clone(), false).await {
-                eprintln!("reindex error: {err}");
-            }
-            continue;
-        }
-
-        let mut changed_paths: Vec<PathBuf> = pending.into_iter().collect();
-        if full_scan_threshold > 0 && changed_paths.len() >= full_scan_threshold {
-            eprintln!(
-                "watch burst: {} paths >= {} (full scan threshold), falling back to full scan",
-                changed_paths.len(),
-                full_scan_threshold
-            );
-            let _ = state.index.note_fallback("watch_full_scan_threshold");
-            if let Err(err) = run_reindex_sharded_full_scan(state.clone()).await {
-                eprintln!("reindex error (full scan threshold): {err}");
-            }
-            continue;
-        }
-        let has_file_like = changed_paths.iter().any(|p| !p.exists() || p.is_file());
-        if has_file_like {
-            changed_paths.retain(|p| !(p.exists() && p.is_dir()));
-        } else {
-            let scan_roots = &state.paths.scan_roots;
-            changed_paths.retain(|p| !scan_roots.iter().any(|r| p == r));
-            changed_paths.retain(|p| p != &state.paths.project_root);
-        }
-        if changed_paths.is_empty() {
-            continue;
-        }
-        if let Err(err) = run_reindex_changed_paths(state.clone(), &changed_paths).await {
-            eprintln!("reindex changed paths error: {err}");
-        }
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundaries() {
+        assert_eq!(truncate_utf8("a界b".to_owned(), 4), "a界");
+        assert_eq!(truncate_utf8("short".to_owned(), 5), "short");
     }
-}
-
-async fn reconcile_loop(state: Arc<AppState>, interval: Duration) {
-    let mut ticker = tokio::time::interval(interval);
-    loop {
-        ticker.tick().await;
-        if let Err(err) = run_reindex_sharded_full_scan(state.clone()).await {
-            eprintln!("reconcile reindex error: {err}");
-        }
-    }
-}
-
-async fn run_reindex_sharded_full_scan(state: Arc<AppState>) -> anyhow::Result<()> {
-    let _guard = state.reindex_lock.lock().await;
-    let index = state.index.clone();
-    let paths = state.paths.clone();
-
-    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let scan_roots = paths.scan_roots.clone();
-        for root in &scan_roots {
-            index.reindex_changed_paths(&paths, std::slice::from_ref(root))?;
-        }
-        index.note_reindex_summary(
-            "sharded_full_scan_incremental",
-            Some(scan_roots.len().try_into().unwrap_or(u64::MAX)),
-        )?;
-        Ok(())
-    })
-    .await??;
-    Ok(())
-}
-
-async fn run_reindex(state: Arc<AppState>, full: bool) -> anyhow::Result<()> {
-    let _guard = state.reindex_lock.lock().await;
-    let index = state.index.clone();
-    let paths = state.paths.clone();
-
-    tokio::task::spawn_blocking(move || {
-        if full {
-            index.reindex_full(&paths)
-        } else {
-            index.reindex(&paths)
-        }
-    })
-    .await??;
-    Ok(())
-}
-
-async fn run_reindex_changed_paths(
-    state: Arc<AppState>,
-    changed_paths: &[PathBuf],
-) -> anyhow::Result<()> {
-    if changed_paths.is_empty() {
-        return Ok(());
-    }
-    let _guard = state.reindex_lock.lock().await;
-    let index = state.index.clone();
-    let paths = state.paths.clone();
-    let changed_paths = changed_paths.to_vec();
-
-    tokio::task::spawn_blocking(move || index.reindex_changed_paths(&paths, &changed_paths))
-        .await??;
-    Ok(())
-}
-
-async fn run_reindex_paths(state: Arc<AppState>, raw_paths: &[String]) -> anyhow::Result<()> {
-    let mut paths = Vec::new();
-    for raw in raw_paths {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            continue;
-        }
-        let p = PathBuf::from(raw);
-        let p = if p.is_absolute() {
-            p
-        } else {
-            state.paths.project_root.join(p)
-        };
-        paths.push(p);
-    }
-    run_reindex_changed_paths(state, &paths).await
-}
-
-#[derive(Debug)]
-struct WatchMsg {
-    paths: Vec<PathBuf>,
-    force_full: bool,
 }

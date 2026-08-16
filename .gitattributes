@@ -1,0 +1,2 @@
+crates/unity-asset-search-index/tests/fixtures/legacy-storage-v1/project/** -text
+crates/unity-asset-search-index/tests/fixtures/legacy-storage-v1/store/** -text

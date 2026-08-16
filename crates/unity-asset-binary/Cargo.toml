@@ -1,9 +1,10 @@
 [package]
 name = "unity-asset-binary"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
-description = "Unity binary file format parser (AssetBundle, SerializedFile)"
+description = "Unity binary format parsing and canonical TypeTree wire execution"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -22,44 +23,31 @@ exclude = [
 
 [dependencies]
 # Core dependencies
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 indexmap = { workspace = true }
 serde_json = { workspace = true }
 
 # Binary parsing
-binrw = { workspace = true }
 byteorder = { workspace = true }
-regex = { workspace = true }
 
 # Compression support
 flate2 = { workspace = true }
 lz4_flex = { workspace = true }
-lzma-rs = "0.3"
-brotli = "3.4"
+# The decoder scratch budget mirrors lzma-rs 0.3.0's allocation model.
+lzma-rs = "=0.3.0"
+brotli = { version = "8.0", default-features = false, features = ["std"] }
 memmap2 = { version = "0.9", optional = true }
 
 # Performance and utilities
 once_cell = { workspace = true }
-num_cpus = "1.16"
-
-# Async support (optional)
-tokio = { workspace = true, optional = true }
-futures = { workspace = true, optional = true }
-async-trait = { workspace = true, optional = true }
-tokio-stream = { workspace = true, optional = true }
-async-stream = { workspace = true, optional = true }
 
 [features]
 default = []
-
-# 异步支持
-async = ["unity-asset-core/async", "tokio", "futures", "async-trait", "tokio-stream", "async-stream"]
 mmap = ["dep:memmap2"]
 
 [dev-dependencies]
-hex = "0.4"
 tempfile = { workspace = true }
 
 [package.metadata.docs.rs]

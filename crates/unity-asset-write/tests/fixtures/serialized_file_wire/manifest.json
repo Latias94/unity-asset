@@ -1,0 +1,2174 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "02aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 16
+          },
+          "metadata": {
+            "offset": 132,
+            "size": 112
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 205,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 177,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 193,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 189,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 201,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 181,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 203,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 185,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 197,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 137,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 133,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 128,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          0,
+          0,
+          0
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": null,
+        "version": 2
+      },
+      "file": "v2.assets.bin",
+      "length": 244,
+      "sha256": "146d339d68ca17c822565940e08bfb981b9276fc846213f58e5fecea4406d525"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "03aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 16
+          },
+          "metadata": {
+            "offset": 132,
+            "size": 100
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 193,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 165,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 181,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 177,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 189,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 169,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 191,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 173,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 185,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 137,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 133,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 128,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          0,
+          0,
+          0
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": null,
+        "version": 3
+      },
+      "file": "v3.assets.bin",
+      "length": 232,
+      "sha256": "c0d8b4589ee7fa02bd2e8efcef8d91373629ffed6014b23e9affb89ea9843f1e"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "05aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 16
+          },
+          "metadata": {
+            "offset": 132,
+            "size": 141
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 201,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 173,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 189,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 185,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 197,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 177,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 199,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 181,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 193,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 137,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 133,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 128,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          0,
+          0,
+          0
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 5
+      },
+      "file": "v5.assets.bin",
+      "length": 273,
+      "sha256": "88c248f7f590f21f9af95b1a9bdf695f160b98054cc152ab3dd177428a54c86a"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "06aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 16
+          },
+          "metadata": {
+            "offset": 132,
+            "size": 155
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 201,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 173,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 189,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 185,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 197,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 177,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 199,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 181,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 193,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 137,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 133,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 128,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          0,
+          0,
+          0
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 6
+      },
+      "file": "v6.assets.bin",
+      "length": 287,
+      "sha256": "50d74df576a66bd70658e8c4bd67a19068d1ca708355648cc6c0e6188f1f4b65"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": 0,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "07aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 16
+          },
+          "metadata": {
+            "offset": 132,
+            "size": 170
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 216,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 184,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 204,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 200,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 212,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 192,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 214,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 196,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 208,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 148,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 144,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 128,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          0,
+          0,
+          0
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 7
+      },
+      "file": "v7.assets.bin",
+      "length": 302,
+      "sha256": "f0c682716084f9839b6df3bd6ce7165a26b5fd39ef63aa44133d9b1a0294f6d6"
+    },
+    {
+      "expected": {
+        "big_id_enabled": true,
+        "big_id_raw": 305419896,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 1,
+        "path_id": 4294967338,
+        "payload_hex": "08aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 16
+          },
+          "metadata": {
+            "offset": 132,
+            "size": 178
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 224,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 188,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 212,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 208,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 220,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 196,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 222,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 200,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 216,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 152,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 148,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 128,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 324478056,
+        "ref_type_count": 0,
+        "reserved": [
+          0,
+          0,
+          0
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 8
+      },
+      "file": "v8.assets.bin",
+      "length": 310,
+      "sha256": "f52f178656473e915fbff5f4047e9a634bb64d745b8635117c8ec3ed6e363b19"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": 0,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "09aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 173
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 107,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 75,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 95,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 91,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 103,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 83,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 105,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 87,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 99,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 39,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 35,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 208,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 9
+      },
+      "file": "v9.assets.bin",
+      "length": 212,
+      "sha256": "e27293bd5dd1ef306d439cb9e915216a24d641f1d31280e9e5b21e66fd7e5c07"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": 0,
+        "class_id": 28,
+        "destroyed": 4660,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "0aaabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 181
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 115,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 103,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 99,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 111,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 91,
+              "size": 4
+            },
+            "object_destroyed": {
+              "offset": 113,
+              "size": 2
+            },
+            "object_path_id": {
+              "offset": 95,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 107,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 39,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 35,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 59,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 43,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 75,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 47,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 55,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 208,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 10
+      },
+      "file": "v10.assets.bin",
+      "length": 212,
+      "sha256": "54700e2e58404c884dcafdb5f3a2162900d5193dfb59b17e2a0145f7bdbc2b1a"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": 0,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "0baabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 177
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 111,
+              "size": 4
+            },
+            "legacy_child_count": {
+              "offset": 75,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 95,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 91,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 103,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 83,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 87,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 99,
+              "size": 4
+            },
+            "object_script_type_index": {
+              "offset": 105,
+              "size": 2
+            },
+            "script_count": {
+              "offset": 107,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 39,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 35,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 208,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": -3,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 11
+      },
+      "file": "v11.assets.bin",
+      "length": 212,
+      "sha256": "167610084590c23557d2d77490e225168f90057efb08811a372f96137403f1f1"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": 0,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "0caabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 185
+          },
+          "metadata_fields": {
+            "external_count": {
+              "offset": 119,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 103,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 99,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 111,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 91,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 95,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 107,
+              "size": 4
+            },
+            "object_script_type_index": {
+              "offset": 113,
+              "size": 2
+            },
+            "script_count": {
+              "offset": 115,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 39,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 35,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 59,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 43,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 75,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 47,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 55,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 208,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": -3,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": null,
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 12
+      },
+      "file": "v12.assets.bin",
+      "length": 212,
+      "sha256": "2625ea17e7ad51ef3821fe19b5a2186111be7f75f358b15daa7eba119cd86184"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": 0,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "0daabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 202
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 136,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 120,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 116,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 128,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 108,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 112,
+              "size": 4
+            },
+            "object_raw_type_reference": {
+              "offset": 124,
+              "size": 4
+            },
+            "object_script_type_index": {
+              "offset": 130,
+              "size": 2
+            },
+            "script_count": {
+              "offset": 132,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 76,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 80,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 60,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 92,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 64,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 72,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 224,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": -3,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 13
+      },
+      "file": "v13.assets.bin",
+      "length": 228,
+      "sha256": "307c55d59372fa72a2f35a6893736a8fdca57501e3aeecf6e456eb8db4124294"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "0eaabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 202
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 136,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 120,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 116,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 128,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 104,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 108,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 124,
+              "size": 4
+            },
+            "object_script_type_index": {
+              "offset": 130,
+              "size": 2
+            },
+            "script_count": {
+              "offset": 132,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 76,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 80,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 60,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 92,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 64,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 72,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 224,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": -3,
+        "serialized_type_index": null,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 14
+      },
+      "file": "v14.assets.bin",
+      "length": 228,
+      "sha256": "cb09b1cc3a1f7f09600e1fa2f1ee16adf9673ac9a8ea90d4f274b81ac30f19a5"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "0faabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 203
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 137,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 120,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 116,
+              "size": 4
+            },
+            "object_class_id": {
+              "offset": 128,
+              "size": 2
+            },
+            "object_count": {
+              "offset": 104,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 108,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 124,
+              "size": 4
+            },
+            "object_script_type_index": {
+              "offset": 130,
+              "size": 2
+            },
+            "object_stripped": {
+              "offset": 132,
+              "size": 1
+            },
+            "script_count": {
+              "offset": 133,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 76,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 80,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 60,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 92,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 64,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 72,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 224,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 28,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": -3,
+        "serialized_type_index": null,
+        "stripped": true,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 15
+      },
+      "file": "v15.assets.bin",
+      "length": 228,
+      "sha256": "6d483831531b8b61e2fc4b03e1bac06e5cfea52bf2cc970f50fc3fdffd5bdcad"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "10aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 201
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 32,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 135,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 120,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 116,
+              "size": 4
+            },
+            "object_count": {
+              "offset": 102,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 108,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 124,
+              "size": 4
+            },
+            "object_script_type_index": {
+              "offset": 128,
+              "size": 2
+            },
+            "object_stripped": {
+              "offset": 130,
+              "size": 1
+            },
+            "script_count": {
+              "offset": 131,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 37,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 33,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 74,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 78,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 58,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 90,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 62,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 70,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 224,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": -3,
+        "serialized_type_index": 0,
+        "stripped": true,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 16
+      },
+      "file": "v16.assets.bin",
+      "length": 228,
+      "sha256": "d10db38b404e91b6c3dbdcc3f058f2b53da456d823df7f9a1e5584aebfa2439c"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "11aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 202
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 136,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 124,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 120,
+              "size": 4
+            },
+            "object_count": {
+              "offset": 107,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 112,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 128,
+              "size": 4
+            },
+            "script_count": {
+              "offset": 132,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 79,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 83,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 95,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 67,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 75,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 224,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": 0,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 17
+      },
+      "file": "v17.assets.bin",
+      "length": 228,
+      "sha256": "513866fd74b18f019533622cc96c1a9dc552e1eab418e8bf97026a643a87b18a"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "12aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 202
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 136,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 124,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 120,
+              "size": 4
+            },
+            "object_count": {
+              "offset": 107,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 112,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 128,
+              "size": 4
+            },
+            "script_count": {
+              "offset": 132,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 79,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 83,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 95,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 67,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 75,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 224,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": 0,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 18
+      },
+      "file": "v18.assets.bin",
+      "length": 228,
+      "sha256": "ff1b39efd1ecb895e050a2eef5dc1831cd97d0b1686fa836cba67fb784659f6e"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "13aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 210
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 144,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 132,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 128,
+              "size": 4
+            },
+            "object_count": {
+              "offset": 115,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 120,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 136,
+              "size": 4
+            },
+            "script_count": {
+              "offset": 140,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 79,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 83,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 103,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 67,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 75,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 240,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 0,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": 0,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 19
+      },
+      "file": "v19.assets.bin",
+      "length": 244,
+      "sha256": "4ee138b3f6bcd25fff9e7ecbfeb739c46f5f4b33d3c920928ac740769534d5b7"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "14aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 305
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 144,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 132,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 128,
+              "size": 4
+            },
+            "object_count": {
+              "offset": 115,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 120,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 136,
+              "size": 4
+            },
+            "ref_type_count": {
+              "offset": 217,
+              "size": 4
+            },
+            "script_count": {
+              "offset": 140,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 79,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 83,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 103,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 67,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 75,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 336,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 1,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": 0,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 20
+      },
+      "file": "v20.assets.bin",
+      "length": 340,
+      "sha256": "29f1b8ea6b103284c06cfff0f4fb075e3bd5e6491e7ac539d6a067849c77c19e"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 0,
+        "path_id": 42,
+        "payload_hex": "15aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 20
+          },
+          "metadata": {
+            "offset": 20,
+            "size": 359
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 35,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 156,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 144,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 140,
+              "size": 4
+            },
+            "object_count": {
+              "offset": 127,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 132,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 148,
+              "size": 4
+            },
+            "ref_type_count": {
+              "offset": 229,
+              "size": 4
+            },
+            "script_count": {
+              "offset": 152,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 40,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 36,
+              "size": 4
+            },
+            "type_dependency_count": {
+              "offset": 115,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 79,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 83,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 63,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 103,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 67,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 75,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 384,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 1,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": 0,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 0,
+        "user_information": "fixture-user",
+        "version": 21
+      },
+      "file": "v21.assets.bin",
+      "length": 388,
+      "sha256": "2f607f9d1d99e94c6e78cabfb963b0537ca39f46b49c451d6dd7dca4e714478c"
+    },
+    {
+      "expected": {
+        "big_id_enabled": false,
+        "big_id_raw": null,
+        "class_id": 28,
+        "destroyed": null,
+        "endian": 1,
+        "path_id": 42,
+        "payload_hex": "16aabbcc",
+        "ranges": {
+          "header": {
+            "offset": 0,
+            "size": 48
+          },
+          "metadata": {
+            "offset": 48,
+            "size": 363
+          },
+          "metadata_fields": {
+            "enable_type_tree": {
+              "offset": 63,
+              "size": 1
+            },
+            "external_count": {
+              "offset": 188,
+              "size": 4
+            },
+            "object_byte_size": {
+              "offset": 176,
+              "size": 4
+            },
+            "object_byte_start": {
+              "offset": 168,
+              "size": 8
+            },
+            "object_count": {
+              "offset": 155,
+              "size": 4
+            },
+            "object_path_id": {
+              "offset": 160,
+              "size": 8
+            },
+            "object_raw_type_reference": {
+              "offset": 180,
+              "size": 4
+            },
+            "ref_type_count": {
+              "offset": 261,
+              "size": 4
+            },
+            "script_count": {
+              "offset": 184,
+              "size": 4
+            },
+            "serialized_type_class_id": {
+              "offset": 68,
+              "size": 4
+            },
+            "type_count": {
+              "offset": 64,
+              "size": 4
+            },
+            "type_dependency_count": {
+              "offset": 143,
+              "size": 4
+            },
+            "type_tree_name_string_offset": {
+              "offset": 107,
+              "size": 4
+            },
+            "type_tree_node_byte_size": {
+              "offset": 111,
+              "size": 4
+            },
+            "type_tree_node_count": {
+              "offset": 91,
+              "size": 4
+            },
+            "type_tree_string_buffer": {
+              "offset": 131,
+              "size": 12
+            },
+            "type_tree_string_buffer_size": {
+              "offset": 95,
+              "size": 4
+            },
+            "type_tree_type_string_offset": {
+              "offset": 103,
+              "size": 4
+            }
+          },
+          "payload": {
+            "offset": 416,
+            "size": 4
+          }
+        },
+        "raw_type_reference": 0,
+        "ref_type_count": 1,
+        "reserved": [
+          161,
+          178,
+          195
+        ],
+        "script_type_index": null,
+        "serialized_type_index": 0,
+        "stripped": null,
+        "type_hash_hex": "202122232425262728292a2b2c2d2e2f",
+        "unknown": 77162851027281784,
+        "user_information": "fixture-user",
+        "version": 22
+      },
+      "file": "v22.assets.bin",
+      "length": 420,
+      "sha256": "8b635320231c16a4e1d2104b6319be40381fd024709d88093e8dccabed9913ff"
+    }
+  ],
+  "differential_verification": {
+    "implementation": "UnityPy 1.25.2 (vendored commit 5567c5e)",
+    "observation": "All version-matrix fixtures parse with one type and one object; dedicated fixtures additionally exercise multiple-object layouts.",
+    "scope_limit": "The synthetic v16 fixture validates the index-only example accepted by UnityPy; it does not settle the conflicting general v16 raw32 interpretation."
+  },
+  "evidence_limits": [
+    "The v2/v3 legacy node deltas follow UnityPy 1.25.2 and AssetStudio. Current AssetRipper applies one legacy layout and is not an oracle for those deltas.",
+    "The v16 raw32 value is intentionally index-only in this synthetic case. UnityPy, AssetStudio, and AssetsTools.NET disagree with AssetRipper and uTinyRipper; only a Unity-authored 5.5 fixture can settle the general encoding."
+  ],
+  "generator": "scripts/generate_serialized_file_goldens.py",
+  "multi_object_cases": [
+    {
+      "expected_objects": [
+        {
+          "path_id": 42,
+          "payload_hex": "a1a2a3a4",
+          "raw_type_reference": 28
+        },
+        {
+          "path_id": 84,
+          "payload_hex": "b1b2b3b4b5b6",
+          "raw_type_reference": 28
+        }
+      ],
+      "file": "multi_v15.assets.bin",
+      "length": 286,
+      "purpose": "Single-object edit preserves the untouched object wire identity",
+      "sha256": "082c6fe302ce63459dfd00966592dee1d848eb5c1bff27f24c76b0e928a494f2"
+    },
+    {
+      "expected_objects": [
+        {
+          "path_id": 42,
+          "payload_hex": "a1a2a3a4",
+          "raw_type_reference": 0
+        },
+        {
+          "path_id": 84,
+          "payload_hex": "b1b2b3b4b5b6",
+          "raw_type_reference": 0
+        }
+      ],
+      "file": "multi_v22.assets.bin",
+      "length": 462,
+      "purpose": "Single-object edit preserves the untouched object wire identity",
+      "sha256": "da764e069ca82355e0fc8438c43959fadb362bfc175f6f5e2890240a9e2a9360"
+    }
+  ],
+  "oracles": [
+    "repo-ref/UnityPy/UnityPy/files/SerializedFile.py",
+    "repo-ref/UnityPy/UnityPy/files/ObjectReader.py",
+    "repo-ref/UnityPy/UnityPy/helpers/TypeTreeNode.py",
+    "repo-ref/assetripper/Source/AssetRipper.IO.Files/SerializedFiles/Parser/SerializedFileMetadata.cs",
+    "repo-ref/assetripper/Source/AssetRipper.IO.Files/SerializedFiles/Parser/ObjectInfo.cs"
+  ],
+  "schema": 1,
+  "special_cases": [
+    {
+      "file": "legacy_v15_monobehaviour.assets.bin",
+      "length": 196,
+      "purpose": "Legacy raw type ID resolves to a MonoBehaviour class-bit identity",
+      "sha256": "0ddc6f538d689a5c28c8ef071212618c7b16dc281ae1a1b585e725af676d204c"
+    }
+  ],
+  "transform_hierarchy_case": {
+    "expected": {
+      "class_id": 4,
+      "embedded_type_tree": true,
+      "endian": 0,
+      "objects": [
+        {
+          "children": [
+            {
+              "file_id": 0,
+              "path_id": 2
+            }
+          ],
+          "father": {
+            "file_id": 0,
+            "path_id": 0
+          },
+          "path_id": 1,
+          "payload_hex": "00000000000000000000000001000000000000000200000000000000",
+          "payload_offset": 0
+        },
+        {
+          "children": [],
+          "father": {
+            "file_id": 0,
+            "path_id": 1
+          },
+          "path_id": 2,
+          "payload_hex": "00000000010000000000000000000000",
+          "payload_offset": 32
+        }
+      ],
+      "raw_type_reference": 0,
+      "type_tree_node_count": 10,
+      "unity_version": "2020.1.0f1",
+      "version": 22
+    },
+    "file": "transform_hierarchy_v22.assets.bin",
+    "length": 672,
+    "purpose": "Embedded Transform TypeTree preserves a complete parent-child topology",
+    "sha256": "f9e405832788f10099352732010d6353910461fdd44d6770692b724b2e6bfda7"
+  }
+}

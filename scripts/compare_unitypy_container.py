@@ -62,40 +62,54 @@ def _unitypy_container_keys(UnityPy, bundle_path: str) -> Set[str]:
     return set(keys)
 
 
-def _run_unity_asset_find_object_container(unity_asset_exe: str, bundle_path: str) -> Set[str]:
+def _run_unity_asset_container_occurrences(
+    unity_asset_exe: str, bundle_path: str
+) -> Set[str]:
     cmd = [
         unity_asset_exe,
-        "find-object",
+        "workspace",
+        "inspect",
+        "bundle-containers",
         "--input",
         bundle_path,
-        "--include-unresolved",
+        "--query-json",
+        "-",
     ]
+    query = {
+        "contract": "unity_asset.bundle_container_query",
+        "version": 1,
+        "pattern": "*",
+    }
     proc = subprocess.run(
         cmd,
+        input=json.dumps(query),
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
         text=True,
         check=False,
     )
     if proc.returncode != 0:
         raise RuntimeError(
-            "unity-asset find-object failed\n"
+            "unity-asset bundle container inspection failed\n"
             + f"bundle={bundle_path}\n"
             + f"cmd={' '.join(cmd)}\n"
-            + proc.stdout
+            + proc.stderr
         )
 
-    keys: Set[str] = set()
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if not line or line.startswith("?") or line.startswith("warning:"):
-            continue
-        if " -> " not in line:
-            continue
-        asset_path = line.split(" -> ", 1)[0].strip()
-        if asset_path:
-            keys.add(_normalize_asset_path(asset_path))
-    return keys
+    result = json.loads(proc.stdout)
+    if (
+        result.get("contract") != "unity_asset.bundle_container_result"
+        or result.get("version") != 1
+    ):
+        raise RuntimeError(
+            "unity-asset returned an unsupported bundle container result contract\n"
+            + f"bundle={bundle_path}\n"
+            + f"result={result!r}"
+        )
+    return {
+        _normalize_asset_path(occurrence["asset_path"])
+        for occurrence in result["occurrences"]
+    }
 
 
 def _detect_unity_asset_exe(repo_root: str, explicit: Optional[str]) -> str:
@@ -125,7 +139,10 @@ def _diff_sets(a: Set[str], b: Set[str]) -> Tuple[List[str], List[str]]:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Compare UnityPy container keys with unity-asset find-object output (sampled)."
+        description=(
+            "Compare UnityPy container keys with unity-asset bundle occurrence output "
+            "(sampled)."
+        )
     )
     parser.add_argument(
         "--unitypy-repo",
@@ -181,7 +198,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for path in sampled:
         try:
             unitypy = _unitypy_container_keys(UnityPy, path)
-            unity_asset = _run_unity_asset_find_object_container(unity_asset_exe, path)
+            unity_asset = _run_unity_asset_container_occurrences(unity_asset_exe, path)
             missing, extra = _diff_sets(unitypy, unity_asset)
             diffs.append(
                 BundleDiff(

@@ -1,8 +1,7 @@
-//! UnityFS bundle rebuild/save support (UnityPy parity).
+//! Canonical prepared-artifact encoding for Unity bundle containers.
 
-mod chunk;
-mod edits;
-mod writer;
+mod artifact_writer;
 
-pub use edits::BundleEdits;
-pub use writer::BundleWriter;
+pub use artifact_writer::{
+    BundleArtifactEntry, BundleArtifactError, BundleArtifactMember, BundleWriter,
+};

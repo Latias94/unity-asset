@@ -1,22 +1,22 @@
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use unity_asset::extraction::{ExistingOutputPolicy, ExtractionFailurePolicy};
+
 #[derive(Parser)]
-#[command(name = "unity_asset")]
-#[command(about = "A Rust-based Unity asset parser")]
-#[command(version)]
+#[command(name = "unity-asset")]
+#[command(about = "Typed Unity asset workspace and extraction tools")]
+#[command(version = crate::build_identity::VERSION_REPORT)]
 pub(crate) struct Cli {
-    /// Fail-fast TypeTree parsing (no best-effort fallbacks)
+    /// Fail-fast TypeTree parsing.
     #[arg(long)]
     pub(crate) strict: bool,
 
-    /// Print collected load warnings and TypeTree warnings (when applicable)
+    /// Emit non-fatal load warnings without corrupting structured failures.
     #[arg(long)]
     pub(crate) show_warnings: bool,
 
-    /// External TypeTree registry JSON/TPK (best-effort fallback for stripped assets).
-    ///
-    /// Can be repeated; earlier registries take precedence (first match wins).
+    /// External TypeTree registry JSON, TPK, or AssetRipper InfoJson directory.
     #[arg(long)]
     pub(crate) typetree_registry: Vec<PathBuf>,
 
@@ -26,499 +26,371 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Parse a Unity YAML file
-    ParseYaml {
-        /// Input YAML file path
+    /// Inspect and mutate one revision-bound Asset Workspace.
+    Workspace(WorkspaceCommand),
+
+    /// Query revision-bound reference facts through structured projections.
+    References(ReferencesCommand),
+
+    /// Export one deterministic, revision-bound artifact set.
+    Export(Box<ExportCommand>),
+
+    /// Extract Unity YAML documents through the canonical extraction planner and publisher.
+    #[command(name = "split-yaml")]
+    SplitYaml {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Output format (summary, detailed, json)
-        #[arg(short, long, default_value = "debug")]
-        format: String,
-
-        /// Preserve original types instead of converting to strings
-        #[arg(long)]
-        preserve_types: bool,
-    },
-
-    /// Extract information from Unity files
-    Extract {
-        /// Input file or directory path
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Output directory
         #[arg(short, long)]
         output: PathBuf,
-
-        /// Unity class types to extract (GameObject, Transform, etc.)
-        #[arg(long)]
-        types: Vec<String>,
+        #[arg(long, value_enum, default_value_t = ExistingOutputArg::Error)]
+        existing_output: ExistingOutputArg,
     },
 
-    /// Export objects from AssetBundles using the bundle `m_Container` (UnityPy-like workflow)
-    ExportBundle {
-        /// Input file or directory path (bundles will be auto-detected)
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Output directory
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Filter container entries by substring or glob (`*`, `?`) (case-insensitive). Empty means export all.
-        #[arg(long, default_value = "")]
-        pattern: String,
-
-        /// Limit exported entries (to keep runtime predictable)
-        #[arg(long)]
-        limit: Option<usize>,
-
-        /// Filter by class id (can be repeated). Only applies to resolvable entries.
-        #[arg(long)]
-        class_id: Vec<i32>,
-
-        /// Filter by class name substring (case-insensitive). Only applies to resolvable entries.
-        #[arg(long, default_value = "")]
-        class_name: String,
-
-        /// Only print what would be exported
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Decode known types (AudioClip -> WAV, Texture2D -> PNG) instead of exporting raw object bytes
-        #[arg(long)]
-        decode: bool,
-
-        /// Overwrite existing output files (still avoids in-run collisions)
-        #[arg(long, conflicts_with = "skip_existing")]
-        overwrite: bool,
-
-        /// Skip entries whose output file already exists
-        #[arg(long)]
-        skip_existing: bool,
-
-        /// Write a JSON manifest of planned/exported entries (for resume and regression checks)
-        #[arg(long)]
-        manifest: Option<PathBuf>,
-
-        /// Resume from a previous manifest (skips entries that are already exported and still exist)
-        #[arg(long, conflicts_with = "overwrite")]
-        resume: Option<PathBuf>,
-
-        /// Retry only failed entries from a previous manifest (uses its `asset_path` and `key`)
-        #[arg(long, conflicts_with_all = ["resume", "overwrite"])]
-        retry_failed_from: Option<PathBuf>,
-
-        /// Continue exporting even if some entries fail; failed entries are recorded in the manifest
-        #[arg(long)]
-        continue_on_error: bool,
-
-        /// Parallel export jobs (0 = auto, 1 = serial)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
-    },
-
-    /// Export objects from SerializedFiles (e.g. `.asset`, `.assets`) by scanning objects directly
-    #[command(name = "export-serialized")]
-    ExportSerialized {
-        /// Input file or directory path (serialized files will be auto-detected)
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Output directory
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Restrict exporting to a specific loaded serialized source path
-        #[arg(long)]
-        source: Option<PathBuf>,
-
-        /// Filter by Unity class id (can be repeated). Empty means export all.
-        #[arg(long)]
-        class_id: Vec<i32>,
-
-        /// Filter by Unity class name substring (case-insensitive).
-        #[arg(long, default_value = "")]
-        class_name: String,
-
-        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
-        ///
-        /// Note: this requires TypeTree to be present and to include a name field; otherwise the object is treated as non-matching.
-        #[arg(long, default_value = "")]
-        name: String,
-
-        /// Limit exported objects
-        #[arg(long)]
-        limit: Option<usize>,
-
-        /// Only print what would be exported
-        #[arg(long)]
-        dry_run: bool,
-
-        /// Decode known types (AudioClip -> WAV/encoded, Texture2D -> PNG, Sprite -> PNG, TextAsset -> TXT) instead of exporting raw bytes
-        #[arg(long)]
-        decode: bool,
-
-        /// Overwrite existing output files
-        #[arg(long, conflicts_with = "skip_existing")]
-        overwrite: bool,
-
-        /// Skip objects whose output file already exists
-        #[arg(long)]
-        skip_existing: bool,
-
-        /// Write a JSON manifest of planned/exported objects (for resume and regression checks)
-        #[arg(long)]
-        manifest: Option<PathBuf>,
-
-        /// Resume from a previous manifest (skips objects that are already exported and still exist)
-        #[arg(long, conflicts_with = "overwrite")]
-        resume: Option<PathBuf>,
-
-        /// Retry only failed objects from a previous manifest
-        #[arg(long, conflicts_with_all = ["resume", "overwrite"])]
-        retry_failed_from: Option<PathBuf>,
-
-        /// Continue exporting even if some objects fail (failures are recorded in the manifest)
-        #[arg(long)]
-        continue_on_error: bool,
-
-        /// Parallel export jobs (0 = auto, 1 = serial)
-        #[arg(long, default_value_t = 0)]
-        jobs: usize,
-    },
-
-    /// List AssetBundle nodes (files) for debugging and inspection
+    /// List physical AssetBundle nodes through the low-level binary adapter.
+    #[command(name = "list-bundle")]
     ListBundle {
-        /// Input AssetBundle path
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Filter node names by substring (case-insensitive). Empty means show all.
         #[arg(long, default_value = "")]
         filter: String,
-
-        /// Print offsets and sizes
         #[arg(long)]
         verbose: bool,
     },
+}
 
-    /// List binary objects (path_id/class_id/peek_name) from SerializedFiles or bundles
-    #[command(name = "list-objects")]
-    ListObjects {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ExistingOutputArg {
+    Error,
+    Skip,
+    Replace,
+}
+
+impl ExistingOutputArg {
+    pub(crate) const fn into_policy(self) -> ExistingOutputPolicy {
+        match self {
+            Self::Error => ExistingOutputPolicy::Error,
+            Self::Skip => ExistingOutputPolicy::Skip,
+            Self::Replace => ExistingOutputPolicy::Replace,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(crate) enum ExtractionFailureArg {
+    CollectAll,
+    StopInPlanOrder,
+}
+
+impl ExtractionFailureArg {
+    pub(crate) const fn into_policy(self) -> ExtractionFailurePolicy {
+        match self {
+            Self::CollectAll => ExtractionFailurePolicy::CollectAll,
+            Self::StopInPlanOrder => ExtractionFailurePolicy::StopInPlanOrder,
+        }
+    }
+}
+
+#[derive(Args)]
+pub(crate) struct WorkspaceCommand {
+    #[command(subcommand)]
+    pub(crate) command: WorkspaceSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceSubcommand {
+    /// Print the stable machine-readable capability catalog.
+    Capabilities,
+
+    /// Inspect immutable workspace state.
+    Inspect(WorkspaceInspectCommand),
+
+    /// Validate persisted mutation plans.
+    Plan(WorkspacePlanCommand),
+
+    /// Build and prove a zero-write candidate revision.
+    Prepare {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Source kind: `all`, `bundle`, or `serialized`
-        #[arg(long, default_value = "serialized")]
-        kind: String,
-
-        /// Restrict listing to a specific loaded source path
+        /// MutationPlan JSON file, or `-` for stdin.
         #[arg(long)]
-        source: Option<PathBuf>,
-
-        /// Restrict listing to a specific bundle asset index (only applies when --kind bundle or all)
-        #[arg(long)]
-        asset_index: Option<usize>,
-
-        /// Filter by Unity class ID (repeatable). Example: `--class-id 28` (Texture2D).
-        #[arg(long)]
-        class_id: Vec<i32>,
-
-        /// Filter by Unity class name substring (case-insensitive). Example: `--class-name Texture`.
-        #[arg(long, default_value = "")]
-        class_name: String,
-
-        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
-        ///
-        /// Note: this requires TypeTree to be present and to include a name field; otherwise the object is treated as non-matching.
-        #[arg(long, default_value = "")]
-        name: String,
-
-        /// Limit printed objects
-        #[arg(long)]
-        limit: Option<usize>,
-
-        /// Print one JSON object per line
-        #[arg(long)]
-        json: bool,
+        plan: PathBuf,
     },
 
-    /// Print parsing stats (SerializedFile header/version/metadata) for loaded sources
-    Stats {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+    /// Inspect one object through the prepared read-your-writes view.
+    Preview {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Source kind: `all`, `bundle`, or `serialized`
-        #[arg(long, default_value = "all")]
-        kind: String,
-
-        /// Limit scanned/printed entries
+        /// MutationPlan JSON file, or `-` for stdin.
         #[arg(long)]
-        limit: Option<usize>,
-
-        /// Print aggregated counts instead of per-source records
+        plan: PathBuf,
+        /// ObjectAddress JSON file, or `-` for stdin.
         #[arg(long)]
-        summary: bool,
-
-        /// Print one JSON object per line
-        #[arg(long)]
-        json: bool,
+        address_json: PathBuf,
     },
 
-    /// Summarize binary `path_id` distributions (negative/zero/positive) for UnityCN/Tuanjie investigations
-    #[command(name = "stats-pathid")]
-    StatsPathId {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+    /// Re-prepare and durably publish one exact mutation plan.
+    Commit {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Source kind: `all`, `bundle`, or `serialized`
-        #[arg(long, default_value = "all")]
-        kind: String,
-
-        /// Limit scanned serialized files (bundle assets count as one each)
+        /// MutationPlan JSON file, or `-` for stdin.
         #[arg(long)]
-        limit: Option<usize>,
-
-        /// Check for duplicate path IDs within each serialized file (slower; uses a HashSet)
+        plan: PathBuf,
+        /// Existing absolute containment root for publication and recovery.
         #[arg(long)]
-        check_duplicates: bool,
-
-        /// Print one JSON summary object
-        #[arg(long)]
-        json: bool,
+        publication_root: PathBuf,
     },
 
-    /// Find objects by AssetBundle `m_Container` asset path pattern (UnityPy-like discovery)
-    FindObject {
-        /// Input file or directory path (bundles will be auto-detected)
+    /// Discover, resume, abandon, or finalize durable recovery evidence.
+    Recover(WorkspaceRecoverCommand),
+}
+
+#[derive(Args)]
+pub(crate) struct WorkspaceInspectCommand {
+    #[command(subcommand)]
+    pub(crate) command: WorkspaceInspectSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceInspectSubcommand {
+    /// Inspect all loaded sources without reparsing or reopening them.
+    Sources {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Filter container entries by substring or glob (`*`, `?`) (case-insensitive). Empty means show all.
-        #[arg(long, default_value = "")]
-        pattern: String,
-
-        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
-        ///
-        /// Note: this requires TypeTree to be present and to include a name field; otherwise the object is treated as non-matching.
-        #[arg(long, default_value = "")]
-        name: String,
-
-        /// Filter by Unity class ID (repeatable). Example: `--class-id 83` (AudioClip).
-        #[arg(long)]
-        class_id: Vec<i32>,
-
-        /// Filter by Unity class name substring (case-insensitive). Example: `--class-name Texture`.
-        #[arg(long, default_value = "")]
-        class_name: String,
-
-        /// Limit matched entries
-        #[arg(long)]
-        limit: Option<usize>,
-
-        /// Include entries that could not be resolved to a `BinaryObjectKey`
-        #[arg(long)]
-        include_unresolved: bool,
-
-        /// Print extra object info (type_id, byte_size) when resolvable
-        #[arg(long)]
-        verbose: bool,
     },
 
-    /// Inspect a single object by source location (useful for TypeTree debugging)
-    InspectObject {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+    /// Inspect all loaded objects in deterministic address order.
+    Objects {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Copy/paste key emitted by `find-object --verbose` (overrides --source/--kind/--asset-index/--path-id)
-        #[arg(long)]
-        key: Option<String>,
-
-        /// Source file path that contains the object (an AssetBundle or a standalone SerializedFile).
-        ///
-        /// When `--input` is a single file, this defaults to `--input`.
-        #[arg(long)]
-        source: Option<PathBuf>,
-
-        /// Source kind: `bundle` or `serialized`
-        #[arg(long, default_value = "bundle")]
-        kind: String,
-
-        /// Asset index inside the bundle (required when `--kind bundle`)
-        #[arg(long)]
-        asset_index: Option<usize>,
-
-        /// Object PathID inside the serialized file
-        #[arg(long)]
-        path_id: Option<i64>,
-
-        /// Limit printed recursion depth
-        #[arg(long, default_value_t = 6)]
-        max_depth: usize,
-
-        /// Limit total printed nodes (prevents huge dumps)
-        #[arg(long, default_value_t = 500)]
-        max_items: usize,
-
-        /// Limit printed array items per array node
-        #[arg(long, default_value_t = 16)]
-        max_array: usize,
-
-        /// Only print paths containing this substring (case-insensitive)
-        #[arg(long, default_value = "")]
-        filter: String,
     },
 
-    /// Dump a JSON TypeTree registry from loaded files (for stripped-asset fallback parsing)
-    #[command(name = "dump-typetree-registry")]
-    DumpTypeTreeRegistry {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+    /// Inspect one object by a structured ObjectAddress.
+    Object {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Output JSON path
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Filter by Unity class ID (repeatable). Empty means dump all.
+        /// ObjectAddress JSON file, or `-` for stdin.
         #[arg(long)]
-        class_id: Vec<i32>,
-
-        /// Emit Unity version as a major.minor prefix (e.g. `2020.3.*`) instead of exact version.
-        #[arg(long)]
-        version_prefix: bool,
-
-        /// Overwrite existing output file
-        #[arg(long)]
-        overwrite: bool,
+        address_json: PathBuf,
     },
 
-    /// Scan PPtr references (`fileID`, `pathID`) from TypeTree without fully parsing objects
-    #[command(name = "scan-pptr")]
-    ScanPPtr {
-        /// Input file or directory path (assets/bundles will be auto-detected)
+    /// Inspect every matching AssetBundle m_Container occurrence.
+    #[command(name = "bundle-containers")]
+    BundleContainers {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Source kind: `all`, `bundle`, or `serialized`
-        #[arg(long, default_value = "all")]
-        kind: String,
-
-        /// Restrict scanning to a specific loaded source path
+        /// BundleContainerQuery JSON file, or `-` for stdin.
         #[arg(long)]
-        source: Option<PathBuf>,
+        query_json: PathBuf,
+    },
+}
 
-        /// Restrict scanning to a specific bundle asset index (only applies when --kind bundle or all)
+#[derive(Args)]
+pub(crate) struct WorkspacePlanCommand {
+    #[command(subcommand)]
+    pub(crate) command: WorkspacePlanSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspacePlanSubcommand {
+    /// Parse, validate, and emit the current canonical MutationPlan JSON.
+    Validate {
+        /// MutationPlan JSON file, or `-` for stdin.
         #[arg(long)]
-        asset_index: Option<usize>,
+        plan: PathBuf,
+    },
+}
 
-        /// Filter by Unity class ID (repeatable). Example: `--class-id 1` (GameObject).
+#[derive(Args)]
+pub(crate) struct WorkspaceRecoverCommand {
+    #[command(subcommand)]
+    pub(crate) command: WorkspaceRecoverSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum WorkspaceRecoverSubcommand {
+    /// List canonical recovery candidates below one publication root.
+    Discover {
         #[arg(long)]
-        class_id: Vec<i32>,
-
-        /// Filter by object `m_Name`/`name` substring (case-insensitive) via a TypeTree prefix fast path.
-        #[arg(long, default_value = "")]
-        name: String,
-
-        /// Limit printed objects
-        #[arg(long)]
-        limit: Option<usize>,
-
-        /// Include objects where TypeTree is unavailable (printed with empty refs)
-        #[arg(long)]
-        include_no_typetree: bool,
-
-        /// Print one JSON object per line
-        #[arg(long)]
-        json: bool,
+        publication_root: PathBuf,
     },
 
-    /// Build a best-effort dependency graph using TypeTree PPtr scanning
-    ///
-    /// This is intentionally optimized for large assets: it prefers the zero-allocation PPtr scan
-    /// path (no full object parsing).
-    #[command(name = "deps")]
-    Deps {
-        /// Input file or directory path (assets/bundles will be auto-detected)
-        #[arg(short, long)]
-        input: PathBuf,
-
-        /// Source kind: `bundle` or `serialized`
-        #[arg(long, default_value = "bundle")]
-        kind: String,
-
-        /// Source file path that contains the objects (an AssetBundle or a standalone SerializedFile)
+    /// Resume filesystem publication without attaching a workspace baseline.
+    Resume {
+        /// RecoveryLocator JSON file, or `-` for stdin.
         #[arg(long)]
-        source: Option<PathBuf>,
-
-        /// Asset index inside the bundle (required when `--kind bundle`)
-        #[arg(long)]
-        asset_index: Option<usize>,
-
-        /// Output format: `summary`, `edges`, `dot`, or `json`
-        #[arg(long, default_value = "summary")]
-        format: String,
-
-        /// Include best-effort object names in `edges` output (uses TypeTree prefix peek)
-        #[arg(long)]
-        names: bool,
-
-        /// Maximum edges to print for `edges`/`dot` output (prevents huge dumps)
-        #[arg(long, default_value_t = 2000)]
-        max_edges: usize,
+        locator_json: PathBuf,
     },
 
-    /// Build a best-effort object graph for a Unity project root (fast scan + `.meta` GUID indexing).
-    #[command(name = "project-graph")]
-    ProjectGraph {
-        /// Unity project root directory.
+    /// Roll back an unfinished publication when the journal proves it is safe.
+    Abandon {
+        /// RecoveryLocator JSON file, or `-` for stdin.
+        #[arg(long)]
+        locator_json: PathBuf,
+    },
+
+    /// Reopen trusted sources and attach a recovered publication to the workspace.
+    Finalize {
         #[arg(short, long)]
         input: PathBuf,
-
-        /// Write output to a file instead of stdout.
+        /// RecoveryLocator JSON file, or `-` for stdin.
         #[arg(long)]
-        output: Option<PathBuf>,
+        locator_json: PathBuf,
+    },
+}
 
-        /// Also load YAML documents (`.asset`, `.prefab`, `.unity`) (heavier).
+#[derive(Args)]
+pub(crate) struct ReferencesCommand {
+    #[command(subcommand)]
+    pub(crate) command: ReferencesSubcommand,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum ReferencesSubcommand {
+    /// Emit one versioned JSON reference-graph projection.
+    Graph {
+        #[arg(short, long)]
+        input: PathBuf,
+        /// Apply Unity-project root filtering for generated directories.
         #[arg(long)]
-        yaml: bool,
-
-        /// Output format (summary, dot, jsonl, json).
-        #[arg(long, default_value = "summary", value_name = "FORMAT")]
-        format: String,
-
-        /// Only run the project scan (load project + collect warnings), skip object graph build.
-        #[arg(long)]
-        scan_only: bool,
-
-        /// Write environment warnings to a JSONL file (one JSON object per warning).
-        #[arg(long)]
-        warnings_jsonl: Option<PathBuf>,
-
-        /// Limit visited files during scan (best-effort).
-        #[arg(long)]
-        max_files: Option<usize>,
-
-        /// Maximum edges to emit for dot/jsonl.
+        unity_project: bool,
+        /// Maximum facts included in the projection.
         #[arg(long, default_value_t = 200_000)]
-        max_edges: usize,
-
-        /// Follow resolved external edges when emitting dot/jsonl.
-        #[arg(long)]
-        follow_external: bool,
-
-        /// Do not respect ignore files (`.gitignore`, `.ignore`).
-        #[arg(long)]
-        no_ignore: bool,
-
-        /// Follow symlinks during project scan.
-        #[arg(long)]
-        follow_symlinks: bool,
+        max_facts: u64,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct ExportCommand {
+    #[arg(short, long)]
+    pub(crate) input: PathBuf,
+
+    #[arg(short, long)]
+    pub(crate) output: PathBuf,
+
+    /// Execute a canonical ExtractionPlan JSON file, or `-` for stdin.
+    #[arg(
+        long,
+        conflicts_with_all = ["request", "dry_run"],
+        required_unless_present = "request"
+    )]
+    pub(crate) plan: Option<PathBuf>,
+
+    /// Build a plan from a canonical ExtractionRequest JSON file, or `-` for stdin.
+    #[arg(long, conflicts_with = "plan", required_unless_present = "plan")]
+    pub(crate) request: Option<PathBuf>,
+
+    /// Print the canonical ExtractionPlan without writing artifacts.
+    #[arg(long, conflicts_with_all = ["resume", "plan", "manifest"])]
+    pub(crate) dry_run: bool,
+
+    /// Read a canonical extraction manifest and verify resumable artifacts.
+    #[arg(long)]
+    pub(crate) resume: Option<PathBuf>,
+
+    /// Publish the canonical manifest at this relative path under `--output`.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub(crate) manifest: Option<PathBuf>,
+
+    #[arg(long, value_enum, default_value_t = ExistingOutputArg::Error)]
+    pub(crate) existing_output: ExistingOutputArg,
+
+    #[arg(long, value_enum, default_value_t = ExtractionFailureArg::CollectAll)]
+    pub(crate) failure: ExtractionFailureArg,
+
+    #[arg(long)]
+    pub(crate) workers: Option<usize>,
+
+    #[arg(long)]
+    pub(crate) max_in_flight_bytes: Option<u64>,
+
+    /// Cap simultaneous open files; the safe publication minimum is 5.
+    #[arg(long)]
+    pub(crate) max_open_files: Option<usize>,
+
+    /// Cap total bytes published by this execution.
+    #[arg(long)]
+    pub(crate) max_output_bytes: Option<u64>,
+
+    /// Cap cumulative final-path bytes read to verify persisted evidence.
+    #[arg(long)]
+    pub(crate) max_evidence_verification_bytes: Option<u64>,
+
+    #[arg(long)]
+    pub(crate) max_report_bytes: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Commands, WorkspaceInspectSubcommand, WorkspaceSubcommand};
+
+    #[test]
+    fn workspace_inspection_uses_nested_typed_commands() {
+        let cli = Cli::try_parse_from([
+            "unity-asset",
+            "workspace",
+            "inspect",
+            "object",
+            "--input",
+            "game.ab",
+            "--address-json",
+            "address.json",
+        ])
+        .unwrap();
+        let Commands::Workspace(command) = cli.command else {
+            panic!("workspace command expected");
+        };
+        let WorkspaceSubcommand::Inspect(command) = command.command else {
+            panic!("workspace inspect command expected");
+        };
+        assert!(matches!(
+            command.command,
+            WorkspaceInspectSubcommand::Object { .. }
+        ));
+    }
+
+    #[test]
+    fn extraction_requires_exactly_one_typed_contract() {
+        assert!(
+            Cli::try_parse_from([
+                "unity-asset",
+                "export",
+                "--input",
+                "game.ab",
+                "--output",
+                "out",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "unity-asset",
+                "export",
+                "--input",
+                "game.ab",
+                "--output",
+                "out",
+                "--request",
+                "request.json",
+                "--plan",
+                "plan.json",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "unity-asset",
+                "export",
+                "--input",
+                "game.ab",
+                "--output",
+                "out",
+                "--request",
+                "request.json",
+                "--dry-run",
+            ])
+            .is_ok()
+        );
+    }
 }

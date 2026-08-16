@@ -1,7 +1,8 @@
 [package]
 name = "unity-asset-search-cli"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "CLI client for unity-asset-search-daemon (debug/ops utility)"
 license.workspace = true
@@ -10,14 +11,25 @@ homepage.workspace = true
 documentation = "https://github.com/Latias94/unity-asset"
 keywords = ["unity", "search", "cli"]
 categories = ["command-line-utilities", "game-development"]
+exclude = ["tests/real_daemon_agent.rs"]
 
 [dependencies]
-anyhow.workspace = true
 clap.workspace = true
+rand.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-reqwest.workspace = true
+unity-asset-core = { workspace = true }
+unity-asset-search-local = { workspace = true }
+unity-asset-search-protocol = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "docsrs"]

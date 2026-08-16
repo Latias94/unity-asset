@@ -1,37 +1,29 @@
-use crate::typetree::{TypeTree, TypeTreeNode, TypeTreeRegistry, TypeTreeSerializationMode};
-use serde::{Deserialize, Deserializer};
-use std::collections::{HashMap, HashSet};
+//! Eager, budgeted registry for AssetRipper TypeTree `InfoJson` dumps.
+
 use std::fs::{self, File};
-use std::io::{self, BufReader, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
-use thiserror::Error;
+use std::io::Read;
+use std::path::Path;
+use std::sync::Arc;
 
-#[derive(Error, Debug)]
-pub enum AssetRipperTypeTreeGeneratorRegistryError {
-    #[error("failed to deserialize AssetRipper TypeTree JSON: {0}")]
-    Serde(#[from] serde_json::Error),
+use serde::{Deserialize, Deserializer};
+use unity_asset_core::{
+    AssetLoadBudget, BudgetError, BudgetedJsonError, ContractJsonLimits, ContractJsonResourceModel,
+    arc_value_allocation_bytes, read_contract_json, vec_allocation_bytes,
+};
 
-    #[error("invalid AssetRipper TypeTree format: {0}")]
-    FileFormatError(String),
+use crate::error::{BinaryError, Result};
+use crate::typetree::{TypeTree, TypeTreeNode, TypeTreeRegistry, TypeTreeSerializationMode};
 
-    #[error("AssetRipper TypeTree I/O error: {0}")]
-    IOError(#[from] io::Error),
-
-    #[error("failed to access AssetRipper TypeTree path {path}: {source}")]
-    PathIOError {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-
-    #[error("failed to deserialize AssetRipper TypeTree JSON at {path}: {source}")]
-    PathSerdeError {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
-}
+const ASSETRIPPER_JSON_RESOURCES: ContractJsonResourceModel =
+    ContractJsonResourceModel::new(6, 4 * 1024, 4 * 1024, 256);
+const ASSETRIPPER_JSON_LIMITS: ContractJsonLimits = ContractJsonLimits::new(
+    "assetripper.typetree.v1",
+    128 * 1024 * 1024,
+    59,
+    4_000_000,
+    4_000_000,
+    ASSETRIPPER_JSON_RESOURCES,
+);
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -70,7 +62,9 @@ struct AssetRipperNode {
     sub_nodes: Vec<AssetRipperNode>,
 }
 
-fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+fn deserialize_required_option<'de, D, T>(
+    deserializer: D,
+) -> std::result::Result<Option<T>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,
@@ -78,28 +72,9 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-impl From<AssetRipperNode> for TypeTreeNode {
-    fn from(node: AssetRipperNode) -> Self {
-        Self {
-            type_name: node.type_name,
-            name: node.name,
-            byte_size: node.byte_size,
-            variable_count: 0,
-            index: node.index,
-            type_flags: i32::from(node.type_flags),
-            version: i32::from(node.version),
-            meta_flags: i32::from_ne_bytes(node.meta_flag.to_ne_bytes()),
-            level: i32::from(node.level),
-            type_str_offset: 0,
-            name_str_offset: 0,
-            ref_type_hash: 0,
-            children: node.sub_nodes.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct ClassTypeTrees {
+    class_id: i32,
     release: Option<Arc<TypeTree>>,
     editor: Option<Arc<TypeTree>>,
 }
@@ -113,190 +88,132 @@ impl ClassTypeTrees {
     }
 }
 
-type ClassesById = HashMap<i32, ClassTypeTrees>;
-
-#[derive(Debug, Default)]
-struct AssetRipperRegistryState {
-    exact: HashMap<String, ClassesById>,
-    loaded_sources: HashSet<String>,
-}
-
-impl AssetRipperRegistryState {
-    fn insert_dump(&mut self, dump: AssetRipperDump) {
-        let classes = dump
-            .classes
-            .into_iter()
-            .filter_map(convert_class)
-            .collect::<ClassesById>();
-
-        self.exact.entry(dump.version).or_default().extend(classes);
-    }
-
-    fn resolve(
-        &self,
-        unity_version: &str,
-        class_id: i32,
-        mode: TypeTreeSerializationMode,
-    ) -> Option<Arc<TypeTree>> {
-        self.exact
-            .get(unity_version)
-            .and_then(|classes| classes.get(&class_id))
-            .and_then(|trees| trees.resolve(mode))
-    }
-}
-
 #[derive(Debug)]
-pub struct AssetRipperTypeTreeGeneratorRegistry {
-    inner: RwLock<AssetRipperRegistryState>,
-    version_sources: HashMap<String, PathBuf>,
+struct VersionTypeTrees {
+    version: String,
+    classes: Vec<ClassTypeTrees>,
 }
 
-impl AssetRipperTypeTreeGeneratorRegistry {
-    fn new() -> Self {
-        Self {
-            inner: RwLock::new(AssetRipperRegistryState::default()),
-            version_sources: HashMap::new(),
-        }
+/// Immutable registry built from one AssetRipper dump or an `InfoJson` directory.
+///
+/// All files are read, validated, converted, and charged to the caller's budget before the
+/// constructor returns. Resolution performs only two binary searches and an `Arc` clone.
+#[derive(Debug)]
+pub struct AssetRipperTypeTreeRegistry {
+    versions: Vec<VersionTypeTrees>,
+}
+
+impl AssetRipperTypeTreeRegistry {
+    /// Reads one complete AssetRipper TypeTree JSON document.
+    pub fn new_from_reader(reader: impl Read, budget: &mut AssetLoadBudget) -> Result<Self> {
+        let dump = read_dump(reader, budget)?;
+        let version = build_version(dump, budget)?;
+        let mut versions = Vec::new();
+        reserve_exact_budgeted(
+            &mut versions,
+            1,
+            budget,
+            "AssetRipper registry version table",
+        )?;
+        versions.push(version);
+        Ok(Self { versions })
     }
 
-    pub fn new_from_path(
-        path: impl AsRef<Path>,
-    ) -> Result<Self, AssetRipperTypeTreeGeneratorRegistryError> {
-        let mut registry = Self::new();
-        registry.add_via_path(path)?;
-        Ok(registry)
-    }
-
-    pub fn new_from_reader(
-        reader: impl Read,
-    ) -> Result<Self, AssetRipperTypeTreeGeneratorRegistryError> {
-        let mut registry = Self::new();
-        registry.add_via_reader(reader)?;
-        Ok(registry)
-    }
-
-    pub fn add_via_path(
-        &mut self,
-        path: impl AsRef<Path>,
-    ) -> Result<(), AssetRipperTypeTreeGeneratorRegistryError> {
-        let path = path.as_ref();
-        if path.is_dir() {
-            self.index_directory(path)
-        } else {
-            let dump = read_dump_from_path(path)?;
-            self.state_mut().insert_dump(dump);
-            Ok(())
-        }
-    }
-
-    pub fn add_via_reader(
-        &mut self,
-        reader: impl Read,
-    ) -> Result<(), AssetRipperTypeTreeGeneratorRegistryError> {
-        let dump = serde_json::from_reader(reader)?;
-        validate_dump(&dump)?;
-        self.state_mut().insert_dump(dump);
-        Ok(())
-    }
-
-    /// Load and validate the indexed JSON file for one exact Unity version.
+    /// Loads one dump file or every immediate `.json` file in an AssetRipper dump directory.
     ///
-    /// Returns `Ok(false)` when the registry has no file indexed for the version.
-    pub fn load_version(
-        &self,
-        version: &str,
-    ) -> Result<bool, AssetRipperTypeTreeGeneratorRegistryError> {
-        let state = self.state();
-        if state.exact.contains_key(version) || state.loaded_sources.contains(version) {
-            return Ok(true);
-        }
-        drop(state);
-
-        let Some(path) = self.version_sources.get(version) else {
-            return Ok(false);
-        };
-        let dump = read_dump_from_path(path)?;
-        if dump.version != version {
-            return Err(AssetRipperTypeTreeGeneratorRegistryError::FileFormatError(
-                format!(
-                    "indexed file {} declares Version {:?}, expected {:?}",
-                    path.display(),
-                    dump.version,
-                    version
-                ),
-            ));
-        }
-
-        let mut state = self.state_mut();
-        if state.loaded_sources.insert(version.to_owned()) {
-            state.insert_dump(dump);
-        }
-        Ok(true)
-    }
-
-    fn index_directory(
-        &mut self,
-        directory: &Path,
-    ) -> Result<(), AssetRipperTypeTreeGeneratorRegistryError> {
-        let info_json = directory.join("InfoJson");
-        let directory = if info_json.is_dir() {
-            info_json
+    /// If `path/InfoJson` is a directory, it takes precedence over JSON files directly under
+    /// `path`. Directory traversal is deliberately non-recursive.
+    pub fn new_from_path(path: impl AsRef<Path>, budget: &mut AssetLoadBudget) -> Result<Self> {
+        let path = path.as_ref();
+        if fs::metadata(path)?.is_dir() {
+            Self::new_from_directory(path, budget)
         } else {
-            directory.to_owned()
+            let file = File::open(path)?;
+            Self::new_from_reader(file, budget).map_err(|error| with_path_context(error, path))
+        }
+    }
+
+    fn new_from_directory(path: &Path, budget: &mut AssetLoadBudget) -> Result<Self> {
+        let info_json = path.join("InfoJson");
+        let directory = match fs::metadata(&info_json) {
+            Ok(metadata) if metadata.is_dir() => info_json.as_path(),
+            Ok(_) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => path,
+            Err(error) => return Err(error.into()),
         };
 
-        let entries = fs::read_dir(&directory).map_err(|source| {
-            AssetRipperTypeTreeGeneratorRegistryError::PathIOError {
-                path: directory.clone(),
-                source,
-            }
-        })?;
-        let mut indexed_files = 0usize;
-        for entry in entries {
-            let entry =
-                entry.map_err(
-                    |source| AssetRipperTypeTreeGeneratorRegistryError::PathIOError {
-                        path: directory.clone(),
-                        source,
-                    },
-                )?;
-            let path = entry.path();
-            if !path.is_file()
-                || !path
-                    .extension()
-                    .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
-            {
+        let mut versions = Vec::new();
+        let mut json_files = 0_u64;
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            budget.consume_members(1)?;
+            if !entry.file_type()?.is_file() {
                 continue;
             }
-            let Some(version) = path.file_stem().and_then(|stem| stem.to_str()) else {
+            let file_path = entry.path();
+            if !is_json_path(&file_path) {
                 continue;
-            };
-            self.version_sources.insert(version.to_owned(), path);
-            indexed_files += 1;
-        }
-        if indexed_files == 0 {
-            return Err(AssetRipperTypeTreeGeneratorRegistryError::FileFormatError(
-                format!(
-                    "AssetRipper TypeTree directory {} contains no .json files",
-                    directory.display()
-                ),
-            ));
-        }
-        Ok(())
-    }
+            }
 
-    fn state(&self) -> std::sync::RwLockReadGuard<'_, AssetRipperRegistryState> {
-        self.inner.read().unwrap_or_else(|error| error.into_inner())
-    }
+            json_files = json_files
+                .checked_add(1)
+                .ok_or(BudgetError::ArithmeticOverflow {
+                    resource: "AssetRipper registry JSON files",
+                })?;
 
-    fn state_mut(&self) -> std::sync::RwLockWriteGuard<'_, AssetRipperRegistryState> {
-        self.inner
-            .write()
-            .unwrap_or_else(|error| error.into_inner())
+            let file = File::open(&file_path)?;
+            let dump =
+                read_dump(file, budget).map_err(|error| with_path_context(error, &file_path))?;
+            let file_version = file_path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    BinaryError::invalid_format(format!(
+                        "AssetRipper TypeTree filename {} has no UTF-8 version stem",
+                        file_path.display()
+                    ))
+                })?;
+            if dump.version != file_version {
+                return Err(BinaryError::invalid_format(format!(
+                    "AssetRipper TypeTree file {} declares Version {:?}, expected {:?}",
+                    file_path.display(),
+                    dump.version,
+                    file_version
+                )));
+            }
+            let version = build_version(dump, budget)?;
+            reserve_exact_budgeted(
+                &mut versions,
+                1,
+                budget,
+                "AssetRipper registry version table",
+            )?;
+            versions.push(version);
+        }
+
+        if json_files == 0 {
+            return Err(BinaryError::invalid_format(format!(
+                "AssetRipper TypeTree directory {} contains no immediate .json files",
+                directory.display()
+            )));
+        }
+
+        versions.sort_unstable_by(|left, right| left.version.cmp(&right.version));
+        if let Some(duplicate) = versions
+            .windows(2)
+            .find(|pair| pair[0].version == pair[1].version)
+        {
+            return Err(BinaryError::invalid_format(format!(
+                "AssetRipper TypeTree directory contains duplicate Version {:?}",
+                duplicate[0].version
+            )));
+        }
+
+        Ok(Self { versions })
     }
 }
 
-impl TypeTreeRegistry for AssetRipperTypeTreeGeneratorRegistry {
+impl TypeTreeRegistry for AssetRipperTypeTreeRegistry {
     fn resolve(&self, unity_version: &str, class_id: i32) -> Option<Arc<TypeTree>> {
         self.resolve_with_mode(unity_version, class_id, TypeTreeSerializationMode::Release)
     }
@@ -307,43 +224,132 @@ impl TypeTreeRegistry for AssetRipperTypeTreeGeneratorRegistry {
         class_id: i32,
         mode: TypeTreeSerializationMode,
     ) -> Option<Arc<TypeTree>> {
-        self.load_version(unity_version).ok()?;
-        self.state().resolve(unity_version, class_id, mode)
+        let version_index = self
+            .versions
+            .binary_search_by(|candidate| candidate.version.as_str().cmp(unity_version))
+            .ok()?;
+        let classes = &self.versions[version_index].classes;
+        let class_index = classes
+            .binary_search_by_key(&class_id, |candidate| candidate.class_id)
+            .ok()?;
+        classes[class_index].resolve(mode)
     }
 }
 
-fn convert_class(class: AssetRipperClass) -> Option<(i32, ClassTypeTrees)> {
-    let release = class.release_root_node.map(type_tree_from_root);
-    let editor = class.editor_root_node.map(type_tree_from_root);
-    if release.is_none() && editor.is_none() {
-        return None;
+fn read_dump(reader: impl Read, budget: &mut AssetLoadBudget) -> Result<AssetRipperDump> {
+    read_contract_json(reader, budget, ASSETRIPPER_JSON_LIMITS).map_err(map_contract_error)
+}
+
+fn map_contract_error(error: BudgetedJsonError) -> BinaryError {
+    match error {
+        BudgetedJsonError::Io(error) => error.into(),
+        BudgetedJsonError::Budget(error) => error.into(),
+        BudgetedJsonError::AllocationFailed { requested } => BinaryError::memory_error(format!(
+            "failed to reserve {requested} bytes for AssetRipper TypeTree JSON"
+        )),
+        BudgetedJsonError::Json(error) => {
+            BinaryError::invalid_format(format!("invalid AssetRipper TypeTree JSON: {error}"))
+        }
+        error @ (BudgetedJsonError::EncodedLimitExceeded { .. }
+        | BudgetedJsonError::StructureLimitExceeded { .. }) => {
+            BinaryError::ResourceLimitExceeded(error.to_string())
+        }
+        error @ BudgetedJsonError::InvalidLimit { .. } => {
+            BinaryError::invalid_data(error.to_string())
+        }
     }
-    Some((class.type_id, ClassTypeTrees { release, editor }))
 }
 
-fn type_tree_from_root(root: AssetRipperNode) -> Arc<TypeTree> {
-    let mut tree = TypeTree::new();
-    tree.nodes.push(root.into());
-    Arc::new(tree)
+fn with_path_context(error: BinaryError, path: &Path) -> BinaryError {
+    match error {
+        BinaryError::InvalidFormat(message) => BinaryError::invalid_format(format!(
+            "AssetRipper TypeTree file {}: {message}",
+            path.display()
+        )),
+        error => error,
+    }
 }
 
-fn validate_dump(dump: &AssetRipperDump) -> Result<(), AssetRipperTypeTreeGeneratorRegistryError> {
-    if dump.version.is_empty() || dump.version.contains('*') {
-        return Err(AssetRipperTypeTreeGeneratorRegistryError::FileFormatError(
-            format!(
-                "Version {:?} must be a non-empty exact Unity version without wildcards",
-                dump.version
-            ),
-        ));
+fn build_version(
+    mut dump: AssetRipperDump,
+    budget: &mut AssetLoadBudget,
+) -> Result<VersionTypeTrees> {
+    validate_exact_version(&dump.version)?;
+    dump.classes.sort_unstable_by_key(|class| class.type_id);
+    if let Some(duplicate) = dump
+        .classes
+        .windows(2)
+        .find(|pair| pair[0].type_id == pair[1].type_id)
+    {
+        return Err(BinaryError::invalid_format(format!(
+            "AssetRipper Version {:?} contains duplicate class ID {}",
+            dump.version, duplicate[0].type_id
+        )));
     }
 
     for class in &dump.classes {
-        if let Some(root) = &class.editor_root_node {
-            validate_node(&dump.version, class.type_id, "EditorRootNode", root)?;
-        }
         if let Some(root) = &class.release_root_node {
-            validate_node(&dump.version, class.type_id, "ReleaseRootNode", root)?;
+            validate_node(
+                &dump.version,
+                class.type_id,
+                "ReleaseRootNode",
+                root,
+                0,
+                budget,
+            )?;
         }
+        if let Some(root) = &class.editor_root_node {
+            validate_node(
+                &dump.version,
+                class.type_id,
+                "EditorRootNode",
+                root,
+                0,
+                budget,
+            )?;
+        }
+    }
+
+    let retained_classes = dump
+        .classes
+        .iter()
+        .filter(|class| class.release_root_node.is_some() || class.editor_root_node.is_some())
+        .count();
+    let mut classes = Vec::new();
+    reserve_exact_budgeted(
+        &mut classes,
+        retained_classes,
+        budget,
+        "AssetRipper registry class table",
+    )?;
+    for class in dump.classes {
+        if class.release_root_node.is_none() && class.editor_root_node.is_none() {
+            continue;
+        }
+        classes.push(ClassTypeTrees {
+            class_id: class.type_id,
+            release: class
+                .release_root_node
+                .map(|root| build_type_tree(root, budget))
+                .transpose()?,
+            editor: class
+                .editor_root_node
+                .map(|root| build_type_tree(root, budget))
+                .transpose()?,
+        });
+    }
+
+    Ok(VersionTypeTrees {
+        version: dump.version,
+        classes,
+    })
+}
+
+fn validate_exact_version(version: &str) -> Result<()> {
+    if version.is_empty() || version.contains('*') {
+        return Err(BinaryError::invalid_format(format!(
+            "AssetRipper Version {version:?} must be a non-empty exact Unity version without wildcards"
+        )));
     }
     Ok(())
 }
@@ -351,44 +357,66 @@ fn validate_dump(dump: &AssetRipperDump) -> Result<(), AssetRipperTypeTreeGenera
 fn validate_node(
     version: &str,
     class_id: i32,
-    path: &str,
+    root_name: &str,
     node: &AssetRipperNode,
-) -> Result<(), AssetRipperTypeTreeGeneratorRegistryError> {
+    expected_level: u8,
+    budget: &mut AssetLoadBudget,
+) -> Result<()> {
+    budget.observe_depth(u32::from(expected_level))?;
+    if node.level != expected_level {
+        return Err(invalid_node_field(
+            version,
+            class_id,
+            root_name,
+            "Level",
+            format_args!(
+                "must match nesting level {expected_level}, got {}",
+                node.level
+            ),
+        ));
+    }
     if node.type_name.is_empty() {
         return Err(invalid_node_field(
             version,
             class_id,
-            path,
+            root_name,
             "TypeName",
-            "must not be empty",
+            format_args!("must not be empty"),
         ));
     }
     if node.name.is_empty() {
         return Err(invalid_node_field(
             version,
             class_id,
-            path,
+            root_name,
             "Name",
-            "must not be empty",
+            format_args!("must not be empty"),
         ));
     }
     if node.byte_size < -1 {
         return Err(invalid_node_field(
             version,
             class_id,
-            path,
+            root_name,
             "ByteSize",
-            &format!("must be at least -1, got {}", node.byte_size),
+            format_args!("must be at least -1, got {}", node.byte_size),
         ));
     }
 
-    for (index, child) in node.sub_nodes.iter().enumerate() {
-        validate_node(
+    let child_level = expected_level.checked_add(1);
+    if !node.sub_nodes.is_empty() && child_level.is_none() {
+        return Err(invalid_node_field(
             version,
             class_id,
-            &format!("{path}.SubNodes[{index}]"),
-            child,
-        )?;
+            root_name,
+            "SubNodes",
+            format_args!("cannot exceed the u8 Level domain"),
+        ));
+    }
+    if let Some(child_level) = child_level {
+        for child in &node.sub_nodes {
+            validate_node(version, class_id, root_name, child, child_level, budget)?;
+        }
     }
     Ok(())
 }
@@ -396,45 +424,118 @@ fn validate_node(
 fn invalid_node_field(
     version: &str,
     class_id: i32,
-    path: &str,
+    root_name: &str,
     field: &str,
-    detail: &str,
-) -> AssetRipperTypeTreeGeneratorRegistryError {
-    AssetRipperTypeTreeGeneratorRegistryError::FileFormatError(format!(
-        "Version {version:?}, class {class_id}, {path}.{field} {detail}"
+    detail: std::fmt::Arguments<'_>,
+) -> BinaryError {
+    BinaryError::invalid_format(format!(
+        "AssetRipper Version {version:?}, class {class_id}, {root_name}.{field} {detail}"
     ))
 }
 
-fn read_dump_from_path(
-    path: &Path,
-) -> Result<AssetRipperDump, AssetRipperTypeTreeGeneratorRegistryError> {
-    let file = File::open(path).map_err(|source| {
-        AssetRipperTypeTreeGeneratorRegistryError::PathIOError {
-            path: path.to_owned(),
-            source,
-        }
-    })?;
-    let dump = serde_json::from_reader(BufReader::new(file)).map_err(|source| {
-        AssetRipperTypeTreeGeneratorRegistryError::PathSerdeError {
-            path: path.to_owned(),
-            source,
-        }
-    })?;
-    validate_dump(&dump)?;
-    Ok(dump)
+fn build_type_tree(root: AssetRipperNode, budget: &mut AssetLoadBudget) -> Result<Arc<TypeTree>> {
+    let root = convert_node(root, budget)?;
+    let mut tree = TypeTree::new();
+    reserve_exact_budgeted(
+        &mut tree.nodes,
+        1,
+        budget,
+        "AssetRipper TypeTree root table",
+    )?;
+    tree.nodes.push(root);
+    consume_arc_allocation::<TypeTree>(budget)?;
+    Ok(Arc::new(tree))
+}
+
+fn convert_node(node: AssetRipperNode, budget: &mut AssetLoadBudget) -> Result<TypeTreeNode> {
+    let AssetRipperNode {
+        type_name,
+        name,
+        level,
+        byte_size,
+        index,
+        version,
+        type_flags,
+        meta_flag,
+        sub_nodes,
+    } = node;
+
+    let mut children = Vec::new();
+    reserve_exact_budgeted(
+        &mut children,
+        sub_nodes.len(),
+        budget,
+        "AssetRipper TypeTree child table",
+    )?;
+    for child in sub_nodes {
+        children.push(convert_node(child, budget)?);
+    }
+
+    Ok(TypeTreeNode {
+        type_name,
+        name,
+        byte_size,
+        variable_count: 0,
+        index,
+        type_flags: i32::from(type_flags),
+        version: i32::from(version),
+        meta_flags: i32::from_ne_bytes(meta_flag.to_ne_bytes()),
+        level: i32::from(level),
+        type_str_offset: 0,
+        name_str_offset: 0,
+        ref_type_hash: 0,
+        children,
+    })
+}
+
+fn reserve_exact_budgeted<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    budget: &mut AssetLoadBudget,
+    resource: &'static str,
+) -> Result<()> {
+    if additional == 0 {
+        return Ok(());
+    }
+    let allocation = vec_allocation_bytes::<T>(additional)
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    let requested = usize::try_from(allocation)
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    budget.check_bytes(allocation)?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|error| BinaryError::allocation(resource, requested, error))?;
+    budget.consume_bytes(allocation)?;
+    Ok(())
+}
+
+fn consume_arc_allocation<T>(budget: &mut AssetLoadBudget) -> Result<()> {
+    let allocation = arc_value_allocation_bytes::<T>()
+        .map_err(|_| BudgetError::ArithmeticOverflow { resource: "bytes" })?;
+    budget.consume_bytes(allocation)?;
+    Ok(())
+}
+
+fn is_json_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::{Value, json};
     use std::fs;
 
-    fn node(type_name: &str, name: &str, version: i32) -> Value {
+    use serde_json::{Value, json};
+    use unity_asset_core::{AssetLoadLimits, BudgetError};
+
+    use super::*;
+
+    fn node(type_name: &str, name: &str, level: u8, version: u16) -> Value {
         json!({
             "TypeName": type_name,
             "Name": name,
-            "Level": 0,
+            "Level": level,
             "ByteSize": -1,
             "Index": 0,
             "Version": version,
@@ -455,318 +556,287 @@ mod tests {
         })
     }
 
-    #[test]
-    fn resolve_defaults_to_release_tree() {
-        let json = dump(
-            "2022.3.0f1",
-            1,
-            node("EditorGameObject", "EditorBase", 3),
-            node("GameObject", "Base", 5),
-        );
-        let registry = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
-        )
-        .unwrap();
-
-        let tree = registry.resolve("2022.3.0f1", 1).unwrap();
-        assert_eq!(tree.nodes[0].type_name, "GameObject");
-        assert_eq!(tree.nodes[0].name, "Base");
-
-        let editor_tree = registry
-            .resolve_with_mode("2022.3.0f1", 1, TypeTreeSerializationMode::Editor)
-            .unwrap();
-        assert_eq!(editor_tree.nodes[0].type_name, "EditorGameObject");
-        assert_eq!(editor_tree.nodes[0].name, "EditorBase");
+    fn load(value: &Value, budget: &mut AssetLoadBudget) -> Result<AssetRipperTypeTreeRegistry> {
+        let encoded = serde_json::to_vec(value).unwrap();
+        AssetRipperTypeTreeRegistry::new_from_reader(encoded.as_slice(), budget)
     }
 
     #[test]
-    fn single_mode_classes_only_resolve_for_their_mode() {
-        let json = json!({
+    fn release_is_default_and_editor_is_selected_explicitly() {
+        let value = dump(
+            "2022.3.0f1",
+            1,
+            node("EditorGameObject", "EditorBase", 0, 3),
+            node("GameObject", "Base", 0, 5),
+        );
+        let registry = load(&value, &mut AssetLoadBudget::default()).unwrap();
+
+        let release = registry.resolve("2022.3.0f1", 1).unwrap();
+        assert_eq!(release.nodes[0].type_name, "GameObject");
+        assert_eq!(release.nodes[0].version, 5);
+        let editor = registry
+            .resolve_with_mode("2022.3.0f1", 1, TypeTreeSerializationMode::Editor)
+            .unwrap();
+        assert_eq!(editor.nodes[0].type_name, "EditorGameObject");
+        assert_eq!(editor.nodes[0].version, 3);
+    }
+
+    #[test]
+    fn single_mode_classes_only_resolve_for_that_mode() {
+        let value = json!({
             "Version": "2022.3.0f1",
             "Classes": [
                 {
                     "TypeID": 1,
-                    "EditorRootNode": node("EditorOnly", "Base", 1),
+                    "EditorRootNode": node("EditorOnly", "Base", 0, 1),
                     "ReleaseRootNode": null
                 },
                 {
                     "TypeID": 2,
                     "EditorRootNode": null,
-                    "ReleaseRootNode": node("ReleaseOnly", "Base", 1)
+                    "ReleaseRootNode": node("ReleaseOnly", "Base", 0, 1)
                 }
             ]
         });
-        let registry = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
-        )
-        .unwrap();
+        let registry = load(&value, &mut AssetLoadBudget::default()).unwrap();
 
         assert!(registry.resolve("2022.3.0f1", 1).is_none());
-        let editor_tree = registry
-            .resolve_with_mode("2022.3.0f1", 1, TypeTreeSerializationMode::Editor)
-            .unwrap();
-        assert_eq!(editor_tree.nodes[0].type_name, "EditorOnly");
-
+        assert!(
+            registry
+                .resolve_with_mode("2022.3.0f1", 1, TypeTreeSerializationMode::Editor)
+                .is_some()
+        );
         assert!(
             registry
                 .resolve_with_mode("2022.3.0f1", 2, TypeTreeSerializationMode::Editor)
                 .is_none()
         );
-        let release_tree = registry
-            .resolve_with_mode("2022.3.0f1", 2, TypeTreeSerializationMode::Release)
-            .unwrap();
-        assert_eq!(release_tree.nodes[0].type_name, "ReleaseOnly");
+        assert!(registry.resolve("2022.3.0f1", 2).is_some());
     }
 
     #[test]
-    fn non_exact_versions_are_rejected() {
-        let root = node("GameObject", "Base", 1);
-        for invalid_version in ["", "2022.*"] {
-            let json = dump(invalid_version, 1, root.clone(), root.clone());
-            let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-                serde_json::to_vec(&json).unwrap().as_slice(),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("Version"));
-            assert!(error.to_string().contains("exact"));
-        }
-    }
-
-    #[test]
-    fn load_version_reports_versions_loaded_from_reader_or_file() {
-        let version = "2022.3.0f1";
-        let root = node("GameObject", "Base", 1);
-        let json = dump(version, 1, root.clone(), root);
-        let bytes = serde_json::to_vec(&json).unwrap();
-
-        let from_reader =
-            AssetRipperTypeTreeGeneratorRegistry::new_from_reader(bytes.as_slice()).unwrap();
-        assert!(from_reader.load_version(version).unwrap());
-
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("single.json");
-        fs::write(&path, bytes).unwrap();
-        let from_file = AssetRipperTypeTreeGeneratorRegistry::new_from_path(&path).unwrap();
-        assert!(from_file.load_version(version).unwrap());
-    }
-
-    #[test]
-    fn classes_without_either_root_are_skipped() {
-        let json = dump("2022.3.0f1", 0, Value::Null, Value::Null);
-        let registry = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
-        )
-        .unwrap();
-
-        assert!(registry.resolve("2022.3.0f1", 0).is_none());
-    }
-
-    #[test]
-    fn missing_required_fields_are_reported() {
-        let missing_version = json!({ "Classes": [] });
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&missing_version).unwrap().as_slice(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("Version"));
-
-        let missing_type_id = json!({
-            "Version": "2022.3.0f1",
-            "Classes": [{
-                "EditorRootNode": node("GameObject", "Base", 1),
-                "ReleaseRootNode": node("GameObject", "Base", 1)
-            }]
-        });
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&missing_type_id).unwrap().as_slice(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("TypeID"));
-
-        let missing_release_root = json!({
-            "Version": "2022.3.0f1",
-            "Classes": [{
-                "TypeID": 1,
-                "EditorRootNode": node("GameObject", "Base", 1)
-            }]
-        });
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&missing_release_root)
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("ReleaseRootNode"));
-
-        let mut missing_meta_flag = node("GameObject", "Base", 1);
-        missing_meta_flag
-            .as_object_mut()
-            .unwrap()
-            .remove("MetaFlag");
-        let json = dump(
-            "2022.3.0f1",
-            1,
-            missing_meta_flag.clone(),
-            missing_meta_flag,
-        );
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("MetaFlag"));
-
-        let mut null_sub_nodes = node("GameObject", "Base", 1);
-        null_sub_nodes["SubNodes"] = Value::Null;
-        let json = dump("2022.3.0f1", 1, null_sub_nodes.clone(), null_sub_nodes);
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("expected a sequence"));
-    }
-
-    #[test]
-    fn root_node_version_does_not_replace_type_tree_format_version() {
-        let root = node("GameObject", "Base", 7);
-        let json = dump("2022.3.0f1", 1, root.clone(), root);
-        let registry = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
+    fn node_metadata_preserves_wire_bits_without_changing_tree_format_version() {
+        let mut root = node("GameObject", "Base", 0, 24_600);
+        root["MetaFlag"] = json!(0xf000_0001_u32);
+        let registry = load(
+            &dump("2022.3.0f1", 1, root.clone(), root),
+            &mut AssetLoadBudget::default(),
         )
         .unwrap();
 
         let tree = registry.resolve("2022.3.0f1", 1).unwrap();
         assert_eq!(tree.version, TypeTree::new().version);
-        assert_eq!(tree.nodes[0].version, 7);
-    }
-
-    #[test]
-    fn meta_flag_preserves_all_u32_bits() {
-        let mut root = node("GameObject", "Base", 24_600);
-        root["MetaFlag"] = json!(0xf000_0001_u32);
-        let json = dump("2022.3.0f1", 1, root.clone(), root);
-        let registry = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-            serde_json::to_vec(&json).unwrap().as_slice(),
-        )
-        .unwrap();
-
-        let tree = registry.resolve("2022.3.0f1", 1).unwrap();
-        assert_eq!(tree.nodes[0].meta_flags as u32, 0xf000_0001);
         assert_eq!(tree.nodes[0].version, 24_600);
+        assert_eq!(tree.nodes[0].meta_flags as u32, 0xf000_0001);
     }
 
     #[test]
-    fn node_protocol_integer_widths_are_validated() {
-        for (field, value, expected_type) in [
-            ("Level", json!(256), "u8"),
-            ("Version", json!(65_536), "u16"),
-            ("TypeFlags", json!(256), "u8"),
-            ("MetaFlag", json!(u64::from(u32::MAX) + 1), "u32"),
-        ] {
-            let mut root = node("GameObject", "Base", 1);
-            root[field] = value;
-            let json = dump("2022.3.0f1", 1, root.clone(), root);
-
-            let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-                serde_json::to_vec(&json).unwrap().as_slice(),
+    fn exact_versions_and_node_semantics_are_validated() {
+        for version in ["", "2022.*"] {
+            let root = node("GameObject", "Base", 0, 1);
+            let error = load(
+                &dump(version, 1, root.clone(), root),
+                &mut AssetLoadBudget::default(),
             )
             .unwrap_err();
-            assert!(
-                error.to_string().contains(expected_type),
-                "unexpected error for {field}: {error}"
-            );
+            assert!(error.to_string().contains("exact"));
         }
+
+        let mut invalid_level = node("GameObject", "Base", 0, 1);
+        invalid_level["SubNodes"] = json!([node("int", "m_Value", 0, 1)]);
+        let error = load(
+            &dump("2022.3.0f1", 42, invalid_level.clone(), invalid_level),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("class 42"), "{message}");
+        assert!(message.contains("Level"), "{message}");
+
+        let mut invalid_size = node("GameObject", "Base", 0, 1);
+        invalid_size["ByteSize"] = json!(-2);
+        let error = load(
+            &dump("2022.3.0f1", 42, invalid_size.clone(), invalid_size),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ByteSize"));
     }
 
     #[test]
-    fn invalid_node_semantics_include_version_class_and_field_context() {
-        for (field, value) in [("TypeName", json!("")), ("ByteSize", json!(-2))] {
-            let mut root = node("GameObject", "Base", 1);
-            root[field] = value;
-            let json = dump("2022.3.0f1", 42, root.clone(), root);
+    fn missing_null_and_unknown_fields_follow_the_pascal_case_contract() {
+        let missing_release = json!({
+            "Version": "2022.3.0f1",
+            "Classes": [{
+                "TypeID": 1,
+                "EditorRootNode": null
+            }]
+        });
+        assert!(
+            load(&missing_release, &mut AssetLoadBudget::default())
+                .unwrap_err()
+                .to_string()
+                .contains("ReleaseRootNode")
+        );
 
-            let error = AssetRipperTypeTreeGeneratorRegistry::new_from_reader(
-                serde_json::to_vec(&json).unwrap().as_slice(),
-            )
-            .unwrap_err();
-            let message = error.to_string();
-            assert!(message.contains("2022.3.0f1"), "{message}");
-            assert!(message.contains("class 42"), "{message}");
-            assert!(message.contains(field), "{message}");
-        }
+        let no_trees = dump("2022.3.0f1", 1, Value::Null, Value::Null);
+        let registry = load(&no_trees, &mut AssetLoadBudget::default()).unwrap();
+        assert!(registry.resolve("2022.3.0f1", 1).is_none());
+
+        let mut unknown = no_trees;
+        unknown["Unexpected"] = json!(true);
+        load(&unknown, &mut AssetLoadBudget::default()).unwrap();
     }
 
     #[test]
-    fn dump_directories_are_indexed_without_eagerly_parsing_files() {
+    fn duplicate_versions_and_classes_are_rejected() {
+        let root = node("GameObject", "Base", 0, 1);
+        let duplicate_class = json!({
+            "Version": "2022.3.0f1",
+            "Classes": [
+                {
+                    "TypeID": 1,
+                    "EditorRootNode": null,
+                    "ReleaseRootNode": root.clone()
+                },
+                {
+                    "TypeID": 1,
+                    "EditorRootNode": null,
+                    "ReleaseRootNode": root.clone()
+                }
+            ]
+        });
+        assert!(
+            load(&duplicate_class, &mut AssetLoadBudget::default())
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate class ID")
+        );
+
         let temp = tempfile::tempdir().unwrap();
+        let encoded = serde_json::to_vec(&dump("2022.3.0f1", 1, Value::Null, root)).unwrap();
+        fs::write(temp.path().join("wrong-name.json"), &encoded).unwrap();
+        let error = AssetRipperTypeTreeRegistry::new_from_path(
+            temp.path(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("expected \"wrong-name\""));
+    }
+
+    #[test]
+    fn directory_prefers_info_json_and_is_non_recursive() {
+        let temp = tempfile::tempdir().unwrap();
+        fs::write(temp.path().join("ignored.json"), b"not json").unwrap();
         let info_json = temp.path().join("InfoJson");
         fs::create_dir(&info_json).unwrap();
-        fs::write(info_json.join("broken.json"), b"not json").unwrap();
-
-        let valid_version = "2022.3.0f1";
-        let root = node("GameObject", "Base", 1);
-        let valid_dump = dump(valid_version, 1, root.clone(), root);
-        fs::write(
-            info_json.join(format!("{valid_version}.json")),
-            serde_json::to_vec(&valid_dump).unwrap(),
-        )
-        .unwrap();
-
-        let from_root = AssetRipperTypeTreeGeneratorRegistry::new_from_path(temp.path());
-        assert!(from_root.is_ok());
-
-        let from_root = from_root.unwrap();
-        assert!(from_root.resolve(valid_version, 1).is_some());
-        let error = from_root.load_version("broken").unwrap_err();
-        assert!(error.to_string().contains("broken.json"));
-        assert!(error.to_string().contains("expected ident"));
-
-        let from_info_json = AssetRipperTypeTreeGeneratorRegistry::new_from_path(&info_json);
-        assert!(from_info_json.is_ok());
-        assert!(
-            from_info_json
-                .unwrap()
-                .resolve_with_mode(valid_version, 1, TypeTreeSerializationMode::Editor)
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn dump_directory_index_is_not_recursive() {
-        let temp = tempfile::tempdir().unwrap();
-        let nested = temp.path().join("nested");
+        let nested = info_json.join("nested");
         fs::create_dir(&nested).unwrap();
-        let root = node("Nested", "Base", 1);
-        let json = dump("2022.3.0f1", 1, root.clone(), root);
+        fs::write(nested.join("ignored.json"), b"not json").unwrap();
+
+        let root = node("GameObject", "Base", 0, 1);
         fs::write(
-            nested.join("2022.3.0f1.json"),
-            serde_json::to_vec(&json).unwrap(),
+            info_json.join("2022.3.0f1.json"),
+            serde_json::to_vec(&dump("2022.3.0f1", 1, root.clone(), root)).unwrap(),
         )
         .unwrap();
 
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_path(temp.path()).unwrap_err();
-        assert!(error.to_string().contains(".json"));
+        let registry = AssetRipperTypeTreeRegistry::new_from_path(
+            temp.path(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap();
+        assert!(registry.resolve("2022.3.0f1", 1).is_some());
     }
 
     #[test]
-    fn empty_dump_directories_are_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_path(temp.path()).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains(".json"), "{message}");
-        assert!(
-            message.contains(&temp.path().display().to_string()),
-            "{message}"
-        );
+    fn directory_parsing_is_eager_and_empty_directories_are_rejected() {
+        let broken = tempfile::tempdir().unwrap();
+        fs::write(broken.path().join("broken.json"), b"not json").unwrap();
+        let error = AssetRipperTypeTreeRegistry::new_from_path(
+            broken.path(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("broken.json"));
+
+        let empty = tempfile::tempdir().unwrap();
+        let error = AssetRipperTypeTreeRegistry::new_from_path(
+            empty.path(),
+            &mut AssetLoadBudget::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("no immediate .json files"));
     }
 
     #[test]
-    fn single_file_paths_are_validated_immediately() {
+    fn single_file_paths_are_loaded_immediately() {
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("invalid.json");
-        fs::write(&path, br#"{"Classes": []}"#).unwrap();
+        let path = temp.path().join("single.json");
+        let root = node("GameObject", "Base", 0, 1);
+        fs::write(
+            &path,
+            serde_json::to_vec(&dump("2022.3.0f1", 1, root.clone(), root)).unwrap(),
+        )
+        .unwrap();
 
-        let error = AssetRipperTypeTreeGeneratorRegistry::new_from_path(&path).unwrap_err();
-        assert!(error.to_string().contains("invalid.json"));
-        assert!(error.to_string().contains("Version"));
+        let registry =
+            AssetRipperTypeTreeRegistry::new_from_path(&path, &mut AssetLoadBudget::default())
+                .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let first = registry.resolve("2022.3.0f1", 1).unwrap();
+        let second = registry.resolve("2022.3.0f1", 1).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn caller_owned_budget_has_an_exact_one_short_boundary() {
+        let root = node("GameObject", "Base", 0, 1);
+        let value = dump("2022.3.0f1", 1, root.clone(), root);
+        let encoded = serde_json::to_vec(&value).unwrap();
+
+        let mut measured = AssetLoadBudget::default();
+        AssetRipperTypeTreeRegistry::new_from_reader(encoded.as_slice(), &mut measured).unwrap();
+        let exact_bytes = measured.usage().bytes;
+
+        let limits = AssetLoadLimits {
+            max_bytes: exact_bytes,
+            ..AssetLoadLimits::default()
+        };
+        let mut exact = AssetLoadBudget::new(limits).unwrap();
+        AssetRipperTypeTreeRegistry::new_from_reader(encoded.as_slice(), &mut exact).unwrap();
+        assert_eq!(exact.usage().bytes, exact_bytes);
+
+        let mut one_short = AssetLoadBudget::new(AssetLoadLimits {
+            max_bytes: exact_bytes - 1,
+            ..AssetLoadLimits::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            AssetRipperTypeTreeRegistry::new_from_reader(encoded.as_slice(), &mut one_short),
+            Err(BinaryError::Budget(BudgetError::Exceeded {
+                resource: "bytes",
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn resolution_does_not_consume_caller_budget() {
+        let root = node("GameObject", "Base", 0, 1);
+        let value = dump("2022.3.0f1", 1, root.clone(), root);
+        let mut budget = AssetLoadBudget::default();
+        let registry = load(&value, &mut budget).unwrap();
+        let before = budget.usage();
+
+        let first = registry.resolve("2022.3.0f1", 1).unwrap();
+        let second = registry
+            .resolve_with_mode("2022.3.0f1", 1, TypeTreeSerializationMode::Editor)
+            .unwrap();
+
+        assert_eq!(budget.usage(), before);
+        assert_eq!(first.nodes[0].type_name, "GameObject");
+        assert_eq!(second.nodes[0].type_name, "GameObject");
     }
 }

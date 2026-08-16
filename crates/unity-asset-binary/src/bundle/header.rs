@@ -5,8 +5,29 @@
 
 use crate::compression::{ArchiveFlags, CompressionType};
 use crate::error::{BinaryError, Result};
-use crate::reader::BinaryReader;
+use crate::reader::{BinaryRead, BinaryReader};
 use serde::{Deserialize, Serialize};
+
+/// Physical header and payload layout selected by the wire signature and format version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BundleLayoutKind {
+    /// Block table plus independently compressed data blocks.
+    FileStream,
+    /// Pre-v6 UnityWeb/UnityRaw streaming header and combined payload.
+    Legacy,
+}
+
+impl BundleLayoutKind {
+    pub fn from_wire(signature: &str, version: u32) -> Result<Self> {
+        match (signature, version) {
+            ("UnityFS", _) | ("UnityWeb" | "UnityRaw", 6) => Ok(Self::FileStream),
+            ("UnityWeb" | "UnityRaw", _) => Ok(Self::Legacy),
+            _ => Err(BinaryError::unsupported(format!(
+                "Unknown bundle signature: {signature}"
+            ))),
+        }
+    }
+}
 
 /// Parsed header fields for legacy Unity bundles (`UnityWeb` / `UnityRaw`).
 ///
@@ -61,6 +82,9 @@ pub struct BundleHeader {
     pub actual_header_size: u64,
     /// Legacy header fields (`UnityWeb` / `UnityRaw`), if applicable.
     pub legacy_web_raw: Option<LegacyWebRawHeader>,
+    /// Extra byte stored after FileStream flags by UnityWeb/UnityRaw v6.
+    #[serde(default)]
+    pub file_stream_header_byte: Option<u8>,
 }
 
 impl BundleHeader {
@@ -69,13 +93,18 @@ impl BundleHeader {
     /// This method reads the bundle header from a binary reader,
     /// handling different bundle formats (UnityFS, UnityWeb, etc.).
     pub fn from_reader(reader: &mut BinaryReader) -> Result<Self> {
-        let signature = reader.read_cstring()?;
-        let version = reader.read_u32()?;
-        let unity_version = reader.read_cstring()?;
-        let unity_revision = reader.read_cstring()?;
+        Self::from_input(reader)
+    }
+
+    pub(crate) fn from_input(input: &mut (impl BinaryRead + ?Sized)) -> Result<Self> {
+        let signature = input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
+        let version = input.read_u32()?;
+        let unity_version = input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
+        let unity_revision = input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
+        let layout = BundleLayoutKind::from_wire(&signature, version)?;
 
         let mut header = Self {
-            signature: signature.clone(),
+            signature,
             version,
             unity_version,
             unity_revision,
@@ -85,13 +114,12 @@ impl BundleHeader {
             flags: 0,
             actual_header_size: 0,
             legacy_web_raw: None,
+            file_stream_header_byte: None,
         };
 
-        // Read additional fields based on bundle format
-        match signature.as_str() {
-            "UnityFS" => {
-                // Modern UnityFS format
-                let size = reader.read_i64()?;
+        match layout {
+            BundleLayoutKind::FileStream => {
+                let size = input.read_i64()?;
                 if size < 0 {
                     return Err(BinaryError::invalid_data(format!(
                         "Negative bundle size in header: {}",
@@ -99,18 +127,19 @@ impl BundleHeader {
                     )));
                 }
                 header.size = size as u64;
-                header.compressed_blocks_info_size = reader.read_u32()?;
-                header.uncompressed_blocks_info_size = reader.read_u32()?;
-                header.flags = reader.read_u32()?;
+                header.compressed_blocks_info_size = input.read_u32()?;
+                header.uncompressed_blocks_info_size = input.read_u32()?;
+                header.flags = input.read_u32()?;
+                if header.signature != "UnityFS" {
+                    header.file_stream_header_byte = Some(input.read_u8()?);
+                }
+                header.actual_header_size = input.position();
             }
-            "UnityWeb" | "UnityRaw" => {
-                // Legacy formats: parse header fields as UnityPy does in `read_web_raw`.
-                // Note: UnityPy reads the hash/crc when version >= 4, but its `save_web_raw`
-                // only supports version <= 3. We still parse newer headers for read parity.
+            BundleLayoutKind::Legacy => {
                 let mut legacy = LegacyWebRawHeader::default();
 
                 if version >= 4 {
-                    let hash = reader.read_bytes(16)?;
+                    let hash = input.read_bytes(16)?;
                     if hash.len() != 16 {
                         return Err(BinaryError::invalid_data(format!(
                             "Legacy bundle hash length mismatch: expected 16, got {}",
@@ -118,13 +147,13 @@ impl BundleHeader {
                         )));
                     }
                     legacy.hash = Some(hash);
-                    legacy.crc = Some(reader.read_u32()?);
+                    legacy.crc = Some(input.read_u32()?);
                 }
 
-                legacy.minimum_streamed_bytes = reader.read_u32()?;
-                legacy.header_size = reader.read_u32()?;
-                legacy.number_of_levels_to_download_before_streaming = reader.read_u32()?;
-                legacy.level_count = reader.read_i32()?;
+                legacy.minimum_streamed_bytes = input.read_u32()?;
+                legacy.header_size = input.read_u32()?;
+                legacy.number_of_levels_to_download_before_streaming = input.read_u32()?;
+                legacy.level_count = input.read_i32()?;
 
                 if legacy.level_count < 1 {
                     return Err(BinaryError::invalid_data(format!(
@@ -140,17 +169,28 @@ impl BundleHeader {
                         .ok_or_else(|| {
                             BinaryError::invalid_data("Legacy levelCount skip overflow")
                         })?;
-                    reader.skip_bytes(skip as usize)?;
+                    let next = input.position().checked_add(skip).ok_or_else(|| {
+                        BinaryError::invalid_data("Legacy levelCount position overflow")
+                    })?;
+                    input.set_position(next)?;
                 }
 
-                legacy.compressed_size = reader.read_u32()?;
-                legacy.uncompressed_size = reader.read_u32()?;
+                legacy.compressed_size = input.read_u32()?;
+                legacy.uncompressed_size = input.read_u32()?;
 
                 if version >= 2 {
-                    legacy.complete_file_size = Some(reader.read_u32()?);
+                    legacy.complete_file_size = Some(input.read_u32()?);
                 }
                 if version >= 3 {
-                    legacy.file_info_header_size = Some(reader.read_u32()?);
+                    legacy.file_info_header_size = Some(input.read_u32()?);
+                }
+
+                if u64::from(legacy.header_size) < input.position() {
+                    return Err(BinaryError::invalid_data(format!(
+                        "Legacy header_size {} precedes parsed header end {}",
+                        legacy.header_size,
+                        input.position()
+                    )));
                 }
 
                 header.size = legacy
@@ -166,26 +206,29 @@ impl BundleHeader {
                 header.actual_header_size = legacy.header_size as u64;
                 header.legacy_web_raw = Some(legacy);
             }
-            _ => {
-                return Err(BinaryError::unsupported(format!(
-                    "Unknown bundle signature: {}",
-                    signature
-                )));
-            }
-        }
-
-        // Record the actual header size (for UnityFS we record the reader position;
-        // for legacy bundles this is already set to the `headerSize` field above).
-        if !header.is_legacy() {
-            header.actual_header_size = reader.position();
         }
 
         Ok(header)
     }
 
-    /// Get the compression type from flags
+    /// Returns the compression implied by the bundle's physical layout.
+    ///
+    /// FileStream bundles encode compression in their archive flags. Legacy
+    /// UnityWeb and UnityRaw bundles instead imply LZMA and no compression,
+    /// respectively, because their headers do not contain archive flags.
     pub fn compression_type(&self) -> Result<CompressionType> {
-        CompressionType::from_flags(self.flags & ArchiveFlags::COMPRESSION_TYPE_MASK)
+        match self.layout_kind()? {
+            BundleLayoutKind::FileStream => {
+                CompressionType::from_flags(self.flags & ArchiveFlags::COMPRESSION_TYPE_MASK)
+            }
+            BundleLayoutKind::Legacy => match self.signature.as_str() {
+                "UnityWeb" => Ok(CompressionType::Lzma),
+                "UnityRaw" => Ok(CompressionType::None),
+                signature => Err(BinaryError::unsupported(format!(
+                    "Unsupported legacy bundle signature: {signature}"
+                ))),
+            },
+        }
     }
 
     /// Check if block info is at the end of the file
@@ -198,9 +241,19 @@ impl BundleHeader {
         self.signature == "UnityFS"
     }
 
+    /// Returns the physical layout implied by the signature and version.
+    pub fn layout_kind(&self) -> Result<BundleLayoutKind> {
+        BundleLayoutKind::from_wire(&self.signature, self.version)
+    }
+
+    /// Check if this bundle uses the block-based FileStream layout.
+    pub fn is_file_stream(&self) -> bool {
+        matches!(self.layout_kind(), Ok(BundleLayoutKind::FileStream))
+    }
+
     /// Check if this is a legacy format bundle
     pub fn is_legacy(&self) -> bool {
-        matches!(self.signature.as_str(), "UnityWeb" | "UnityRaw")
+        matches!(self.layout_kind(), Ok(BundleLayoutKind::Legacy))
     }
 
     /// Get the expected data offset after the header
@@ -217,45 +270,21 @@ impl BundleHeader {
 
     /// Calculate the size of the header itself
     pub fn header_size(&self) -> u64 {
-        // Use the actual header size recorded during parsing
-        // This is more accurate than calculating it
         if self.actual_header_size > 0 {
-            self.actual_header_size
-        } else {
-            // Fallback to calculation if actual size not recorded
-            let base_size = match self.signature.as_str() {
-                "UnityFS" => {
-                    // Signature + version + unity_version + unity_revision + size + compressed_size + uncompressed_size + flags
-                    self.signature.len()
-                        + 1
-                        + 4
-                        + self.unity_version.len()
-                        + 1
-                        + self.unity_revision.len()
-                        + 1
-                        + 8
-                        + 4
-                        + 4
-                        + 4
-                }
-                "UnityWeb" | "UnityRaw" => {
-                    // Signature + version + unity_version + unity_revision + size
-                    self.signature.len()
-                        + 1
-                        + 4
-                        + self.unity_version.len()
-                        + 1
-                        + self.unity_revision.len()
-                        + 1
-                        + 4
-                }
-                _ => 0,
-            };
-
-            // Add padding for alignment
-            let aligned_size = (base_size + 15) & !15; // Align to 16 bytes
-            aligned_size as u64
+            return self.actual_header_size;
         }
+        if let Some(legacy) = &self.legacy_web_raw {
+            return u64::from(legacy.header_size);
+        }
+
+        let common = self
+            .signature
+            .len()
+            .saturating_add(1 + 4)
+            .saturating_add(self.unity_version.len() + 1)
+            .saturating_add(self.unity_revision.len() + 1);
+        let file_stream = 8 + 4 + 4 + 4 + usize::from(self.signature != "UnityFS");
+        u64::try_from(common.saturating_add(file_stream)).unwrap_or(u64::MAX)
     }
 
     /// Validate the header for consistency
@@ -279,8 +308,7 @@ impl BundleHeader {
             return Err(BinaryError::invalid_data("Invalid bundle size"));
         }
 
-        // UnityFS specific validations
-        if self.is_unity_fs() {
+        if self.layout_kind()? == BundleLayoutKind::FileStream {
             if self.compressed_blocks_info_size == 0 && self.uncompressed_blocks_info_size == 0 {
                 return Err(BinaryError::invalid_data("Invalid block info sizes"));
             }
@@ -294,15 +322,17 @@ impl BundleHeader {
 
     /// Get bundle format information
     pub fn format_info(&self) -> BundleFormatInfo {
+        let layout = self.layout_kind().ok();
+        let is_compressed = self
+            .compression_type()
+            .map(|compression| compression != CompressionType::None)
+            .unwrap_or(false);
         BundleFormatInfo {
             signature: self.signature.clone(),
             version: self.version,
-            is_compressed: self
-                .compression_type()
-                .map(|ct| ct != CompressionType::None)
-                .unwrap_or(false),
-            supports_streaming: self.is_unity_fs(),
-            has_directory_info: self.is_unity_fs(),
+            is_compressed,
+            supports_streaming: layout == Some(BundleLayoutKind::FileStream),
+            has_directory_info: layout == Some(BundleLayoutKind::FileStream),
         }
     }
 }
@@ -373,5 +403,59 @@ mod tests {
 
         assert!(!legacy_header.is_unity_fs());
         assert!(legacy_header.is_legacy());
+
+        let web_v6 = BundleHeader {
+            signature: "UnityWeb".to_string(),
+            version: 6,
+            ..Default::default()
+        };
+        assert!(!web_v6.is_unity_fs());
+        assert!(web_v6.is_file_stream());
+        assert!(!web_v6.is_legacy());
+
+        let legacy_info = legacy_header.format_info();
+        assert!(legacy_info.is_compressed);
+        assert!(!legacy_info.has_directory_info);
+        let web_v6_info = web_v6.format_info();
+        assert!(!web_v6_info.is_compressed);
+        assert!(web_v6_info.has_directory_info);
+    }
+
+    #[test]
+    fn compression_type_follows_the_physical_layout() {
+        let legacy_web = BundleHeader {
+            signature: "UnityWeb".to_string(),
+            version: 5,
+            flags: CompressionType::None as u32,
+            ..Default::default()
+        };
+        let legacy_raw = BundleHeader {
+            signature: "UnityRaw".to_string(),
+            version: 5,
+            flags: CompressionType::Lz4 as u32,
+            ..Default::default()
+        };
+        let file_stream_web = BundleHeader {
+            signature: "UnityWeb".to_string(),
+            version: 6,
+            flags: CompressionType::Lz4Hc as u32,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            legacy_web.compression_type().unwrap(),
+            CompressionType::Lzma
+        );
+        assert!(legacy_web.format_info().is_compressed);
+        assert_eq!(
+            legacy_raw.compression_type().unwrap(),
+            CompressionType::None
+        );
+        assert!(!legacy_raw.format_info().is_compressed);
+        assert_eq!(
+            file_stream_web.compression_type().unwrap(),
+            CompressionType::Lz4Hc
+        );
+        assert!(file_stream_web.format_info().is_compressed);
     }
 }

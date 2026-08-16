@@ -52,6 +52,8 @@ repo-ref/
 # Python virtual environments (local tooling)
 .venv/
 .venv*/
+__pycache__/
+*.py[cod]
 
 # Local search index (daemon cache)
 .unity-asset-search/

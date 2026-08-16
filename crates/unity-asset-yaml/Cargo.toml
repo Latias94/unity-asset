@@ -1,7 +1,8 @@
 [package]
 name = "unity-asset-yaml"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "YAML format support for Unity asset parsing"
 license.workspace = true
@@ -22,13 +23,13 @@ exclude = [
 
 [dependencies]
 # Core dependency
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
+unity-asset-core = { workspace = true }
 
 # Workspace dependencies
-serde = { workspace = true }
-serde_yaml = { workspace = true }
+yaml-rust2 = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
+same-file.workspace = true
 
 # Async support (optional)
 tokio = { workspace = true, optional = true }
@@ -36,8 +37,7 @@ async-trait = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
 
 [dev-dependencies]
-anyhow = { workspace = true }
-tokio-test = "0.4"
+tempfile.workspace = true
 
 [features]
 default = []

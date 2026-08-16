@@ -2,12 +2,14 @@ use crate::fast_path;
 use crate::shared::AppContext;
 use anyhow::Result;
 use std::path::PathBuf;
+use unity_asset::AssetLoadBudget;
 
 pub(crate) fn run(input: PathBuf, filter: String, verbose: bool, _ctx: &AppContext) -> Result<()> {
     let candidate_paths = fast_path::collect_candidate_paths(&input)?;
 
     let filter_lc = filter.to_ascii_lowercase();
     let mut found_any = false;
+    let mut budget = AssetLoadBudget::default();
 
     for path in candidate_paths {
         if !fast_path::is_assetbundle_path(&path) {
@@ -15,7 +17,7 @@ pub(crate) fn run(input: PathBuf, filter: String, verbose: bool, _ctx: &AppConte
         }
 
         let options = fast_path::bundle_list_options();
-        let bundle = match fast_path::load_bundle_for_list(&path, options) {
+        let bundle = match fast_path::load_bundle_for_list(&path, options, &mut budget) {
             Ok(v) => v,
             Err(_) => continue,
         };

@@ -1,5 +1,6 @@
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
-use unity_asset_binary::typetree::{TypeTree, TypeTreeNode, TypeTreeSerializer};
+use unity_asset_binary::typetree::{TypeTree, TypeTreeNode, TypeTreeParseOptions, TypeTreeSchema};
+use unity_asset_core::AssetLoadBudget;
 
 fn le_i32(v: i32) -> [u8; 4] {
     v.to_le_bytes()
@@ -40,12 +41,14 @@ fn typetree_name_peek_prefix_parses_only_until_name() {
     bytes.push(0); // align to 4
     bytes.extend_from_slice(&le_i32(99)); // m_Flags (should remain unread)
 
+    let mut budget = AssetLoadBudget::default();
+    let schema = TypeTreeSchema::compile(&tree, &[], &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_prefix_detailed(
+    let out = schema
+        .read_object_prefix(
             &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
+            &mut budget,
+            TypeTreeParseOptions::default(),
             prefix_len,
         )
         .unwrap();

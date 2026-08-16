@@ -1,6 +1,6 @@
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
-use unity_asset_binary::typetree::{TypeTree, TypeTreeNode, TypeTreeSerializer};
-use unity_asset_core::UnityValue;
+use unity_asset_binary::typetree::{TypeTree, TypeTreeNode, TypeTreeParseOptions, TypeTreeSchema};
+use unity_asset_core::{AssetLoadBudget, UnityValue};
 
 fn le_i32(v: i32) -> [u8; 4] {
     v.to_le_bytes()
@@ -24,14 +24,11 @@ fn typelessdata_reads_length_prefixed_bytes_and_aligns_when_flagged() {
     bytes.push(0); // padding to 4-byte alignment
     bytes.extend_from_slice(&le_i32(123456)); // should remain unread
 
+    let mut budget = AssetLoadBudget::default();
+    let schema = TypeTreeSchema::compile(&tree, &[], &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_prefix_detailed(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-            1,
-        )
+    let out = schema
+        .read_object_prefix(&mut reader, &mut budget, TypeTreeParseOptions::default(), 1)
         .unwrap();
 
     let v = out.properties.get("m_Data").expect("m_Data present");

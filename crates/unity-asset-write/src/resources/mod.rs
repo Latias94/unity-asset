@@ -1,50 +1,21 @@
-use unity_asset_core::{Result, UnityAssetError};
+//! Deterministic, budgeted streamed-resource allocation.
+//!
+//! A resource plan borrows the bytes owned by the caller and performs all arithmetic and shape
+//! validation before it touches an [`crate::artifact::ArtifactBatch`]. Plans may be constructed
+//! from a complete borrowed slice or incrementally with caller-owned metadata accounting.
+//! Preparing either form creates one exact streamed-resource artifact. The artifact batch owns the
+//! output allocation budget and transaction, so failed encoding never leaves a partially appended
+//! CAB behind.
 
-/// A writable resource "cab" (Unity `.resS` / `.resource`) buffer.
-///
-/// This mirrors UnityPy's `get_writeable_cab()` writer behavior at a minimal level:
-/// callers append bytes and record offsets/sizes into streamed-resource fields.
-#[derive(Debug, Clone)]
-pub struct WritableCab {
-    pub name: String,
-    pub flags: u32,
-    bytes: Vec<u8>,
-}
+mod allocation;
+mod encoder;
 
-impl WritableCab {
-    pub fn new(name: impl Into<String>, flags: u32) -> Self {
-        Self {
-            name: name.into(),
-            flags,
-            bytes: Vec::new(),
-        }
-    }
+pub use allocation::{
+    StreamedResourceAllocation, StreamedResourceAllocationIter, StreamedResourceExtent,
+    StreamedResourceFlags, StreamedResourcePlan, StreamedResourcePlanError,
+    StreamedResourcePlanner, StreamedResourcePlannerError, StreamedResourcePreview,
+};
+pub use encoder::{DeclaredStreamedResource, PreparedStreamedResource, StreamedResourceError};
 
-    pub fn bytes(&self) -> &[u8] {
-        self.bytes.as_slice()
-    }
-
-    pub fn len(&self) -> u64 {
-        self.bytes.len() as u64
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    pub fn append(&mut self, data: &[u8]) -> Result<u64> {
-        let offset = self.len();
-        let new_len = self
-            .bytes
-            .len()
-            .checked_add(data.len())
-            .ok_or_else(|| UnityAssetError::format("WritableCab size overflow"))?;
-        self.bytes.reserve(new_len.saturating_sub(self.bytes.len()));
-        self.bytes.extend_from_slice(data);
-        Ok(offset)
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
-    }
-}
+#[cfg(test)]
+mod tests;

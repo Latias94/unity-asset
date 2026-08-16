@@ -2,178 +2,159 @@
 
 All notable changes to this project will be documented in this file.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-14
+
+### Added
+
+- Added business search protocol revision 5 with bounded background-reindex discovery, structured process-lifetime task failure evidence, explicit control rejection for internal operations, published Draft 2020-12 structural schemas, and a deterministic SDK bundle containing the schema and fixture contract.
+
+- Added `AssetWorkspace` as the authoritative owner of immutable source catalogs, content-addressed backing bytes, workspace revisions, snapshots, and prepared views.
+- Added the versioned `WorkspaceInspector` source and object projections, exact structured lookup, streamed-resource resolution, and the allocation-free `workspace_capabilities` catalog.
+- Added canonical `MutationPlan` v3 JSON/YAML contracts with workspace, revision, source fingerprint, object digest, operation-order, and semantic guard validation.
+- Added zero-write prepare with independently reparsed segmented artifacts, read-your-writes inspection, deterministic proof manifests, and an opaque single-use `PreparedChange`.
+- Added recoverable in-place publication with validated containment roots, durable journals, directory identity binding, `CommitReport`, recovery discovery, `RecoveryLocator`, `RecoveryOutcome`, and `RollbackReceipt` contracts.
+- Added one revision-bound `ReferenceGraph` with typed field paths, coverage, resolution states, incoming/outgoing/closure queries, caching, and deterministic JSON, JSON Lines, and DOT projections.
+- Added typed extraction request v4, plan v8, manifest v6, and report v6 contracts with bundle-container and reference-traversal queries, deterministic artifact paths, caller-budgeted execution, recoverable publication, verified resume, and explicit representation-semantics identities.
+- Added a YAML-only extraction request profile and identity-first `file-id-*`/`ordinal-*` artifact paths for agent-safe document export.
+- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, capability-authenticated loopback HTTP discovery, and bounded idempotent reindex operations.
+- Added deterministic tag-release evidence, exact cargo-dist artifact-plan validation, isolated archive-consumer verification, real MSRV validation, pinned release inputs, checksums, GitHub Draft Release byte read-back, and build provenance attestations.
+- Added schema-aware mutation recipes that inspect exact YAML or binary provenance and lower guarded field, reference, schema, sequence, hierarchy, UnityEvent, material, transform, and streamed-audio changes into plan fragments.
+- Added deterministic performance contracts for unified TypeTree traversal and segmented prepared artifacts.
+
+### Changed
+
+- **Breaking:** Advanced the current Rust/C# business search protocol from revision 4 to revision 5, removed pre-rendered HTML search-hit fields, and retained revisions 1 through 4 as immutable archives.
+
+- **Breaking:** Replaced mutable high-level loading and editing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
+- **Breaking:** Replaced broad text-oriented CLI inspection and export surfaces with typed `workspace`, `references`, `export`, and `split-yaml` commands that exchange versioned JSON contracts; `split-yaml` now emits the canonical extraction report and manifest instead of a parallel YAML-split report.
+- **Breaking:** Replaced string YAML anchors in object identities with canonical non-zero numeric `YamlFileId` values, rejected ambiguous spellings such as `01`, and changed compact object addresses from `oa1:` to `oa2:`.
+- **Breaking:** Made prepared artifact format evidence opaque and replaced caller-side format matching with sealed, borrowed source proofs minted by `unity-asset-write`.
+- **Breaking:** Removed the legacy media Processor/Converter APIs, owned AudioClip/Texture2D/Sprite carriers, context-free quick decoders, generic image/audio exporters, and public swizzler utilities. Strict `AudioClipLayout`, `Texture2DLayout`, `SpriteLayout`, and `Prepared*` artifacts are now the only media preparation path.
+- **Breaking:** Removed MP3 and AAC from strict prepared-audio descriptors until a bounded full-codec validator exists; decoded-preferred extraction now falls back to raw bytes and decoded-required extraction reports typed unsupported encoding.
+- Consolidated prepared YAML inspection on the canonical `unity-asset-yaml` parser and removed the duplicate writer-owned YAML frontend and budget model.
+- **Breaking:** Replaced the earlier search transports with one project-bound loopback HTTP request endpoint discovered through a private, atomically published per-process capability descriptor. Removed transport negotiation, session framing, configurable bearer tokens, `IndexProgress`, and compatibility fallback.
+- **Breaking:** Unified TypeTree read, skip, PPtr scan, validation, encoding, and byte-preserving rewrite on one compiled `TypeTreeSchema`; TypeTree write errors now use `TypeTreeWriteError`, and `unity_asset_write::Endian` was replaced by the shared `ByteOrder`.
+- Made JSON and TPK TypeTree ingestion caller-budgeted, deterministic, depth-bounded, and immutable; workspace loads retain only required schemas in frozen per-source registries.
+- Reworked source loading, archive/WebFile/bundle expansion, edits, serialization, and publication to stage complete candidate state before one authority-changing commit.
+- Replaced contiguous output images with budgeted seekable segment graphs that retain unchanged source ranges, independently reparse candidate artifacts, and stream verified bytes during publication.
+- Bound source fingerprints, object identities, prepared artifacts, journals, extraction manifests, changes, and search generations to the versioned BLAKE3 `DigestV1` contract.
+- Made binary reference changes allocate external-file IDs deterministically and preserve exact PPtr shape, directory occurrence order, and source ownership.
+- Moved optional decode representations behind extraction policies while keeping authoritative selection, identity, planning, and manifest semantics in the high-level workspace.
+- Bound extraction final-path evidence reads to one cumulative, recovery-adjustable verification limit.
+
+### Fixed
+
+- Hardened parsing, decompression, registry loading, recursive serialization, semantic cloning, and artifact construction so caller-owned budgets are charged before allocation or expansion.
+- Preserved wire-faithful SerializedFile version gates, signed path IDs, byte order, alignment, type tables, external tables, object proof ranges, and unchanged object bytes across rebuilds.
+- Preserved AssetBundle signature, directory-node semantics, duplicate occurrences, compression policy, and exact encoded block ranges; unsupported encrypted layouts now fail structurally.
+- Made publication restart-safe across interruption, partial replacement, stale evidence, destination drift, directory replacement, and idempotent recovery redelivery.
+- Made search reindex admission idempotent by transaction identity and resilient to queueing, retries, worker failure, cancellation, and conflicting payloads.
+
+### Removed
+
+- **Breaking:** Removed the superseded mutable aggregate loader, direct edit/save lifecycle, pending write state, and implicit filesystem dependency probing.
+- **Breaking:** Removed mutable serialized-file edit sessions, change trackers, bare-byte object replacement, and raw object mutation escape hatches.
+- **Breaking:** Removed duplicate TypeTree builders, serializers, traversal facades, registries, semantic digest engines, and reference models.
+- **Breaking:** Removed obsolete CLI commands whose behavior is now represented by typed workspace inspection, reference projection, extraction, or low-level format examples.
+- **Breaking:** Removed the duplicate library-level YAML split planner, executor, plan, report, and capability contract; YAML splitting now uses the generic extraction plan and publication journal.
+- **Breaking:** Removed placeholder Mesh decoding/export, fabricated binary metadata summaries, cached Bundle loader facades, and implicit Unity version defaults rather than reporting capabilities or observations the library cannot prove.
+- **Breaking:** Removed the Unix-domain-socket and Windows named-pipe search transports, Bootstrap negotiation, four-byte framing, peer-process authorization, and the C# framed-session adapter.
+- Removed production dependence on callback-based script-schema generation; immutable JSON/TPK registries are now the workspace boundary.
 
 ## [0.3.0] - 2026-01-27
 
 ### Highlights
-- Better “UnityPy-style” discovery and export workflows:
-  - AssetBundle `m_Container` discovery supports glob patterns (`*`, `?`) and case-insensitive matching.
-  - Environment-wide dependency graph for SerializedFiles (TypeTree + PPtr scan), with best-effort external resolution.
-- Search stack is ready for downstream use:
-  - `unity-asset-search-core` / `unity-asset-search-index` (library crates)
-  - `unity-asset-search-daemon` / `unity-asset-search-cli` (tools)
+
+- Added UnityPy-style AssetBundle container discovery with glob patterns and case-insensitive matching.
+- Added best-effort cross-file reference analysis for SerializedFiles and a reusable local search stack.
+- Introduced the search core, index, daemon, and CLI crates for downstream tools.
 
 ### Added
-- Glob matching for AssetBundle `m_Container` discovery (`*`, `?`) and CLI support for glob patterns.
-- `unity-asset-cli stats` to print parsing stats (bundle signature + SerializedFile version/unity/metadata counts) for loaded sources, with an optional `--summary` aggregation mode.
-- `unity-asset-cli stats-pathid` to summarize `path_id` sign/min/max distributions for binary objects (useful for UnityCN/Tuanjie investigations).
-- Dependency graph extraction for SerializedFiles (TypeTree + PPtr scan) in `MetadataExtractor`.
-- Environment-wide dependency graph builder (best-effort external resolution via `.meta` GUID cache and bundle name heuristics).
-- Environment-wide unified object graph (`Environment::build_object_graph`) across YAML + binary sources (best-effort GUID/fileID resolution).
-- YAML UI edit helpers (best-effort):
-  - Button: set `m_Interactable`, clear/append persistent `onClick` calls (`m_OnClick.m_PersistentCalls.m_Calls`).
-  - Canvas: render mode, pixel perfect, sorting flags (overlay-focused).
-  - CanvasScaler: scale mode + reference resolution (screen-size workflow).
-  - LayoutGroup: padding/alignment/spacing + common child layout toggles.
-  - Toggle: set `m_IsOn`/`m_Interactable` and append persistent `onValueChanged` calls.
-  - Slider: set value/min/max/wholeNumbers/interactable and append persistent `onValueChanged` calls.
-  - Dropdown: set `m_Value`/`m_Interactable` and append persistent `onValueChanged` calls.
-  - InputField: set `m_Text`/`m_Interactable` and append persistent `onValueChanged`/`onEndEdit` calls.
-  - TMP_InputField: set `m_Text`/`m_Interactable` and append persistent `onValueChanged`/`onEndEdit` calls.
-  - ScrollRect: set content/viewport refs, axis toggles, normalized position/velocity, and append persistent `onValueChanged` calls.
-  - CanvasGroup: set alpha/interactable/raycast flags.
-  - ContentSizeFitter: set horizontal/vertical fit modes.
-  - LayoutElement: set sizes + ignoreLayout + layout priority.
-  - ToggleGroup: set allowSwitchOff.
-  - Scrollbar: set value/size/steps/interactable and append persistent `onValueChanged` calls.
-- Additional binary typed helpers (UnityPy-like ergonomics):
-  - GameObject: set name (`m_Name`/`name`) and active (`m_IsActive`).
-  - Transform: set local position/rotation/scale.
-  - RectTransform: set anchored position/size/anchors/pivot/offsets (best-effort).
-  - SpriteRenderer: set `m_Sprite` (PPtr).
-  - Sprite: set `m_RD.texture` / `m_RD.alphaTexture` (PPtr).
-  - SpriteAtlas: set `m_RenderDataMap[*].texture` / `m_RenderDataMap[*].alphaTexture` (PPtr).
-- `EnvironmentEditSession::save_binary_object_class` to support a UnityPy `Object.save()`-style workflow for binary edits.
-- Legacy bundle repacking (UnityPy parity):
-  - `BundleWriter` now supports saving `UnityWeb` / `UnityRaw` bundles (versions `<= 3`).
-- Directory-wide `.meta` GUID indexing (`Environment::index_meta_guids_in_directory`) for higher external resolution hit rates without loading every asset file.
-- `Environment::set_type_tree_registry_from_paths` to load `.tpk`/`.json` TypeTree registries (best-effort parsing for stripped assets).
-- External workflow to generate MonoBehaviour/script TypeTrees via UnityPy + TypeTreeGeneratorAPI:
-  - `scripts/export_unitypy_script_typetrees.py` exports a JSON TypeTree registry (`schema: 2`) keyed by `script_id` (Hash128).
-  - `docs/SCRIPT_TYPETREES.md` documents export + Rust-side loading.
-  - Opt-in E2E test wires the exporter into Rust parsing to validate stripped MonoBehaviour parsing.
-- `Environment::load_project` to scan a Unity project root with ignore support and fast binary sniffing (and without loading `.meta` documents by default).
-- Graph helpers for analysis and incremental rebuild:
-  - `roots` / `leaves` / `cycles` helpers for quick inspection.
-  - Rebuild a single source subgraph (`build_dependency_graph_for_source`).
-  - Incremental invalidation when reloading sources (`invalidate_dependency_scan_cache_for_source`).
-- Search indexing can optionally include AssetBundle `m_Container` asset paths as `kind=BundleContainer` for Everything-style discovery.
-- Search daemon flags for container indexing and ignore control (`--search-everything`, `--index-bundle-container-entries`, `--no-gitignore`, `--no-ignore-files`).
-- Search daemon `/v1/status` reports best-effort reindex progress (operation + phases + counters) for in-editor UX.
-- Search daemon `/v1/reindex` supports `wait=false` to start long reindex jobs asynchronously (recommended for GUI clients).
-- Experimental Unity Editor plugin (Asset Hero, UPM package `com.frankorz.asset-hero`, currently in `repo-ref/` only) to start the daemon and provide in-editor search + find references (Unity 2022.3+, UI Toolkit).
-- Release automation via `cargo-dist` to ship multi-platform binaries alongside GitHub Releases.
-- A manual GitHub Actions workflow to backfill missing dist assets for an existing tag (repair path).
+
+- Added bundle-container path discovery and optional indexing as `BundleContainer` search documents.
+- Added superseded aggregate diagnostics for bundle headers, SerializedFile metadata, and signed path-ID distributions; current inspection uses `WorkspaceInspector`.
+- Added TypeTree PPtr extraction, external GUID resolution, and early incremental reference-analysis helpers.
+- Added a superseded class-helper layer for common YAML UI controls and binary GameObject, Transform, RectTransform, SpriteRenderer, Sprite, and SpriteAtlas changes.
+- Added legacy UnityWeb and UnityRaw repacking for supported versions.
+- Added directory-wide `.meta` GUID indexing and best-effort Unity project discovery.
+- Added JSON/TPK TypeTree registries and the optional external script-schema exporter documented in `docs/SCRIPT_TYPETREES.md`.
+- Added search flags for bundle-container indexing and ignore policy, progress reporting, asynchronous reindex orchestration, and an experimental Unity Editor client.
+- Added `cargo-dist` release automation and a manual workflow for repairing missing release assets.
 
 ### Changed
-- Bundle search/filter helpers now align better with UnityPy-style discovery semantics:
-  - `BundleLoader::find_assets_by_name` matches embedded asset names instead of bundle path strings.
-  - `BundleLoader::find_assets_by_type` and `BundleProcessor::extract_assets_by_type` filter by actual object presence.
+
+- Updated bundle name and type filters to inspect embedded asset names and actual object presence.
 
 ### Fixed
-- Metadata reporting:
-  - Populate `file_info.compression_type` when extracting from bundles.
-  - Fill `ObjectSummary.dependencies` from scanned internal references when enabled.
-- YAML serializer: avoid emitting `{...}` placeholders for complex objects when they appear as items in block arrays.
-- Unity version parser: accept UnityCN/Tuanjie suffix forms (e.g. `2022.3.48t6`, `2022.3.48f1c1`) and ignore revision suffixes in parentheses.
-- TypeTree writer: preserve rare unnamed child fields by copying their original byte slices during object rewrites.
-- TypeTree writer: normalize `PPtr<>` inputs (`m_FileID/m_PathID` vs `fileID/pathID`, `Null` -> zero pointer).
-- TypeTree writer: support legacy `version==2` TypeTree dump by writing `m_VariableCount` (best-effort).
-- SerializedFile (legacy): parse and save `version < 9` layout by seeking metadata at end-of-file (endian boolean prefix) and emitting a compatible save layout.
-- BundleFile (legacy): parse `UnityWeb` / `UnityRaw` bundles using UnityPy `read_web_raw` header layout and directory offsets (fixes extraction/load semantics for UnityWeb).
-- BundleFile (UnityFS): strip encryption flags on save (UnityPy parity; encryption is not re-applied).
-- More robust external reference resolution by canonicalizing filesystem paths when loading and indexing `.meta` GUIDs.
-- Preserve AssetBundle `m_Container` entries with null PPtr (`m_PathID=0`) as unresolved paths instead of dropping them.
+
+- Populated bundle compression metadata and object reference summaries.
+- Prevented YAML serialization from emitting placeholder mappings for complex block-array elements.
+- Accepted UnityCN/Tuanjie version suffixes and ignored parenthesized revisions for comparison.
+- Preserved rare unnamed TypeTree children, normalized PPtr input shapes, and supported the legacy version-2 variable-count field.
+- Added metadata-at-end parsing and saving for pre-version-9 SerializedFiles.
+- Corrected legacy UnityWeb and UnityRaw header and directory-offset handling.
+- Improved external reference resolution through normalized physical paths and retained null bundle-container pointers as unresolved occurrences.
 
 ### Breaking Changes
-- None intended. As a reminder, in the 0.x series breaking changes may occur between minor versions.
+
+- None intended. In the 0.x series, breaking changes may occur between minor versions.
 
 ## [0.2.0] - 2025-12-26
 
 ### Highlights
-- Major refactor and crate split to support a clear layered architecture (parsing → handles → environment → decode).
-- UnityPy-like discovery and export workflows:
-  - fast object handles (`ObjectHandle`) and `peek_name` for large scans
-  - `find-object`, `scan-pptr`, `deps`, `export-bundle` in the CLI
-- Optional decode/export helpers moved into `unity-asset-decode` (Texture2D/Sprite/AudioClip/Mesh), kept out of the core parser by default.
-- Safer and more predictable parsing (strict vs lenient TypeTree modes, structured warnings, no library stderr logging).
-- Better coverage of real-world Unity layouts (UnityFS/WebFile detection, streamed resources, stripped TypeTree fallbacks via external registries).
+
+- Split the project into parsing, high-level loading, optional decode, and CLI crates.
+- Added on-demand binary object handles, fast name peeking, reference scanning, and early discovery/export workflows.
+- Made TypeTree policy explicit and replaced library stderr logging with structured warnings.
+- Expanded UnityFS, WebFile, streamed-resource, and stripped-TypeTree coverage.
 
 ### Breaking Changes
-- This is a large refactor release. In the 0.x series, breaking API changes may occur between minor versions.
-- Crates are now split by concern:
-  - `unity-asset` (user-facing library), `unity-asset-cli` (CLI), `unity-asset-decode` (optional decode/export),
-    plus `unity-asset-core`, `unity-asset-yaml`, `unity-asset-binary`.
-- Decode/export is opt-in (CLI `--features decode`, or use `unity-asset-decode` directly).
+
+- Split user-facing, CLI, decode, core, YAML, and binary concerns into separate crates.
+- Made decode/export opt-in through feature flags or the dedicated decode crate.
 
 ### Added
-- High-level `Environment` API in `unity-asset` for loading YAML + binary sources and iterating objects across AssetBundles, SerializedFiles, and WebFiles.
-- `ObjectHandle` for on-demand object reads (UnityPy-style “ObjectReader”-like handle) and fast `peek_name`.
-- External TypeTree registry support (JSON/TPK; composable registries) for best-effort parsing when TypeTree is stripped.
-- User-facing CLI workflows:
-  - inspection/discovery: `list-bundle`, `list-objects`, `find-object`, `inspect-object`
-  - scanning/graphs: `scan-pptr`, `deps`
-  - export: `export-bundle` (manifest/resume; optional `--decode`)
-- Documentation: `docs/REFACTORING.md` describes the refactor plan, constraints, and future work.
+
+- Added a superseded high-level YAML/binary loader for cross-container iteration.
+- Added `ObjectHandle` for on-demand reads and fast `peek_name`.
+- Added composable JSON/TPK TypeTree registries for stripped assets.
+- Added early CLI inspection, reference scanning, and manifest-based export workflows.
 
 ### Changed
-- TypeTree parsing is user-controlled (strict vs lenient) and reports warnings via structured collectors instead of printing.
-- Bulk object lookup is optimized for repeated queries (lazy `path_id` index; avoids unnecessary copies).
+
+- Made strict versus lenient TypeTree parsing caller-controlled and routed warnings through structured collectors.
+- Optimized repeated binary object lookup with a lazy path-ID index.
 
 ### Fixed
-- UnityFS archive flags handling (including `BlocksInfoAtEnd`) and several version-sensitive SerializedFile header/object edge cases.
-- WebFile detection and decompression behavior, including correct handling of uncompressed `UnityWebData*` containers.
-- TypeTree alignment and common-string resolution edge cases that previously caused misreads or missing fields.
+
+- Corrected UnityFS archive flags, version-sensitive SerializedFile headers and object tables, WebFile detection and decompression, TypeTree alignment, and common-string lookup.
 
 ### Security
-- Hardened parsing against hostile inputs (bounded string reads, checked arithmetic, decompression/resource limits).
+
+- Added bounded string reads, checked arithmetic, decompression ceilings, and parser resource limits.
 
 ## [0.1.0] - 2025-08-27
 
 ### Added
 
-#### Core Features
-- **YAML Processing**: Unity YAML format support with multi-document parsing
-- **Binary Asset Processing**: AssetBundle and SerializedFile parsing with compression support
-- **Type Safety**: Rust's type system prevents common parsing vulnerabilities
-- **Async/Await API**: Optional async support for all parsing operations
-- **CLI Tools**: Both synchronous and asynchronous command-line interfaces
-
-#### Supported Formats
-- **YAML Files**: .asset, .prefab, .unity, .meta files
-- **Binary Assets**: AssetBundle (UnityFS, UnityWeb, UnityRaw), SerializedFile
-- **Compression**: LZ4, LZMA, Brotli, Gzip support
-- **Unity Versions**: 3.4 - 2023.x compatibility
-
-#### Object Processing
-- **AudioClip**: Audio processing with sample extraction
-- **Texture2D**: Basic texture processing (RGBA32, RGB24, ARGB32, Alpha8)
-- **Sprite**: Sprite parsing and metadata extraction
-- **Mesh**: Mesh data structure parsing
-- **TypeTree**: TypeTree parsing and manipulation
-
-#### CLI Features
-- **Batch Processing**: Recursive directory scanning and processing
-- **Multiple Output Formats**: JSON, YAML, debug formats
-- **Progress Reporting**: Real-time progress bars and statistics
-- **Configurable Concurrency**: Adjustable parallel processing
+- Added Unity YAML multi-document parsing.
+- Added AssetBundle and SerializedFile parsing with LZ4, LZMA, Brotli, and Gzip support.
+- Added optional async parsing APIs and synchronous/asynchronous CLI tools.
+- Added early AudioClip, Texture2D, Sprite, Mesh, and TypeTree processing.
+- Added recursive batch processing, JSON/YAML/debug output, progress reporting, and configurable concurrency.
 
 ### Architecture
-- `unity-asset-core`: Core data structures and traits
-- `unity-asset-yaml`: YAML format parsing and serialization
-- `unity-asset-binary`: Binary asset parsing (AssetBundle, SerializedFile)
-- `unity-asset`: Main library crate
-- `unity-asset-cli`: Command-line tools
+
+- Added `unity-asset-core`, `unity-asset-yaml`, `unity-asset-binary`, `unity-asset`, and `unity-asset-cli`.
 
 ### Known Limitations
-- **Texture Formats**: Limited to basic uncompressed formats (RGBA32, RGB24, ARGB32, Alpha8)
-- **LZMA Decompression**: Some Unity 5.x files with specific LZMA variants may fail to decompress
+
+- Texture decoding covered a limited set of basic uncompressed formats.
+- Some Unity 5.x LZMA variants remained unsupported.
 
 ### Acknowledgments
-This project builds upon:
+
 - [UnityPy](https://github.com/K0lb3/UnityPy) by @K0lb3
 - [unity-rs](https://github.com/yuanyan3060/unity-rs) by @yuanyan3060

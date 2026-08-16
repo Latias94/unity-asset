@@ -1,62 +1,73 @@
 use std::fmt;
+use std::str::FromStr;
 
-/// UnityPy-compatible packer selector for container saving.
-///
-/// UnityPy accepts:
-/// - `"none"` (default)
-/// - `"lz4"`
-/// - `"lzma"`
-/// - `"original"`
-/// - a tuple `(block_info_flag, data_flag)` for UnityFS
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnityPyPacker {
-    None,
+use thiserror::Error;
+
+/// Semantic packing policy for a prepared container artifact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PackingPolicy {
+    /// Retain the source container's signature, flags, and compression policy.
+    #[default]
+    Preserve,
+    /// Emit an uncompressed container while retaining all other wire semantics.
+    Uncompressed,
     Lz4,
     Lzma,
-    Original,
-    UnityFsFlags {
-        block_info_flag: u32,
-        data_flag: u32,
-    },
 }
 
-impl UnityPyPacker {
-    pub fn from_unitypy_str(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "none" => Some(Self::None),
-            "lz4" => Some(Self::Lz4),
-            "lzma" => Some(Self::Lzma),
-            "original" => Some(Self::Original),
-            _ => None,
+impl FromStr for PackingPolicy {
+    type Err = PackingPolicyParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "preserve" => Ok(Self::Preserve),
+            "uncompressed" => Ok(Self::Uncompressed),
+            "lz4" => Ok(Self::Lz4),
+            "lzma" => Ok(Self::Lzma),
+            _ => Err(PackingPolicyParseError {
+                value: value.to_owned(),
+            }),
         }
     }
 }
 
-impl fmt::Display for UnityPyPacker {
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unsupported packing policy {value:?}; expected preserve, uncompressed, lz4, or lzma")]
+pub struct PackingPolicyParseError {
+    value: String,
+}
+
+impl fmt::Display for PackingPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UnityPyPacker::None => write!(f, "none"),
-            UnityPyPacker::Lz4 => write!(f, "lz4"),
-            UnityPyPacker::Lzma => write!(f, "lzma"),
-            UnityPyPacker::Original => write!(f, "original"),
-            UnityPyPacker::UnityFsFlags {
-                block_info_flag,
-                data_flag,
-            } => write!(f, "({block_info_flag}, {data_flag})"),
+            PackingPolicy::Preserve => write!(f, "preserve"),
+            PackingPolicy::Uncompressed => write!(f, "uncompressed"),
+            PackingPolicy::Lz4 => write!(f, "lz4"),
+            PackingPolicy::Lzma => write!(f, "lzma"),
         }
     }
 }
 
-/// Options for saving/repacking outputs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PackerOptions {
-    pub packer: UnityPyPacker,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Default for PackerOptions {
-    fn default() -> Self {
-        Self {
-            packer: UnityPyPacker::None,
+    #[test]
+    fn semantic_policy_names_round_trip() {
+        for policy in [
+            PackingPolicy::Preserve,
+            PackingPolicy::Uncompressed,
+            PackingPolicy::Lz4,
+            PackingPolicy::Lzma,
+        ] {
+            assert_eq!(policy.to_string().parse::<PackingPolicy>(), Ok(policy));
+        }
+    }
+
+    #[test]
+    fn obsolete_unitypy_names_are_rejected() {
+        for value in ["original", "none"] {
+            assert!(value.parse::<PackingPolicy>().is_err());
         }
     }
 }

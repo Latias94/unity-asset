@@ -1,7 +1,7 @@
 use unity_asset_binary::asset::SerializedType;
 use unity_asset_binary::reader::{BinaryReader, ByteOrder};
-use unity_asset_binary::typetree::{TypeTree, TypeTreeNode, TypeTreeSerializer};
-use unity_asset_core::UnityValue;
+use unity_asset_binary::typetree::{TypeTree, TypeTreeNode, TypeTreeParseOptions, TypeTreeSchema};
+use unity_asset_core::{AssetLoadBudget, UnityValue};
 
 fn push_aligned_string_le(out: &mut Vec<u8>, s: &str) {
     let bytes = s.as_bytes();
@@ -68,14 +68,12 @@ fn referenced_object_data_is_parsed_via_ref_types() {
     push_aligned_string_le(&mut bytes, "MyAsm");
     bytes.extend_from_slice(&123i32.to_le_bytes());
 
+    let mut budget = AssetLoadBudget::default();
+    let schema =
+        TypeTreeSchema::compile(&tree, std::slice::from_ref(&ref_type), &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_detailed_with_ref_types(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-            std::slice::from_ref(&ref_type),
-        )
+    let out = schema
+        .read_object(&mut reader, &mut budget, TypeTreeParseOptions::default())
         .unwrap();
 
     let UnityValue::Object(m_ref) = out.properties.get("m_Ref").expect("m_Ref present") else {
@@ -149,14 +147,12 @@ fn referenced_object_data_resolves_via_unity_field_aliases() {
     push_aligned_string_le(&mut bytes, "MyAsm");
     bytes.extend_from_slice(&456i32.to_le_bytes());
 
+    let mut budget = AssetLoadBudget::default();
+    let schema =
+        TypeTreeSchema::compile(&tree, std::slice::from_ref(&ref_type), &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_detailed_with_ref_types(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-            std::slice::from_ref(&ref_type),
-        )
+    let out = schema
+        .read_object(&mut reader, &mut budget, TypeTreeParseOptions::default())
         .unwrap();
 
     let UnityValue::Object(m_ref) = out.properties.get("m_Ref").expect("m_Ref present") else {
@@ -170,8 +166,8 @@ fn referenced_object_data_resolves_via_unity_field_aliases() {
 }
 
 #[test]
-fn referenced_object_fallback_marks_unresolved_type() {
-    // No ref_types provided; ReferencedObjectData should fall back but remain explainable.
+fn referenced_object_fallback_reads_statically_provable_payload() {
+    // No ref_types are provided, but this placeholder has a statically provable wire extent.
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
@@ -213,29 +209,25 @@ fn referenced_object_fallback_marks_unresolved_type() {
     push_aligned_string_le(&mut bytes, "ASM");
     bytes.extend_from_slice(&7i32.to_le_bytes());
 
+    let mut budget = AssetLoadBudget::default();
+    let schema = TypeTreeSchema::compile(&tree, &[], &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_prefix_detailed(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-            1,
-        )
+    let out = schema
+        .read_object_prefix(&mut reader, &mut budget, TypeTreeParseOptions::default(), 1)
         .unwrap();
 
     let UnityValue::Object(m_ref) = out.properties.get("m_Ref").expect("m_Ref present") else {
         panic!("m_Ref should be object");
     };
+    let UnityValue::Object(typ) = m_ref.get("type").expect("type present") else {
+        panic!("type should be object");
+    };
     assert_eq!(
-        m_ref
-            .get("_referenced_type_unresolved")
-            .and_then(|v| v.as_bool()),
-        Some(true)
+        typ.get("class").and_then(UnityValue::as_str),
+        Some("MissingClass")
     );
-    assert_eq!(
-        m_ref.get("_referenced_type_key").and_then(|v| v.as_str()),
-        Some("MissingClass|NS|ASM")
-    );
+    assert_eq!(typ.get("ns").and_then(UnityValue::as_str), Some("NS"));
+    assert_eq!(typ.get("asm").and_then(UnityValue::as_str), Some("ASM"));
 
     let UnityValue::Object(data) = m_ref.get("data").expect("data present") else {
         panic!("data should be object");
@@ -245,9 +237,8 @@ fn referenced_object_fallback_marks_unresolved_type() {
 }
 
 #[test]
-fn managed_references_registry_is_consumed_without_affecting_following_fields() {
-    // The parser should consume `ManagedReferencesRegistry` bytes without allocating, and keep the
-    // reader in sync for following fields.
+fn managed_references_registry_is_materialized_without_affecting_following_fields() {
+    // The first registry is retained as writable data while traversal stays in sync.
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
@@ -291,18 +282,21 @@ fn managed_references_registry_is_consumed_without_affecting_following_fields() 
     bytes.extend_from_slice(&[0u8; 3]);
     bytes.extend_from_slice(&0x11223344i32.to_le_bytes());
 
+    let mut budget = AssetLoadBudget::default();
+    let schema = TypeTreeSchema::compile(&tree, &[], &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_detailed(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-        )
+    let out = schema
+        .read_object(&mut reader, &mut budget, TypeTreeParseOptions::default())
         .unwrap();
 
-    assert!(
-        matches!(out.properties.get("m_Registry"), Some(UnityValue::Null)),
-        "ManagedReferencesRegistry should be skipped (Null) to avoid large allocations"
+    let registry = out
+        .properties
+        .get("m_Registry")
+        .and_then(UnityValue::as_object)
+        .expect("the first registry should remain writable");
+    assert_eq!(
+        registry.get("m_Data").and_then(UnityValue::as_bytes),
+        Some([0xAA].as_slice())
     );
     assert_eq!(
         out.properties.get("m_Next").and_then(|v| v.as_i64()),
@@ -312,7 +306,7 @@ fn managed_references_registry_is_consumed_without_affecting_following_fields() 
 }
 
 #[test]
-fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync() {
+fn managed_references_registry_budgetedly_materializes_large_byte_arrays() {
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
@@ -354,19 +348,23 @@ fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync(
     }
     bytes.extend_from_slice(&0x55667788i32.to_le_bytes());
 
+    let mut budget = AssetLoadBudget::default();
+    let schema = TypeTreeSchema::compile(&tree, &[], &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_detailed(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-        )
+    let out = schema
+        .read_object(&mut reader, &mut budget, TypeTreeParseOptions::default())
         .unwrap();
 
-    assert!(matches!(
-        out.properties.get("m_Registry"),
-        Some(UnityValue::Null)
-    ));
+    let data = out
+        .properties
+        .get("m_Registry")
+        .and_then(UnityValue::as_object)
+        .and_then(|registry| registry.get("m_Data"))
+        .and_then(UnityValue::as_bytes)
+        .expect("registry byte array should be materialized");
+    assert_eq!(data.len(), n as usize);
+    assert_eq!(data.first(), Some(&0xAB));
+    assert_eq!(data.last(), Some(&0xAB));
     assert_eq!(
         out.properties.get("m_Next").and_then(|v| v.as_i64()),
         Some(0x55667788)
@@ -375,7 +373,7 @@ fn managed_references_registry_skips_large_byte_arrays_and_keeps_reader_in_sync(
 }
 
 #[test]
-fn managed_references_registry_skips_nested_string_vectors_and_keeps_reader_in_sync() {
+fn managed_references_registry_materializes_nested_string_vectors() {
     let mut tree = TypeTree::new();
     let mut root = TypeTreeNode::with_info("Root".to_string(), "Root".to_string(), -1);
 
@@ -424,19 +422,30 @@ fn managed_references_registry_skips_nested_string_vectors_and_keeps_reader_in_s
     }
     bytes.extend_from_slice(&0x01020304i32.to_le_bytes());
 
+    let mut budget = AssetLoadBudget::default();
+    let schema = TypeTreeSchema::compile(&tree, &[], &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let out = serializer
-        .parse_object_detailed(
-            &mut reader,
-            unity_asset_binary::typetree::TypeTreeParseOptions::default(),
-        )
+    let out = schema
+        .read_object(&mut reader, &mut budget, TypeTreeParseOptions::default())
         .unwrap();
 
-    assert!(matches!(
-        out.properties.get("m_Registry"),
-        Some(UnityValue::Null)
-    ));
+    let registry = out
+        .properties
+        .get("m_Registry")
+        .and_then(UnityValue::as_object)
+        .expect("registry should be materialized");
+    assert_eq!(
+        registry.get("m_Version").and_then(UnityValue::as_i64),
+        Some(2)
+    );
+    let names = registry
+        .get("m_Names")
+        .and_then(UnityValue::as_array)
+        .expect("registry names should be an array");
+    assert_eq!(
+        names.iter().map(UnityValue::as_str).collect::<Vec<_>>(),
+        vec![Some("a"), Some("bc")]
+    );
     assert_eq!(
         out.properties.get("m_Next").and_then(|v| v.as_i64()),
         Some(0x01020304)
@@ -506,13 +515,14 @@ fn scan_pptrs_can_traverse_managed_reference_payloads_via_ref_types() {
     bytes.extend_from_slice(&0i32.to_le_bytes()); // m_FileID
     bytes.extend_from_slice(&1234i64.to_le_bytes()); // m_PathID
 
+    let mut budget = AssetLoadBudget::default();
+    let schema =
+        TypeTreeSchema::compile(&tree, std::slice::from_ref(&ref_type), &mut budget).unwrap();
     let mut reader = BinaryReader::new(&bytes, ByteOrder::Little);
-    let serializer = TypeTreeSerializer::new(&tree);
-    let scan = serializer
-        .scan_pptrs_with_ref_types(&mut reader, Some(std::slice::from_ref(&ref_type)))
-        .unwrap();
+    let scan = schema.scan_pptrs(&mut reader, &mut budget).unwrap();
 
     assert_eq!(scan.internal, vec![1234]);
     assert!(scan.external.is_empty());
+    assert_eq!(scan.stats.unity_values_materialized, 0);
     assert_eq!(reader.position() as usize, bytes.len());
 }

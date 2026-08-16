@@ -1,135 +1,360 @@
-# Unity Asset Parser
+# unity-asset
 
-A Rust implementation of Unity asset parsing, inspired by and learning from [UnityPy](https://github.com/K0lb3/UnityPy). This project focuses on parsing Unity YAML and binary formats with Rust's memory safety and performance characteristics.
+`unity-asset` is a Rust toolkit for inspecting, indexing, extracting, and making guarded changes
+to Unity YAML and binary assets. It supports revision-bound workflows over YAML documents,
+SerializedFiles, AssetBundles, WebFiles, ZIP/APK archives, and streamed resource files.
 
-## Project Status
+The project is under active development. It is suitable for tooling, research, and controlled
+asset pipelines, but it does not claim full Unity serialization coverage or replace the Unity
+Editor.
 
-**Early Development**: This is a learning project and reference implementation. It is **not production-ready** and has significant limitations compared to mature tools like UnityPy.
+## Design
 
-### What This Project Is
-- **Learning Exercise**: Understanding Unity's file formats through Rust implementation
-- **Parser Focus**: Emphasis on parsing and data extraction rather than manipulation
-- **Rust Exploration**: Exploring how Rust's type system can help with binary parsing
-- **Reference Implementation**: Code that others can learn from and build upon
+The high-level API is built around one authoritative aggregate:
 
-### What This Project Is NOT
-- **UnityPy Replacement**: UnityPy remains the most mature Python solution
-- **Asset Editor**: This is a read-only parser, not an asset creation/editing tool
+```mermaid
+flowchart LR
+    Input[Caller-owned sources] --> Workspace[AssetWorkspace]
+    Workspace --> Snapshot[WorkspaceSnapshot]
+    Snapshot --> Inspect[WorkspaceInspector]
+    Snapshot --> References[ReferenceGraph]
+    Snapshot --> Extract[ExtractionPlanner]
+    Plan[MutationPlan] --> Workspace
+    Workspace --> Prepared[PreparedChange]
+    Prepared --> Preview[PreparedView]
+    Prepared --> Commit[CommitReport]
+    Commit --> Recovery[RecoveryLocator]
+    Commit --> Search[ChangeSet handoff]
+```
 
-## Architecture
+The main invariants are:
 
-The project uses a workspace structure to organize different parsing capabilities:
+- `AssetWorkspace` is the only public mutation owner.
+- `WorkspaceSnapshot` and `PreparedView` are immutable and revision-bound.
+- `SourceLocator` and `ObjectAddress` are portable logical identities; in-process handles also
+  carry workspace and revision context.
+- `MutationPlan` stores ordered, guarded intent. It performs no writes.
+- `prepare` performs a complete, zero-durable-write proof and returns an opaque
+  `PreparedChange`.
+- `PreparedChange` is not serializable and cannot be reconstructed from a report. `commit`
+  consumes it.
+- Publication is journaled and currently reports
+  `CommitAtomicity::PerArtifactRecoverable`.
+- Automation uses versioned structured contracts. Display text is never an input protocol.
+
+See [ADR 0004](docs/adr/0004-asset-workspace-transactions.md) for the transaction model and
+[the migration guide](docs/MIGRATING_TO_ASSET_WORKSPACE.md) for breaking API and CLI changes.
+
+## Workspace Layout
 
 ```text
-unity-asset/
-├── crates/                # Reusable Rust crates (libraries)
-│   ├── unity-asset-core/  # Core data structures and traits
-│   ├── unity-asset-yaml/  # YAML file parsing (stable)
-│   ├── unity-asset-binary/ # Binary asset parsing (advanced, WIP)
-│   ├── unity-asset-decode/ # Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
-│   ├── unity-asset/       # Main library crate (published as `unity-asset`)
-│   └── unity-asset-search-*/ # Search indexing core (daemon uses these)
-├── apps/                  # End-user applications (CLI/daemon)
-│   ├── unity-asset-cli/   # CLI tools (sync + async)
-│   ├── unity-asset-search-daemon/ # Local search server (HTTP)
-│   └── unity-asset-search-cli/    # Client CLI for the daemon
-└── tests/                # Integration tests and sample files
+crates/
+  unity-asset-core/          Identity, revisions, budgets, values, diagnostics
+  unity-asset-yaml/          Unity YAML parser and serializer internals
+  unity-asset-binary/        AssetBundle, SerializedFile, WebFile, TypeTree
+  unity-asset-write/         Wire-faithful encoders and prepared artifacts
+  unity-asset-decode/        Optional audio, texture, and sprite codecs
+  unity-asset/               Workspace, references, extraction, schema recipes
+  unity-asset-search-core/   Search query and ranking policy
+  unity-asset-search-index/  Revisioned derived index and generation store
+apps/
+  unity-asset-cli/           Typed workspace and extraction CLI
+  unity-asset-search-daemon/ Local search service
+  unity-asset-search-cli/    Search service client
 ```
 
-### Crates
+Rust does not make transitive crates directly importable. Depend on `unity-asset` for the
+high-level workflow. Add `unity-asset-binary`, `unity-asset-write`, or `unity-asset-decode`
+directly only when using their low-level APIs.
 
-- `unity-asset` (library): main user-facing API. Start here for `Environment` (YAML + binary) and `YamlDocument`.
-- `unity-asset-binary` (parser): low-level binary parsers (AssetBundle/SerializedFile/WebFile) plus fast object helpers (`ObjectHandle`).
-- `unity-asset-decode` (decode/export): optional decode/export helpers behind feature flags (Texture/Audio/Sprite/Mesh).
-- `unity-asset-yaml` (YAML): YAML-specific parsing/serialization; also re-exported via `unity-asset`.
-- `unity-asset-core` (core): shared data structures, errors, and dynamic `UnityValue` types.
-- `unity-asset-cli` (CLI): command-line tools (not required for library integration).
-- `unity-asset-search-daemon` (app): local HTTP search daemon (indexing + query).
-- `unity-asset-search-cli` (app): CLI client for the search daemon.
+## Capabilities
 
-Examples are maintained per-crate and are built in CI. For instance:
-`cargo run -p unity-asset --example env_load_and_list -- tests/samples`
-`cargo run -p unity-asset-binary --example sniff_kind -- tests/samples/char_118_yuki.ab`
-See `docs/README.md` for documentation entry points, and `docs/EXAMPLES.md` for a curated list of runnable recipes.
+### Inspection
 
-### Current Capabilities
+- Immutable source and object projections through `WorkspaceInspector`
+- Stable source identities across nested containers
+- Format metadata for SerializedFiles, AssetBundles, WebFiles, archives, YAML, and streamed data
+- Typed six-state lookup results: resolved, unloaded, missing, ambiguous, invalid, or null where
+  the domain supports null
+- Caller-owned `AssetLoadBudget` across parsing, decompression, traversal, and result retention
 
-#### YAML Processing (Complete)
-- Unity YAML format parsing for common file types (.asset, .prefab, .unity)
-- Multi-document parsing support
-- Reference resolution and cross-document linking
-- Filtering and querying capabilities
-- Serialization back to YAML format
+### References
 
-#### Binary Asset Processing (Advanced, WIP)
-- AssetBundle structure parsing (UnityFS format)
-- SerializedFile parsing with full object extraction
-- TypeTree structure parsing and dynamic object reading
-- Compression support (LZ4, LZMA, Brotli)
-- Metadata extraction and analysis (experimental; includes dependency graph, best-effort hierarchy/component mapping, and external reference resolution via `externals`)
-- Performance monitoring and basic statistics
+- One revision-bound `ReferenceGraph` for YAML and binary pointers
+- Incoming, outgoing, root, leaf, closure, and cycle queries
+- Structured resolution facts and diagnostics
+- Deterministic JSON, JSON Lines, and DOT projections
+- The same graph interface over committed snapshots and prepared previews
 
-#### Object Processing (Partial)
-- **AudioClip**: Full format support (Vorbis, MP3, WAV, AAC) via `unity-asset-decode` (Symphonia-based decoder)
-- **Texture2D**: Complete parsing + best-effort decoding + PNG export via `unity-asset-decode`
-- **Sprite**: Full metadata extraction + atlas support + image cutting via `unity-asset-decode`
-- **Mesh**: Structure parsing + vertex data extraction + basic export via `unity-asset-decode`
-- **GameObject/Transform**: Basic TypeTree-based hierarchy & component mapping (best-effort; still WIP)
+### Mutation and Publication
 
-#### CLI Tools (Usable, WIP)
-- Synchronous CLI for file inspection and batch processing
-- Asynchronous CLI with concurrent processing and progress tracking
-- Export capabilities (PNG, OGG, WAV, basic mesh formats)
-- Comprehensive metadata analysis and reporting
-- Basic progress reporting
-  - `list-objects`: list objects from SerializedFiles/bundles (path_id/class_id/type/name) using TypeTree fast paths
-  - `export-serialized`: export objects from `.asset/.assets` by scanning objects directly (raw `.bin`, optional best-effort decode)
+- Versioned, canonical `MutationPlan` contracts
+- Guarded field, reference, schema, resource, sequence, and explicitly unsafe raw replacement
+- Schema recipes for higher-level Unity operations
+- Transactional prepare with independent artifact reparse
+- Read-your-writes inspection through `PreparedView`
+- Compare-and-swap checks over source fingerprints and destination state
+- Journaled publication, deterministic recovery, and structured `CommitReport`
 
-**Known Limitations**
-- Some advanced Unity asset types not yet implemented (MonoBehaviour scripts, complex shaders)
-- Object manipulation is read-only (no writing back to Unity formats)
-- Some edge cases in LZMA decompression may fail on corrupted data
-- Advanced texture formats require `unity-asset-decode` `texture-advanced` feature (DXT, ETC, ASTC)
-- Audio decoding requires `unity-asset-decode` `audio` feature (Symphonia integration)
-- Large file performance could be optimized further
-- Error messages could be more user-friendly
-- Some metadata/dependency/hierarchy analyses are currently simplified placeholders
-- Object data is lazily accessed by default; use `SerializedFileParser::from_bytes_with_options(data, true)` if you explicitly need per-object preloaded buffers
-- For large objects without TypeTree, raw bytes are not expanded into `_raw_data` for performance; use `UnityObject::raw_data()`
-- TypeTree byte-like fields are represented as `UnityValue::Bytes` (not `Array<Integer>`) for performance: `TypelessData` and `vector<UInt8/SInt8/char>`. Use `UnityValue::as_bytes()` to access them.
+### Extraction
 
-## Quick Start
+- Versioned `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport`
+- Explicit object, bundle-container, and reference-traversal selection
+- Deterministic relative paths and artifact ordering
+- Resumable manifests and bounded execution
+- Optional decoded audio, texture, and sprite output with the `decode` feature
 
-### Requirements
+### Search
 
-- Rust stable (`edition = "2024"`)
-- `cargo-nextest` (recommended for running tests)
+- Rebuildable, generation-based local search index
+- Stable result ordering, fuzzy matching, suggestions, and reverse references
+- Transaction- and revision-bound `ChangeSet` handoff after commit
+- Atomic generation switching keeps readers on the previous complete generation if rebuilding
+  fails
 
-### Installation
-
-This project is published on crates.io. Install it with:
+## Installation
 
 ```toml
-# Add to your Cargo.toml
 [dependencies]
-unity-asset = "0.3.0"
+unity-asset = "0.4.0"
 ```
 
+Add optional low-level crates only when needed:
+
+```toml
+[dependencies]
+unity-asset-binary = "0.4.0"
+unity-asset-write = "0.4.0"
+unity-asset-decode = { version = "0.4.0", features = ["audio", "texture-advanced"] }
+```
+
+Install the command-line tools:
+
 ```bash
-# Install CLI tools
 cargo install unity-asset-cli
-```
-
-To install the local search daemon (used by Asset Hero) and its companion CLI:
-
-```bash
 cargo install unity-asset-search-daemon
 cargo install unity-asset-search-cli
 ```
 
-For maintainers: the tag-driven publish/release process is documented in `docs/RELEASING.md`.
+## Library Quick Start
 
-To build from source:
+Load one explicit source, freeze a snapshot, and inspect typed projections:
+
+```rust,no_run
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{AssetWorkspace, WorkspaceInspector};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut budget = AssetLoadBudget::default();
+    let mut workspace = AssetWorkspace::new()?;
+    workspace.load_path("game.bundle", &mut budget)?;
+
+    let snapshot = workspace.snapshot();
+    let inspector = WorkspaceInspector::new(&snapshot);
+
+    for source in inspector.sources(&mut budget)? {
+        println!(
+            "{:?}: {} encoded bytes",
+            source.source().kind(),
+            source.encoded_length()
+        );
+    }
+
+    for object in inspector.objects(&mut budget)? {
+        let class = object.object().class();
+        println!(
+            "{:?}: {} ({})",
+            object.address(),
+            class.class_name(),
+            class.class_id()
+        );
+    }
+
+    Ok(())
+}
+```
+
+Library source loading is explicit. Applications that scan a project directory should apply
+their own trust and ignore policy, then call `load_source` with a stable `SourceAlias` for each
+selected root source. The CLI provides a budgeted directory-discovery policy for command-line
+use.
+
+External JSON, TPK, or AssetRipper `InfoJson` TypeTree registries are immutable workspace options:
+
+```rust,no_run
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{AssetWorkspace, WorkspaceOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut budget = AssetLoadBudget::default();
+    let options = WorkspaceOptions::lenient()
+        .with_type_tree_registry_paths(
+            &["typetree.json", "unity.tpk", "AssetRipper/InfoJson"],
+            &mut budget,
+        )?;
+    let mut workspace = AssetWorkspace::with_options(options)?;
+    workspace.load_path("game.bundle", &mut budget)?;
+    Ok(())
+}
+```
+
+Prepare, inspect the candidate revision, and publish the exact proven artifacts:
+
+```rust,no_run
+use std::path::Path;
+
+use unity_asset::AssetLoadBudget;
+use unity_asset::workspace::{
+    AssetWorkspace, CommitReport, MutationPlan, PrepareOptions, PublicationTarget,
+    WorkspaceInspector,
+};
+
+fn publish(
+    workspace: &mut AssetWorkspace,
+    plan: MutationPlan,
+    publication_root: &Path,
+    budget: &mut AssetLoadBudget,
+) -> Result<CommitReport, Box<dyn std::error::Error>> {
+    let prepared = workspace.prepare(plan, PrepareOptions::default(), budget)?;
+
+    let preview = prepared.view();
+    let _candidate_objects = WorkspaceInspector::new(&preview).objects(budget)?;
+
+    let target = PublicationTarget::in_place(publication_root)?;
+    Ok(workspace.commit(prepared, target, budget)?)
+}
+```
+
+The publication root must already exist, be absolute, and satisfy the platform containment
+checks. Persist `CommitReport` and `RecoveryLocator`, not `PreparedChange`.
+
+## Typed CLI
+
+The installed binary is `unity-asset`. Workspace commands emit JSON to stdout and diagnostics to
+stderr. Structured inputs accept a JSON file or `-` for stdin.
+
+Discover the exact workspace subcommands routed by the installed binary, together with their JSON
+inputs, stdout contracts, stdin limits, and filesystem prerequisites:
+
+```bash
+unity-asset workspace capabilities
+```
+
+This emits `unity_asset.workspace_cli_capabilities` v1. It intentionally describes only the CLI
+surface; use the Rust `workspace_capabilities()` API when embedding the broader library workflow.
+
+Inspect a file or a directory of supported sources:
+
+```bash
+unity-asset workspace inspect sources --input tests/samples
+unity-asset workspace inspect objects --input tests/samples
+unity-asset workspace inspect object \
+  --input tests/samples \
+  --address-json object-address.json
+```
+
+Inspect every matching `AssetBundle.m_Container` occurrence with a versioned query:
+
+```json
+{"contract":"unity_asset.bundle_container_query","version":1,"pattern":"Assets/"}
+```
+
+```bash
+unity-asset workspace inspect bundle-containers \
+  --input tests/samples \
+  --query-json container-query.json
+```
+
+Validate and execute a mutation plan:
+
+```bash
+unity-asset workspace plan validate --plan mutation-plan.json
+unity-asset workspace prepare --input tests/samples --plan mutation-plan.json
+unity-asset workspace preview \
+  --input tests/samples \
+  --plan mutation-plan.json \
+  --address-json object-address.json
+unity-asset workspace commit \
+  --input tests/samples \
+  --plan mutation-plan.json \
+  --publication-root /absolute/output-root
+```
+
+`prepare` prints a report. It cannot transfer commit authority to another process. `preview` and
+`commit` therefore reopen the trusted inputs and re-run prepare from the same canonical plan.
+
+Discover and handle durable recovery evidence:
+
+```bash
+unity-asset workspace recover discover --publication-root /absolute/output-root
+unity-asset workspace recover resume --locator-json recovery-locator.json
+unity-asset workspace recover abandon --locator-json recovery-locator.json
+unity-asset workspace recover finalize \
+  --input tests/samples \
+  --locator-json recovery-locator.json
+```
+
+Build a bounded reference projection:
+
+```bash
+unity-asset references graph \
+  --input tests/samples \
+  --max-facts 200000
+```
+
+Plan or execute deterministic extraction:
+
+```bash
+unity-asset export \
+  --input tests/samples \
+  --output out \
+  --request extraction-request.json \
+  --dry-run
+
+unity-asset export \
+  --input tests/samples \
+  --output out \
+  --plan extraction-plan.json \
+  --manifest manifest.json
+```
+
+The low-level bundle adapter and a YAML-only extraction convenience command remain available:
+
+```bash
+unity-asset list-bundle --input game.bundle --filter CAB-
+unity-asset split-yaml --input scene.unity --output split
+```
+
+`split-yaml` is a thin profile over the canonical extraction contracts. It emits the standard
+`unity_asset.extraction_report`, writes `extraction-manifest.json`, and uses the same recoverable
+publication journal as `export`; it does not maintain a second YAML-specific report contract.
+
+Use global parsing policy before the subcommand:
+
+```bash
+unity-asset \
+  --strict \
+  --show-warnings \
+  --typetree-registry typetree.json \
+  workspace inspect objects --input tests/samples
+```
+
+## Limitations
+
+- Unity formats are versioned and not fully documented. Unsupported layouts fail explicitly.
+- Write support targets existing supported schemas and containers; arbitrary asset authoring is
+  out of scope.
+- Runtime TypeTree callbacks are not accepted. Use immutable, budgeted JSON, TPK, or AssetRipper
+  `InfoJson` registries.
+- Decoding is best effort and feature-gated. Raw extraction remains available when a codec is
+  unavailable.
+- Publication does not promise cross-file atomic visibility. Each replacement is atomic and the
+  complete set is recoverable through its journal.
+- Runtime IDs, revision-bound handles, and reports are workspace-specific. Portable addresses and
+  fingerprints must still be resolved or validated against the intended snapshot; do not splice
+  runtime values across workspaces or revisions.
+
+## Development
 
 ```bash
 git clone https://github.com/Latias94/unity-asset.git
@@ -138,218 +363,17 @@ cargo build --workspace
 cargo nextest run --workspace
 ```
 
-By default, `unity-asset-cli` is built without decode/export helpers to keep builds lighter. To enable `--decode` support and best-effort exporters:
-
-```bash
-cargo install unity-asset-cli --features decode
-```
-
-### Testing Status
-
-We have basic tests for core functionality, but this is not a comprehensive test suite. Some tests pass, others reveal limitations in our implementation.
-
-### Comparison with UnityPy
-
-[UnityPy](https://github.com/K0lb3/UnityPy) is a mature, feature-complete Python library for Unity asset manipulation. This Rust project is:
-
-- **Much less mature**: UnityPy has years of development and community contributions
-- **More limited**: We focus on parsing, not manipulation or export
-- **Learning-oriented**: This project helps understand Unity formats through Rust
-- **Experimental**: Many features are incomplete or missing
-
-If you need a production tool for Unity asset processing, **use UnityPy instead**.
-
-## Basic Usage Examples
-
-### YAML File Parsing
-
-```rust
-use unity_asset::{YamlDocument, UnityDocument};
-
-// Load a Unity YAML file
-let (doc, warnings) = YamlDocument::load_yaml_with_warnings("ProjectSettings.asset", false)?;
-for w in warnings {
-    eprintln!("warning: {}", w);
-}
-
-// Get basic information
-println!("Found {} entries", doc.entries().len());
-
-// Try to find specific objects (may not work for all files)
-if let Ok(settings) = doc.get(Some("PlayerSettings"), None) {
-    println!("Found PlayerSettings");
-}
-```
-
-### UnityPy-like Environment (YAML + Binary)
-
-```rust
-use unity_asset::environment::{Environment, EnvironmentObjectRef};
-use unity_asset_binary::typetree::JsonTypeTreeRegistry;
-use std::sync::Arc;
-
-let mut env = Environment::new();
-
-// Optional: provide an external TypeTree registry for stripped assets (best-effort).
-// This can improve coverage when `enableTypeTree = false` in serialized files.
-// let registry = JsonTypeTreeRegistry::from_path("typetree_registry.json")?;
-// env.set_type_tree_registry(Some(Arc::new(registry)));
-
-env.load("tests/samples")?;
-
-// `path_id` is only unique within a single SerializedFile.
-// Use `BinaryObjectKey` when you need a globally-unique handle you can round-trip later.
-let sources = env.binary_sources();
-if let Some((_kind, source_path)) = sources.first() {
-    let keys = env.find_binary_object_keys_in_source(source_path, 1);
-    if let Some(key) = keys.first() {
-        let _parsed = env.read_binary_object_key(key)?;
-    }
-}
-
-// Unity `PPtr` resolution needs a context object because `fileID` indexes into the context file's externals.
-// For the common case `fileID=0`, it points to the same SerializedFile as the context.
-if let Some(obj_ref) = env.find_binary_object(1) {
-    let _pptr_obj = env.read_binary_pptr(&obj_ref, 0, 1)?;
-}
-
-// AssetBundles often expose a container mapping from asset paths to objects.
-// This is the primary discovery mechanism in UnityPy.
-// Note: This is best-effort; when TypeTree is stripped, we fall back to a raw binary parser for `m_Container`.
-let container = env.find_binary_object_keys_in_bundle_container("Assets/");
-for (asset_path, key) in container.into_iter().take(10) {
-    let _obj = env.read_binary_object_key(&key)?;
-    println!("{} -> path_id={}", asset_path, key.path_id);
-}
-
-for obj in env.objects() {
-    match obj {
-        EnvironmentObjectRef::Yaml(class) => {
-            let _ = &class.class_name;
-        }
-        EnvironmentObjectRef::Binary(obj_ref) => {
-            // Parse on-demand (best-effort)
-            let _parsed = obj_ref.read()?;
-            let _key = obj_ref.key();
-        }
-    }
-}
-```
-
-### CLI Usage
-
-```bash
-# Parse a single YAML file
-cargo run --bin unity-asset -- parse-yaml -i ProjectSettings.asset
-
-# List bundle nodes (files) for debugging/inspection
-cargo run --bin unity-asset -- list-bundle -i tests/samples/char_118_yuki.ab --filter "CAB-" --verbose
-
-# Find objects via AssetBundle `m_Container` (discovery)
-cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --pattern "Assets/" --limit 20 --verbose
-
-# Filter by type (useful for scripts/batch workflows)
-cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --class-name "Texture2D" --limit 20
-
-# Filter by object name (best-effort; requires TypeTree and a name field)
-cargo run --bin unity-asset -- find-object -i tests/samples/char_118_yuki.ab --name "yuki" --limit 20 --verbose
-
-# Dump an external TypeTree registry (best-effort fallback for stripped assets)
-cargo run --bin unity-asset -- dump-typetree-registry -i tests/samples -o typetree_registry.json --version-prefix
-
-# Use an external TypeTree registry during discovery/inspection (best-effort)
-cargo run --bin unity-asset -- --typetree-registry typetree_registry.json find-object -i tests/samples --pattern "Assets/" --limit 20 --verbose
-
-# `--typetree-registry` also accepts a UnityPy-compatible `.tpk` file and can be repeated:
-cargo run --bin unity-asset -- \
-    --typetree-registry typetree_registry.json \
-    --typetree-registry unitypy.tpk \
-    find-object -i tests/samples --pattern "Assets/" --limit 20 --verbose
-
-# Inspect a single object (TypeTree / Null-field debugging)
-# - Easiest: copy/paste the `key=bok2|...` line from `find-object --verbose` and use `--key`.
-# - Or pass the location fields explicitly (use `--kind serialized` for standalone `.assets` files).
-cargo run --bin unity-asset -- inspect-object -i tests/samples --key 'bok2|bundle|0|1|<outer_len>|tests/samples/char_118_yuki.ab|0|' \
-    --max-depth 6 --max-items 200 --filter "m_StreamData"
-# If you suspect TypeTree mismatches, enable fail-fast parsing and print warnings:
-# `--strict` (fail-fast) and `--show-warnings` (print TypeTree warnings)
-
-# Scan PPtr references without fully parsing objects (fast dependency/graph workflows)
-cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --limit 5
-cargo run --bin unity-asset -- scan-pptr -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --class-id 114 --json
-
-# Build a best-effort dependency graph via TypeTree PPtr scanning
-cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --format summary
-cargo run --bin unity-asset -- deps -i tests/samples/char_118_yuki.ab --kind bundle --asset-index 0 --format dot --max-edges 2000 > graph.dot
-
-# Export objects from AssetBundles via `m_Container` (UnityPy-like workflow)
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --limit 50
-# Decode known types (best-effort):
-# - `AudioClip`: export embedded/streamed audio bytes (e.g. `.ogg`) or decode to `.wav` fallback
-# - `Texture2D`: decode and export as `.png`
-# - `Sprite`: resolve referenced `Texture2D`, crop sprite rect, and export as `.sprite.png`
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode --limit 50
-#
-# Parallelize export/decode work:
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode --jobs 0
-#
-# Filter by type (reduces work on large bundles):
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --class-name "Texture2D" --decode --jobs 0
-#
-# Re-runs: keep output deterministic and resumable via a manifest
-# - `--continue-on-error` records failures as `status=failed` with an error string
-# - `--resume` skips already-exported entries (when the previous output path still exists)
-# - `--retry-failed-from` re-exports only entries that failed previously
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode \\
-    --manifest out/manifest.json --continue-on-error --jobs 0
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode \\
-    --retry-failed-from out/manifest.json --manifest out/manifest.retry.json --continue-on-error --jobs 0
-cargo run --bin unity-asset -- export-bundle -i tests/samples -o out/ --pattern "Assets/" --decode \\
-    --resume out/manifest.retry.json --manifest out/manifest.resume.json --jobs 0
-#
-# Note: outputs are raw SerializedFile object bytes (`.bin`), not necessarily the original file format.
-#
-# Note (streamed resources): some `AudioClip`/`Texture2D` objects reference external `.resS`/`.resource`
-# files that are not embedded inside the bundle. `export-bundle --decode` will try:
-# 1) resource nodes inside the same bundle (UnityFS)
-# 2) sibling resource files on disk (same directory / `StreamingAssets/`)
-# If the resource file is missing, it falls back to exporting raw `.bin`.
-
-# Try async processing (experimental)
-cargo run --features async --bin unity-asset-async -- \
-    parse-yaml -i Assets/ --recursive --progress
-```
-
-## Architecture Details
-
-This project is organized as a Rust workspace with separate crates for different concerns:
-
-- **`unity-asset-core`**: Core data structures and traits
-- **`unity-asset-yaml`**: YAML format parsing
-- **`unity-asset-binary`**: Binary format parsing (AssetBundle, SerializedFile)
-- **`unity-asset-decode`**: Optional decode/export helpers (Texture/Audio/Sprite/Mesh)
-- **`unity-asset`**: Main library crate (published as `unity-asset`)
-- **`unity-asset-cli`**: Command-line tools (published as `unity-asset-cli`)
+Examples and integration tests use the sample assets in `tests/samples`. Release procedures are
+documented in `docs/RELEASING.md`.
 
 ## Acknowledgments
 
-This project is a learning exercise inspired by and learning from several excellent projects:
-
-### **[UnityPy](https://github.com/K0lb3/UnityPy)** by [@K0lb3](https://github.com/K0lb3)
-- The gold standard for Unity asset manipulation
-- Our primary reference for understanding Unity formats
-- Test cases and expected behavior patterns
-
-### **[unity-rs](https://github.com/yuanyan3060/unity-rs)** by [@yuanyan3060](https://github.com/yuanyan3060)
-- Pioneering Rust implementation of Unity asset parsing
-- Architecture and parsing technique inspiration
-- Binary format handling examples
-
-### **[unity-yaml-parser](https://github.com/socialpoint-labs/unity-yaml-parser)** by [@socialpoint-labs](https://github.com/socialpoint-labs)
-- Original inspiration for this project
-- YAML format expertise and reference resolution patterns
-- Clean API design principles
+The implementation learns from [UnityPy](https://github.com/K0lb3/UnityPy),
+[AssetRipper](https://github.com/AssetRipper/AssetRipper),
+[unity-rs](https://github.com/yuanyan3060/unity-rs), and
+[unity-yaml-parser](https://github.com/socialpoint-labs/unity-yaml-parser). They are references,
+not runtime dependencies.
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+MIT. See [LICENSE](LICENSE).

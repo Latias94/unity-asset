@@ -1,564 +1,160 @@
-# UnityPy Parity & Rewrite Tracker
+# UnityPy Compatibility and Rewrite Status
 
-This document tracks the ongoing effort to reach feature parity with the reference UnityPy codebase vendored in this repository.
+This project uses UnityPy behavior as a compatibility reference while deliberately exposing a
+different public architecture. The goal is format interoperability and equivalent user outcomes,
+not API-shape parity.
 
-It is intentionally **implementation-oriented**:
-- maps UnityPy modules/functions to Rust modules/APIs,
-- defines **milestones** with checkable TODOs,
-- documents **acceptance criteria** and **test strategy** so refactors remain auditable.
+## Comparison Baseline
 
-## Reference Baseline
+- UnityPy version: `1.25.2`
+- UnityPy commit: `5567c5eddc9dbeaef27b5113f5927226bee4f8ca`
+- UnityCN/Tuanjie observations: [UNITYCN_NOTES.md](UNITYCN_NOTES.md)
 
-This repo treats the vendored UnityPy snapshot as the executable specification for edit/write behavior.
+Historical comparison results remain useful, but the current Rust authority is the checked-in
+wire, characterization, recovery, and end-to-end test suite.
 
-- UnityPy version: `1.24.2` (`repo-ref/UnityPy/UnityPy/__init__.py`)
-- UnityPy commit: `14f2134c5996a21b15e5fb3ab649e0168e32267d` (`repo-ref/UnityPy`)
-- UnityCN/Tuanjie quirks: `docs/UNITYCN_NOTES.md`
+## Compatibility Definition
 
-## Scope Definition (What “Parity” Means)
+Compatibility means that supported inputs can be:
 
-Parity targets UnityPy’s **edit pipeline**, not only reading:
+1. loaded with bounded parsing and decompression;
+2. inspected with stable source and object identity;
+3. changed through a guarded, deterministic plan;
+4. independently rebuilt and reparsed before publication;
+5. published with explicit packing and recovery semantics; and
+6. reopened by this project and, where the external validator supports the format, UnityPy.
 
-1. Load files into an environment (containers + serialized files)
-2. Read objects (TypeTree-driven) and allow mutation
-3. Write object data back (TypeTree writer)
-4. Rebuild `SerializedFile` (metadata + object table + data stream)
-5. Rebuild containers (`UnityFS` bundles, `WebFile`)
-6. Handle `.resS` / streamed resource payloads
-7. Save out to disk with UnityPy-compatible packer options
+The following are intentionally not goals:
 
-Non-goals (for now):
-- Byte-for-byte identical output vs original inputs (UnityPy itself is not byte-stable either)
-- Perfect editor-level semantics for all asset types (parity targets file-format correctness first)
+- reproducing the Python object model or mutation API;
+- silently scanning the filesystem while resolving references;
+- byte-identical output when a semantic rewrite legitimately changes layout;
+- guessing stripped schemas or encrypted bundle policy;
+- treating a successful write call as sufficient proof of a valid artifact.
 
-Future parity targets (post edit-pipeline):
-- UnityPy's typed object layer (`repo-ref/UnityPy/UnityPy/classes/*`, especially `generated.py`) for ergonomic field access and safe edits
-- Export/convenience helpers (`repo-ref/UnityPy/UnityPy/tools/extractor.py`, `repo-ref/UnityPy/UnityPy/export/*`)
-
-## Current Gap Shortlist
-
-This is a quick “what’s left” index; the detailed checklist below remains the source of truth.
+## Architecture
 
-P0 (blocks broad edit compatibility):
-- MonoBehaviour/script TypeTrees for stripped files:
-  - supported via `script_id` registry lookup + external exporter workflow (`docs/SCRIPT_TYPETREES.md`)
-  - Note: a built-in generator (managed/il2cpp) is intentionally deferred until a mature reference/validation corpus exists.
-
-P1 (important, but not blocking most modern samples):
-- Unity CN encrypted UnityFS bundles:
-  - UnityPy can decrypt/load via `ArchiveStorageManager.ArchiveStorageDecryptor`.
-  - Rust does not implement decryption yet (requires a real-world corpus + validation strategy).
-
-P2 / future:
-- Bundle encryption save support (UnityPy explicitly has a TODO here too; it clears encryption flags on save).
-- Broader typed helper coverage for UI/editor workflows (RectTransform/Canvas/Text/etc), including YAML prefab/scene editing ergonomics.
-
-## Finding Legacy Samples (v<9 / UnityWeb / UnityRaw)
-
-Some remaining parity items require a validation corpus (otherwise we risk implementing the wrong layout).
-
-Use the CLI to quickly identify bundle signatures and embedded SerializedFile versions:
-
-```
-cargo run -p unity-asset-cli --bin unity-asset -- stats --input <path-or-dir> --kind all --limit 50
-# or aggregated counts:
-cargo run -p unity-asset-cli --bin unity-asset -- stats --input <path-or-dir> --kind all --summary
-```
-
-## High-Level Architecture (Rust Target)
-
-To avoid destabilizing the existing parser crates, the write/edit pipeline should live in a **dedicated crate** and integrate into higher-level APIs:
-
-- New crate (recommended): `crates/unity-asset-write`
-  - `BinaryWriter` primitives (shared)
-  - TypeTree write support
-  - `SerializedFile` rebuild/save
-  - `BundleFile`/`WebFile` rebuild/save
-  - Resource (`.resS`) write & external registration
-  - “changed” tracking akin to UnityPy’s `mark_changed()`
-
-Integration:
-- `crates/unity-asset` should expose UnityPy-like ergonomic methods (e.g. `Environment::save(...)`) on top of `unity-asset-write`.
-
-## Module Mapping (UnityPy → Rust)
-
-This mapping is intentionally **source-derived**: it enumerates UnityPy's write/edit entrypoints and
-maps each one to its Rust equivalent (or documents a gap). Baseline UnityPy files scanned for this
-section:
-
-- `repo-ref/UnityPy/UnityPy/environment.py`
-- `repo-ref/UnityPy/UnityPy/files/File.py`
-- `repo-ref/UnityPy/UnityPy/files/ObjectReader.py`
-- `repo-ref/UnityPy/UnityPy/files/SerializedFile.py`
-- `repo-ref/UnityPy/UnityPy/files/BundleFile.py`
-- `repo-ref/UnityPy/UnityPy/files/WebFile.py`
-- `repo-ref/UnityPy/UnityPy/helpers/TypeTreeHelper.py`
-
-### Environment / Loading semantics
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/environment.py`
-  - `Environment.load_file(...)` supports:
-    - `.split0/.split1/...` merge (common mobile/console outputs)
-    - `.zip/.apk` load
-    - case-insensitive path resolution via `find_sensitive_path(...)`
-  - `Environment.find_file(...)` supports best-effort dependency lookup by:
-    - simplified name matching (`simplify_name`: basename + lowercase)
-    - scanning the environment root directory when direct lookup fails
-
-Rust (current):
-- `crates/unity-asset/src/environment/imp/loader.rs`
-  - `Environment::load_file(...)` best-effort detects YAML vs binary
-  - `Environment::load_project(...)` project walk + optional `.meta` GUID indexing
-
-TODO (parity):
-- [x] Support `.splitN` merge load (UnityPy `reSplit` + `_load_split_file`)
-- [x] Support `.zip/.apk` environment load (UnityPy `load_zip_file`)
-- [x] Add case-insensitive path resolution helper for dependency loads (UnityPy `find_sensitive_path`) (best-effort for relative paths)
-- [x] Add a best-effort `find_file`-style fallback when resolving dependencies by path fails:
-  - simplified-name matching (basename + lowercase)
-  - optional directory scan under `Environment.base_path` (cached index)
-  - implementation: `crates/unity-asset/src/environment/imp/dependency_files.rs` + `Environment::resolve_pptr_path_key_best_effort(...)`
-
-### Environment / Save entrypoint
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/environment.py`
-  - `Environment.save(pack="none", out_path="output")`
-
-Rust (current):
-- `crates/unity-asset/src/environment.rs`
-  - `Environment::save(pack, out_dir)` writes only changed sources
-  - `.zip/.apk` entries are treated as standalone sources (UnityPy-style): edited entries are written to `out_dir` and the archive is not re-packed
-  - delegates to `unity-asset-write` rebuilders:
-    - `SerializedFileWriter`
-    - `BundleWriter`
-    - `WebFileWriter`
-
-### Object editing hook
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/classes/Object.py`
-  - `Object.save()` → calls `ObjectReader.save_typetree(self)`
-- `repo-ref/UnityPy/UnityPy/files/ObjectReader.py`
-  - `save_typetree(...)` (writes TypeTree and stores raw bytes)
-  - `set_raw_data(...)` + `assets_file.mark_changed()`
-  - `patch(...)` is an alias for `save_typetree(...)`
-  - `get_raw_data()` reads the current object bytes (useful for low-level diffs)
-
-Rust (current):
-- `crates/unity-asset-binary/src/object.rs`
-  - `ObjectHandle` (UnityPy `ObjectReader`-like) is read-only today
-- `crates/unity-asset/src/environment/imp/edit.rs`
-  - `EnvironmentEditSession` provides UnityPy-like edit + save hooks on top of `ObjectHandle`:
-    - `edit_binary_object_key(...)` (mutate in a closure)
-    - `save_binary_object_class(...)` (UnityPy `Object.save()`-style: mutate outside, then persist)
-- `crates/unity-asset-write/src/object/serialized_file_session.rs`
-  - `SerializedFileEditSession` (UnityPy-like: edit -> save_typetree/set_raw_data -> mark_changed)
-  - `ChangeTracker` trait mirrors UnityPy `mark_changed()` / `is_changed`
-  - stores either:
-    - parsed properties + TypeTree → encode to raw bytes (`save_typetree` / `edit_object`), or
-    - raw byte patch (escape hatch: `set_raw_data`)
-
-### File.mark_changed / get_writeable_cab (streamed resources)
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/files/File.py`
-  - `File.mark_changed()` bubbles up to parent containers
-  - `File.get_writeable_cab(name=None)` creates an `EndianBinaryWriter` stored under the container
-- `repo-ref/UnityPy/UnityPy/files/SerializedFile.py`
-  - `SerializedFile.get_writeable_cab(...)` registers the cab as an external (GUID + `archive:/...`)
-    when the serialized file is inside a Bundle/WebFile container
-
-Rust (current):
-- `crates/unity-asset/src/environment/imp/edit.rs`
-  - `EnvironmentEditSession::write_to_cab(...)` / `write_streamed_resource_to_field(...)`
-- `crates/unity-asset-write/src/resources/mod.rs`
-  - `WritableCab` (UnityPy `EndianBinaryWriter` analogue; stored in container edits)
-
-Notes:
-- UnityPy returns `None` for `SerializedFile.get_writeable_cab` when not inside a container.
-  Rust supports a best-effort standalone sidecar write under `out/{file}_data/{cab}` to keep the
-  streamed-resource editing workflow possible for `.assets` files.
-
-### MonoBehaviour TypeTree generation
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/files/ObjectReader.py`
-  - `generate_monobehaviour_node(...)` uses `Environment.typetree_generator` + script metadata
-
-Rust (current):
-- supports `TypeTreeRegistry` inputs (`.tpk` / JSON) for stripped TypeTrees
-- supports script-specific TypeTree lookup for MonoBehaviour-like script types via `script_id` (registry hook)
-  - JSON registry `schema: 2` supports `script_id` (32-hex) entries
-- supports a script TypeTree generator hook (UnityPy `typetree_generator` equivalent) via `Environment::set_script_type_tree_generator(...)`
-- does not yet generate MonoBehaviour nodes from script assemblies
-
-TODO (parity):
-- [x] Provide a MonoBehaviour node generator hook (equivalent capability to UnityPy `typetree_generator`)
-  - [x] Hook point + cache exists (caller-provided generator, keyed by `script_id`)
-  - [x] Document an external workflow to feed the hook via a JSON registry (`schema: 2`)
-    - exporter: `scripts/export_unitypy_script_typetrees.py` (UnityPy + TypeTreeGeneratorAPI)
-    - docs: `docs/SCRIPT_TYPETREES.md`
-  - [ ] Provide a built-in generator implementation (managed/il2cpp) (future)
-
-### TypeTree read/write
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/helpers/TypeTreeHelper.py`
-  - `read_typetree(...)`
-  - `write_typetree(...)` / `write_value(...)`
-  - alignment driven by `MetaFlag` (`kAlignBytes`)
-
-Rust (current):
-- `crates/unity-asset-binary/src/typetree/serializer.rs`
-  - parse + scan fast paths
-  - `TypeTreeSerializer` drives parsing and PPtr scanning (read-only)
-- `crates/unity-asset-write/src/typetree/`
-  - TypeTree-driven writer (UnityPy `TypeTreeHelper.write_value` parity)
-  - includes best-effort template writes for rare unnamed children (preserve original byte slices)
-
-### SerializedFile save/rebuild
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/files/SerializedFile.py`
-  - `SerializedFile.save(packer=None) -> bytes`
-  - rebuilds:
-    - header
-    - metadata stream (types, object table, scripts, externals, ref types, userInformation)
-    - data stream (object bytes), plus alignment rules (8/16 as needed)
-
-Rust (current):
-- `crates/unity-asset-binary/src/asset/parser.rs`
-  - read-only parse logic, plus lazy object slicing
-- `crates/unity-asset-binary/src/asset/header.rs`
-  - header parse, including v22 extended fields
-- `crates/unity-asset-write/src/serialized_file/writer.rs`
-  - `SerializedFileWriter::save(...) -> Vec<u8>`
-  - supports both:
-    - v>=9 layout (metadata after header)
-    - v<9 legacy layout (metadata at end-of-file; UnityPy parity)
-  - all version gates mirrored from UnityPy:
-    - v>=7 unityVersion
-    - v>=8 platform
-    - v>=13 enableTypeTree
-    - 7<=v<14 bigIdEnabled in metadata
-    - v>=11 scriptTypes
-    - v>=20 refTypes
-    - v>=22 extended header fields and 64-bit offsets
-  - data section alignment (notably UnityPy aligns objects’ data stream)
-
-### BundleFile (UnityFS) save/rebuild
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/files/BundleFile.py`
-  - `BundleFile.save(packer=None) -> bytes`
-  - `save_fs(...)` for UnityFS:
-    - rebuild directory info
-    - rebuild and compress block info
-    - chunk-based compression for file data
-  - supports `packer`: `"none"`, `"original"`, `"lz4"`, `"lzma"`, `(block_info_flag, data_flag)`
-
-Rust (current):
-- `crates/unity-asset-binary/src/bundle/*`
-  - robust parsing + decompression, including lazy block cache
-- `crates/unity-asset-write/src/bundle/writer.rs`
-  - `BundleWriter::save(...)` (UnityPy parity)
-  - supports:
-    - UnityFS repack with UnityPy packer semantics (`none`/`lz4`/`lzma`/`original`/custom flags)
-    - legacy UnityWeb/UnityRaw repack (UnityPy only supports saving versions `<= 3`)
-  - strips UnityFS encryption flags on save (UnityPy parity; encryption is not re-applied)
-- `crates/unity-asset-write/src/bundle/edits.rs`
-  - `BundleEdits` supports both replacing existing entries and adding new entries
-
-### WebFile save/rebuild
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/files/WebFile.py`
-  - `WebFile.save(files=None, packer="none", signature="UnityWebData1.0") -> bytes`
-  - supports gzip/brotli/none
-
-Rust (current):
-- `crates/unity-asset-binary/src/webfile.rs` (parse)
-- `crates/unity-asset-write/src/webfile/writer.rs`
-  - `WebFileWriter::save(...)` (UnityPy parity; gzip/brotli/none)
-  - supports signature validation (`UnityWebData*` / `TuanjieWebData*`)
-  - supports replacements/additions via `WebFileEdits`
-
-### Resource files / `.resS` (writeable cab)
-
-UnityPy:
-- `repo-ref/UnityPy/UnityPy/files/File.py`
-  - `File.get_writeable_cab(...)` creates/returns an `EndianBinaryWriter` for `.resS`
-- `repo-ref/UnityPy/UnityPy/files/SerializedFile.py`
-  - `SerializedFile.get_writeable_cab(...)` registers it in externals
-
-Rust (current):
-- loader can read resources (best-effort; streamed read helpers exist)
-- `crates/unity-asset-write/src/resources/mod.rs`
-  - `WritableCab` abstraction
-  - external registration and path conventions aligned with UnityPy:
-    - `archive:/{serialized_name}/{cab_name}` (UnityPy uses the serialized file name as the first component)
-
-## TODO Milestones (Trackable Checklist)
-
-### M0 — Project scaffolding & public API shape
-
-- [x] Create `crates/unity-asset-write` with minimal public surface
-- [x] Define core traits/structs:
-  - [x] `ChangeTracker` (UnityPy `mark_changed`)
-  - [x] `SerializedFileEditSession` (per `SerializedFile`)
-  - [x] `PackerOptions` (string/tuple parity with UnityPy)
-- [x] Add `unity-asset` integration stubs:
-  - [x] `Environment::save(pack, out_dir)` implemented (standalone SerializedFile + UnityFS bundle repack)
-  - [x] `Environment::edit_binary_object_key(...)` / `EnvironmentEditSession` for UnityPy-like change tracking
-
-Acceptance:
-- Compiles with `cargo build --workspace`
-
-### M1 — BinaryWriter primitives (required for all write paths)
-
-- [x] Implement `BinaryWriter` with:
-  - [x] endian support (little/big)
-  - [x] primitives mirroring UnityPy `EndianBinaryWriter`
-  - [x] `align_stream(alignment)`
-  - [x] `write_aligned_string`, `write_byte_array`
-
-Acceptance:
-- Unit tests for endian + alignment correctness (round-trip with `BinaryReader`)
-
-### M2 — TypeTree write parity
-
-- [x] Implement TypeTree-driven writer matching UnityPy `TypeTreeHelper.write_value`
-- [x] Cover types:
-  - [x] primitives (`SInt8/UInt8/.../double/bool`)
-  - [x] `string`, `TypelessData`
-  - [x] `pair` (accepts Array(len=2) + Object(first/second))
-  - [x] arrays (including aligned arrays)
-  - [x] Handle rare TypeTrees with unnamed children by preserving original byte slices (template write mode)
-  - [x] `PPtr<>` (accept `m_FileID/m_PathID` and `fileID/pathID`; `Null` -> zero pointer) + tests
-  - [x] `ReferencedObject` (ref_types-aware)
-  - [x] managed references registry (`ManagedReferencesRegistry`) skip rules
-- [x] Add targeted fixtures by parsing existing samples and re-serializing a no-op tree
-
-Acceptance:
-- For selected objects: parse → write → parse yields equivalent structure (within expected normalization)
-
-### M3 — SerializedFile.save parity
-
-- [x] `SerializedFileWriter.save(...)` implementing UnityPy layout and version gates (v>=9 baseline)
-- [x] Object table rebuild:
-  - [x] offsets (32/64-bit depending on version)
-  - [x] size, type id/index, stripped/script fields
-  - [x] alignment (object stream + metadata alignment)
-- [x] Support “edited object bytes” overriding original slices (`SerializedFileEdits`)
-- [x] Support `version < 9` save (legacy metadata-at-end layout, with endian boolean prefix)
-- [x] Legacy TypeTree dump `SerializedType::write_type_tree` for `version == 2` (writes `m_VariableCount` best-effort)
-
-Acceptance:
-- A `.assets` produced by Rust can be loaded by:
-  - [x] this Rust parser
-  - [x] UnityPy (baseline snapshot) (opt-in: `UNITYPY_E2E=1`; see `crates/unity-asset-write/tests/unitypy_e2e.rs`)
-
-TODO (parity):
-- [x] Support stripped TypeTree edits in `SerializedFileEditSession` via `TypeTreeRegistry`
-
-### M4 — BundleFile.save (UnityFS) parity
-
-- [x] Implement chunk/block builder like UnityPy `CompressionHelper.chunk_based_compress`
-- [x] Implement compression:
-  - [x] LZ4 (block mode)
-  - [x] LZMA (UnityPy-style header layout: 5-byte header, no unpacked-size field)
-  - [x] Validate LZMA encoder parameters (props/dict) vs UnityPy defaults (guarded by unit test)
-  - [x] Packer compatibility:
-  - [x] `"none"`, `"lz4"`, `"lzma"`, `"original"`, tuple form
-- [x] Directory info rebuild and file flags propagation
-- [x] Strip bundle encryption flags on save (UnityPy parity; encryption is not re-applied)
-- [x] Legacy bundle parse (`UnityWeb` / `UnityRaw`) header + directory offsets (UnityPy `read_web_raw` parity)
-- [x] Legacy bundle save (`UnityWeb` / `UnityRaw`) (UnityPy only supports saving versions `<= 3`)
-
-Acceptance:
-- [x] A rebuilt bundle loads in this Rust parser (roundtrip test)
-- [x] UnityPy loads the saved bundle and matches directory listing (opt-in: `UNITYPY_E2E=1`; see `crates/unity-asset-write/tests/unitypy_e2e.rs`)
-
-### M5 — WebFile.save parity
-
-- [x] Rebuild header + file table + data blobs
-- [x] Compression parity:
-  - [x] gzip compress
-  - [x] brotli compress (best-effort; see note below)
-- [x] Signature handling (`UnityWebData*` / `TuanjieWebData*`)
-
-Acceptance:
-- [x] WebFile loads in Rust parser; extracted sub-files match.
-- [x] Uncompressed WebFile output loads in UnityPy.
-- [ ] TODO: UnityPy cannot currently re-load brotli-compressed WebFiles produced via `WebFile.save(packer="brotli")` due to its `BROTLI_MAGIC` heuristic; treat brotli as best-effort until upstream behavior changes.
-
-### M6 — `.resS` / streamed resources parity
-
-- [x] Implement `get_writeable_cab` equivalent behavior (P0):
-  - [x] create a writable cab buffer inside container (`AssetBundle` / `WebFile`)
-  - [x] propagate bundle file flags (best-effort)
-  - [x] register as external with GUID and archive path (`archive:/{serialized_name}/{cab_name}`)
-- [x] Write standalone sidecar cab files under `out/{asset_file_name}_data/{cab_name}` (best-effort; UnityPy does not expose this for standalone `SerializedFile`)
-- [x] Provide an ergonomic helper for streamed-resource fields:
-  - [x] `EnvironmentEditSession::write_streamed_resource_to_field(...)` writes bytes into a cab and updates `{path,offset,size}` / `{m_Source,m_Offset,m_Size}` in-place (e.g. `m_StreamData`)
-- [x] Provide generic dot-path editing helpers for binary objects:
-  - [x] `EnvironmentEditSession::set_binary_value_at_path(...)` for `UnityValue` updates
-  - [x] `EnvironmentEditSession::get_binary_value_at_path(...)` reads from pending edits or by parsing the source object
-- [x] Provide a generic `PPtr` path helper (Unity-style references):
-  - [x] resolve via `Environment::resolve_pptr_path_key(...)`
-  - [x] set via `EnvironmentEditSession::set_pptr_path_to_key(...)` (best-effort externals)
-- [x] Provide best-effort "find references" for binary `PPtr` fields:
-  - [x] `Environment::find_binary_pptr_references_to(...)` returns `(from, pptr_path, file_id, path_id, resolved)`
-- [x] Implement YAML-side "find references" for YAML PPtr-like objects (prefab/scene YAML), returning `(YamlObjectKey, pptr_path, file_id/guid/type, resolved?)`
-- [x] Provide typed convenience helpers for common streamed asset types:
-  - [x] AudioClip (`m_Resource`)
-  - [x] Texture2D (`m_StreamData`)
-  - [x] Mesh (`m_StreamData`)
-  - [x] VideoClip (`m_ExternalResources`)
-- [x] Provide a typed convenience helper for a common non-streamed edit:
-  - [x] TextAsset (`m_Script`)
-- [x] Expand typed helpers (UnityPy-like ergonomics):
-  - [x] MeshFilter (`m_Mesh`)
-  - [x] MeshRenderer (`m_Materials`, `m_AdditionalVertexStreams`)
-  - [x] SpriteRenderer (`m_Sprite`)
-  - [x] Sprite (`m_RD.texture`, `m_RD.alphaTexture`)
-  - [x] SpriteAtlas (`m_RenderDataMap[*].texture`, `m_RenderDataMap[*].alphaTexture`)
-  - [x] Material:
-    - [x] TexEnv texture (`m_SavedProperties.m_TexEnvs[*].m_Texture`) by name
-    - [x] TexEnv scale/offset (`m_SavedProperties.m_TexEnvs[*].m_Scale/m_Offset`) by name
-    - [x] Floats/Colors/Ints (`m_SavedProperties.m_Floats/m_Colors/m_Ints`) by name
-  - [x] VideoPlayer (`m_Url`, `m_VideoClip`)
-- [x] Add YAML prefab/scene editing helpers (UI-focused baseline):
-  - [x] Query YAML objects by `class_name` + dot-path + string value, returning `YamlObjectKey`
-  - [x] Resolve `GameObject.m_Component[*].component.fileID` to component anchors within the same YAML file
-  - [x] Find MonoBehaviour components by `m_Script.guid` (script GUID)
-  - [x] RectTransform setters (`m_AnchoredPosition`, `m_SizeDelta`, `m_AnchorMin`, `m_AnchorMax`, `m_Pivot`, `m_OffsetMin`, `m_OffsetMax`)
-  - [x] Transform setters (`m_LocalPosition`, `m_LocalRotation`, `m_LocalScale`)
-  - [x] Hierarchy helpers:
-    - [x] Find child GameObject by name path (traverse `m_Children` → `m_GameObject`)
-    - [x] Reparent GameObjects (update `m_Father` / `m_Children`)
-  - [x] Generic YAML setters for common UI fields:
-    - [x] PPtr-like refs (`{fileID,guid,type}`) and internal anchor refs
-    - [x] Color (`{r,g,b,a}`) and GameObject active (`m_IsActive`)
-  - [ ] TODO: expand typed helpers further (more classes + deeper editor semantics)
-  - [ ] YAML UI helpers:
-    - [x] Image/RawImage: sprite/texture refs, color, raycast target
-    - [x] Text/TMP_Text: text, color, font size (best-effort)
-    - [x] Button: interactable + persistent onClick calls (best-effort)
-    - [x] Canvas/CanvasScaler (best-effort)
-    - [x] Layout groups (best-effort)
-    - [x] Toggle: isOn, interactable, persistent onValueChanged calls (best-effort)
-    - [x] Slider: value, min/max, wholeNumbers, interactable, persistent onValueChanged calls (best-effort)
-    - [x] Dropdown: value, interactable, persistent onValueChanged calls (best-effort)
-    - [x] InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
-    - [x] TMP_InputField: text, interactable, persistent onValueChanged/onEndEdit calls (best-effort)
-    - [x] ScrollRect: content/viewport refs, axis toggles, normalizedPosition/velocity, persistent onValueChanged calls (best-effort)
-    - [x] CanvasGroup: alpha, interactable, raycast flags (best-effort)
-    - [x] ContentSizeFitter: horizontal/vertical fit modes (best-effort)
-    - [x] LayoutElement: sizes + ignoreLayout + priority (best-effort)
-    - [x] ToggleGroup: allowSwitchOff (best-effort)
-    - [x] Scrollbar: value/size/steps/interactable + persistent onValueChanged calls (best-effort)
-
-Acceptance:
-- [x] A bundle can be modified to point `m_StreamData` at a newly written cab and reloaded.
-
-### M7 — Regression suite (“golden”)
-
-- [x] Add integration tests that shell out to vendored UnityPy (opt-in via env var)
-  - [x] UnityFS bundle: Rust save -> UnityPy load OK + directory sanity checks
-  - [x] SerializedFile: Rust save -> UnityPy load OK + objects non-empty
-  - [x] Rust TypeTree edit (rename a `m_Name`/`name` field) -> repack bundle -> UnityPy observes mutation
-- [x] Add corpus-driven tests with `tests/samples/*`:
-  - [x] bundle round-trip (no-op save)
-  - [x] serialized file round-trip
-
-Acceptance:
-- `cargo nextest run --workspace` passes on CI/dev machines (with a clearly documented UnityPy test dependency toggle)
-
-How to run UnityPy E2E checks locally:
-
-1) Create or point to a python that can import UnityPy dependencies (recommended: `.venv-unitypy`).
-2) Run:
-
-```
-$env:UNITYPY_E2E = "1"
-# optional, if not using `.venv-unitypy`:
-$env:UNITYPY_PYTHON = "C:\\path\\to\\python.exe"
-cargo nextest run -p unity-asset-write unitypy_
-```
-
-How to run external AssetBundle E2E edits locally (no samples checked into repo):
-
-This repo includes opt-in tests that can edit and repack an *external* AssetBundle, then optionally ask UnityPy to validate the result.
-
-1) Point the test at an existing bundle on your machine (the test writes to a temp output dir; it does not modify the input file):
-
-```
-$env:UNITY_ASSET_EXTERNAL_BUNDLE = "C:\\path\\to\\bundle.ab"
-```
-
-2) Run the Rust-side E2E:
-
-```
-cargo nextest run -p unity-asset external_bundle_
-```
-
-3) Optional: enable UnityPy validation (requires `repo-ref/UnityPy` and a working python env):
-
-```
-$env:UNITYPY_E2E = "1"
-# optional, if not using `.venv-unitypy`:
-$env:UNITYPY_PYTHON = "C:\\path\\to\\python.exe"
-cargo nextest run -p unity-asset external_bundle_
-```
-
-How to run an external corpus regression (directory scan, limited; no samples checked into repo):
-
-This is useful for validating broad format compatibility against a local bundle directory without checking any assets into git.
-The test performs `parse -> save -> reparse` and can optionally ask UnityPy to load the saved output.
-
-1) Point the test at a directory (or a single file) on your machine:
-
-```
-$env:UNITY_ASSET_EXTERNAL_CORPUS = "C:\\path\\to\\AssetBundles"
-```
-
-2) Limit scope to keep runs fast (recommended):
-
-```
-$env:UNITY_ASSET_EXTERNAL_CORPUS_LIMIT = "20"         # default: 20
-$env:UNITY_ASSET_EXTERNAL_CORPUS_MAX_BYTES = "200000000" # default: 200,000,000 (~200MB)
-$env:UNITY_ASSET_EXTERNAL_CORPUS_VERBOSE = "1"        # optional: print every processed path
-$env:UNITY_ASSET_EXTERNAL_CORPUS_PACKER = "none"      # optional: none|lz4|lzma|original (default: original)
-```
-
-3) Run the Rust-side roundtrip:
-
-```
-cargo nextest run -p unity-asset-write external_corpus_
-```
-
-4) Optional: enable UnityPy validation (only checks a small subset per run):
-
-```
-$env:UNITYPY_E2E = "1"
-$env:UNITY_ASSET_EXTERNAL_CORPUS_UNITYPY_LIMIT = "3"  # default: 3
-cargo nextest run -p unity-asset-write external_corpus_
-```
-
-## Risk Register (Known Hard Parts)
-
-- Unity version branching: header formats (`<9`, `>=9`, `>=22`) and object table changes.
-- Endianness: big-endian assets exist; writer must honor `header.endian`.
-- TypeTree stripped assets (`enableTypeTree=false`): requires registry-based node reconstruction or limited editing modes.
-- Managed references (`ReferencedObject`, `ManagedReferencesRegistry`) correctness.
-- Compression: UnityFS chunking and flags semantics (`original` mode) must match UnityPy expectations.
-- `.resS` coupling: external file registration and consistent cab naming/path rules.
-
-## Notes (Implementation Principles)
-
-- Prefer correctness and spec parity over micro-optimizations in write path.
-- Keep read-only parser crates stable; put new mutation/write behavior behind a separate crate and explicit APIs.
-- Every milestone must add tests that prevent regressions in subsequent refactors.
+| Concern | Current Rust authority | Compatibility outcome |
+|---|---|---|
+| Source ownership and identity | `AssetWorkspace`, `SourceLocator`, `WorkspaceSnapshot` | Nested archive, WebFile, bundle, SerializedFile, YAML, and streamed-resource sources retain exact ownership and revision identity. |
+| Inspection | `WorkspaceInspector` over committed or prepared `WorkspaceView` values | Sources and objects have versioned JSON projections; exact lookup preserves missing, ambiguous, and invalid states. |
+| Mutation | `MutationPlan` v3 and `MutationPlanFragment` | Ordered, digest-guarded operations replace implicit mutable object state. |
+| Preflight | `AssetWorkspace::prepare` and opaque `PreparedChange` | Every candidate artifact is encoded, sealed, independently reparsed, and exposed through read-your-writes inspection before publication. |
+| Publication | `AssetWorkspace::commit`, `PublicationTarget`, and recovery contracts | Publication is per-artifact recoverable, transaction-keyed, and idempotently recoverable from durable evidence. |
+| TypeTree semantics | `TypeTreeSchema` shared by read, skip, scan, write, and rewrite | Alignment, numeric bulk paths, unsigned values, PPtr scanning, and unnamed-field byte preservation use one schema execution model. |
+| References | Revision-bound `ReferenceGraph` | Incoming, outgoing, closure, and projections preserve field paths, raw targets, coverage, and resolution state without hidden loads. |
+| Extraction | `ExtractionRequest`, `ExtractionPlan`, `ExtractionManifest`, and `ExtractionReport` | Selection, representation, output collision policy, resume verification, and resource ceilings are persisted as typed contracts. |
+| Search | Consumer-owned `SearchGeneration` updated from `ChangeSet` | Search and reverse-reference state remain derived from an authoritative workspace revision. |
+
+Run `unity-asset workspace capabilities` to discover the exact supported operation families and
+wire versions instead of inferring them from this narrative.
+
+## Format Status
+
+### TypeTree Read and Rewrite
+
+Implemented:
+
+- signed and unsigned primitives, floating-point values, booleans, strings, TypelessData, pairs,
+  arrays, maps, PPtr values, referenced objects, and managed-reference traversal;
+- strict and lenient parsing policy;
+- allocation-free skip and zero-object-materialization PPtr scans on bulk-compatible data;
+- template rewrite that preserves untouched bytes, alignment, padding, and unnamed fields;
+- budgeted JSON and TPK registries, including script-ID lookup for stripped MonoBehaviour data;
+- frozen per-source registry snapshots with allocation-free lookup.
+
+Script-specific schemas can be generated by an external toolchain as documented in
+[SCRIPT_TYPETREES.md](SCRIPT_TYPETREES.md). Native managed-assembly and IL2CPP schema generation is
+not implemented.
+
+### SerializedFile
+
+Implemented:
+
+- version-sensitive headers and metadata, including extended version 22 fields;
+- modern metadata-before-data and legacy metadata-at-end layouts;
+- 32-bit and 64-bit offsets, object alignment, scripts, externals, reference types, and user data;
+- guarded object replacement through `EncodedSerializedObject`;
+- unchanged object ranges retained from immutable source backing;
+- independent reparse before a prepared artifact becomes committable.
+
+The external compatibility suite covers representative version and layout matrices. Additional
+real-world corpora are still valuable for uncommon engine forks and custom metadata.
+
+### AssetBundle
+
+Implemented:
+
+- UnityFS parse, lazy block access, deterministic rebuild, and explicit preserve, uncompressed,
+  LZ4, or LZMA packing;
+- legacy UnityWeb and UnityRaw layouts where the external reference also supports saving them;
+- directory order and duplicate member occurrences;
+- structured rejection of encrypted layouts that cannot be reproduced safely.
+
+UnityCN encrypted UnityFS decryption and encrypted output are not implemented. The writer does not
+publish a silently decrypted substitute.
+
+### WebFile
+
+Implemented:
+
+- UnityWebData and TuanjieWebData signatures;
+- deterministic file-table rebuild;
+- uncompressed, Gzip, and Brotli policies;
+- member replacement and addition;
+- segmented prepared images and independent validation.
+
+Brotli output is valid for the Rust reader. Compatibility with UnityPy's historical Brotli magic
+heuristic remains best-effort and is not used as a universal external acceptance gate.
+
+### Streamed Resources
+
+Implemented:
+
+- exact resolution against streamed-resource sources already present in a workspace;
+- checked range access without filesystem probing;
+- deterministic, budgeted multi-extent allocation;
+- resource-replacement mutation as a public mutation family;
+- prepared artifact digests, validation, and publication evidence.
+
+Broader convenience recipes that coordinate every class-specific metadata shape with newly
+allocated external payloads remain an expansion area.
+
+### Semantic Recipes
+
+Implemented recipes include guarded field replacement, reference replacement, schema replacement,
+sequence edits, Transform and RectTransform changes, hierarchy reparenting, UnityEvent persistent
+calls, material texture references, and AudioClip streamed-resource shapes. Recipe capability
+inspection reports unsupported schema variants instead of falling back to an unsafe setter.
+
+Coverage is intentionally incomplete. New recipes should lower to `MutationPlanFragment`, preserve
+observed schema provenance, and add cross-format tests; they should not create a parallel mutation
+lifecycle.
+
+## Verification
+
+The compatibility evidence is split by risk:
+
+- exact wire matrices for SerializedFile versions and bundle/container layouts;
+- no-op and guarded TypeTree rewrite tests;
+- independent prepared-artifact reparsing;
+- deterministic canonical JSON and digest contracts;
+- commit interruption, discovery, resume, abandon, and finalize tests;
+- optional UnityPy end-to-end reopening;
+- characterization baselines for TypeTree traversal and prepared artifacts.
+
+The opt-in external validator is enabled with `UNITYPY_E2E=1`. It is a second reader, not the
+authority for budget, identity, transaction, or recovery semantics.
+
+## Remaining Priorities
+
+1. Expand real-world encrypted and engine-fork corpora before designing decryption policy.
+2. Add native script-schema generation only when managed and IL2CPP outputs can be validated
+   deterministically across Unity versions.
+3. Broaden semantic recipe coverage from observed schemas and end-to-end game-development needs.
+4. Extend decoded extraction representations without pulling heavy codecs into the core workspace.
+5. Keep Unix, big-endian, compression, and interruption matrices in CI while local development
+   remains resource-conscious.
+
+Any new compatibility feature must preserve caller-owned budgets, stable identities, immutable
+views, canonical contracts, and the prepare-before-publish proof boundary.

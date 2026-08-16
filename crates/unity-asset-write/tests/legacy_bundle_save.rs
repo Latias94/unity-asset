@@ -1,6 +1,11 @@
+mod support;
+
+use std::sync::Arc;
+
 use unity_asset_binary::bundle::BundleParser;
-use unity_asset_write::PackerOptions;
-use unity_asset_write::bundle::{BundleEdits, BundleWriter};
+use unity_asset_write::PackingPolicy;
+
+use support::{OrderedBundleEntry, ordered_bundle_entries, prepare_bundle_bytes};
 
 fn write_cstring(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
@@ -87,10 +92,12 @@ fn can_save_unityraw_bundle_and_reload_with_edits() {
     let input_bytes = build_minimal_unityraw_v3_bundle("test.txt", b"abc");
     let bundle = BundleParser::from_bytes(input_bytes).unwrap();
 
-    let mut edits = BundleEdits::new();
-    edits.replace_file_bytes("test.txt", b"abcd".to_vec());
-
-    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default()).unwrap();
+    let mut entries = ordered_bundle_entries(&bundle).unwrap();
+    let OrderedBundleEntry::File { bytes, .. } = &mut entries[0] else {
+        panic!("legacy fixture entry is a file");
+    };
+    *bytes = Arc::from(&b"abcd"[..]);
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Uncompressed).unwrap();
     let reparsed = BundleParser::from_bytes(saved).unwrap();
 
     assert_eq!(reparsed.header.signature, "UnityRaw");
@@ -98,6 +105,16 @@ fn can_save_unityraw_bundle_and_reload_with_edits() {
     let node = &reparsed.nodes[0];
     let out = reparsed.extract_node_data(node).unwrap();
     assert_eq!(out, b"abcd");
+}
+
+#[test]
+fn canonical_unityraw_v3_noop_matches_characterized_wire_bytes() {
+    let input = build_minimal_unityraw_v3_bundle("test.txt", b"abc");
+    let bundle = BundleParser::from_bytes(input.clone()).unwrap();
+    let entries = ordered_bundle_entries(&bundle).unwrap();
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve).unwrap();
+
+    assert_eq!(saved, input);
 }
 
 fn build_minimal_unityweb_v3_bundle(file_name: &str, file_bytes: &[u8]) -> Vec<u8> {
@@ -164,10 +181,12 @@ fn can_save_unityweb_bundle_and_reload_with_edits() {
     let input_bytes = build_minimal_unityweb_v3_bundle("test.txt", b"abc");
     let bundle = BundleParser::from_bytes(input_bytes).unwrap();
 
-    let mut edits = BundleEdits::new();
-    edits.replace_file_bytes("test.txt", b"abcd".to_vec());
-
-    let saved = BundleWriter::save(&bundle, &edits, PackerOptions::default()).unwrap();
+    let mut entries = ordered_bundle_entries(&bundle).unwrap();
+    let OrderedBundleEntry::File { bytes, .. } = &mut entries[0] else {
+        panic!("legacy fixture entry is a file");
+    };
+    *bytes = Arc::from(&b"abcd"[..]);
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve).unwrap();
     let reparsed = BundleParser::from_bytes(saved).unwrap();
 
     assert_eq!(reparsed.header.signature, "UnityWeb");
@@ -175,4 +194,14 @@ fn can_save_unityweb_bundle_and_reload_with_edits() {
     let node = &reparsed.nodes[0];
     let out = reparsed.extract_node_data(node).unwrap();
     assert_eq!(out, b"abcd");
+}
+
+#[test]
+fn canonical_unityweb_v3_noop_matches_characterized_wire_bytes() {
+    let input = build_minimal_unityweb_v3_bundle("test.txt", b"abc");
+    let bundle = BundleParser::from_bytes(input.clone()).unwrap();
+    let entries = ordered_bundle_entries(&bundle).unwrap();
+    let saved = prepare_bundle_bytes(&bundle, &entries, PackingPolicy::Preserve).unwrap();
+
+    assert_eq!(saved, input);
 }

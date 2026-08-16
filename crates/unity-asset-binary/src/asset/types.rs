@@ -2,8 +2,9 @@
 //!
 //! This module defines the core data structures for Unity asset processing.
 
+use super::format::{ExternalEncoding, PathIdEncoding, SerializedFileFormat};
 use crate::error::{BinaryError, Result};
-use crate::reader::BinaryReader;
+use crate::reader::{BinaryInput, BinaryReader, not_enough_data_u64};
 use crate::typetree::{TypeTree, TypeTreeParser};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -53,59 +54,51 @@ impl SerializedType {
         }
     }
 
-    /// Parse SerializedType from binary data
-    pub fn from_reader(
-        reader: &mut BinaryReader,
-        version: u32,
+    pub(crate) fn from_input<I: BinaryInput + ?Sized>(
+        input: &mut I,
+        format: SerializedFileFormat,
         enable_type_tree: bool,
         is_ref_type: bool,
     ) -> Result<Self> {
-        let class_id = reader.read_i32()?;
+        let class_id = input.read_i32()?;
         let mut serialized_type = Self::new(class_id);
 
-        if version >= 16 {
-            serialized_type.is_stripped_type = reader.read_bool()?;
+        if format.serialized_types_have_stripped_flag() {
+            serialized_type.is_stripped_type = input.read_bool()?;
         }
 
-        if version >= 17 {
-            serialized_type.script_type_index = reader.read_i16()?;
+        if format.serialized_types_have_script_type_index() {
+            serialized_type.script_type_index = input.read_i16()?;
         }
 
-        if version >= 13 {
-            // Based on UnityPy logic.
-            let should_read_script_id = (is_ref_type && serialized_type.script_type_index >= 0)
-                || (version < 16 && class_id < 0)
-                || (version >= 16 && class_id == 114); // MonoBehaviour
-
-            if should_read_script_id {
-                // Read script ID
-                let script_id_bytes = reader.read_bytes(16)?;
+        if format.serialized_types_have_hashes() {
+            if format.serialized_type_has_script_id(
+                class_id,
+                serialized_type.script_type_index,
+                is_ref_type,
+            ) {
+                let script_id_bytes = input.read_bytes(16)?;
                 serialized_type.script_id.copy_from_slice(&script_id_bytes);
             }
 
-            // Always read old type hash for version >= 13
-            let old_type_hash_bytes = reader.read_bytes(16)?;
+            let old_type_hash_bytes = input.read_bytes(16)?;
             serialized_type
                 .old_type_hash
                 .copy_from_slice(&old_type_hash_bytes);
         }
 
         if enable_type_tree {
-            // Use blob format for version >= 12 or version == 10 (like unity-rs)
-            if version >= 12 || version == 10 {
-                serialized_type.type_tree = TypeTreeParser::from_reader_blob(reader, version)?;
-            } else {
-                serialized_type.type_tree = TypeTreeParser::from_reader(reader, version)?;
-            }
+            serialized_type.type_tree = TypeTreeParser::from_input_with_format(input, format)?;
 
-            if version >= 21 {
-                if is_ref_type {
-                    serialized_type.class_name = reader.read_cstring()?;
-                    serialized_type.namespace = reader.read_cstring()?;
-                    serialized_type.assembly_name = reader.read_cstring()?;
-                } else {
-                    serialized_type.type_dependencies = read_i32_array(reader)?;
-                }
+            if is_ref_type && format.has_ref_type_names() {
+                serialized_type.class_name =
+                    input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
+                serialized_type.namespace =
+                    input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
+                serialized_type.assembly_name =
+                    input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
+            } else if !is_ref_type && format.has_type_dependencies() {
+                serialized_type.type_dependencies = read_i32_array(input)?;
             }
         }
 
@@ -154,20 +147,68 @@ impl SerializedType {
 
         Ok(())
     }
+
+    /// Validates that retained wire fields are representable by the selected format.
+    pub fn validate_for_format(&self, format: SerializedFileFormat) -> Result<()> {
+        if self.class_id == 0 {
+            return Err(BinaryError::invalid_data("Class ID cannot be zero"));
+        }
+        if !format.serialized_types_have_stripped_flag() && self.is_stripped_type {
+            return Err(BinaryError::invalid_data(format!(
+                "SerializedFile v{} cannot encode a stripped SerializedType flag",
+                format.version()
+            )));
+        }
+        if !format.serialized_types_have_script_type_index() && self.script_type_index != -1 {
+            return Err(BinaryError::invalid_data(format!(
+                "SerializedFile v{} cannot encode a SerializedType script index",
+                format.version()
+            )));
+        }
+        if !format.serialized_types_have_hashes()
+            && (self.script_id != [0; 16] || self.old_type_hash != [0; 16])
+        {
+            return Err(BinaryError::invalid_data(format!(
+                "SerializedFile v{} cannot encode SerializedType hashes",
+                format.version()
+            )));
+        }
+        if !format.has_type_dependencies() && !self.type_dependencies.is_empty() {
+            return Err(BinaryError::invalid_data(format!(
+                "SerializedFile v{} cannot encode type dependencies",
+                format.version()
+            )));
+        }
+        if !self.type_tree.is_empty() && self.type_tree.version != format.version() {
+            return Err(BinaryError::invalid_data(format!(
+                "TypeTree version {} does not match SerializedFile v{}",
+                self.type_tree.version,
+                format.version()
+            )));
+        }
+        Ok(())
+    }
 }
 
-fn read_i32_array(reader: &mut BinaryReader) -> Result<Vec<i32>> {
-    let count = reader.read_i32()?;
-    if count < 0 {
-        return Err(BinaryError::invalid_data(format!(
-            "Negative array length: {}",
-            count
-        )));
+fn read_i32_array(input: &mut (impl BinaryInput + ?Sized)) -> Result<Vec<i32>> {
+    let signed_count = input.read_i32()?;
+    let count = u64::try_from(signed_count)
+        .map_err(|_| BinaryError::invalid_data(format!("Negative array length: {signed_count}")))?;
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<i32>() as u64)
+        .ok_or_else(|| BinaryError::invalid_data("i32 array byte length overflow"))?;
+    if byte_count > input.remaining() {
+        return Err(not_enough_data_u64(byte_count, input.remaining()));
     }
-    let count = count as usize;
-    let mut values = Vec::with_capacity(count);
+    input.consume_entries(count)?;
+    let count = usize::try_from(count)
+        .map_err(|_| BinaryError::memory_error("i32 array length does not fit in usize"))?;
+    let mut values = Vec::new();
+    values.try_reserve_exact(count).map_err(|error| {
+        BinaryError::memory_error(format!("Failed to reserve {count} i32 values: {error}"))
+    })?;
     for _ in 0..count {
-        values.push(reader.read_i32()?);
+        values.push(input.read_i32()?);
     }
     Ok(values)
 }
@@ -176,7 +217,7 @@ fn read_i32_array(reader: &mut BinaryReader) -> Result<Vec<i32>> {
 ///
 /// Represents a reference to an asset in another Unity file,
 /// used for cross-file asset dependencies.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FileIdentifier {
     /// Temporary empty string field for version >= 6.
     pub temp_empty: String,
@@ -189,24 +230,31 @@ pub struct FileIdentifier {
 }
 
 impl FileIdentifier {
-    /// Parse FileIdentifier from binary data
-    pub fn from_reader(reader: &mut BinaryReader, version: u32) -> Result<Self> {
-        let temp_empty = if version >= 6 {
-            reader.read_cstring()?
-        } else {
-            String::new()
+    pub(crate) fn from_input<I: BinaryInput + ?Sized>(
+        input: &mut I,
+        format: SerializedFileFormat,
+    ) -> Result<Self> {
+        let encoding = format.external_encoding();
+        let temp_empty = match encoding {
+            ExternalEncoding::AssetPathGuidAndType => {
+                input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?
+            }
+            ExternalEncoding::PathOnly | ExternalEncoding::GuidAndType => String::new(),
         };
 
         let mut guid = [0u8; 16];
         let mut type_ = 0i32;
 
-        if version >= 5 {
-            let guid_bytes = reader.read_bytes(16)?;
+        if matches!(
+            encoding,
+            ExternalEncoding::GuidAndType | ExternalEncoding::AssetPathGuidAndType
+        ) {
+            let guid_bytes = input.read_bytes(16)?;
             guid.copy_from_slice(&guid_bytes);
-            type_ = reader.read_i32()?;
+            type_ = input.read_i32()?;
         }
 
-        let path = reader.read_cstring()?;
+        let path = input.read_cstring_limited(BinaryReader::DEFAULT_MAX_STRING_LEN)?;
 
         Ok(Self {
             temp_empty,
@@ -255,53 +303,205 @@ impl FileIdentifier {
     }
 }
 
-/// Object information within a SerializedFile
-///
-/// Contains metadata about individual Unity objects including
-/// their location, type, and path ID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Exact meaning and bit pattern of the object table's 32-bit type reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectTypeReference {
+    /// Standalone object parsed outside a SerializedFile object table.
+    ///
+    /// This state has no wire representation and must be rejected by SerializedFile encoders.
+    StandaloneClass { class_id: i32 },
+    /// Legacy type ID followed by an independently stored 16-bit class-ID bit pattern.
+    Legacy {
+        raw_type_id: i32,
+        class_id_bits: u16,
+    },
+    /// Format 16 transition whose raw value is resolved with index-first wire semantics.
+    TransitionalV16 { raw: i32 },
+    /// Validated index into the SerializedType table.
+    SerializedTypeIndex { index: u32 },
+}
+
+impl ObjectTypeReference {
+    /// Returns the original 32-bit value stored in the object table.
+    pub fn raw_value(self) -> Result<i32> {
+        match self {
+            Self::StandaloneClass { class_id } => Err(BinaryError::invalid_data(format!(
+                "Standalone class ID {class_id} has no SerializedFile wire representation"
+            ))),
+            Self::Legacy { raw_type_id, .. } => Ok(raw_type_id),
+            Self::TransitionalV16 { raw } => Ok(raw),
+            Self::SerializedTypeIndex { index } => i32::try_from(index).map_err(|_| {
+                BinaryError::invalid_data(format!(
+                    "SerializedType index {index} does not fit the i32 wire field"
+                ))
+            }),
+        }
+    }
+
+    pub const fn legacy_class_id_bits(self) -> Option<u16> {
+        match self {
+            Self::Legacy { class_id_bits, .. } => Some(class_id_bits),
+            Self::StandaloneClass { .. }
+            | Self::TransitionalV16 { .. }
+            | Self::SerializedTypeIndex { .. } => None,
+        }
+    }
+}
+
+/// Version-specific object-table fields retained exactly as read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectMetadata {
+    Destroyed { value: u16 },
+    ScriptTypeIndex { index: i16 },
+    ScriptTypeIndexAndStripped { index: i16, stripped: u8 },
+    None,
+}
+
+impl ObjectMetadata {
+    pub const fn destroyed(self) -> Option<u16> {
+        match self {
+            Self::Destroyed { value } => Some(value),
+            _ => None,
+        }
+    }
+
+    pub const fn script_type_index(self) -> Option<i16> {
+        match self {
+            Self::ScriptTypeIndex { index } | Self::ScriptTypeIndexAndStripped { index, .. } => {
+                Some(index)
+            }
+            Self::Destroyed { .. } | Self::None => None,
+        }
+    }
+
+    pub const fn stripped_raw(self) -> Option<u8> {
+        match self {
+            Self::ScriptTypeIndexAndStripped { stripped, .. } => Some(stripped),
+            _ => None,
+        }
+    }
+}
+
+/// Object information within a SerializedFile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ObjectInfo {
-    /// Path ID of the object (unique within file)
-    pub path_id: i64,
-    /// Offset of object data in the file
-    pub byte_start: u64,
-    /// Size of object data
-    pub byte_size: u32,
-    /// Unity class ID of the object
-    pub type_id: i32,
-    /// Raw type ID from the object table (index into `types` for version >= 16, otherwise `-1`)
-    pub type_index: i32,
-    /// Object data
-    pub data: Vec<u8>,
+    path_id: i64,
+    byte_start: u64,
+    byte_size: u32,
+    type_reference: ObjectTypeReference,
+    class_id: i32,
+    serialized_type_index: Option<u32>,
+    metadata: ObjectMetadata,
+    loaded_data: Option<Vec<u8>>,
 }
 
 impl ObjectInfo {
-    /// Create a new ObjectInfo
-    pub fn new(
+    pub(crate) fn from_wire(
         path_id: i64,
         byte_start: u64,
         byte_size: u32,
-        type_id: i32,
-        type_index: i32,
+        type_reference: ObjectTypeReference,
+        class_id: i32,
+        serialized_type_index: Option<u32>,
+        metadata: ObjectMetadata,
     ) -> Self {
         Self {
             path_id,
             byte_start,
             byte_size,
-            type_id,
-            type_index,
-            data: Vec::new(),
+            type_reference,
+            class_id,
+            serialized_type_index,
+            metadata,
+            loaded_data: None,
         }
     }
 
-    /// Check if object data is loaded
-    pub fn has_data(&self) -> bool {
-        !self.data.is_empty()
+    /// Constructs metadata for standalone object parsing outside a SerializedFile object table.
+    ///
+    /// Standalone metadata intentionally has no SerializedFile wire representation.
+    pub fn for_standalone_class(
+        path_id: i64,
+        byte_start: u64,
+        byte_size: u32,
+        class_id: i32,
+    ) -> Result<Self> {
+        let object = Self {
+            path_id,
+            byte_start,
+            byte_size,
+            type_reference: ObjectTypeReference::StandaloneClass { class_id },
+            class_id,
+            serialized_type_index: None,
+            metadata: ObjectMetadata::None,
+            loaded_data: None,
+        };
+        object.validate()?;
+        Ok(object)
     }
 
-    /// Get the end offset of this object
-    pub fn byte_end(&self) -> u64 {
-        self.byte_start + self.byte_size as u64
+    pub const fn path_id(&self) -> i64 {
+        self.path_id
+    }
+
+    pub const fn byte_start(&self) -> u64 {
+        self.byte_start
+    }
+
+    pub const fn byte_size(&self) -> u32 {
+        self.byte_size
+    }
+
+    pub const fn type_reference(&self) -> ObjectTypeReference {
+        self.type_reference
+    }
+
+    pub const fn class_id(&self) -> i32 {
+        self.class_id
+    }
+
+    pub const fn serialized_type_index(&self) -> Option<u32> {
+        self.serialized_type_index
+    }
+
+    pub const fn metadata(&self) -> ObjectMetadata {
+        self.metadata
+    }
+
+    /// Returns object bytes loaded independently of the backing SerializedFile.
+    ///
+    /// `Some(&[])` is a loaded zero-byte payload. `None` means callers may fall back to the
+    /// object's backing SerializedFile range.
+    pub fn loaded_data(&self) -> Option<&[u8]> {
+        self.loaded_data.as_deref()
+    }
+
+    /// Installs payload bytes copied by the parser's explicit preload path.
+    ///
+    /// This is crate-private so callers cannot mutate a parsed SerializedFile outside the
+    /// validated writer pipeline. Internal tests may also use it to construct parser fixtures.
+    pub(crate) fn install_loaded_data(&mut self, data: Vec<u8>) {
+        self.loaded_data = Some(data);
+    }
+
+    pub(crate) fn clone_without_loaded_data(&self) -> Self {
+        Self {
+            path_id: self.path_id,
+            byte_start: self.byte_start,
+            byte_size: self.byte_size,
+            type_reference: self.type_reference,
+            class_id: self.class_id,
+            serialized_type_index: self.serialized_type_index,
+            metadata: self.metadata,
+            loaded_data: None,
+        }
+    }
+
+    /// Returns the checked absolute end offset of this object's payload.
+    pub fn byte_end(&self) -> Result<u64> {
+        self.byte_start
+            .checked_add(u64::from(self.byte_size))
+            .ok_or_else(|| BinaryError::invalid_data("Object byte range overflow"))
     }
 
     /// Validate object info
@@ -310,12 +510,31 @@ impl ObjectInfo {
             return Err(BinaryError::invalid_data("Path ID cannot be zero"));
         }
 
-        if self.byte_size == 0 {
-            return Err(BinaryError::invalid_data("Byte size cannot be zero"));
+        if self.class_id == 0 {
+            return Err(BinaryError::invalid_data("Type ID cannot be zero"));
         }
 
-        if self.type_id == 0 {
-            return Err(BinaryError::invalid_data("Type ID cannot be zero"));
+        match self.type_reference {
+            ObjectTypeReference::StandaloneClass { class_id } => {
+                if class_id != self.class_id {
+                    return Err(BinaryError::invalid_data(
+                        "Standalone object type reference and class ID disagree",
+                    ));
+                }
+                if self.serialized_type_index.is_some() || self.metadata != ObjectMetadata::None {
+                    return Err(BinaryError::invalid_data(
+                        "Standalone objects cannot carry SerializedFile type or metadata fields",
+                    ));
+                }
+            }
+            ObjectTypeReference::SerializedTypeIndex { index } => {
+                if self.serialized_type_index != Some(index) {
+                    return Err(BinaryError::invalid_data(
+                        "Object type reference and resolved SerializedType index disagree",
+                    ));
+                }
+            }
+            ObjectTypeReference::Legacy { .. } | ObjectTypeReference::TransitionalV16 { .. } => {}
         }
 
         Ok(())
@@ -433,13 +652,17 @@ pub struct LocalSerializedObjectIdentifier {
 }
 
 impl LocalSerializedObjectIdentifier {
-    pub fn from_reader(reader: &mut BinaryReader, version: u32) -> Result<Self> {
-        let local_serialized_file_index = reader.read_i32()?;
-        let local_identifier_in_file = if version < 14 {
-            reader.read_i32()? as i64
-        } else {
-            reader.align()?;
-            reader.read_i64()?
+    pub(crate) fn from_input<I: BinaryInput + ?Sized>(
+        input: &mut I,
+        format: SerializedFileFormat,
+    ) -> Result<Self> {
+        let local_serialized_file_index = input.read_i32()?;
+        let local_identifier_in_file = match format.path_id_encoding() {
+            PathIdEncoding::I32 | PathIdEncoding::BigIdFlag => i64::from(input.read_i32()?),
+            PathIdEncoding::AlignedI64 => {
+                input.align()?;
+                input.read_i64()?
+            }
         };
         Ok(Self {
             local_serialized_file_index,
@@ -475,5 +698,29 @@ mod tests {
         registry.add_type(stype);
         assert!(registry.has_type(28));
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn installed_zero_byte_object_data_is_distinct_from_missing_data() {
+        let mut object = ObjectInfo::for_standalone_class(1, 0, 0, 1).unwrap();
+        assert_eq!(object.loaded_data(), None);
+
+        object.install_loaded_data(Vec::new());
+        assert_eq!(object.loaded_data(), Some([].as_slice()));
+    }
+
+    #[test]
+    fn standalone_object_preserves_full_i32_class_id_without_wire_fields() {
+        let object = ObjectInfo::for_standalone_class(1, 0, 0, class_ids::SPRITE_ATLAS)
+            .expect("standalone objects accept every valid Unity class ID");
+
+        assert_eq!(object.class_id(), class_ids::SPRITE_ATLAS);
+        assert_eq!(
+            object.type_reference(),
+            ObjectTypeReference::StandaloneClass {
+                class_id: class_ids::SPRITE_ATLAS,
+            }
+        );
+        assert!(object.type_reference().raw_value().is_err());
     }
 }

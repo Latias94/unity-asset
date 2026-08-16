@@ -1,10 +1,17 @@
+mod support;
+#[path = "support/webfile.rs"]
+mod webfile_support;
+
 use std::path::{Path, PathBuf};
 
 use unity_asset_binary::bundle::AssetBundle;
-use unity_asset_binary::file::UnityFile;
-use unity_asset_write::bundle::{BundleEdits, BundleWriter};
+use unity_asset_binary::file::{UnityFile, UnityFileLoadOutcome};
+use unity_asset_write::PackingPolicy;
 use unity_asset_write::serialized_file::{SerializedFileEdits, SerializedFileWriter};
-use unity_asset_write::{PackerOptions, UnityPyPacker};
+use unity_asset_write::webfile::WebFilePackingPolicy;
+
+use support::{ordered_bundle_entries, prepare_bundle_bytes};
+use webfile_support::{ordered_webfile_members, prepare_webfile_bytes};
 
 fn repo_root() -> PathBuf {
     // `CARGO_MANIFEST_DIR` is `.../crates/unity-asset-write`.
@@ -48,13 +55,8 @@ fn roundtrip_bundle_noop(bundle: &AssetBundle) -> anyhow::Result<()> {
         .map(|n| n.name.clone())
         .collect();
 
-    let saved = BundleWriter::save(
-        bundle,
-        &BundleEdits::default(),
-        PackerOptions {
-            packer: UnityPyPacker::Original,
-        },
-    )?;
+    let entries = ordered_bundle_entries(bundle)?;
+    let saved = prepare_bundle_bytes(bundle, &entries, PackingPolicy::Preserve)?;
 
     let reparsed = unity_asset_binary::bundle::BundleParser::from_bytes(saved)?;
 
@@ -108,9 +110,19 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
 
     for path in samples {
         let bytes = std::fs::read(&path)?;
-        let parsed = match unity_asset_binary::file::load_unity_file_from_memory(bytes) {
-            Ok(v) => v,
-            Err(_) => {
+        let mut budget = unity_asset_core::AssetLoadBudget::default();
+        let parsed = match unity_asset_binary::file::try_load_unity_file_from_memory_with_budget(
+            bytes,
+            &mut budget,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "recognized Unity container failed to parse for {}: {error}",
+                file_label(&path)
+            )
+        })? {
+            UnityFileLoadOutcome::Recognized(file) => file,
+            UnityFileLoadOutcome::Unrecognized => {
                 // `tests/samples` can also contain raw resource blobs (`.resS`/`.resource`) or
                 // other non-container artifacts; skip those in this corpus test.
                 skipped += 1;
@@ -135,7 +147,7 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
                     let reparsed =
                         unity_asset_binary::asset::SerializedFileParser::from_bytes(out)?;
                     assert_eq!(reparsed.header.version, sf.header.version);
-                    assert_eq!(reparsed.objects.len(), sf.objects.len());
+                    assert_eq!(reparsed.objects().len(), sf.objects().len());
                     assert_eq!(
                         reparsed.externals.len(),
                         sf.externals.len(),
@@ -149,16 +161,13 @@ fn corpus_roundtrip_noop_save_is_loadable() -> anyhow::Result<()> {
                 let out = SerializedFileWriter::save(&sf, &SerializedFileEdits::default())?;
                 let reparsed = unity_asset_binary::asset::SerializedFileParser::from_bytes(out)?;
                 assert_eq!(reparsed.header.version, sf.header.version);
-                assert_eq!(reparsed.objects.len(), sf.objects.len());
+                assert_eq!(reparsed.objects().len(), sf.objects().len());
             }
             UnityFile::WebFile(web) => {
                 // Corpus currently doesn't vendor WebFile samples, but keep this branch for completeness.
-                let saved = unity_asset_write::webfile::WebFileWriter::save(
-                    &web,
-                    &unity_asset_write::webfile::WebFileEdits::default(),
-                    unity_asset_write::webfile::WebFilePacker::None,
-                    None,
-                )?;
+                let members = ordered_webfile_members(&web)?;
+                let saved =
+                    prepare_webfile_bytes(&web, &members, WebFilePackingPolicy::Uncompressed)?;
                 let reparsed = unity_asset_binary::webfile::WebFile::from_bytes(saved)?;
                 assert_eq!(reparsed.files().len(), web.files().len());
             }

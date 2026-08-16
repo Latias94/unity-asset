@@ -1,283 +1,107 @@
-//! Mobile texture format decoders
-//!
-//! This module handles mobile-specific texture formats like ETC, ASTC, PVRTC, etc.
-//! Requires the texture-advanced feature for texture2ddecoder integration.
+//! Mobile block-compressed texture decoders.
 
-use super::{Decoder, create_rgba_image, validate_dimensions};
-use crate::error::{BinaryError, Result};
+use super::{TextureDecodeBuffers, TextureDecodeInput};
+#[cfg(feature = "texture-advanced")]
+use super::{decode_word_output, decoder_bgra_to_rgba};
+#[cfg(feature = "texture-advanced")]
 use crate::texture::formats::TextureFormat;
-use crate::texture::types::Texture2D;
-use image::RgbaImage;
+use unity_asset_binary::{BinaryError, Result};
 
-/// Decoder for mobile texture formats
-pub struct MobileDecoder;
+pub(super) struct MobileDecoder;
 
 impl MobileDecoder {
-    /// Create a new mobile decoder
-    pub fn new() -> Self {
+    pub(super) const fn new() -> Self {
         Self
     }
 
-    /// Decode ETC2 RGB format
-    #[cfg(feature = "texture-advanced")]
-    fn decode_etc2_rgb(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
-        validate_dimensions(width, height)?;
-
-        let mut output = vec![0u32; (width * height) as usize];
-
-        match texture2ddecoder::decode_etc2_rgb(data, width as usize, height as usize, &mut output)
+    pub(super) fn decode(
+        &self,
+        texture: TextureDecodeInput<'_>,
+        buffers: &mut TextureDecodeBuffers,
+    ) -> Result<()> {
+        #[cfg(feature = "texture-advanced")]
         {
-            Ok(_) => {
-                // Convert u32 RGBA to u8 RGBA
-                let rgba_data: Vec<u8> = output
-                    .iter()
-                    .flat_map(|&pixel| {
-                        [
-                            (pixel & 0xFF) as u8,         // R
-                            ((pixel >> 8) & 0xFF) as u8,  // G
-                            ((pixel >> 16) & 0xFF) as u8, // B
-                            255,                          // A (ETC2 RGB has no alpha)
-                        ]
-                    })
-                    .collect();
-
-                create_rgba_image(rgba_data, width, height)
+            let data = texture.data();
+            let width = texture.width();
+            let height = texture.height();
+            match texture.format() {
+                TextureFormat::ETC2_RGB => decode_word_output(
+                    buffers,
+                    "ETC2 RGB decoding",
+                    |output| {
+                        texture2ddecoder::decode_etc2_rgb(
+                            data,
+                            width as usize,
+                            height as usize,
+                            output,
+                        )
+                    },
+                    |pixel| {
+                        let [red, green, blue, _] = decoder_bgra_to_rgba(pixel);
+                        [red, green, blue, 255]
+                    },
+                ),
+                TextureFormat::ETC2_RGBA8 => decode_word_output(
+                    buffers,
+                    "ETC2 RGBA8 decoding",
+                    |output| {
+                        texture2ddecoder::decode_etc2_rgba8(
+                            data,
+                            width as usize,
+                            height as usize,
+                            output,
+                        )
+                    },
+                    decoder_bgra_to_rgba,
+                ),
+                TextureFormat::ASTC_RGBA_4x4 => {
+                    decode_astc(buffers, data, width, height, 4, 4, "ASTC 4x4 decoding")
+                }
+                TextureFormat::ASTC_RGBA_6x6 => {
+                    decode_astc(buffers, data, width, height, 6, 6, "ASTC 6x6 decoding")
+                }
+                TextureFormat::ASTC_RGBA_8x8 => {
+                    decode_astc(buffers, data, width, height, 8, 8, "ASTC 8x8 decoding")
+                }
+                format => Err(BinaryError::unsupported(format!(
+                    "Format {format:?} is not a supported mobile texture format"
+                ))),
             }
-            Err(e) => Err(BinaryError::generic(format!(
-                "ETC2 RGB decoding failed: {}",
-                e
-            ))),
         }
-    }
-
-    /// Decode ETC2 RGBA8 format
-    #[cfg(feature = "texture-advanced")]
-    fn decode_etc2_rgba8(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
-        validate_dimensions(width, height)?;
-
-        let mut output = vec![0u32; (width * height) as usize];
-
-        match texture2ddecoder::decode_etc2_rgba8(
-            data,
-            width as usize,
-            height as usize,
-            &mut output,
-        ) {
-            Ok(_) => {
-                // Convert u32 RGBA to u8 RGBA
-                let rgba_data: Vec<u8> = output
-                    .iter()
-                    .flat_map(|&pixel| {
-                        [
-                            (pixel & 0xFF) as u8,         // R
-                            ((pixel >> 8) & 0xFF) as u8,  // G
-                            ((pixel >> 16) & 0xFF) as u8, // B
-                            ((pixel >> 24) & 0xFF) as u8, // A
-                        ]
-                    })
-                    .collect();
-
-                create_rgba_image(rgba_data, width, height)
-            }
-            Err(e) => Err(BinaryError::generic(format!(
-                "ETC2 RGBA8 decoding failed: {}",
-                e
-            ))),
+        #[cfg(not(feature = "texture-advanced"))]
+        {
+            let _ = buffers;
+            Err(BinaryError::unsupported(format!(
+                "Mobile format {:?} requires texture-advanced feature",
+                texture.format()
+            )))
         }
-    }
-
-    /// Decode ASTC 4x4 format
-    #[cfg(feature = "texture-advanced")]
-    fn decode_astc_4x4(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
-        validate_dimensions(width, height)?;
-
-        let mut output = vec![0u32; (width * height) as usize];
-
-        match texture2ddecoder::decode_astc(
-            data,
-            width as usize,
-            height as usize,
-            4,
-            4,
-            &mut output,
-        ) {
-            Ok(_) => {
-                // Convert u32 RGBA to u8 RGBA
-                let rgba_data: Vec<u8> = output
-                    .iter()
-                    .flat_map(|&pixel| {
-                        [
-                            (pixel & 0xFF) as u8,         // R
-                            ((pixel >> 8) & 0xFF) as u8,  // G
-                            ((pixel >> 16) & 0xFF) as u8, // B
-                            ((pixel >> 24) & 0xFF) as u8, // A
-                        ]
-                    })
-                    .collect();
-
-                create_rgba_image(rgba_data, width, height)
-            }
-            Err(e) => Err(BinaryError::generic(format!(
-                "ASTC 4x4 decoding failed: {}",
-                e
-            ))),
-        }
-    }
-
-    /// Decode ASTC 6x6 format
-    #[cfg(feature = "texture-advanced")]
-    fn decode_astc_6x6(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
-        validate_dimensions(width, height)?;
-
-        let mut output = vec![0u32; (width * height) as usize];
-
-        match texture2ddecoder::decode_astc(
-            data,
-            width as usize,
-            height as usize,
-            6,
-            6,
-            &mut output,
-        ) {
-            Ok(_) => {
-                // Convert u32 RGBA to u8 RGBA
-                let rgba_data: Vec<u8> = output
-                    .iter()
-                    .flat_map(|&pixel| {
-                        [
-                            (pixel & 0xFF) as u8,         // R
-                            ((pixel >> 8) & 0xFF) as u8,  // G
-                            ((pixel >> 16) & 0xFF) as u8, // B
-                            ((pixel >> 24) & 0xFF) as u8, // A
-                        ]
-                    })
-                    .collect();
-
-                create_rgba_image(rgba_data, width, height)
-            }
-            Err(e) => Err(BinaryError::generic(format!(
-                "ASTC 6x6 decoding failed: {}",
-                e
-            ))),
-        }
-    }
-
-    /// Decode ASTC 8x8 format
-    #[cfg(feature = "texture-advanced")]
-    fn decode_astc_8x8(&self, data: &[u8], width: u32, height: u32) -> Result<RgbaImage> {
-        validate_dimensions(width, height)?;
-
-        let mut output = vec![0u32; (width * height) as usize];
-
-        match texture2ddecoder::decode_astc(
-            data,
-            width as usize,
-            height as usize,
-            8,
-            8,
-            &mut output,
-        ) {
-            Ok(_) => {
-                // Convert u32 RGBA to u8 RGBA
-                let rgba_data: Vec<u8> = output
-                    .iter()
-                    .flat_map(|&pixel| {
-                        [
-                            (pixel & 0xFF) as u8,         // R
-                            ((pixel >> 8) & 0xFF) as u8,  // G
-                            ((pixel >> 16) & 0xFF) as u8, // B
-                            ((pixel >> 24) & 0xFF) as u8, // A
-                        ]
-                    })
-                    .collect();
-
-                create_rgba_image(rgba_data, width, height)
-            }
-            Err(e) => Err(BinaryError::generic(format!(
-                "ASTC 8x8 decoding failed: {}",
-                e
-            ))),
-        }
-    }
-
-    /// Fallback for when texture-advanced feature is not enabled
-    #[cfg(not(feature = "texture-advanced"))]
-    fn decode_unsupported(&self, format: TextureFormat) -> Result<RgbaImage> {
-        Err(BinaryError::unsupported(format!(
-            "Mobile format {:?} requires texture-advanced feature",
-            format
-        )))
     }
 }
 
-impl Decoder for MobileDecoder {
-    fn decode(&self, texture: &Texture2D) -> Result<RgbaImage> {
-        let width = texture.width as u32;
-        let height = texture.height as u32;
-        let data = &texture.image_data;
-
-        match texture.format {
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC2_RGB => self.decode_etc2_rgb(data, width, height),
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ETC2_RGBA8 => self.decode_etc2_rgba8(data, width, height),
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ASTC_RGBA_4x4 => self.decode_astc_4x4(data, width, height),
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ASTC_RGBA_6x6 => self.decode_astc_6x6(data, width, height),
-            #[cfg(feature = "texture-advanced")]
-            TextureFormat::ASTC_RGBA_8x8 => self.decode_astc_8x8(data, width, height),
-
-            #[cfg(not(feature = "texture-advanced"))]
-            format if format.is_mobile_format() => self.decode_unsupported(format),
-
-            _ => Err(BinaryError::unsupported(format!(
-                "Format {:?} is not a mobile format",
-                texture.format
-            ))),
-        }
-    }
-
-    fn can_decode(&self, format: TextureFormat) -> bool {
-        #[cfg(feature = "texture-advanced")]
-        {
-            matches!(
-                format,
-                TextureFormat::ETC2_RGB
-                    | TextureFormat::ETC2_RGBA8
-                    | TextureFormat::ASTC_RGBA_4x4
-                    | TextureFormat::ASTC_RGBA_6x6
-                    | TextureFormat::ASTC_RGBA_8x8
+#[cfg(feature = "texture-advanced")]
+fn decode_astc(
+    buffers: &mut TextureDecodeBuffers,
+    data: &[u8],
+    width: u32,
+    height: u32,
+    block_width: usize,
+    block_height: usize,
+    operation: &'static str,
+) -> Result<()> {
+    decode_word_output(
+        buffers,
+        operation,
+        |output| {
+            texture2ddecoder::decode_astc(
+                data,
+                width as usize,
+                height as usize,
+                block_width,
+                block_height,
+                output,
             )
-        }
-
-        #[cfg(not(feature = "texture-advanced"))]
-        {
-            false
-        }
-    }
-
-    fn supported_formats(&self) -> Vec<TextureFormat> {
-        #[cfg(feature = "texture-advanced")]
-        {
-            vec![
-                TextureFormat::ETC2_RGB,
-                TextureFormat::ETC2_RGBA8,
-                TextureFormat::ASTC_RGBA_4x4,
-                TextureFormat::ASTC_RGBA_6x6,
-                TextureFormat::ASTC_RGBA_8x8,
-            ]
-        }
-
-        #[cfg(not(feature = "texture-advanced"))]
-        {
-            vec![]
-        }
-    }
-}
-
-impl Default for MobileDecoder {
-    fn default() -> Self {
-        Self::new()
-    }
+        },
+        decoder_bgra_to_rgba,
+    )
 }

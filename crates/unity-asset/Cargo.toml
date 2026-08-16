@@ -1,7 +1,8 @@
 [package]
 name = "unity-asset"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 description = "A comprehensive Rust library for parsing Unity asset files (YAML and binary formats)"
 license.workspace = true
@@ -23,24 +24,53 @@ exclude = [
 
 [dependencies]
 # Re-export sub-crates
-unity-asset-core = { path = "../unity-asset-core", version = "0.3.0" }
-unity-asset-yaml = { path = "../unity-asset-yaml", version = "0.3.0" }
-unity-asset-binary = { path = "../unity-asset-binary", version = "0.3.0" }
-unity-asset-write = { path = "../unity-asset-write", version = "0.3.0" }
-ignore = { workspace = true }
+unity-asset-core = { workspace = true }
+unity-asset-yaml = { workspace = true }
+unity-asset-binary = { workspace = true }
+unity-asset-write = { workspace = true }
+unity-asset-decode = { workspace = true }
 zip = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["unbounded_depth"] }
+yaml-rust2 = { workspace = true }
+rand = { workspace = true }
+indexmap = { workspace = true }
+unicode-normalization = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true, features = ["fs"] }
+libc = "0.2"
 
 [features]
 default = ["mmap"]
-async = ["unity-asset-core/async", "unity-asset-yaml/async", "unity-asset-binary/async"]
+async = ["unity-asset-core/async", "unity-asset-yaml/async"]
 mmap = ["unity-asset-binary/mmap"]
+decode = [
+    "unity-asset-decode/audio",
+    "unity-asset-decode/sprite",
+    "unity-asset-decode/texture-advanced",
+]
 
 [dev-dependencies]
-tokio = { workspace = true }
+flate2 = { workspace = true }
+image = { workspace = true }
 tempfile = { workspace = true }
-unity-asset-decode = { path = "../unity-asset-decode", version = "0.3.0", features = ["audio"] }
-serde = { workspace = true }
-serde_json = { workspace = true }
+symphonia = { version = "0.5", default-features = false, features = ["ogg", "vorbis"] }
+unity-asset-decode = { workspace = true, features = ["audio"] }
 
 [package.metadata.docs.rs]
 no-default-features = true
