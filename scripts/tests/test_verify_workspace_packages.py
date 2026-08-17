@@ -232,68 +232,67 @@ class PackageVerifierRejectionTests(unittest.TestCase):
             ],
         )
 
-    def test_documented_feature_consumer_uses_only_the_promised_features(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package = contract.WorkspacePackage(
-                name="unity-asset-decode",
-                version="0.4.0",
-                manifest_path=root / "source" / "Cargo.toml",
-                dependencies=(),
-                publish=None,
-                is_library=True,
-                feature_names=("audio", "texture", "texture-advanced"),
-                library_target_name="unity_asset_decode",
-            )
-            profile = next(
-                profile
-                for profile in contract.DOCUMENTED_FEATURE_PROFILES
-                if profile.name == "readme-decode-media"
-            )
+    def test_documented_feature_consumers_use_exact_promised_features(self) -> None:
+        cases = (
+            {
+                "profile": "readme-decode-media",
+                "package": "unity-asset-decode",
+                "library_target": "unity_asset_decode",
+                "available_features": ("audio", "texture", "texture-advanced"),
+                "expected_features": ["audio", "texture-advanced"],
+                "expected_default_features": True,
+            },
+            {
+                "profile": "workspace-decode",
+                "package": "unity-asset",
+                "library_target": "unity_asset",
+                "available_features": ("async", "decode", "mmap"),
+                "expected_features": ["decode"],
+                "expected_default_features": True,
+            },
+        )
+        self.assertEqual(
+            {case["profile"] for case in cases},
+            {profile.name for profile in contract.DOCUMENTED_FEATURE_PROFILES},
+        )
 
-            _, manifest_path = verifier.create_consumer(
-                root / "consumer",
-                package,
-                profile.name,
-                profile.features,
-                default_features=profile.default_features,
-            )
+        for case in cases:
+            with (
+                self.subTest(profile=case["profile"]),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                package = contract.WorkspacePackage(
+                    name=case["package"],
+                    version="0.4.0",
+                    manifest_path=root / "source" / "Cargo.toml",
+                    dependencies=(),
+                    publish=None,
+                    is_library=True,
+                    feature_names=case["available_features"],
+                    library_target_name=case["library_target"],
+                )
+                profile = next(
+                    profile
+                    for profile in contract.DOCUMENTED_FEATURE_PROFILES
+                    if profile.name == case["profile"]
+                )
 
-            manifest = manifest_path.read_text(encoding="utf-8")
-            self.assertIn('default-features = true', manifest)
-            self.assertIn('features = ["audio", "texture-advanced"]', manifest)
-            self.assertNotIn('"texture"', manifest)
+                _, manifest_path = verifier.create_consumer(
+                    root / "consumer",
+                    package,
+                    profile.name,
+                    profile.features,
+                    default_features=profile.default_features,
+                )
 
-    def test_workspace_decode_consumer_enables_only_the_documented_feature(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package = contract.WorkspacePackage(
-                name="unity-asset",
-                version="0.4.0",
-                manifest_path=root / "source" / "Cargo.toml",
-                dependencies=(),
-                publish=None,
-                is_library=True,
-                feature_names=("async", "decode", "mmap"),
-                library_target_name="unity_asset",
-            )
-            profile = next(
-                profile
-                for profile in contract.DOCUMENTED_FEATURE_PROFILES
-                if profile.name == "workspace-decode"
-            )
-            _, manifest_path = verifier.create_consumer(
-                root / "consumer",
-                package,
-                profile.name,
-                profile.features,
-                default_features=profile.default_features,
-            )
-
-            manifest = manifest_path.read_text(encoding="utf-8")
-            self.assertIn('features = ["decode"]', manifest)
-            self.assertNotIn('"async"', manifest)
-            self.assertNotIn('"mmap"', manifest)
+                manifest = contract.load_toml(manifest_path)
+                dependency = manifest["dependencies"][case["package"]]
+                self.assertEqual(dependency["features"], case["expected_features"])
+                self.assertEqual(
+                    dependency["default-features"],
+                    case["expected_default_features"],
+                )
 
     def test_consumer_suite_batches_public_api_profiles(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

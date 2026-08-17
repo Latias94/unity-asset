@@ -36,21 +36,11 @@ jobs:
       run: python -m unittest discover -s scripts/tests -p "test_*.py"
 
   workspace-package:
-    name: Isolated workspace package / ${{ matrix.os }} / ${{ matrix.mode }}
-    runs-on: ${{ matrix.os }}
+    name: Canonical workspace package contract
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
       contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            mode: full
-          - os: macos-latest
-            mode: packages
-          - os: windows-latest
-            mode: packages
 
     steps:
     - uses: actions/checkout@v4
@@ -66,7 +56,7 @@ jobs:
         python-version: "3.12"
 
     - name: Verify packaged dependency isolation
-      run: python scripts/verify_workspace_packages.py --mode ${{ matrix.mode }}
+      run: python scripts/verify_workspace_packages.py --mode full
 
   msrv:
     name: MSRV / Rust 1.88.0
@@ -136,8 +126,9 @@ jobs:
         done
 
   workspace-publication-platforms:
-    name: Filesystem publication and security / ${{ matrix.os }}
+    name: Platform compilation and contracts / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -161,6 +152,13 @@ jobs:
       uses: Swatinem/rust-cache@v2
       with:
         shared-key: workspace-publication-${{ matrix.os }}
+
+    - name: Compile production targets and documented feature profiles
+      if: runner.os != 'Linux'
+      run: |
+        cargo check --workspace --lib --bins --examples --all-features --locked
+        cargo check -p unity-asset-decode --features audio,texture-advanced --locked
+        cargo check -p unity-asset --features decode --locked
 
     - name: Run platform publication, recovery, and extraction unit tests
       if: runner.os != 'Linux'

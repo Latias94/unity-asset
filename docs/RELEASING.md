@@ -51,11 +51,14 @@ step.
 
    Package mode packages every publishable crate, unpacks the archives, and
    builds isolated consumers for default and explicitly documented feature
-   profiles. CI runs that platform-sensitive proof on macOS and Windows; Ubuntu
-   additionally installs each published binary from the same archive closure.
-   `--mode full` is reserved for a clean commit because its binary source identity
-   must describe the exact packaged bytes. Use `--mode preflight` for the fast
-   metadata and dependency-policy check.
+   profiles. Ordinary CI treats the Ubuntu `--mode full` run as the canonical
+   archive and consumer proof. macOS and Windows compile the production targets
+   and documented feature profiles, then run their platform contracts without
+   repeating platform-independent packaging work. The release workflow repeats
+   the full proof from the immutable tag before credentials are exposed.
+   `--mode full` requires a clean commit because its binary source identity must
+   describe the exact packaged bytes. Use `--mode preflight` for the fast metadata
+   and dependency-policy check.
 5. Commit the release source. Do not modify the commit after tagging it.
 6. Create and push the signed tag. The tag push is deliberately inert and
    cannot publish crates or a GitHub Release:
