@@ -1,18 +1,11 @@
 from __future__ import annotations
 
 import re
-import sys
 import unittest
 from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-SCRIPTS_ROOT = REPOSITORY_ROOT / "scripts"
-sys.path.insert(0, str(SCRIPTS_ROOT))
-
-import workspace_package_contract as package_contract
-
-
 RELEASE_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "release.yml"
 CI_WORKFLOW = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 ACTION_PIN = re.compile(r"^\s*uses:\s*[^\s@]+@[0-9a-f]{40}(?:\s+#.*)?$")
@@ -99,7 +92,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.ci,
         )
 
-    def test_ci_separates_canonical_packages_from_platform_contracts(self) -> None:
+    def test_ci_separates_canonical_package_authority_from_platform_checks(self) -> None:
         package_job = job_block(self.ci, "workspace-package")
         self.assertIn("runs-on: ubuntu-latest", package_job)
         self.assertNotIn("matrix:", package_job)
@@ -109,7 +102,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         )
         self.assertEqual(
             self.ci.count("python scripts/verify_workspace_packages.py"),
-            1,
+            2,
         )
         self.assertIn("UNITY_ASSET_SOURCE_COMMIT: ${{ github.sha }}", self.ci)
 
@@ -119,19 +112,11 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             "os: [ubuntu-latest, macos-latest, windows-latest]",
             platform_matrix,
         )
-        compilation = step_containing(platform_job, "cargo check --workspace")
-        self.assertIn("if: runner.os != 'Linux'", compilation)
-        self.assertIn(
-            "cargo check --workspace --lib --bins --examples --all-features --locked",
-            compilation,
+        platform_packages = step_containing(
+            platform_job,
+            "python scripts/verify_workspace_packages.py --mode packages",
         )
-        for profile in package_contract.DOCUMENTED_FEATURE_PROFILES:
-            with self.subTest(profile=profile.name):
-                features = ",".join(profile.features)
-                self.assertIn(
-                    f"cargo check -p {profile.package} --features {features} --locked",
-                    compilation,
-                )
+        self.assertIn("if: runner.os != 'Linux'", platform_packages)
 
         command = "python scripts/run_real_daemon_agent.py"
         self.assertIn(command, platform_job)

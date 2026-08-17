@@ -153,12 +153,9 @@ jobs:
       with:
         shared-key: workspace-publication-${{ matrix.os }}
 
-    - name: Compile production targets and documented feature profiles
+    - name: Verify platform package and consumer compatibility
       if: runner.os != 'Linux'
-      run: |
-        cargo check --workspace --lib --bins --examples --all-features --locked
-        cargo check -p unity-asset-decode --features audio,texture-advanced --locked
-        cargo check -p unity-asset --features decode --locked
+      run: python scripts/verify_workspace_packages.py --mode packages
 
     - name: Run platform publication, recovery, and extraction unit tests
       if: runner.os != 'Linux'
