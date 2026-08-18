@@ -4,13 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-08-18
+## [0.3.0] - 2026-08-18
 
 ### Highlights
 
 - Rebuilt high-level asset work around `AssetWorkspace`: callers now inspect immutable revisions, author guarded mutation plans, preview prepared output, and recover interrupted publication without reconstructing internal proof or ordering rules.
 - Unified YAML and binary references, schema-aware mutations, streamed-resource extraction, and local search around revision-bound identities and caller-owned budgets, so automation receives typed evidence instead of best-effort summaries.
-- Added a project-bound local search service over capability-authenticated loopback HTTP, with one canonical JSON contract shared by Rust, the CLI, C#, and future MCP adapters; 0.4.0 publishes that business protocol for the first time as revision 1.
+- Added a project-bound local search service over capability-authenticated loopback HTTP, with one canonical JSON contract shared by Rust, the CLI, C#, and future MCP adapters; 0.3.0 publishes that business protocol for the first time as revision 1.
 - Deepened UnityFS, WebFile, UnityWeb, UnityRaw, SerializedFile, TypeTree, PPtr, AudioClip, Texture2D, and Sprite handling while preserving source bytes, format semantics, and bounded resource use.
 - Hardened package and binary releases with isolated archive consumers, signed-source evidence, deterministic SDK artifacts, checksums, remote byte verification, and provenance attestations.
 
@@ -26,13 +26,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Added one revision-bound `ReferenceGraph` with typed field paths, coverage, resolution states, incoming/outgoing/closure queries, caching, and deterministic JSON, JSON Lines, and DOT projections.
 - Added typed extraction request v4, plan v8, manifest v6, and report v6 contracts with bundle-container and reference-traversal queries, deterministic artifact paths, caller-budgeted execution, recoverable publication, verified resume, and explicit representation-semantics identities.
 - Added a YAML-only extraction request profile and identity-first `file-id-*`/`ordinal-*` artifact paths for agent-safe document export.
-- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, capability-authenticated loopback HTTP discovery, and bounded idempotent reindex operations resilient to retries, worker failure, cancellation, and conflicting payloads.
+- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, capability-authenticated loopback HTTP discovery, bounded endpoint withdrawal during shutdown, and idempotent reindex operations resilient to retries, worker failure, cancellation, and conflicting payloads.
 - Added deterministic tag-release evidence, exact cargo-dist artifact-plan validation, isolated archive-consumer verification, real MSRV validation, pinned release inputs, checksums, GitHub Draft Release byte read-back, and build provenance attestations.
 - Added schema-aware mutation recipes that inspect exact YAML or binary provenance and lower guarded field, reference, schema, sequence, hierarchy, UnityEvent, material, transform, and streamed-audio changes into plan fragments.
 - Added a budgeted, immutable AssetRipper TypeTreeDump registry with release/editor mode selection for stripped assets. ([#2](https://github.com/Latias94/unity-asset/pull/2); thanks [@JomerDev](https://github.com/JomerDev))
 
 ### Changed
 
+- **Breaking:** Declared Rust 1.88.0 as the minimum supported Rust version.
 - **Breaking:** Replaced the mutable `Environment` aggregate loader, direct edit/save lifecycle, pending write state, and implicit filesystem probing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
 - **Breaking:** Replaced broad text-oriented CLI inspection and export surfaces with typed `workspace`, `references`, `export`, and `split-yaml` commands that exchange versioned JSON contracts; `split-yaml` now emits the canonical extraction report and manifest instead of a parallel YAML-split report.
 - **Breaking:** Replaced string YAML anchors in object identities with canonical non-zero numeric `YamlFileId` values, rejected ambiguous spellings such as `01`, and changed compact object addresses from `oa1:` to `oa2:`.
@@ -52,6 +53,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Hardened parsing, decompression, registry loading, recursive serialization, semantic cloning, and artifact construction so caller-owned budgets are charged before allocation or expansion.
 - Preserved wire-faithful SerializedFile version gates, signed path IDs, byte order, alignment, type tables, external tables, object proof ranges, and unchanged object bytes across rebuilds.
 - Preserved AssetBundle signature, directory-node semantics, duplicate occurrences, compression policy, and exact encoded block ranges; unsupported encrypted layouts now fail structurally.
+
+### Security
+
+- The new loopback HTTP search service ships with `h2` 0.4.16, excluding RUSTSEC-2026-0258 from the release dependency graph.
 
 ### Removed
 

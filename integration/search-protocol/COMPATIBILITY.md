@@ -21,7 +21,7 @@ Business revision 1 is the first published contract and is current:
 - fixed-width identifiers retain their v1 prefix and encoded width;
 - query-policy, project, daemon instance, request, and operation bindings are exact.
 
-Any incompatible JSON shape, semantic invariant, operation, identifier encoding, or body-limit change after the 0.4.0 release requires a new business revision. The private endpoint descriptor states the one installed business revision; clients reject a different revision instead of negotiating or falling back.
+Any incompatible JSON shape, semantic invariant, operation, identifier encoding, or body-limit change after the 0.3.0 release requires a new business revision. The private endpoint descriptor states the one installed business revision; clients reject a different revision instead of negotiating or falling back.
 
 The public SDK contains `schema/business-v1.schema.json`. This Draft 2020-12 document describes structural JSON shape only. Canonical encoding, byte budgets, request/response identity binding, and lifecycle state-machine rules remain the Rust/C# conformance authority.
 

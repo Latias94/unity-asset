@@ -19,7 +19,7 @@ execution: code
 > do not depend on the superseded transport.
 
 > **Protocol publication reset (2026-08-18):** No business protocol revision crossed a public
-> release boundary before 0.4.0. The final Rust/C# contract is therefore published as revision 1,
+> release boundary before 0.3.0. The final Rust/C# contract is therefore published as revision 1,
 > and development-only revision archives are deleted. Future incompatible changes must preserve
 > every revision that has appeared in a published release.
 
@@ -890,7 +890,7 @@ flowchart LR
 ## Risks And Dependencies
 
 - **Loopback capability exposure:** The descriptor is secret material, and plain HTTP cannot authenticate a server before the first credential-bearing request. Keep it under the private runtime authority, bind only an operating-system-selected `127.0.0.1` port, publish after readiness, withdraw before drain, disable proxies and redirects, and revalidate descriptor generation around requests. If cross-user server authenticity becomes required, pin ephemeral TLS rather than inventing another challenge protocol.
-- **External Unity plugin break:** The plugin repository cannot be changed here. Publish the `netstandard2.0` reference source, revision-1 fixtures, schema, and migration documentation before release. After 0.4.0, incompatible changes require a new business revision; only the plugin repository claims concrete Editor versions.
+- **External Unity plugin break:** The plugin repository cannot be changed here. Publish the `netstandard2.0` reference source, revision-1 fixtures, schema, and migration documentation before release. After 0.3.0, incompatible changes require a new business revision; only the plugin repository claims concrete Editor versions.
 - **Endpoint identity and startup races:** A stale descriptor, partial binding, or competing daemon could target the wrong process. Make the project lease a required endpoint-claim capability, publish the descriptor last through crash-atomic primitives, revalidate descriptor generation across discovery and requests, bind project/instance on every envelope, and remove endpoints only when ownership still matches.
 - **Private index-root drift:** Overrides or inherited ACLs could expose or corrupt aggregated project metadata. Revalidate owner, mode/DACL protection, root file identity, and no-follow handles at create, reopen, and publication boundaries.
 - **Transport resource amplification:** Per-body limits do not bound many slow clients. Enforce request deadlines, bounded bodies and responses, HTTP connection limits, class-specific dispatch semaphores, and bounded operation retention with exact-limit stress tests.

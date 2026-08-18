@@ -116,16 +116,16 @@ directly only when using their low-level APIs.
 
 ```toml
 [dependencies]
-unity-asset = "0.4.0"
+unity-asset = "0.3.0"
 ```
 
 Add optional low-level crates only when needed:
 
 ```toml
 [dependencies]
-unity-asset-binary = "0.4.0"
-unity-asset-write = "0.4.0"
-unity-asset-decode = { version = "0.4.0", features = ["audio", "texture-advanced"] }
+unity-asset-binary = "0.3.0"
+unity-asset-write = "0.3.0"
+unity-asset-decode = { version = "0.3.0", features = ["audio", "texture-advanced"] }
 ```
 
 Install the command-line tools:

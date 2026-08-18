@@ -3039,7 +3039,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "image",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-binary"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "brotli",
  "byteorder",
@@ -3084,7 +3084,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-cli"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3097,7 +3097,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-core"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "blake3",
@@ -3112,7 +3112,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-decode"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "crc32fast",
@@ -3129,7 +3129,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-cli"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "rand",
@@ -3146,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-core"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "fuzzy-matcher",
  "serde",
@@ -3156,7 +3156,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-daemon"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-index"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3204,7 +3204,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-local"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "fs2",
  "hex",
@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-search-protocol"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "serde",
@@ -3236,7 +3236,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-write"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "brotli",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "unity-asset-yaml"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
