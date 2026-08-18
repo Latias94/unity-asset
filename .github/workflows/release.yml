@@ -577,7 +577,7 @@ jobs:
           for application in ${{ matrix.applications }}; do
             archive="target/distrib/$application-$target$extension"
             test -f "$archive"
-            extract_directory="$(mktemp -d)"
+            extract_directory="$(python -c 'import os, tempfile; print(tempfile.mkdtemp(prefix="unity-asset-release-binary-", dir=os.environ["RUNNER_TEMP"]))')"
             executable="$(python scripts/release_binary_identity.py \
               --archive "$archive" \
               --application "$application" \

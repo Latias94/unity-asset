@@ -337,6 +337,37 @@ class ReleaseBundleTests(unittest.TestCase):
         self.assertEqual(executable.read_bytes(), payload)
         self.assertEqual(list(output.iterdir()), [executable])
 
+    def test_rejects_an_output_directory_below_a_symlinked_ancestor(self) -> None:
+        root = Path(tempfile.mkdtemp(prefix="unity-asset-binary-output-link-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        application = "unity-asset-search-cli"
+        target = "x86_64-pc-windows-msvc"
+        archive = root / f"{application}-{target}.zip"
+        write_executable_archive(archive, application, target)
+        physical_parent = root / "physical"
+        physical_parent.mkdir()
+        output = physical_parent / "native"
+        output.mkdir()
+        alias = root / "alias"
+        try:
+            alias.symlink_to(physical_parent, target_is_directory=True)
+        except OSError as error:
+            self.skipTest(f"directory symlinks are unavailable: {error}")
+
+        with self.assertRaisesRegex(
+            ReleaseBinaryIdentityError, "symlink or junction"
+        ):
+            extract_verified_release_binary(
+                archive,
+                application=application,
+                target=target,
+                version=VERSION,
+                source_commit=SOURCE_COMMIT,
+                output_directory=alias / "native",
+            )
+
+        self.assertEqual(list(output.iterdir()), [])
+
     def test_validates_every_tar_member_before_creating_the_executable(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="unity-asset-binary-late-member-"))
         self.addCleanup(shutil.rmtree, root, ignore_errors=True)

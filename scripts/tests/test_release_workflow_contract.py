@@ -285,6 +285,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("dist build --artifacts=local", dist)
         native_probe = step_containing(dist, "python scripts/release_binary_identity.py")
         self.assertIn('--archive "$archive"', native_probe)
+        self.assertIn('dir=os.environ["RUNNER_TEMP"]', native_probe)
+        self.assertNotIn('extract_directory="$(mktemp -d)"', native_probe)
         self.assertIn('--output-directory "$extract_directory"', native_probe)
         self.assertIn('actual="$("$executable" --version', native_probe)
         self.assertLess(dist.index(native_probe), dist.index("Upload dist artifacts"))
