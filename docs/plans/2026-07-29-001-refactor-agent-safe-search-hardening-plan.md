@@ -18,14 +18,19 @@ execution: code
 > generation, workspace, media, release, and verification requirements continue to apply where they
 > do not depend on the superseded transport.
 
+> **Protocol publication reset (2026-08-18):** No business protocol revision crossed a public
+> release boundary before 0.4.0. The final Rust/C# contract is therefore published as revision 1,
+> and development-only revision archives are deleted. Future incompatible changes must preserve
+> every revision that has appeared in a published release.
+
 ## Goal Capsule
 
 | Field | Contract |
 |---|---|
-| Objective | Turn the current Unity asset workspace and local search stack into a publishable, execution-principal-scoped, semantics-versioned product surface that Rust callers, CLIs, Unity integrations, and AI agents can use through the same strict contracts. |
-| Authority | This plan supersedes ADR 0001's loopback HTTP and bearer-token transport decisions. ADR 0004's workspace, publication, and derived-view boundaries remain authoritative. The completed TypeTree, Prepared Artifact, single-writer immutable Search Generation publication, and publication-protocol invariants from the 2026-07-15 plan are not reopened; this plan intentionally extends Search Generation semantic identity, manifest/storage contracts, and lifecycle evidence. |
+| Objective | Turn the current Unity asset workspace and local search stack into a publishable, capability-authenticated, semantics-versioned product surface that Rust callers, CLIs, Unity integrations, and AI agents can use through the same strict contracts. |
+| Authority | ADR 0005 supersedes the transport decisions in this plan and ADR 0001. ADR 0004's workspace, publication, and derived-view boundaries remain authoritative. The completed TypeTree, Prepared Artifact, single-writer immutable Search Generation publication, and publication-protocol invariants from the 2026-07-15 plan are not reopened; this plan intentionally extends Search Generation semantic identity, manifest/storage contracts, and lifecycle evidence. |
 | Execution profile | Breaking replacement with same-unit deletion when each replacement lands, one owner for each invariant, sequential focused Cargo gates, platform-specific CI for Unix behavior, and reviewable conventional commits by implementation unit. |
-| Stop conditions | Stop only for an operating-system guarantee that invalidates the execution-principal-scoped IPC design, an independently verified wire-format contradiction, or a required change in product scope. Compatibility with the deleted HTTP, token, gitignore, or shallow facade surfaces is not a stop condition. |
+| Stop conditions | Stop only for an independently verified wire-format contradiction, an invalid same-user loopback capability assumption, or a required change in product scope. Compatibility with deleted development-only protocol revisions, legacy IPC, gitignore, or shallow facade surfaces is not a stop condition. |
 | Tail ownership | ce-work owns implementation, focused verification, simplification, Codex-only review, commits, and final workspace gates under the active goal. |
 
 ---
@@ -843,24 +848,24 @@ flowchart LR
 - Split oversized daemon, search state, workspace interface, and recovery files only along the ownership established in U1-U10.
 - Consolidate search daemon test helpers under one cross-platform harness; retain zsh only for Unix CI stress scenarios.
 - Remove obsolete imports, features, dependencies, examples, tests, and docs discovered by `rg` and package inspection.
-- Advance the changed business wire contract to a new revision, retain revision-1 fixture bytes as immutable evidence, and reject unsupported cross-revision exchanges during Bootstrap rather than mutating a frozen revision in place.
+- Publish the final business wire contract as revision 1, retain only fixture bytes that cross a public release boundary, and reject unsupported revisions rather than preserving development-only compatibility archives.
 - Update README, examples, ADRs, API docs, and architecture diagrams.
 - Add final black-box, package, platform, and fixture conformance suites.
 
 **Approach:**
 
 - Move protocol dispatch out of daemon main, source-state operations out of search state, admission/loading out of workspace interface, and recovery subdomains out of the oversized recovery file.
-- Replace the public raw `VerifiedLocalStreamV1` seam with `VerifiedFramedTransportV1`. Keep platform streams private, make inbound frame reads inseparable from principal verification, and retain Bootstrap/project/instance/revision binding in the client and server session owners above it.
+- Replace the legacy IPC/session stack with one stateless, capability-authenticated HTTP endpoint bound to `127.0.0.1`. HTTP owns framing; canonical business envelopes retain project, instance, revision, request, and query-policy binding on every exchange.
 - Preserve publication-protocol and journal persistence ownership; do not redesign completed durable state transitions during a mechanical split.
 - Keep `source_catalog.rs` cohesive unless a real second responsibility remains after the transaction migration.
-- Delete all HTTP/token names, endpoint constants, patched-glob comments, old ignore flags, forwarding YAML module, old hierarchy constructors, and fake capability declarations.
+- Delete the superseded IPC, Bootstrap, framed-session, native transport-adapter, anonymous HTTP, long-lived token, patched-glob, old ignore, forwarding YAML, old hierarchy, and fake capability surfaces.
 - Run a public API and dependency audit from packaged artifacts, not only source grep.
 
 **Test scenarios:**
 
-- One black-box flow starts a real daemon child process, checks readiness, reindexes, searches, paginates both reference directions, handles stale cursor and replacement races, and shuts down through structured IPC. Stub servers remain protocol-unit fixtures and do not satisfy this gate.
+- One black-box flow starts a real daemon child process, checks readiness, reindexes, searches, paginates both reference directions, handles stale cursor and replacement races, and shuts down through the capability-authenticated HTTP endpoint. Stub servers remain protocol-unit fixtures and do not satisfy this gate.
 - One agent flow uses only capabilities and JSON requests.
-- One transport-neutral C# session completes Bootstrap and all business operations against the real Rust daemon through a test-only Rust relay that owns endpoint discovery, native peer verification, and `VerifiedFramedTransportV1`. This proves the C# session against real dispatch without moving production native transport ownership out of the external Unity plugin. Frozen revision-1 fixtures remain byte-identical and cross-revision requests fail before business dispatch.
+- One C# client completes all business operations against the real Rust daemon through the published loopback HTTP contract. Current revision-1 fixtures remain canonical, and unsupported revisions fail before business dispatch.
 - One workspace flow admits sources, inspects, prepares media and hierarchy changes, commits, reopens, and observes the new revision/search generation.
 - Ubuntu owns the canonical archive and binary identity proof; macOS and Windows compile locally produced package archives and external consumers only to cover native target configuration, then run platform contracts.
 - Removed symbol and dependency assertions prevent accidental reintroduction.
@@ -872,24 +877,23 @@ flowchart LR
 ## System-Wide Impact
 
 - **Public Rust API:** Search wire DTOs move crates; hierarchy projection constructors disappear; media plans use typed descriptors; workspace state construction narrows.
-- **CLI:** HTTP URL and token flags disappear. An explicit validated project locator selects private index and IPC roots. Reference and JSON request capabilities expand.
+- **CLI:** Configurable HTTP URL and token flags disappear. A validated project locator selects private runtime/index roots, and the client discovers a lease-bound endpoint descriptor containing a fresh per-daemon capability.
 - **Cross-language contract:** Wire counts, durations, IDs, and paths use explicit portable representations; the repository publishes C# reference fixtures for the external Unity consumer.
 - **Persistence:** Search storage contract and generation manifests change. Old valid generations become explicitly stale and rebuildable; corruption remains fail closed.
 - **Filesystem:** The index root moves to a deterministic platform-private cache root: effective-UID-private on Unix and persistent-user-SID-private on Windows under normal privilege/integrity dominance. Windows logon-context DACLs remain defense in depth, not a same-user provenance boundary. `.gitignore` and `.ignore` no longer affect indexing; `.unity-asset-search-ignore` follows SearchIgnoreV1.
-- **Security:** IPC authorization moves from possession of a bearer token on localhost to mutually verified Unix effective UID or exact Windows `SecurityContextIdV1`, with a non-secret endpoint descriptor and private index root. There is no network listener. Windows filesystem ACLs are not represented as providing symmetric isolation between elevation or integrity contexts.
-- **Operations:** Readiness and watcher/build failures become structured state. Existing scripts and Unity integrations must migrate to IPC fixtures.
+- **Security:** Every request to the IPv4-loopback-only endpoint requires a fresh per-daemon capability published in a user-private descriptor. The supported boundary is the local operating-system user; mutually hostile same-user processes and administrators are explicitly outside it.
+- **Operations:** Readiness and watcher/build failures become structured state. Existing scripts and Unity integrations must migrate to the versioned HTTP/JSON fixtures.
 - **Release:** All published packages are verified outside the workspace, and one tag/commit owns crates and binaries.
 - **Agent parity:** Agents receive the same domain actions, generation context, cursors, capabilities, budgets, and structured failures as human CLI users.
 - **Failure propagation:** Asset commit success remains independent from search refresh success. Search rebuild and media preparation failures never roll back an authoritative workspace commit.
 
 ## Risks And Dependencies
 
-- **Windows named-pipe identity correctness:** Direct final-DACL creation, crash-atomic single-use slot rotation, security-context comparison, server PID/start binding, process-token inspection, and publication replacement detection are high risk. Mitigate with client-rights inspection, create-instance and `WRITE_DAC` denial, cross-integrity, restricted-token, AppContainer, replacement-server, remote-client, rotation/cancellation failure injection, capacity bounds, and Codex security review before completing U2.
-- **Unix credential portability:** Linux and macOS expose peer identity and private runtime roots differently. Hide them behind explicit target modules, verify both client and server, and require platform CI; other Unix targets return unsupported instead of inheriting an unproved `cfg(unix)` path.
-- **External Unity plugin break:** The plugin repository cannot be changed here. Publish the `netstandard2.0` reference source, versioned fixtures, and migration documentation before release, and bump the business protocol revision so old clients fail during the frozen bootstrap. Only the plugin repository claims concrete Editor versions.
-- **Endpoint identity and startup races:** A stale descriptor, partial binding, or competing daemon could target the wrong process. Make the project lease a required `EndpointClaim` capability, publish descriptor last through crash-atomic primitives, authenticate the server process before bootstrap, re-read generation evidence across rendezvous discovery, bind project/instance on every envelope, and remove endpoints only when ownership still matches.
+- **Loopback capability exposure:** The descriptor is secret material, and plain HTTP cannot authenticate a server before the first credential-bearing request. Keep it under the private runtime authority, bind only an operating-system-selected `127.0.0.1` port, publish after readiness, withdraw before drain, disable proxies and redirects, and revalidate descriptor generation around requests. If cross-user server authenticity becomes required, pin ephemeral TLS rather than inventing another challenge protocol.
+- **External Unity plugin break:** The plugin repository cannot be changed here. Publish the `netstandard2.0` reference source, revision-1 fixtures, schema, and migration documentation before release. After 0.4.0, incompatible changes require a new business revision; only the plugin repository claims concrete Editor versions.
+- **Endpoint identity and startup races:** A stale descriptor, partial binding, or competing daemon could target the wrong process. Make the project lease a required endpoint-claim capability, publish the descriptor last through crash-atomic primitives, revalidate descriptor generation across discovery and requests, bind project/instance on every envelope, and remove endpoints only when ownership still matches.
 - **Private index-root drift:** Overrides or inherited ACLs could expose or corrupt aggregated project metadata. Revalidate owner, mode/DACL protection, root file identity, and no-follow handles at create, reopen, and publication boundaries.
-- **Transport resource amplification:** Small per-frame limits do not bound many slow clients. Enforce ordinary plus control-reserved session capacity, short reserved-lane deadlines, global dispatch semaphores, bounded response builders, and operation retention with exact-limit stress tests.
+- **Transport resource amplification:** Per-body limits do not bound many slow clients. Enforce request deadlines, bounded bodies and responses, HTTP connection limits, class-specific dispatch semaphores, and bounded operation retention with exact-limit stress tests.
 - **Ignore behavior break:** Projects using root gitignore rules will index different files. Make the new policy file and migration examples explicit; do not silently emulate partial Git semantics.
 - **Index rebuild cost:** Semantic mismatch intentionally forces a full rebuild. Preserve stale query availability, expose progress, and benchmark representative Unity projects.
 - **Scanner path races:** Discovery and open are separate. Treat discovery as a hint, authorize reads only through anchored handles, and revalidate snapshots before generation publication.
@@ -908,9 +912,9 @@ flowchart LR
 
 ### Cross-Cutting Gates
 
-- Protocol golden, invalid-state, frame-bound, and CLI subprocess contracts.
-- Rust/C# golden compatibility, frozen bootstrap, endpoint descriptor, project/instance/process binding, operation idempotency, slow-client, and global backpressure contracts.
-- Windows named-pipe, security-context, server-identity, private-root, and filesystem security tests locally; Linux/macOS bidirectional peer credential, private-root, and no-follow tests in CI.
+- Protocol golden, invalid-state, bounded-body, HTTP, and CLI subprocess contracts.
+- Rust/C# golden compatibility, endpoint descriptor, project/instance/query-policy binding, operation idempotency, slow-client, and global backpressure contracts.
+- Windows, Linux, and macOS private-root, descriptor publication/revalidation, no-follow filesystem, and real-daemon HTTP tests on their native CI runners.
 - Search semantic migration, stale availability, full rebuild, watcher recovery, and abandoned-staging tests.
 - Workspace transaction failure injection, media truncation, descriptor mismatch, hierarchy invariant, and prepared-view tests.
 - Isolated package graph, MSRV, stable workspace, strict Clippy, all-target build, and rustdoc gates.

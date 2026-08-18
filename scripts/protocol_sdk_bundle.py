@@ -51,7 +51,7 @@ REQUIRED_SDK_PATHS = frozenset(
             / "UnityAsset.SearchProtocol.Reference.csproj"
         ).as_posix(),
         (FIXTURE_ARCHIVE_DIRECTORY / "manifest.json").as_posix(),
-        (SCHEMA_ARCHIVE_DIRECTORY / "business-v5.schema.json").as_posix(),
+        (SCHEMA_ARCHIVE_DIRECTORY / "business-v1.schema.json").as_posix(),
     }
 )
 

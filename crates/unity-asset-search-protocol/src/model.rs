@@ -20,7 +20,7 @@ use crate::operation::{BackgroundReindexOperation, validate_background_reindex_o
 use crate::validation::{ContractValidationError, ValidateContract, ensure_revision};
 use crate::{MAX_REFERENCE_RESULTS, QueryPolicyId};
 
-pub const SEARCH_PROTOCOL_REVISION: u16 = 5;
+pub const SEARCH_PROTOCOL_REVISION: u16 = 1;
 pub const MAX_API_ERROR_JSON_BYTES: u64 = 224 * 1024;
 pub const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_PORTABLE_PATH_BYTES: usize = 32 * 1024;

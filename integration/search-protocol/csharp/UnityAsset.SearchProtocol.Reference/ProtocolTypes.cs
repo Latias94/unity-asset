@@ -6,7 +6,7 @@ namespace UnityAsset.SearchProtocol.Reference
 {
     public static class ProtocolConstants
     {
-        public const ushort BusinessProtocolRevision = 5;
+        public const ushort BusinessProtocolRevision = 1;
         public const uint CoreDiagnosticVersion = 2;
         public const int MaxBackgroundReindexOperations = 5;
     }

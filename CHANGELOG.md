@@ -4,37 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] - 2026-08-14
+## [0.4.0] - 2026-08-18
+
+### Highlights
+
+- Rebuilt high-level asset work around `AssetWorkspace`: callers now inspect immutable revisions, author guarded mutation plans, preview prepared output, and recover interrupted publication without reconstructing internal proof or ordering rules.
+- Unified YAML and binary references, schema-aware mutations, streamed-resource extraction, and local search around revision-bound identities and caller-owned budgets, so automation receives typed evidence instead of best-effort summaries.
+- Added a project-bound local search service over capability-authenticated loopback HTTP, with one canonical JSON contract shared by Rust, the CLI, C#, and future MCP adapters; 0.4.0 publishes that business protocol for the first time as revision 1.
+- Deepened UnityFS, WebFile, UnityWeb, UnityRaw, SerializedFile, TypeTree, PPtr, AudioClip, Texture2D, and Sprite handling while preserving source bytes, format semantics, and bounded resource use.
+- Hardened package and binary releases with isolated archive consumers, signed-source evidence, deterministic SDK artifacts, checksums, remote byte verification, and provenance attestations.
 
 ### Added
 
-- Added business search protocol revision 5 with bounded background-reindex discovery, structured process-lifetime task failure evidence, explicit control rejection for internal operations, published Draft 2020-12 structural schemas, and a deterministic SDK bundle containing the schema and fixture contract.
+- Published business search protocol revision 1 with bounded background-reindex discovery, structured process-lifetime task failure evidence, explicit control rejection for internal operations, Draft 2020-12 structural schemas, and a deterministic SDK bundle containing the schema and fixture contract.
 
 - Added `AssetWorkspace` as the authoritative owner of immutable source catalogs, content-addressed backing bytes, workspace revisions, snapshots, and prepared views.
 - Added the versioned `WorkspaceInspector` source and object projections, exact structured lookup, streamed-resource resolution, and the allocation-free `workspace_capabilities` catalog.
 - Added canonical `MutationPlan` v3 JSON/YAML contracts with workspace, revision, source fingerprint, object digest, operation-order, and semantic guard validation.
 - Added zero-write prepare with independently reparsed segmented artifacts, read-your-writes inspection, deterministic proof manifests, and an opaque single-use `PreparedChange`.
-- Added recoverable in-place publication with validated containment roots, durable journals, directory identity binding, `CommitReport`, recovery discovery, `RecoveryLocator`, `RecoveryOutcome`, and `RollbackReceipt` contracts.
+- Added recoverable in-place publication with validated containment roots, durable journals, directory identity binding, `CommitReport`, recovery discovery, `RecoveryLocator`, `RecoveryOutcome`, and `RollbackReceipt` contracts; retries remain safe across interruption, partial replacement, stale evidence, and destination drift.
 - Added one revision-bound `ReferenceGraph` with typed field paths, coverage, resolution states, incoming/outgoing/closure queries, caching, and deterministic JSON, JSON Lines, and DOT projections.
 - Added typed extraction request v4, plan v8, manifest v6, and report v6 contracts with bundle-container and reference-traversal queries, deterministic artifact paths, caller-budgeted execution, recoverable publication, verified resume, and explicit representation-semantics identities.
 - Added a YAML-only extraction request profile and identity-first `file-id-*`/`ordinal-*` artifact paths for agent-safe document export.
-- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, capability-authenticated loopback HTTP discovery, and bounded idempotent reindex operations.
+- Added a revision-bound, consumer-owned search pipeline with transaction-keyed `ChangeSet` handoff, coherent `SearchGeneration` state, capability-authenticated loopback HTTP discovery, and bounded idempotent reindex operations resilient to retries, worker failure, cancellation, and conflicting payloads.
 - Added deterministic tag-release evidence, exact cargo-dist artifact-plan validation, isolated archive-consumer verification, real MSRV validation, pinned release inputs, checksums, GitHub Draft Release byte read-back, and build provenance attestations.
 - Added schema-aware mutation recipes that inspect exact YAML or binary provenance and lower guarded field, reference, schema, sequence, hierarchy, UnityEvent, material, transform, and streamed-audio changes into plan fragments.
-- Added deterministic performance contracts for unified TypeTree traversal and segmented prepared artifacts.
+- Added a budgeted, immutable AssetRipper TypeTreeDump registry with release/editor mode selection for stripped assets. ([#2](https://github.com/Latias94/unity-asset/pull/2); thanks [@JomerDev](https://github.com/JomerDev))
 
 ### Changed
 
-- **Breaking:** Advanced the current Rust/C# business search protocol from revision 4 to revision 5, removed pre-rendered HTML search-hit fields, and retained revisions 1 through 4 as immutable archives.
-
-- **Breaking:** Replaced mutable high-level loading and editing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
+- **Breaking:** Replaced the mutable `Environment` aggregate loader, direct edit/save lifecycle, pending write state, and implicit filesystem probing with `AssetWorkspace`, immutable `WorkspaceView` values, guarded plans, prepare, preview, recoverable commit, and explicit recovery.
 - **Breaking:** Replaced broad text-oriented CLI inspection and export surfaces with typed `workspace`, `references`, `export`, and `split-yaml` commands that exchange versioned JSON contracts; `split-yaml` now emits the canonical extraction report and manifest instead of a parallel YAML-split report.
 - **Breaking:** Replaced string YAML anchors in object identities with canonical non-zero numeric `YamlFileId` values, rejected ambiguous spellings such as `01`, and changed compact object addresses from `oa1:` to `oa2:`.
-- **Breaking:** Made prepared artifact format evidence opaque and replaced caller-side format matching with sealed, borrowed source proofs minted by `unity-asset-write`.
 - **Breaking:** Removed the legacy media Processor/Converter APIs, owned AudioClip/Texture2D/Sprite carriers, context-free quick decoders, generic image/audio exporters, and public swizzler utilities. Strict `AudioClipLayout`, `Texture2DLayout`, `SpriteLayout`, and `Prepared*` artifacts are now the only media preparation path.
 - **Breaking:** Removed MP3 and AAC from strict prepared-audio descriptors until a bounded full-codec validator exists; decoded-preferred extraction now falls back to raw bytes and decoded-required extraction reports typed unsupported encoding.
-- Consolidated prepared YAML inspection on the canonical `unity-asset-yaml` parser and removed the duplicate writer-owned YAML frontend and budget model.
-- **Breaking:** Replaced the earlier search transports with one project-bound loopback HTTP request endpoint discovered through a private, atomically published per-process capability descriptor. Removed transport negotiation, session framing, configurable bearer tokens, `IndexProgress`, and compatibility fallback.
 - **Breaking:** Unified TypeTree read, skip, PPtr scan, validation, encoding, and byte-preserving rewrite on one compiled `TypeTreeSchema`; TypeTree write errors now use `TypeTreeWriteError`, and `unity_asset_write::Endian` was replaced by the shared `ByteOrder`.
 - Made JSON and TPK TypeTree ingestion caller-budgeted, deterministic, depth-bounded, and immutable; workspace loads retain only required schemas in frozen per-source registries.
 - Reworked source loading, archive/WebFile/bundle expansion, edits, serialization, and publication to stage complete candidate state before one authority-changing commit.
@@ -49,57 +52,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 - Hardened parsing, decompression, registry loading, recursive serialization, semantic cloning, and artifact construction so caller-owned budgets are charged before allocation or expansion.
 - Preserved wire-faithful SerializedFile version gates, signed path IDs, byte order, alignment, type tables, external tables, object proof ranges, and unchanged object bytes across rebuilds.
 - Preserved AssetBundle signature, directory-node semantics, duplicate occurrences, compression policy, and exact encoded block ranges; unsupported encrypted layouts now fail structurally.
-- Made publication restart-safe across interruption, partial replacement, stale evidence, destination drift, directory replacement, and idempotent recovery redelivery.
-- Made search reindex admission idempotent by transaction identity and resilient to queueing, retries, worker failure, cancellation, and conflicting payloads.
 
 ### Removed
 
-- **Breaking:** Removed the superseded mutable aggregate loader, direct edit/save lifecycle, pending write state, and implicit filesystem dependency probing.
 - **Breaking:** Removed mutable serialized-file edit sessions, change trackers, bare-byte object replacement, and raw object mutation escape hatches.
-- **Breaking:** Removed duplicate TypeTree builders, serializers, traversal facades, registries, semantic digest engines, and reference models.
-- **Breaking:** Removed obsolete CLI commands whose behavior is now represented by typed workspace inspection, reference projection, extraction, or low-level format examples.
-- **Breaking:** Removed the duplicate library-level YAML split planner, executor, plan, report, and capability contract; YAML splitting now uses the generic extraction plan and publication journal.
 - **Breaking:** Removed placeholder Mesh decoding/export, fabricated binary metadata summaries, cached Bundle loader facades, and implicit Unity version defaults rather than reporting capabilities or observations the library cannot prove.
-- **Breaking:** Removed the Unix-domain-socket and Windows named-pipe search transports, Bootstrap negotiation, four-byte framing, peer-process authorization, and the C# framed-session adapter.
-- Removed production dependence on callback-based script-schema generation; immutable JSON/TPK registries are now the workspace boundary.
-
-## [0.3.0] - 2026-01-27
-
-### Highlights
-
-- Added UnityPy-style AssetBundle container discovery with glob patterns and case-insensitive matching.
-- Added best-effort cross-file reference analysis for SerializedFiles and a reusable local search stack.
-- Introduced the search core, index, daemon, and CLI crates for downstream tools.
-
-### Added
-
-- Added bundle-container path discovery and optional indexing as `BundleContainer` search documents.
-- Added superseded aggregate diagnostics for bundle headers, SerializedFile metadata, and signed path-ID distributions; current inspection uses `WorkspaceInspector`.
-- Added TypeTree PPtr extraction, external GUID resolution, and early incremental reference-analysis helpers.
-- Added a superseded class-helper layer for common YAML UI controls and binary GameObject, Transform, RectTransform, SpriteRenderer, Sprite, and SpriteAtlas changes.
-- Added legacy UnityWeb and UnityRaw repacking for supported versions.
-- Added directory-wide `.meta` GUID indexing and best-effort Unity project discovery.
-- Added JSON/TPK TypeTree registries and the optional external script-schema exporter documented in `docs/SCRIPT_TYPETREES.md`.
-- Added search flags for bundle-container indexing and ignore policy, progress reporting, asynchronous reindex orchestration, and an experimental Unity Editor client.
-- Added `cargo-dist` release automation and a manual workflow for repairing missing release assets.
-
-### Changed
-
-- Updated bundle name and type filters to inspect embedded asset names and actual object presence.
-
-### Fixed
-
-- Populated bundle compression metadata and object reference summaries.
-- Prevented YAML serialization from emitting placeholder mappings for complex block-array elements.
-- Accepted UnityCN/Tuanjie version suffixes and ignored parenthesized revisions for comparison.
-- Preserved rare unnamed TypeTree children, normalized PPtr input shapes, and supported the legacy version-2 variable-count field.
-- Added metadata-at-end parsing and saving for pre-version-9 SerializedFiles.
-- Corrected legacy UnityWeb and UnityRaw header and directory-offset handling.
-- Improved external reference resolution through normalized physical paths and retained null bundle-container pointers as unresolved occurrences.
-
-### Breaking Changes
-
-- None intended. In the 0.x series, breaking changes may occur between minor versions.
 
 ## [0.2.0] - 2025-12-26
 
