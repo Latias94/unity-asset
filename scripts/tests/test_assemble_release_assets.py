@@ -129,16 +129,20 @@ class ReleaseAssetAssemblyTests(unittest.TestCase):
                 ]
             ),
         )
+        checksummed_names = sorted(
+            [
+                *expected_names,
+                "release-dist-plan.json",
+                "release-evidence.json",
+                protocol_bundle.name,
+            ]
+        )
+        output_digests = {
+            name: hashlib.sha256((output / name).read_bytes()).hexdigest()
+            for name in checksummed_names
+        }
         expected_checksums = "".join(
-            f"{hashlib.sha256((output / name).read_bytes()).hexdigest()}  {name}\n"
-            for name in sorted(
-                [
-                    *expected_names,
-                    "release-dist-plan.json",
-                    "release-evidence.json",
-                    protocol_bundle.name,
-                ]
-            )
+            f"{output_digests[name]}  {name}\n" for name in checksummed_names
         )
         self.assertEqual(
             (output / "SHA256SUMS").read_text(encoding="utf-8"), expected_checksums
@@ -152,6 +156,54 @@ class ReleaseAssetAssemblyTests(unittest.TestCase):
         self.assertEqual(
             (output / protocol_bundle.name).read_bytes(), protocol_bundle.read_bytes()
         )
+        for checksum_name in (
+            name for name in expected_names if name.endswith(".sha256")
+        ):
+            archive_name = checksum_name.removesuffix(".sha256")
+            self.assertEqual(
+                (output / checksum_name).read_bytes(),
+                f"{output_digests[archive_name]}  {archive_name}\n".encode("ascii"),
+            )
+
+    def test_accepts_and_canonicalizes_cargo_dist_sidecars(self) -> None:
+        temporary, evidence, digest, plan, plan_digest, protocol_bundle = self.make_fixture()
+        self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
+        sidecars = sorted((temporary / "dist").rglob("*.sha256"))
+        for sidecar in sidecars:
+            archive_name = sidecar.name.removesuffix(".sha256")
+            archive_digest = hashlib.sha256(
+                sidecar.with_name(archive_name).read_bytes()
+            ).hexdigest()
+            sidecar.write_text(
+                f"{archive_digest} *{archive_name}\n\n",
+                encoding="ascii",
+                newline="\n",
+            )
+
+        output = temporary / "assembled"
+        ASSEMBLER.assemble(
+            temporary / "dist",
+            evidence,
+            digest,
+            plan,
+            plan_digest,
+            protocol_bundle,
+            output,
+        )
+
+        for sidecar in sidecars:
+            archive_name = sidecar.name.removesuffix(".sha256")
+            archive_digest = hashlib.sha256((output / archive_name).read_bytes()).hexdigest()
+            canonical_sidecar = f"{archive_digest}  {archive_name}\n".encode("ascii")
+            self.assertEqual(
+                (output / sidecar.name).read_bytes(),
+                canonical_sidecar,
+            )
+            canonical_digest = hashlib.sha256(canonical_sidecar).hexdigest()
+            self.assertIn(
+                f"{canonical_digest}  {sidecar.name}\n",
+                (output / "SHA256SUMS").read_text(encoding="ascii"),
+            )
 
     def test_rejects_duplicate_flattened_names(self) -> None:
         temporary, evidence, digest, plan, plan_digest, protocol_bundle = self.make_fixture()
@@ -232,12 +284,24 @@ class ReleaseAssetAssemblyTests(unittest.TestCase):
     def test_rejects_checksum_sidecar_with_a_wrong_digest(self) -> None:
         temporary, evidence, digest, plan, plan_digest, protocol_bundle = self.make_fixture()
         self.addCleanup(shutil.rmtree, temporary, ignore_errors=True)
-        sidecar = next((temporary / "dist").rglob("*.sha256"))
+        _, artifact_matrix = ASSEMBLER.load_dist_plan(
+            plan,
+            plan_digest,
+            tag="v0.4.0",
+            version="0.4.0",
+        )
+        last_checksum_name = artifact_matrix[-1].checksum_name
+        sidecar = next(
+            path
+            for path in (temporary / "dist").rglob("*.sha256")
+            if path.name == last_checksum_name
+        )
         sidecar.write_text(
             f"{'0' * 64}  {sidecar.name.removesuffix('.sha256')}\n",
             encoding="ascii",
             newline="\n",
         )
+        output = temporary / "out"
 
         with self.assertRaisesRegex(ASSEMBLER.AssemblyError, "checksum digest mismatch"):
             ASSEMBLER.assemble(
@@ -247,8 +311,9 @@ class ReleaseAssetAssemblyTests(unittest.TestCase):
                 plan,
                 plan_digest,
                 protocol_bundle,
-                temporary / "out",
+                output,
             )
+        self.assertFalse(output.exists())
 
     def test_rejects_checksum_sidecar_with_a_noncanonical_filename(self) -> None:
         temporary, evidence, digest, plan, plan_digest, protocol_bundle = self.make_fixture()
@@ -278,7 +343,8 @@ class ReleaseAssetAssemblyTests(unittest.TestCase):
         archive_name = sidecar.name.removesuffix(".sha256")
         archive = sidecar.with_name(archive_name)
         sidecar.write_text(
-            f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive_name}\nextra\n",
+            f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive_name}\n"
+            f"{'0' * 64}  other-archive.tar.xz\n",
             encoding="ascii",
             newline="\n",
         )
