@@ -105,7 +105,7 @@ fn loopback_descriptor_has_one_exact_canonical_wire_representation() {
         "\"daemon_instance_id\":\"daemon-v1:22222222222222222222222222222222\",",
         "\"port\":42424,",
         "\"capability\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
-        "\"business_protocol_revision\":5,",
+        "\"business_protocol_revision\":1,",
         "\"query_policy_id\":\"query-policy-v1:4444444444444444444444444444444444444444444444444444444444444444\",",
         "\"server_pid\":4242}"
     );

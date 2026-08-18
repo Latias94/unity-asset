@@ -39,13 +39,13 @@ class ProtocolSdkBundleTests(unittest.TestCase):
         self.write(reference / "Generated.designer.cs", b"designer\n")
         self.write(reference / "bin" / "Debug" / "Reference.dll", b"binary\n")
         self.write(reference / "obj" / "project.assets.json", b"{}\n")
-        self.write(fixtures / "manifest.json", b'{"fixture_format":2}\n')
+        self.write(fixtures / "manifest.json", b'{"fixture_format":1}\n')
         self.write(
-            fixtures / "requests" / "search-v2.json",
+            fixtures / "requests" / "search-v1.json",
             b'{"operation":"search"}\n',
         )
         self.write(
-            schemas / "business-v5.schema.json",
+            schemas / "business-v1.schema.json",
             b'{"$id":"business","$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
         )
 
@@ -111,8 +111,8 @@ class ProtocolSdkBundleTests(unittest.TestCase):
                     "csharp/UnityAsset.SearchProtocol.Reference/"
                     "UnityAsset.SearchProtocol.Reference.csproj",
                     "fixtures/manifest.json",
-                    "fixtures/requests/search-v2.json",
-                    "schema/business-v5.schema.json",
+                    "fixtures/requests/search-v1.json",
+                    "schema/business-v1.schema.json",
                 ],
             )
 
@@ -247,7 +247,7 @@ class ProtocolSdkBundleTests(unittest.TestCase):
             ),
             BUNDLE._SourceFile("fixtures/manifest.json", b"{}\n"),
             BUNDLE._SourceFile(
-                "schema/business-v5.schema.json",
+                "schema/business-v1.schema.json",
                 b'{"$schema":"https://json-schema.org/draft/2020-12/schema"}\n',
             ),
         )
@@ -352,7 +352,7 @@ class ProtocolSdkBundleTests(unittest.TestCase):
             )
 
     def test_builder_requires_both_public_schema_entrypoints(self) -> None:
-        (self.root / "integration/search-protocol/schema/business-v5.schema.json").unlink()
+        (self.root / "integration/search-protocol/schema/business-v1.schema.json").unlink()
         with self.assertRaisesRegex(
             BUNDLE.ProtocolSdkBundleError, "protocol SDK source inventory is incomplete"
         ):

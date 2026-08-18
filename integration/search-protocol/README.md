@@ -1,6 +1,6 @@
 # Unity Asset Search Protocol Integration
 
-This directory is the language-neutral integration surface for current `unity-asset-search-protocol` business revision 5. It contains canonical JSON fixtures, a published structural JSON Schema, a Unity-independent C# reference codec and HTTP client, and an executable conformance runner. Business revisions 1, 2, 3, and 4 are retained only as byte-frozen archives and are not implemented by the current runtime.
+This directory is the language-neutral integration surface for `unity-asset-search-protocol` business revision 1. It contains canonical JSON fixtures, a published structural JSON Schema, a Unity-independent C# reference codec and HTTP client, and an executable conformance runner.
 
 The Rust crate remains the source of truth for the protocol. These artifacts make the contract reviewable and testable by clients that cannot link Rust directly.
 
@@ -9,15 +9,11 @@ The Rust crate remains the source of truth for the protocol. These artifacts mak
 ```text
 fixtures/
   manifest.json              Current fixture inventory and expected peer binding
-  frozen-business-v1.json    Digests for the archived revision 1 byte set
-  frozen-business-v2.json    Digests for the archived revision 2 byte set
-  frozen-business-v3.json    Digests for the archived revision 3 byte set
-  frozen-business-v4.json    Digests for the archived revision 4 byte set
-  requests/                  Archived v1/v2/v3/v4 and current v5 requests
-  responses/                 Archived v1/v2/v3/v4 and current v5 responses
+  requests/                  Canonical revision 1 requests
+  responses/                 Canonical revision 1 responses
   invalid/                   Binding and cross-revision rejection cases
 schema/
-  business-v5.schema.json    Structural business revision 5 shape schema
+  business-v1.schema.json    Structural business revision 1 shape schema
 csharp/
   UnityAsset.SearchProtocol.Reference/    netstandard2.0 codec and HTTP client
   UnityAsset.SearchProtocol.Conformance/  net8.0 fixture and live-daemon runner
@@ -30,7 +26,7 @@ Every exchange is one capability-authenticated HTTP/1.1 `POST /v1/request` on IP
 
 The private `endpoint.v2.json` descriptor supplies the operating-system-selected port, ephemeral bearer capability, project ID, daemon instance ID, query-policy ID, and current business revision. Clients reject descriptors for another revision and revalidate the exact descriptor around each exchange. There is no transport session or revision negotiation.
 
-Business revision 5 contains these operations:
+Business revision 1 contains these operations:
 
 - `capabilities`
 - `status`
@@ -45,7 +41,7 @@ Business revision 5 contains these operations:
 
 Request and response envelopes bind every exchange to a protocol revision, request ID, project ID, daemon instance ID, and query-policy ID. A response is valid only in the context of its originating request.
 
-The current codec accepts and emits only business revision 5. Revision 2 added daemon lifecycle evidence to `status` and the closed `idempotency_conflict` API error code. Revision 3 adopted numeric nonzero YAML `file_id` object selectors. Revision 4 added a required typed `source_object` to every reference hit. Revision 5 removes pre-rendered HTML highlight fields, makes structured UTF-8 ranges authoritative, exposes bounded background reindex operations, forbids cancelling those internal operations, and reports the first process-lifetime task failure as `daemon.process_failure`.
+The current codec accepts and emits only business revision 1. This first published contract uses numeric nonzero YAML `file_id` object selectors, requires a typed `source_object` on every reference hit, makes structured UTF-8 highlight ranges authoritative, exposes bounded background reindex operations, forbids cancelling those internal operations, and reports the first process-lifetime task failure as `daemon.process_failure`.
 
 ## Canonical JSON And Limits
 
@@ -71,7 +67,7 @@ Reference cursors bind the generation and query-policy ID and carry a SHA-256 bi
   bearer capability;
 - `ProtocolHttpClient` as the bounded capability-authenticated loopback HTTP adapter.
 
-Domain operation payloads remain schema-validated JSON instead of becoming a second public object graph. `RequestEnvelopeV1` and `ResponseEnvelopeV1` retain their historical class names, but their wire revision always comes from `ProtocolConstants.BusinessProtocolRevision`, which is 5.
+Domain operation payloads remain schema-validated JSON instead of becoming a second public object graph. `RequestEnvelopeV1` and `ResponseEnvelopeV1` use `ProtocolConstants.BusinessProtocolRevision`, which is 1.
 
 `ProtocolHttpClient` derives the loopback URI and exact `Host` value internally, disables proxies, redirects, cookies, decompression, and connection reuse, sends the capability only as a bearer header, bounds response streaming by operation, and validates every response against its request.
 
@@ -111,7 +107,7 @@ dotnet run --project integration/search-protocol/csharp/UnityAsset.SearchProtoco
 The runner verifies that:
 
 - every listed fixture is non-empty and every fixture JSON document is listed;
-- all ten revision 5 request and response operations are covered;
+- all ten revision 1 request and response operations are covered;
 - decode followed by canonical encode reproduces every valid fixture byte-for-byte;
 - protocol revision, project, daemon instance, query-policy, and request bindings are exact;
 - exact-limit JSON documents succeed and one-byte-over documents fail;
@@ -120,7 +116,6 @@ The runner verifies that:
 - the public HTTP client uses a validated private descriptor and exposes structured success/error payloads;
 - an external `netstandard2.0` consumer compiles without `InternalsVisibleTo` access;
 - the published business schema is valid UTF-8 JSON using Draft 2020-12;
-- every archived business revision 1, 2, 3, and 4 fixture still matches its frozen inventory.
 
 The JSON Schema describes structural shape only: types, required fields, closed object properties, enums, identifier patterns, and bounded collections. It does not replace the Rust/C# validators for canonical property order, duplicate-key rejection, UTF-8 byte budgets, HTTP body limits, request/response bindings, or lifecycle invariants. The SDK bundle includes the schema alongside the reference codec and fixtures.
 

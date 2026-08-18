@@ -43,7 +43,7 @@ fn response_encoder(request: &RequestEnvelope) -> unity_asset_search_protocol::R
 
 fn fixture_search_response() -> SearchResponse {
     let envelope: ResponseEnvelope = serde_json::from_str(include_str!(
-        "../../../integration/search-protocol/fixtures/responses/search-v5.json"
+        "../../../integration/search-protocol/fixtures/responses/search-v1.json"
     ))
     .unwrap();
     let ResponseOutcome::Success(operation) = envelope.into_outcome() else {
