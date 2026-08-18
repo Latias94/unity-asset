@@ -29,7 +29,7 @@ step.
 
 ## Preparing a release
 
-1. Choose the version, for example `0.4.0`.
+1. Choose the version, for example `0.3.0`.
 2. Update `[workspace.package].version` and every internal requirement in root
    `Cargo.toml` to that version. Member manifests inherit the workspace values;
    they must not declare independent versions or internal path-version pairs.
@@ -65,8 +65,8 @@ step.
    cannot publish crates or a GitHub Release:
 
    ```text
-   git tag -s v0.4.0 -m "v0.4.0"
-   git push origin v0.4.0
+   git tag -s v0.3.0 -m "v0.3.0"
+   git push origin v0.3.0
    ```
 
 7. Run the `Release` workflow manually with the existing tag as its `tag` input
