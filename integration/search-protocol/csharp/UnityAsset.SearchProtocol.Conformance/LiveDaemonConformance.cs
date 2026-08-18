@@ -15,7 +15,14 @@ internal static class LiveDaemonConformance
         {
             try
             {
-                return File.ReadAllBytes(descriptorPath);
+                using var descriptor = new FileStream(
+                    descriptorPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read | FileShare.Delete);
+                using var encoded = new MemoryStream();
+                descriptor.CopyTo(encoded);
+                return encoded.ToArray();
             }
             catch (Exception error) when (
                 error is FileNotFoundException

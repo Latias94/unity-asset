@@ -16,6 +16,12 @@ use crate::{
 const DAEMON_LEASE_FILE: &str = ".daemon-v1.lock";
 const LOOPBACK_ENDPOINT_DESCRIPTOR_FILE: &str = "endpoint.v2.json";
 const TEMPORARY_ATTEMPTS: usize = 16;
+#[cfg(windows)]
+const WINDOWS_DESCRIPTOR_CLAIM_RETRY_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(500);
+#[cfg(windows)]
+const WINDOWS_DESCRIPTOR_CLAIM_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(10);
 const LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION: PublicationSlots = PublicationSlots::new(
     LOOPBACK_ENDPOINT_DESCRIPTOR_FILE,
     ".endpoint-v2.staging",
@@ -542,12 +548,43 @@ fn discover_loopback_named(
 fn claim_loopback_descriptor(
     namespace: &EndpointNamespaceV1,
 ) -> Result<Option<QuarantinedPublication>, EndpointStoreError> {
-    publication::claim_current(namespace, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION).map_err(
-        |source| EndpointStoreError::DescriptorIo {
-            operation: "claim loopback endpoint descriptor for cleanup",
-            source,
-        },
-    )
+    claim_loopback_descriptor_io(namespace).map_err(|source| EndpointStoreError::DescriptorIo {
+        operation: "claim loopback endpoint descriptor for cleanup",
+        source,
+    })
+}
+
+#[cfg(not(windows))]
+fn claim_loopback_descriptor_io(
+    namespace: &EndpointNamespaceV1,
+) -> io::Result<Option<QuarantinedPublication>> {
+    publication::claim_current(namespace, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION)
+}
+
+#[cfg(windows)]
+fn claim_loopback_descriptor_io(
+    namespace: &EndpointNamespaceV1,
+) -> io::Result<Option<QuarantinedPublication>> {
+    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+    let deadline = std::time::Instant::now() + WINDOWS_DESCRIPTOR_CLAIM_RETRY_WINDOW;
+    loop {
+        match publication::claim_current(namespace, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION) {
+            Err(source)
+                if matches!(
+                    source.raw_os_error(),
+                    Some(code)
+                        if code == ERROR_SHARING_VIOLATION as i32
+                            || code == ERROR_LOCK_VIOLATION as i32
+                ) && std::time::Instant::now() < deadline =>
+            {
+                // Cross-language readers cannot universally opt into FILE_SHARE_DELETE. Preserve
+                // the atomic quarantine protocol while a short-lived descriptor read completes.
+                std::thread::sleep(WINDOWS_DESCRIPTOR_CLAIM_RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn restore_quarantine(
@@ -735,6 +772,48 @@ mod tests {
         drop(namespace);
         drop(roots);
         cleanup_test_namespace(&cleanup_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_waits_for_a_short_lived_descriptor_reader() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::time::Duration;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let (roots, namespace, cleanup_path) = test_namespace();
+        let lease = namespace.acquire_daemon_lease().unwrap();
+        let descriptor = LoopbackEndpointDescriptor::for_current_process(
+            namespace.project_id(),
+            generate_daemon_instance_id().unwrap(),
+            42_424,
+            HttpCapability::from_bytes([0x11; 32]).unwrap(),
+            QueryPolicyId::from_bytes([0x44; 32]),
+        )
+        .unwrap();
+        let mut publication = namespace
+            .publish_loopback_endpoint(&lease, &descriptor)
+            .unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(cleanup_path.join(LOOPBACK_ENDPOINT_DESCRIPTOR_FILE))
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(reader);
+        });
+
+        let cleanup = publication.remove();
+        releaser.join().unwrap();
+        drop(publication);
+        drop(lease);
+        drop(namespace);
+        drop(roots);
+        cleanup_test_namespace(&cleanup_path);
+
+        assert_eq!(cleanup.unwrap(), LoopbackEndpointCleanup::Removed);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
