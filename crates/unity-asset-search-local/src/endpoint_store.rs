@@ -16,6 +16,12 @@ use crate::{
 const DAEMON_LEASE_FILE: &str = ".daemon-v1.lock";
 const LOOPBACK_ENDPOINT_DESCRIPTOR_FILE: &str = "endpoint.v2.json";
 const TEMPORARY_ATTEMPTS: usize = 16;
+#[cfg(windows)]
+const WINDOWS_DESCRIPTOR_CLAIM_RETRY_WINDOW: std::time::Duration =
+    std::time::Duration::from_millis(500);
+#[cfg(windows)]
+const WINDOWS_DESCRIPTOR_CLAIM_RETRY_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(10);
 const LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION: PublicationSlots = PublicationSlots::new(
     LOOPBACK_ENDPOINT_DESCRIPTOR_FILE,
     ".endpoint-v2.staging",
@@ -86,6 +92,7 @@ impl EndpointNamespaceV1 {
         Ok(PublishedLoopbackEndpointGuard {
             namespace: self.clone(),
             generation: LoopbackEndpointGeneration::new(encoded),
+            cleanup_retry: LoopbackDescriptorCleanupRetry::default(),
             warning: LoopbackEndpointPublicationWarning {
                 durability_unconfirmed: commit.durability_unconfirmed(),
                 verification_unconfirmed,
@@ -112,12 +119,14 @@ impl EndpointNamespaceV1 {
                     operation: "recover abandoned loopback endpoint descriptor publication",
                     source,
                 })?;
-        let descriptor = if let Some(quarantine) = claim_loopback_descriptor(self)? {
-            remove_quarantine(self, quarantine)?;
-            LoopbackEndpointCleanup::Removed
-        } else {
-            LoopbackEndpointCleanup::AlreadyAbsent
-        };
+        let mut cleanup_retry = LoopbackDescriptorCleanupRetry::default();
+        let descriptor =
+            if let Some(quarantine) = claim_loopback_descriptor(self, &mut cleanup_retry)? {
+                remove_quarantine(self, quarantine)?;
+                LoopbackEndpointCleanup::Removed
+            } else {
+                LoopbackEndpointCleanup::AlreadyAbsent
+            };
         if recovery.removed_any() || descriptor == LoopbackEndpointCleanup::Removed {
             Ok(LoopbackEndpointCleanup::Removed)
         } else {
@@ -398,6 +407,7 @@ pub enum LoopbackEndpointCleanup {
 pub(crate) struct PublishedLoopbackEndpointGuard {
     namespace: EndpointNamespaceV1,
     generation: LoopbackEndpointGeneration,
+    cleanup_retry: LoopbackDescriptorCleanupRetry,
     warning: LoopbackEndpointPublicationWarning,
     active: bool,
 }
@@ -414,8 +424,9 @@ impl PublishedLoopbackEndpointGuard {
         Ok(outcome)
     }
 
-    fn remove_if_current(&self) -> Result<LoopbackEndpointCleanup, EndpointStoreError> {
-        let Some(quarantine) = claim_loopback_descriptor(&self.namespace)? else {
+    fn remove_if_current(&mut self) -> Result<LoopbackEndpointCleanup, EndpointStoreError> {
+        let Some(quarantine) = claim_loopback_descriptor(&self.namespace, &mut self.cleanup_retry)?
+        else {
             return Ok(LoopbackEndpointCleanup::AlreadyAbsent);
         };
         let encoded = match read_loopback_descriptor_named(&self.namespace, quarantine.name()) {
@@ -541,13 +552,66 @@ fn discover_loopback_named(
 
 fn claim_loopback_descriptor(
     namespace: &EndpointNamespaceV1,
+    cleanup_retry: &mut LoopbackDescriptorCleanupRetry,
 ) -> Result<Option<QuarantinedPublication>, EndpointStoreError> {
-    publication::claim_current(namespace, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION).map_err(
-        |source| EndpointStoreError::DescriptorIo {
+    cleanup_retry
+        .claim(namespace)
+        .map_err(|source| EndpointStoreError::DescriptorIo {
             operation: "claim loopback endpoint descriptor for cleanup",
             source,
-        },
-    )
+        })
+}
+
+#[derive(Default)]
+struct LoopbackDescriptorCleanupRetry {
+    #[cfg(windows)]
+    deadline: Option<std::time::Instant>,
+}
+
+impl LoopbackDescriptorCleanupRetry {
+    fn claim(
+        &mut self,
+        namespace: &EndpointNamespaceV1,
+    ) -> io::Result<Option<QuarantinedPublication>> {
+        #[cfg(not(windows))]
+        {
+            publication::claim_current(namespace, LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION)
+        }
+
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+
+            let deadline = *self.deadline.get_or_insert_with(|| {
+                std::time::Instant::now() + WINDOWS_DESCRIPTOR_CLAIM_RETRY_WINDOW
+            });
+            loop {
+                match publication::claim_current(
+                    namespace,
+                    LOOPBACK_ENDPOINT_DESCRIPTOR_PUBLICATION,
+                ) {
+                    Err(source)
+                        if matches!(
+                            source.raw_os_error(),
+                            Some(code)
+                                if code == ERROR_SHARING_VIOLATION as i32
+                                    || code == ERROR_LOCK_VIOLATION as i32
+                        ) =>
+                    {
+                        let remaining =
+                            deadline.saturating_duration_since(std::time::Instant::now());
+                        if remaining.is_zero() {
+                            return Err(source);
+                        }
+                        // Cross-language readers cannot universally opt into FILE_SHARE_DELETE.
+                        // Preserve the atomic quarantine protocol while a short read completes.
+                        std::thread::sleep(WINDOWS_DESCRIPTOR_CLAIM_RETRY_DELAY.min(remaining));
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
 }
 
 fn restore_quarantine(
@@ -731,6 +795,101 @@ mod tests {
             LoopbackEndpointCleanup::Removed
         );
 
+        drop(lease);
+        drop(namespace);
+        drop(roots);
+        cleanup_test_namespace(&cleanup_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_waits_for_a_short_lived_descriptor_reader() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::time::Duration;
+
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let (roots, namespace, cleanup_path) = test_namespace();
+        let lease = namespace.acquire_daemon_lease().unwrap();
+        let descriptor = LoopbackEndpointDescriptor::for_current_process(
+            namespace.project_id(),
+            generate_daemon_instance_id().unwrap(),
+            42_424,
+            HttpCapability::from_bytes([0x11; 32]).unwrap(),
+            QueryPolicyId::from_bytes([0x44; 32]),
+        )
+        .unwrap();
+        let mut publication = namespace
+            .publish_loopback_endpoint(&lease, &descriptor)
+            .unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(cleanup_path.join(LOOPBACK_ENDPOINT_DESCRIPTOR_FILE))
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(reader);
+        });
+
+        let cleanup = publication.remove();
+        releaser.join().unwrap();
+        drop(publication);
+        drop(lease);
+        drop(namespace);
+        drop(roots);
+        cleanup_test_namespace(&cleanup_path);
+
+        assert_eq!(cleanup.unwrap(), LoopbackEndpointCleanup::Removed);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_drop_does_not_restart_an_exhausted_contention_window() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use std::time::Duration;
+
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let (roots, namespace, cleanup_path) = test_namespace();
+        let lease = namespace.acquire_daemon_lease().unwrap();
+        let descriptor = LoopbackEndpointDescriptor::for_current_process(
+            namespace.project_id(),
+            generate_daemon_instance_id().unwrap(),
+            42_424,
+            HttpCapability::from_bytes([0x11; 32]).unwrap(),
+            QueryPolicyId::from_bytes([0x44; 32]),
+        )
+        .unwrap();
+        let mut publication = namespace
+            .publish_loopback_endpoint(&lease, &descriptor)
+            .unwrap();
+        let descriptor_path = cleanup_path.join(LOOPBACK_ENDPOINT_DESCRIPTOR_FILE);
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .open(&descriptor_path)
+            .unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(750));
+            drop(reader);
+        });
+
+        assert!(matches!(
+            publication.remove(),
+            Err(EndpointStoreError::DescriptorIo { source, .. })
+                if source.raw_os_error() == Some(ERROR_SHARING_VIOLATION as i32)
+        ));
+        drop(publication);
+        releaser.join().unwrap();
+        assert!(descriptor_path.exists());
+
+        let mut cleanup_retry = LoopbackDescriptorCleanupRetry::default();
+        let quarantine = claim_loopback_descriptor(&namespace, &mut cleanup_retry)
+            .unwrap()
+            .unwrap();
+        remove_quarantine(&namespace, quarantine).unwrap();
         drop(lease);
         drop(namespace);
         drop(roots);

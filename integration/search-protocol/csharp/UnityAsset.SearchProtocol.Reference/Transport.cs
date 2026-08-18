@@ -68,7 +68,8 @@ namespace UnityAsset.SearchProtocol.Reference
         /// no-follow, ownership, and permission checks. It must return the exact current bytes on
         /// every invocation, or <see langword="null"/> when the descriptor is absent. This SDK
         /// validates protocol data but does not authorize filesystem paths. Concurrent exchanges
-        /// may invoke the callback concurrently.
+        /// may invoke the callback concurrently. On Windows, filesystem-backed sources should allow
+        /// delete sharing when the host API supports it so atomic replacement can proceed during a read.
         /// </summary>
         public static LoopbackEndpointDescriptor ReadFromSource(
             Func<byte[]?> readCurrentCanonicalDescriptor,
