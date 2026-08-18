@@ -30,10 +30,19 @@ def job_block(document: str, job: str) -> str:
 
 
 def step_containing(job: str, marker: str) -> str:
+    lines = job.splitlines(keepends=True)
+    steps_index = next(
+        index for index, line in enumerate(lines) if line.strip() == "steps:"
+    )
+    step_prefix = next(
+        line[: len(line) - len(line.lstrip(" "))] + "- "
+        for line in lines[steps_index + 1 :]
+        if line.lstrip(" ").startswith("- ")
+    )
     steps: list[str] = []
     current: list[str] = []
-    for line in job.splitlines(keepends=True):
-        if line.startswith("      - "):
+    for line in lines[steps_index + 1 :]:
+        if line.startswith(step_prefix):
             if current:
                 steps.append("".join(current))
             current = [line]
@@ -83,21 +92,34 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
             self.ci,
         )
 
-    def test_ci_keeps_cross_platform_package_and_real_daemon_contracts(self) -> None:
+    def test_ci_separates_canonical_package_authority_from_platform_checks(self) -> None:
         package_job = job_block(self.ci, "workspace-package")
-        matrix = mapping_block(package_job, "matrix", 6)
-        self.assertIn("- os: ubuntu-latest\n            mode: full", matrix)
-        self.assertIn("- os: macos-latest\n            mode: packages", matrix)
-        self.assertIn("- os: windows-latest\n            mode: packages", matrix)
-        self.assertEqual(matrix.count("- os:"), 3)
+        self.assertIn("runs-on: ubuntu-latest", package_job)
+        self.assertNotIn("matrix:", package_job)
         self.assertIn(
-            "python scripts/verify_workspace_packages.py --mode ${{ matrix.mode }}",
+            "python scripts/verify_workspace_packages.py --mode full",
             package_job,
+        )
+        self.assertEqual(
+            self.ci.count("python scripts/verify_workspace_packages.py"),
+            2,
         )
         self.assertIn("UNITY_ASSET_SOURCE_COMMIT: ${{ github.sha }}", self.ci)
 
+        platform_job = job_block(self.ci, "workspace-publication-platforms")
+        platform_matrix = mapping_block(platform_job, "matrix", 6)
+        self.assertIn(
+            "os: [ubuntu-latest, macos-latest, windows-latest]",
+            platform_matrix,
+        )
+        platform_packages = step_containing(
+            platform_job,
+            "python scripts/verify_workspace_packages.py --mode packages",
+        )
+        self.assertIn("if: runner.os != 'Linux'", platform_packages)
+
         command = "python scripts/run_real_daemon_agent.py"
-        self.assertIn(command, job_block(self.ci, "workspace-publication-platforms"))
+        self.assertIn(command, platform_job)
         self.assertIn(command, self.jobs["platform-contracts"])
 
     def test_release_jobs_are_finite_and_only_explicit_dispatch_can_publish(self) -> None:

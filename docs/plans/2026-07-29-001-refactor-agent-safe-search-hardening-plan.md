@@ -862,7 +862,7 @@ flowchart LR
 - One agent flow uses only capabilities and JSON requests.
 - One transport-neutral C# session completes Bootstrap and all business operations against the real Rust daemon through a test-only Rust relay that owns endpoint discovery, native peer verification, and `VerifiedFramedTransportV1`. This proves the C# session against real dispatch without moving production native transport ownership out of the external Unity plugin. Frozen revision-1 fixtures remain byte-identical and cross-revision requests fail before business dispatch.
 - One workspace flow admits sources, inspects, prepares media and hierarchy changes, commits, reopens, and observes the new revision/search generation.
-- Package consumers build with default and documented feature combinations on supported platforms.
+- Ubuntu owns the canonical archive and binary identity proof; macOS and Windows compile locally produced package archives and external consumers only to cover native target configuration, then run platform contracts.
 - Removed symbol and dependency assertions prevent accidental reintroduction.
 
 **Verification:** All focused suites, full workspace nextest, strict Clippy, docs, builds, isolated packages, release dry-run, Windows local gates, and Unix/macOS CI gates pass.
