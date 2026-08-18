@@ -108,14 +108,15 @@ def load_dist_plan(
 
 def validate_checksum_sidecars(
     artifacts: dict[str, Path], matrix: tuple[DistributionArtifactPair, ...]
-) -> None:
+) -> dict[str, bytes]:
+    canonical_sidecars: dict[str, bytes] = {}
     for pair in matrix:
         sidecar = artifacts[pair.checksum_name]
         try:
             content = sidecar.read_text(encoding="ascii")
         except (OSError, UnicodeDecodeError) as error:
             raise AssemblyError(f"cannot read checksum sidecar {sidecar}: {error}") from error
-        pattern = rf"([0-9a-f]{{64}})  {re.escape(pair.archive_name)}\n"
+        pattern = rf"([0-9a-f]{{64}}) ([ *]){re.escape(pair.archive_name)}\n(?:\n)?"
         match = re.fullmatch(pattern, content)
         if match is None:
             raise AssemblyError(
@@ -128,6 +129,10 @@ def validate_checksum_sidecars(
                 f"checksum digest mismatch for {pair.archive_name}: "
                 f"expected {actual_digest}, got {match.group(1)}"
             )
+        canonical_sidecars[pair.checksum_name] = (
+            f"{actual_digest}  {pair.archive_name}\n".encode("ascii")
+        )
+    return canonical_sidecars
 
 
 def collect_dist_files(dist_root: Path, expected_names: tuple[str, ...]) -> dict[str, Path]:
@@ -237,10 +242,15 @@ def assemble(
         raise AssemblyError("search protocol SDK bundle collides with a dist artifact")
 
     artifacts = collect_dist_files(dist_root, expected_artifacts)
-    validate_checksum_sidecars(artifacts, artifact_matrix)
+    canonical_sidecars = validate_checksum_sidecars(artifacts, artifact_matrix)
     output.mkdir(parents=True, exist_ok=True)
     for name, source in artifacts.items():
-        shutil.copyfile(source, output / name)
+        destination = output / name
+        canonical_sidecar = canonical_sidecars.get(name)
+        if canonical_sidecar is None:
+            shutil.copyfile(source, destination)
+        else:
+            destination.write_bytes(canonical_sidecar)
     shutil.copyfile(evidence, output / "release-evidence.json")
     shutil.copyfile(resolved_dist_plan, output / "release-dist-plan.json")
     shutil.copyfile(
