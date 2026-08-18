@@ -172,15 +172,42 @@ def gh_json(
         raise ReleaseAssetError(f"GitHub API returned invalid JSON for {endpoint}") from error
 
 
-def fetch_release(repository: str, tag: str) -> Mapping[str, Any] | None:
+def fetch_release(
+    repository: str,
+    tag: str,
+    expected_release_id: int | None = None,
+) -> Mapping[str, Any] | None:
+    if expected_release_id is not None:
+        payload = gh_json(
+            "GET",
+            f"repos/{repository}/releases/{expected_release_id}",
+            allow_not_found=True,
+        )
+        if payload is None:
+            return None
+        if not isinstance(payload, Mapping):
+            raise ReleaseAssetError("GitHub Release endpoint returned a non-object")
+        return payload
+
     payload = gh_json(
-        "GET", f"repos/{repository}/releases/tags/{tag}", allow_not_found=True
+        "GET",
+        f"repos/{repository}/releases?per_page=100",
+        paginate=True,
     )
-    if payload is None:
-        return None
-    if not isinstance(payload, Mapping):
-        raise ReleaseAssetError("GitHub Release endpoint returned a non-object")
-    return payload
+    if not isinstance(payload, list):
+        raise ReleaseAssetError("GitHub Releases endpoint returned a non-array")
+    matches: list[Mapping[str, Any]] = []
+    for page in payload:
+        if not isinstance(page, list):
+            raise ReleaseAssetError("GitHub Release page is not an array")
+        for release in page:
+            if not isinstance(release, Mapping):
+                raise ReleaseAssetError("GitHub Release is not an object")
+            if release.get("tag_name") == tag:
+                matches.append(release)
+    if len(matches) > 1:
+        raise ReleaseAssetError(f"GitHub has multiple releases for tag {tag}")
+    return matches[0] if matches else None
 
 
 def list_remote_assets(repository: str, release_id: int) -> list[RemoteAsset]:
@@ -562,7 +589,11 @@ def main() -> int:
         args.expected_body_file,
         bundle.evidence.github_release,
     )
-    release = fetch_release(args.github_repository, args.tag)
+    release = fetch_release(
+        args.github_repository,
+        args.tag,
+        expected_release_id,
+    )
     state = examine_release(
         expected,
         release,
@@ -597,7 +628,11 @@ def main() -> int:
             except ReleaseAssetError as error:
                 publish_error = error
             try:
-                release = fetch_release(args.github_repository, args.tag)
+                release = fetch_release(
+                    args.github_repository,
+                    args.tag,
+                    expected_release_id,
+                )
                 state = examine_release(
                     expected,
                     release,
