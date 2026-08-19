@@ -227,8 +227,14 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         upload = step_containing(draft, "needs_upload == 'true'")
         readback = step_containing(draft, "--phase staged")
         self.assertIn("--expected-evidence-sha256", preflight)
+        self.assertIn("id: release", upload)
         self.assertIn("draft: true", upload)
         self.assertIn("overwrite_files: true", upload)
+        self.assertIn(
+            "EXPECTED_RELEASE_ID: ${{ steps.release.outputs.id || steps.preflight.outputs.release_id }}",
+            readback,
+        )
+        self.assertIn('--expected-release-id "$EXPECTED_RELEASE_ID"', readback)
         self.assertIn('github-output "$GITHUB_OUTPUT"', readback)
 
         final = self.jobs["github-release"]

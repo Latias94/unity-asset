@@ -806,6 +806,7 @@ jobs:
           --github-output "$GITHUB_OUTPUT"
 
       - name: Create or update the verified draft release
+        id: release
         if: steps.preflight.outputs.needs_upload == 'true'
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.3.2
         with:
@@ -824,6 +825,7 @@ jobs:
         env:
           EXPECTED_COMMIT: ${{ needs.validate.outputs.commit }}
           EXPECTED_EVIDENCE_SHA256: ${{ needs.validate.outputs.evidence_sha256 }}
+          EXPECTED_RELEASE_ID: ${{ steps.release.outputs.id || steps.preflight.outputs.release_id }}
           GH_TOKEN: ${{ github.token }}
         run: >-
           python scripts/verify_github_release_assets.py
@@ -835,6 +837,7 @@ jobs:
           --expected-body-file release-proof/release-notes.md
           --expected-evidence-sha256 "$EXPECTED_EVIDENCE_SHA256"
           --phase staged
+          --expected-release-id "$EXPECTED_RELEASE_ID"
           --github-output "$GITHUB_OUTPUT"
 
   github-release:

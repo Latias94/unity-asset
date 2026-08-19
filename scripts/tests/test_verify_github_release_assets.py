@@ -257,6 +257,12 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
             commit="a" * 40,
             metadata=self.metadata(),
         )
+        fetch.assert_has_calls(
+            [
+                mock.call("owner/repository", "v0.4.0", 42),
+                mock.call("owner/repository", "v0.4.0", 42),
+            ]
+        )
         entered["bundle"].assert_called_once_with(
             Path("release-assets"),
             "v0.4.0",
@@ -282,7 +288,7 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
         fetch = entered["fetch"]
         publish = entered["publish"]
         publish.assert_not_called()
-        fetch.assert_called_once()
+        fetch.assert_called_once_with("owner/repository", "v0.4.0", 42)
 
     def test_full_workflow_rerun_accepts_exact_published_terminal_state(self) -> None:
         for phase in ("preflight", "staged"):
@@ -478,6 +484,64 @@ class GitHubReleaseAssetVerifierTests(unittest.TestCase):
         self.assertNotIn(body, arguments)
         request = json.loads(run_gh.call_args.kwargs["input_text"])
         self.assertEqual(request, {"body": body, "draft": False})
+
+    def test_fetch_release_lists_drafts_and_rejects_duplicate_tags(self) -> None:
+        release = self.release(draft=True)
+        other_release = self.release(release_id=41)
+        other_release["tag_name"] = "v0.3.0"
+        with mock.patch.object(
+            VERIFIER,
+            "gh_json",
+            return_value=[[other_release], [release]],
+        ) as gh_json:
+            self.assertEqual(
+                VERIFIER.fetch_release("owner/repository", "v0.4.0"),
+                release,
+            )
+
+        gh_json.assert_called_once_with(
+            "GET",
+            "repos/owner/repository/releases?per_page=100",
+            paginate=True,
+        )
+
+        with mock.patch.object(
+            VERIFIER,
+            "gh_json",
+            return_value=[[other_release]],
+        ):
+            self.assertIsNone(
+                VERIFIER.fetch_release("owner/repository", "v0.4.0")
+            )
+
+        with mock.patch.object(
+            VERIFIER,
+            "gh_json",
+            return_value=[[release], [self.release(release_id=43)]],
+        ):
+            with self.assertRaisesRegex(
+                VERIFIER.ReleaseAssetError,
+                "multiple releases",
+            ):
+                VERIFIER.fetch_release("owner/repository", "v0.4.0")
+
+    def test_fetch_release_uses_bound_release_id_for_drafts(self) -> None:
+        release = self.release(draft=True)
+        with mock.patch.object(
+            VERIFIER,
+            "gh_json",
+            return_value=release,
+        ) as gh_json:
+            self.assertEqual(
+                VERIFIER.fetch_release("owner/repository", "v0.4.0", 42),
+                release,
+            )
+
+        gh_json.assert_called_once_with(
+            "GET",
+            "repos/owner/repository/releases/42",
+            allow_not_found=True,
+        )
 
     def test_run_gh_maps_operating_system_errors(self) -> None:
         with mock.patch.object(
