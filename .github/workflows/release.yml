@@ -425,6 +425,12 @@ jobs:
     needs: [validate, package, release-assets, github-draft]
     if: inputs.mode == 'publish'
     timeout-minutes: 90
+    # GitHub draft releases are not readable by a contents-read token. The
+    # production gate revalidates the private draft by its exact release ID
+    # before any crates.io write, so this job needs the same release read
+    # authority as the staging job.
+    permissions:
+      contents: write
     environment:
       name: crates-io-production
     steps:
