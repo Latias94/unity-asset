@@ -195,6 +195,7 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         publish = self.jobs["publish"]
         self.assertIn("needs: [validate, package, release-assets, github-draft]", publish)
         self.assertIn("name: crates-io-production", publish)
+        self.assertIn("contents: write", publish)
         reverify = step_containing(
             publish, "python scripts/verify_github_release_assets.py"
         )
